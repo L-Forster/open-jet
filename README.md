@@ -1,21 +1,23 @@
-# open-jetson
+# open-jet
 
-Minimal agentic TUI for running LLMs on NVIDIA Jetson edge devices.
+Minimal agentic TUI for running LLMs on edge devices.
 
 ## Setup
 
-1. Install [Ollama](https://ollama.com) on your Jetson device.
+1. Install [Ollama](https://ollama.com) on your device.
 2. Pull a model: `ollama pull llama3.2`
-3. Install open-jetson:
+3. Create a venv and install open-jet (on Arch, use `python -m pip` so the venv is used):
 
 ```bash
-pip install -e .
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
 ```
 
 4. Run:
 
 ```bash
-open-jetson
+open-jet
 ```
 
 ## Configuration

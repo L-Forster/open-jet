@@ -1,7 +1,7 @@
 [project]
-name = "open-jetson"
+name = "open-jet"
 version = "0.1.0"
-description = "Minimal agentic TUI for running LLMs on Jetson edge devices"
+description = "Minimal agentic TUI for running LLMs on edge devices"
 requires-python = ">=3.10"
 dependencies = [
     "textual>=3.0",
@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-open-jetson = "src.app:main"
+open-jet = "src.app:main"
 
 [build-system]
 requires = ["setuptools>=68"]
