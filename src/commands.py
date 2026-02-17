@@ -31,8 +31,9 @@ class SlashCommandHandler:
             description="Clear chat only (keep current server/KV state)",
             aliases=("clear_messages",),
         ),
-        CommandSpec(name="status", description="Show conversation/context status"),
+        CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
         CommandSpec(name="condense", description="Manually condense older context"),
+        CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
     )
 
     def __init__(self, app: OpenJetApp, banner: str) -> None:
@@ -54,7 +55,9 @@ class SlashCommandHandler:
             self._render_unknown(log, text)
             return True
 
-        cmd = self.resolve_command(raw.split()[0])
+        parts = raw.split(maxsplit=1)
+        cmd = self.resolve_command(parts[0])
+        arg = parts[1].strip() if len(parts) > 1 else ""
         if cmd == "help":
             self._render_help(log)
             return True
@@ -68,7 +71,10 @@ class SlashCommandHandler:
             self._status(log)
             return True
         if cmd == "condense":
-            self._condense(log)
+            await self._condense(log)
+            return True
+        if cmd == "load":
+            await self._load(log, arg)
             return True
 
         self._render_unknown(log, text)
@@ -126,22 +132,39 @@ class SlashCommandHandler:
             )
 
     def _status(self, log: RichLog) -> None:
-        if not self.app.agent:
+        snapshot = self.app.runtime_status_snapshot()
+        if not snapshot.get("ready"):
             log.write("[dim]Agent not initialized.[/]")
             log.write("")
             return
 
-        msg_count = self.app.agent.conversation_message_count()
-        thinking = self.app._thinking_timer is not None
         log.write(
             "[dim]"
-            f"Context messages (excluding system): {msg_count} | "
-            f"generating: {'yes' if thinking else 'no'}"
+            f"Messages: {snapshot['messages']} | "
+            f"Generating: {'yes' if snapshot['generating'] else 'no'}"
             "[/]"
         )
+        log.write(
+            "[dim]"
+            f"Context tokens: {snapshot['context_tokens']}/{snapshot['context_window_tokens']} | "
+            f"Prompt budget: {snapshot['prompt_budget_tokens']} | "
+            f"Reserve: {snapshot['reserve_tokens']} | "
+            f"Remaining: {snapshot['remaining_prompt_tokens']}"
+            "[/]"
+        )
+        total_mb = snapshot.get("memory_total_mb")
+        available_mb = snapshot.get("memory_available_mb")
+        used_percent = snapshot.get("memory_used_percent")
+        if total_mb is not None and available_mb is not None and used_percent is not None:
+            log.write(
+                "[dim]"
+                f"RAM: {available_mb:.0f}MB free / {total_mb:.0f}MB total "
+                f"({used_percent:.1f}% used)"
+                "[/]"
+            )
         log.write("")
 
-    def _condense(self, log: RichLog) -> None:
+    async def _condense(self, log: RichLog) -> None:
         if self.app._thinking_timer:
             log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
             log.write("")
@@ -151,9 +174,10 @@ class SlashCommandHandler:
             log.write("")
             return
 
-        summary = self.app.agent.condense_context()
+        summary = await self.app.agent.condense_context(force=True)
         log.write(f"[dim]{summary}[/]")
         log.write("")
+        self.app.refresh_token_counter()
         if self.app.session_logger:
             self.app.session_logger.log_event("manual_condense", summary=summary)
 
@@ -161,6 +185,23 @@ class SlashCommandHandler:
         log.write(f"[yellow]Unknown command:[/] {text}")
         log.write("[dim]Run /help to list available commands.[/]")
         log.write("")
+
+    async def _load(self, log: RichLog, raw_arg: str) -> None:
+        path = raw_arg.strip()
+        if not path:
+            log.write("[yellow]Usage:[/] /load <path>")
+            log.write("")
+            return
+
+        if path.startswith("@[") and path.endswith("]"):
+            path = path[2:-1].strip()
+        elif path.startswith("@"):
+            path = path[1:].strip()
+
+        ok = await self.app.load_context_file(path, log)
+        if not ok:
+            log.write("[dim]Use /status to inspect current budget and memory.[/]")
+            log.write("")
 
     def resolve_command(self, token: str) -> str | None:
         needle = token.strip().lower()

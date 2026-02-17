@@ -6,6 +6,13 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
+from .runtime_limits import (
+    MIN_TOKEN_BUDGET,
+    derive_file_token_budget,
+    estimate_tokens,
+    read_memory_snapshot,
+)
+
 
 @dataclass
 class ExecResult:
@@ -39,6 +46,7 @@ class LoadFileResult:
     content: str = ""
     detail: str = ""
     estimated_tokens: int = 0
+    returned_tokens: int = 0
     token_budget: int = 0
     truncated: bool = False
     mem_available_mb: float | None = None
@@ -55,7 +63,8 @@ class LoadFileResult:
         )
         return (
             f"Loaded {self.path} "
-            f"(tokens~{self.estimated_tokens}/{self.token_budget}, "
+            f"(tokens~{self.returned_tokens}/{self.token_budget}, "
+            f"full~{self.estimated_tokens}, "
             f"truncated={trunc}, mem_available={mem_str})"
         )
 
@@ -70,7 +79,6 @@ _TEXT_EXTENSIONS = {
     ".dockerfile", ".makefile",
 }
 _MAX_READ_BYTES = 2 * 1024 * 1024
-_MIN_TOKEN_BUDGET = 128
 
 
 # -- Shell executor ----------------------------------------------------------
@@ -163,13 +171,14 @@ async def load_file(path: str, max_tokens: int | None = None) -> LoadFileResult:
         clipped_to_max_read = True
 
     text = raw.decode("utf-8", errors="replace")
-    mem_available_mb = _read_mem_available_mb()
-    budget_from_ram = _derive_budget_from_ram(mem_available_mb)
+    mem = read_memory_snapshot()
+    mem_available_mb = mem.available_mb if mem else None
+    budget_from_ram = derive_file_token_budget(mem_available_mb)
     requested_budget = max_tokens if max_tokens is not None else budget_from_ram
-    token_budget = max(_MIN_TOKEN_BUDGET, min(budget_from_ram, int(requested_budget)))
+    token_budget = max(MIN_TOKEN_BUDGET, min(budget_from_ram, int(requested_budget)))
     max_chars = token_budget * 4
 
-    estimated_tokens = _estimate_tokens(text)
+    estimated_tokens = estimate_tokens(text)
     truncated = False
     if len(text) > max_chars:
         text = text[:max_chars]
@@ -178,12 +187,14 @@ async def load_file(path: str, max_tokens: int | None = None) -> LoadFileResult:
         truncated = True
     if truncated:
         text = f"{text}\n\n...[truncated for context safety]"
+    returned_tokens = estimate_tokens(text)
 
     return LoadFileResult(
         ok=True,
         path=str(p),
         content=text,
         estimated_tokens=estimated_tokens,
+        returned_tokens=returned_tokens,
         token_budget=token_budget,
         truncated=truncated,
         mem_available_mb=mem_available_mb,
@@ -206,27 +217,3 @@ def _is_supported_text_file(path: Path) -> bool:
     if name in {"dockerfile", "makefile"}:
         return True
     return suffix in _TEXT_EXTENSIONS
-
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
-
-
-def _read_mem_available_mb() -> float | None:
-    try:
-        with open("/proc/meminfo", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    kb = int(line.split()[1])
-                    return kb / 1024.0
-    except Exception:
-        return None
-    return None
-
-
-def _derive_budget_from_ram(mem_available_mb: float | None) -> int:
-    if mem_available_mb is None:
-        return 512
-    # Runtime-only budget from currently available RAM.
-    dynamic = int(mem_available_mb * 4.0)
-    return max(_MIN_TOKEN_BUDGET, dynamic)

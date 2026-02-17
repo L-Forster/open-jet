@@ -9,6 +9,7 @@ from enum import Enum, auto
 from typing import AsyncIterator
 
 from .ollama_client import OllamaClient, ToolCall
+from .runtime_limits import ContextBudget, derive_context_budget, read_memory_snapshot
 
 
 class ActionKind(Enum):
@@ -39,6 +40,9 @@ class Agent:
         client: OllamaClient,
         system_prompt: str,
         *,
+        context_window_tokens: int | None = None,
+        context_reserved_tokens: int | None = None,
+        min_prompt_tokens: int = 256,
         min_available_mb: int | None = None,
         max_used_percent: float | None = None,
         memory_check_interval_chunks: int = 16,
@@ -48,6 +52,9 @@ class Agent:
         self.client = client
         self.system_prompt = system_prompt
         self.messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        self.context_window_tokens = context_window_tokens
+        self.context_reserved_tokens = context_reserved_tokens
+        self.min_prompt_tokens = max(128, int(min_prompt_tokens))
         self.min_available_mb = min_available_mb
         self.max_used_percent = max_used_percent
         self.memory_check_interval_chunks = max(1, int(memory_check_interval_chunks))
@@ -66,6 +73,15 @@ class Agent:
     def estimated_context_tokens(self) -> int:
         return self._estimated_context_tokens()
 
+    def context_budget(self) -> ContextBudget | None:
+        if not self.context_window_tokens:
+            return None
+        return derive_context_budget(
+            self.context_window_tokens,
+            reserve_tokens=self.context_reserved_tokens,
+            min_prompt_tokens=self.min_prompt_tokens,
+        )
+
     async def run_turn(self) -> AsyncIterator[AgentEvent]:
         """Run one model turn. Yields events the TUI should handle.
 
@@ -74,13 +90,13 @@ class Agent:
         2. Call complete_tool_call() with the result.
         3. Call run_turn() again to let the model see the result.
         """
-        pressure_reason = self._memory_pressure_reason()
+        pressure_reason = self._resource_pressure_reason()
         if pressure_reason:
             tool_call = self._build_condense_tool_call()
             self._append_assistant_tool_call("", tool_call)
             yield AgentEvent(
                 kind=ActionKind.TEXT,
-                text=f"(out of memory, condensing chat to reduce kvcache: {pressure_reason})",
+                text=f"(resource pressure, condensing chat: {pressure_reason})",
             )
             yield AgentEvent(
                 kind=ActionKind.TOOL_REQUEST,
@@ -103,14 +119,14 @@ class Agent:
                     pending_tool_calls.extend(chunk.tool_calls)
 
                 if chunk_count % self.memory_check_interval_chunks == 0:
-                    pressure_reason = self._memory_pressure_reason()
+                    pressure_reason = self._resource_pressure_reason()
                     if pressure_reason:
                         tool_call = self._build_condense_tool_call()
                         self._append_assistant_tool_call(collected_text, tool_call)
                         yield AgentEvent(
                             kind=ActionKind.TEXT,
                             text=(
-                                "\n(out of memory, condensing chat to reduce kvcache: "
+                                "\n(resource pressure, condensing chat: "
                                 f"{pressure_reason})"
                             ),
                         )
@@ -190,57 +206,50 @@ class Agent:
             return False
         return tool_call.arguments.get("command", "").strip() == CONDENSE_COMMAND
 
-    def condense_context(self) -> str:
-        """Condense older messages into a compact system summary."""
-        if len(self.messages) <= 2:
-            return "No condensation needed."
+    async def condense_context(self, *, force: bool = False) -> str:
+        """Condense message history with an LLM-generated summary."""
+        if len(self.messages) <= 1:
+            return "No message history to condense."
 
         total_before = self._estimated_context_tokens()
         original_messages = len(self.messages)
-        notes: list[str] = []
+        history = self.messages[1:]
+        transcript = self._history_as_text(history)
+        target_tokens = max(96, min(self.condense_target_tokens, total_before // 2))
+        summary = await self._summarize_text(transcript, target_tokens=target_tokens)
+        if not summary:
+            return "Condense failed: model returned empty summary."
 
-        # Keep system prompt plus only the newest N messages.
-        keep = max(2, self.keep_last_messages)
-        recent = self.messages[-keep:]
-        older = self.messages[1:-keep]
-
-        if older:
-            summary = self._build_summary(older)
-            summary_msg = {
-                "role": "system",
-                "content": (
-                    "Condensed conversation context (older turns):\n"
-                    f"{summary}"
-                ),
-            }
-            self.messages = [self.messages[0], summary_msg, *recent]
-            notes.append("summarized older turns")
-        else:
-            notes.append("no older turns to summarize")
-
-        # If still large, progressively trim oldest remaining non-system messages.
-        while (
-            self._estimated_context_tokens() > self.condense_target_tokens
-            and len(self.messages) > 4
-        ):
-            del self.messages[2]
-            notes.append("dropped oldest detailed turn")
-
-        # Final safeguard: truncate oldest large payload if still over target.
-        if self._estimated_context_tokens() > self.condense_target_tokens:
-            for idx in range(1, max(1, len(self.messages) - 1)):
-                content = str(self.messages[idx].get("content", ""))
-                if len(content) > 800:
-                    self.messages[idx]["content"] = content[:800] + "\n...[truncated]"
-                    notes.append("truncated oversized message")
-                    break
+        summary_msg = {
+            "role": "system",
+            "content": (
+                "Condensed conversation context:\n"
+                f"{summary}"
+            ),
+        }
+        self.messages = [self.messages[0], summary_msg]
 
         total_after = self._estimated_context_tokens()
+        if total_after >= total_before:
+            tighter_target = max(64, target_tokens // 2)
+            tighter_summary = await self._summarize_text(summary, target_tokens=tighter_target)
+            if tighter_summary:
+                self.messages = [
+                    self.messages[0],
+                    {
+                        "role": "system",
+                        "content": (
+                            "Condensed conversation context:\n"
+                            f"{tighter_summary}"
+                        ),
+                    },
+                ]
+                total_after = self._estimated_context_tokens()
+
         return (
             "Context condensed via command tool. "
             f"messages: {original_messages} -> {len(self.messages)}, "
-            f"tokens(est): {total_before} -> {total_after}. "
-            f"actions: {', '.join(notes)}"
+            f"tokens(est): {total_before} -> {total_after}."
         )
 
     def _estimated_context_tokens(self) -> int:
@@ -251,8 +260,32 @@ class Agent:
             total += max(1, len(content) // 4) + 8
         return total
 
+    def _resource_pressure_reason(self) -> str | None:
+        context_pressure = self._context_pressure_reason()
+        if context_pressure:
+            return context_pressure
+        return self._memory_pressure_reason()
+
+    def _context_pressure_reason(self) -> str | None:
+        budget = self.context_budget()
+        if not budget:
+            return None
+        current = self._estimated_context_tokens()
+        if current <= budget.prompt_tokens:
+            return None
+        return (
+            f"context={current}t exceeds prompt budget "
+            f"{budget.prompt_tokens}t/{budget.window_tokens}t "
+            f"(reserve={budget.reserve_tokens}t)"
+        )
+
     def _memory_pressure_reason(self) -> str | None:
-        total_mb, available_mb, used_percent = self._read_memory_info_mb()
+        snapshot = read_memory_snapshot()
+        if not snapshot:
+            return None
+        total_mb = snapshot.total_mb
+        available_mb = snapshot.available_mb
+        used_percent = snapshot.used_percent
         if total_mb is None or available_mb is None or used_percent is None:
             return None
 
@@ -273,36 +306,27 @@ class Agent:
             )
         return None
 
-    def _read_memory_info_mb(self) -> tuple[float | None, float | None, float | None]:
-        mem_total_kb: int | None = None
-        mem_available_kb: int | None = None
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        mem_total_kb = int(line.split()[1])
-                    elif line.startswith("MemAvailable:"):
-                        mem_available_kb = int(line.split()[1])
-        except OSError:
-            return None, None, None
-
-        if not mem_total_kb or mem_available_kb is None:
-            return None, None, None
-
-        total_mb = mem_total_kb / 1024.0
-        available_mb = mem_available_kb / 1024.0
-        used_percent = ((mem_total_kb - mem_available_kb) / mem_total_kb) * 100.0
-        return total_mb, available_mb, used_percent
-
-    def _build_summary(self, older_messages: list[dict]) -> str:
+    def _history_as_text(self, older_messages: list[dict]) -> str:
         lines: list[str] = []
-        for msg in older_messages[-20:]:
+        for msg in older_messages:
             role = str(msg.get("role", "unknown")).upper()
             text = " ".join(str(msg.get("content", "")).split())
-            if len(text) > 220:
-                text = text[:217] + "..."
             if text:
-                lines.append(f"- {role}: {text}")
-        if not lines:
-            return "- (no prior text content)"
+                lines.append(f"{role}: {text}")
         return "\n".join(lines)
+
+    async def _summarize_text(self, text: str, *, target_tokens: int) -> str:
+        prompt = (
+            "Summarize the conversation history for future context.\n"
+            f"Keep key facts, constraints, and decisions. Target under {target_tokens} tokens.\n"
+            "Remove repetition and fluff. Return only the summary."
+        )
+        messages = [
+            {"role": "system", "content": "You summarize conversation context for an offline coding agent."},
+            {"role": "user", "content": f"{prompt}\n\nConversation:\n{text}"},
+        ]
+        chunks: list[str] = []
+        async for chunk in self.client.chat_stream(messages, use_tools=False):
+            if chunk.text:
+                chunks.append(chunk.text)
+        return "".join(chunks).strip()

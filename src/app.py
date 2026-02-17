@@ -14,12 +14,14 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, RichLog, Static
+from textual.widgets._input import Selection
 
 from .agent import ActionKind, Agent, ToolCall
 from .commands import SlashCommandHandler
 from .completion import CompletionEngine, FileMentionCompletionProvider, SlashCompletionProvider
 from .executor import load_file, read_file, run_shell, write_file
 from .ollama_client import OllamaClient
+from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
 from .session_logging import SessionLogger
 
 
@@ -179,6 +181,13 @@ class OpenJetApp(App):
         self.agent = Agent(
             client=self.client,
             system_prompt=self.cfg.get("system_prompt", ""),
+            context_window_tokens=self.client.context_window_tokens,
+            context_reserved_tokens=(
+                int(mem_cfg["context_reserved_tokens"])
+                if mem_cfg.get("context_reserved_tokens") is not None
+                else None
+            ),
+            min_prompt_tokens=int(mem_cfg.get("min_prompt_tokens", 256)),
             min_available_mb=(
                 int(mem_cfg["min_available_mb"])
                 if mem_cfg.get("min_available_mb") is not None
@@ -271,28 +280,29 @@ class OpenJetApp(App):
             return
 
         if event.key == "up" and self.completion.state:
+            event.prevent_default()
             self.completion.cycle(-1)
             self._render_completion_suggestions()
             event.stop()
             return
         if event.key == "down" and self.completion.state:
+            event.prevent_default()
             self.completion.cycle(1)
             self._render_completion_suggestions()
             event.stop()
             return
         if event.key == "tab":
+            event.prevent_default()
             if self.completion.state:
                 prompt.value = self.completion.apply_selected(prompt.value)
                 self._update_completion_suggestions(prompt.value)
-                cursor = len(prompt.value)
-                if hasattr(prompt, "cursor_position"):
-                    prompt.cursor_position = cursor
-                if hasattr(prompt, "selection"):
-                    prompt.selection = (cursor, cursor)
+                prompt.action_end(select=False)
+                self.call_after_refresh(self._collapse_prompt_selection)
                 prompt.focus()
             elif prompt.value.lstrip().startswith(("/", "@")):
                 # Keep focus in chat input when tab is used for completion contexts.
                 prompt.focus()
+                self.call_after_refresh(self._collapse_prompt_selection)
             event.stop()
             return
 
@@ -339,38 +349,51 @@ class OpenJetApp(App):
             return
 
         for mention_path in paths:
-            current_tokens = self.agent.estimated_context_tokens()
-            context_window = self.client.context_window_tokens if self.client else 2048
-            safety_headroom = max(128, int(context_window * 0.12))
-            remaining_tokens = max(128, context_window - current_tokens - safety_headroom)
-            result = await load_file(mention_path, max_tokens=remaining_tokens)
-            if not result.ok:
-                log.write(f"[yellow]@{mention_path}:[/] {result.detail}")
-                continue
-
-            context_text = (
-                "User-loaded file context:\n"
-                f"path: {result.path}\n"
-                f"tokens_estimated: {result.estimated_tokens}\n"
-                f"token_budget: {result.token_budget}\n"
-                f"truncated: {'yes' if result.truncated else 'no'}\n"
-                "content:\n"
-                f"{result.content}"
-            )
-            self.agent.messages.append({"role": "system", "content": context_text})
-            log.write(f"[dim]Loaded @{mention_path} into context ({result.summary}).[/]")
-            if self.session_logger:
-                self.session_logger.log_event(
-                    "context_file_loaded",
-                    mention_path=mention_path,
-                    resolved_path=result.path,
-                    context_tokens_before=current_tokens,
-                    estimated_tokens=result.estimated_tokens,
-                    token_budget=result.token_budget,
-                    truncated=result.truncated,
-                    mem_available_mb=result.mem_available_mb,
-                )
+            await self.load_context_file(mention_path, log)
         self._render_token_counter()
+
+    async def load_context_file(self, path: str, log: RichLog) -> bool:
+        if not self.agent:
+            return False
+        mention_path = path.strip()
+        if not mention_path:
+            log.write("[yellow]load:[/] empty path")
+            return False
+
+        current_tokens = self.agent.estimated_context_tokens()
+        remaining_tokens = self._remaining_prompt_tokens()
+        result = await load_file(mention_path, max_tokens=remaining_tokens)
+        if not result.ok:
+            log.write(f"[yellow]@{mention_path}:[/] {result.detail}")
+            return False
+
+        context_text = (
+            "User-loaded file context:\n"
+            f"path: {result.path}\n"
+            f"tokens_estimated: {result.estimated_tokens}\n"
+            f"tokens_loaded: {result.returned_tokens}\n"
+            f"token_budget: {result.token_budget}\n"
+            f"truncated: {'yes' if result.truncated else 'no'}\n"
+            "content:\n"
+            f"{result.content}"
+        )
+        self.agent.messages.append({"role": "system", "content": context_text})
+        log.write(f"[dim]Loaded @{mention_path} into context ({result.summary}).[/]")
+        if self.session_logger:
+            self.session_logger.log_event(
+                "context_file_loaded",
+                mention_path=mention_path,
+                resolved_path=result.path,
+                context_tokens_before=current_tokens,
+                estimated_tokens=result.estimated_tokens,
+                returned_tokens=result.returned_tokens,
+                token_budget=result.token_budget,
+                remaining_prompt_tokens=remaining_tokens,
+                truncated=result.truncated,
+                mem_available_mb=result.mem_available_mb,
+            )
+        self._render_token_counter()
+        return True
 
     def _update_completion_suggestions(self, raw_value: str) -> None:
         if self._awaiting_approval:
@@ -413,10 +436,46 @@ class OpenJetApp(App):
             counter.update("[dim]tokens: 0/0[/]")
             return
         current = self.agent.estimated_context_tokens()
-        draft = _estimate_text_tokens(draft_text)
+        draft = estimate_tokens(draft_text)
         total = current + draft
         window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
-        counter.update(f"[dim]tokens: {total}/{window}[/]")
+        budget = self.agent.context_budget() or derive_context_budget(window)
+        remaining = max(0, budget.prompt_tokens - total)
+        if total > budget.prompt_tokens:
+            color = "red"
+        elif remaining <= 256:
+            color = "yellow"
+        else:
+            color = "dim"
+        counter.update(
+            f"[{color}]tokens: {total}/{window} | prompt<= {budget.prompt_tokens} | remaining: {remaining}[/]"
+        )
+
+    def runtime_status_snapshot(self) -> dict:
+        if not self.agent:
+            return {"ready": False}
+
+        window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
+        budget = self.agent.context_budget() or derive_context_budget(window)
+        current = self.agent.estimated_context_tokens()
+        remaining = max(0, budget.prompt_tokens - current)
+        mem = read_memory_snapshot()
+        return {
+            "ready": True,
+            "messages": self.agent.conversation_message_count(),
+            "generating": self._thinking_timer is not None,
+            "context_tokens": current,
+            "context_window_tokens": window,
+            "prompt_budget_tokens": budget.prompt_tokens,
+            "reserve_tokens": budget.reserve_tokens,
+            "remaining_prompt_tokens": remaining,
+            "memory_total_mb": mem.total_mb if mem else None,
+            "memory_available_mb": mem.available_mb if mem else None,
+            "memory_used_percent": mem.used_percent if mem else None,
+        }
+
+    def refresh_token_counter(self) -> None:
+        self._render_token_counter()
 
     # -- Agent turn ----------------------------------------------------------
 
@@ -476,7 +535,7 @@ class OpenJetApp(App):
     async def _handle_tool_call(self, tc: ToolCall, log: RichLog) -> None:
         if self.agent.is_internal_condense_tool(tc):
             log.write(f"[yellow]{tc.name}:[/] {_fmt_args(tc)}")
-            result = self.agent.condense_context()
+            result = await self.agent.condense_context()
             log.write(f"  [dim]{result}[/]")
             log.write("")
             self.agent.complete_tool_call(tc, result)
@@ -508,6 +567,9 @@ class OpenJetApp(App):
                     arguments=tc.arguments,
                 )
 
+        if tc.name == "load_file":
+            self._clamp_load_file_tool_budget(tc)
+
         t0 = time.monotonic()
         result, meta = await _execute_tool(tc)
         duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
@@ -526,6 +588,26 @@ class OpenJetApp(App):
             log.write(f"  [dim]... ({len(result.splitlines()) - 20} more lines)[/]")
         log.write("")
         self.agent.complete_tool_call(tc, result)
+
+    def _clamp_load_file_tool_budget(self, tc: ToolCall) -> None:
+        if not isinstance(tc.arguments, dict):
+            return
+        remaining = self._remaining_prompt_tokens()
+        current = tc.arguments.get("max_tokens")
+        if not isinstance(current, int):
+            tc.arguments["max_tokens"] = remaining
+            return
+        tc.arguments["max_tokens"] = max(128, min(current, remaining))
+
+    def _remaining_prompt_tokens(self) -> int:
+        if not self.agent:
+            return 128
+        current = self.agent.estimated_context_tokens()
+        budget = self.agent.context_budget()
+        if not budget:
+            window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
+            budget = derive_context_budget(window)
+        return max(128, budget.prompt_tokens - current)
 
     def _start_thinking(self) -> int:
         status = self.query_one("#assistant-status", Static)
@@ -603,6 +685,11 @@ class OpenJetApp(App):
         if self._approval_future and not self._approval_future.done():
             self._approval_future.set_result(approved)
 
+    def _collapse_prompt_selection(self) -> None:
+        prompt = self.query_one("#prompt", Input)
+        cursor = prompt.cursor_position
+        prompt.selection = Selection(cursor, cursor)
+
 
 # ---------------------------------------------------------------------------
 # Tool dispatch
@@ -659,6 +746,7 @@ async def _execute_tool(tc: ToolCall) -> tuple[str, dict]:
             "ok": True,
             "truncated": loaded.truncated,
             "estimated_tokens": loaded.estimated_tokens,
+            "returned_tokens": loaded.returned_tokens,
             "token_budget": loaded.token_budget,
             "mem_available_mb": loaded.mem_available_mb,
         }
@@ -691,10 +779,6 @@ def _extract_file_mentions(text: str) -> list[str]:
         seen.add(candidate)
         cleaned.append(candidate)
     return cleaned
-
-
-def _estimate_text_tokens(text: str) -> int:
-    return max(1, len(text) // 4) if text else 0
 
 
 # ---------------------------------------------------------------------------

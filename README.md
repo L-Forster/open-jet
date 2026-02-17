@@ -1,12 +1,12 @@
 # open-jet
 
-Minimal agentic TUI for running LLMs on edge devices.
+Minimal agentic TUI for offline edge devices (Jetson-class targets).
 
 ## Setup
 
-1. Install [Ollama](https://ollama.com) on your device.
-2. Pull a model: `ollama pull llama3.2`
-3. Create a venv and install open-jet (on Arch, use `python -m pip` so the venv is used):
+1. Install `llama-server` (from `llama.cpp`) on your device and ensure it is on `PATH` (or at `~/llama.cpp/build/bin/llama-server`).
+2. Put your `.gguf` model on disk.
+3. Create a venv and install:
 
 ```bash
 python -m venv .venv
@@ -20,16 +20,49 @@ python -m pip install -e .
 open-jet
 ```
 
-## Configuration
-
-Edit `config.yaml` to change the Ollama endpoint, model, or system prompt.
+On first run, the TUI asks for your model path and writes it to `config.yaml`.
 
 ## Usage
 
-- Type a message and press Enter to chat.
-- When the model proposes a shell command, a confirmation dialog appears.
-- Press `y` to approve or `n` to deny.
-- Press `Ctrl+C` to quit.
+- Chat normally with Enter.
+- `@file` or `@[path with spaces]` loads file content into context automatically.
+- Typing `/` shows slash command suggestions; `Up/Down` cycles and `Tab` autocompletes.
+- `Tab` also autocompletes `@` file paths from the current workspace.
+- A live token counter is shown under the chat input.
+- Tool calls that can change system state still require approval (`y` / `n`).
+- `Ctrl+C` quits.
+
+## Slash Commands
+
+- `/help`: list commands.
+- `/clear`: clear chat and restart `llama-server` (flush KV cache).
+- `/clear-chat`: clear chat only.
+- `/status`: show context and RAM status.
+- `/condense`: manually condense older context.
+- `/load <path>`: preload a text/code file into context.
+
+## Edge Device Notes
+
+- File loading is runtime-budgeted using current `MemAvailable` and prompt budget.
+- Only text/code files are allowed for context loading.
+- Large files are truncated and marked with `...[truncated for context safety]`.
+- `load_file` tool calls are clamped to remaining prompt budget at runtime.
+
+## Configuration
+
+Key options in `config.yaml`:
+
+```yaml
+context_window_tokens: 2048
+memory_guard:
+  context_reserved_tokens: null
+  min_prompt_tokens: 256
+  min_available_mb: null
+  max_used_percent: null
+  check_interval_chunks: 16
+  condense_target_tokens: 900
+  keep_last_messages: 6
+```
 
 ## Session Logging
 
