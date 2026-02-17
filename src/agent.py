@@ -46,6 +46,7 @@ class Agent:
         keep_last_messages: int = 6,
     ) -> None:
         self.client = client
+        self.system_prompt = system_prompt
         self.messages: list[dict] = [{"role": "system", "content": system_prompt}]
         self.min_available_mb = min_available_mb
         self.max_used_percent = max_used_percent
@@ -55,6 +56,15 @@ class Agent:
 
     def add_user_message(self, text: str) -> None:
         self.messages.append({"role": "user", "content": text})
+
+    def reset_conversation(self) -> None:
+        self.messages = [{"role": "system", "content": self.system_prompt}]
+
+    def conversation_message_count(self) -> int:
+        return max(0, len(self.messages) - 1)
+
+    def estimated_context_tokens(self) -> int:
+        return self._estimated_context_tokens()
 
     async def run_turn(self) -> AsyncIterator[AgentEvent]:
         """Run one model turn. Yields events the TUI should handle.

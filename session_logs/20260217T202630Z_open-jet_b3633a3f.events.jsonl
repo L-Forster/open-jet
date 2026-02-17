@@ -1,0 +1,4 @@
+{"timestamp": "2026-02-17T20:26:30.201734+00:00", "session_id": "b3633a3f6d964a23be38e1e72c815203", "type": "session_start", "data": {"session_id": "b3633a3f6d964a23be38e1e72c815203", "label": "open-jet", "events_file": "session_logs/20260217T202630Z_open-jet_b3633a3f.events.jsonl", "metrics_file": "session_logs/20260217T202630Z_open-jet_b3633a3f.metrics.jsonl"}}
+{"timestamp": "2026-02-17T20:26:30.202235+00:00", "session_id": "b3633a3f6d964a23be38e1e72c815203", "type": "app_mount", "data": {"cwd": "/home/louis/open-jet"}}
+{"timestamp": "2026-02-17T20:26:33.419612+00:00", "session_id": "b3633a3f6d964a23be38e1e72c815203", "type": "llm_ready", "data": {"model": "/home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf"}}
+{"timestamp": "2026-02-17T20:39:22.618303+00:00", "session_id": "b3633a3f6d964a23be38e1e72c815203", "type": "session_end", "data": {"session_id": "b3633a3f6d964a23be38e1e72c815203"}}

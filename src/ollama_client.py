@@ -50,6 +50,27 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "load_file",
+            "description": "Load a text/code file into context with RAM-safe truncation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to a text/code file",
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Optional max token budget for loaded content",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "write_file",
             "description": "Write content to a file. Always requires user confirmation.",
             "parameters": {
@@ -99,15 +120,23 @@ def _find_llama_server() -> str:
 class OllamaClient:
     """Starts llama-server and streams chat completions via its OpenAI API."""
 
-    def __init__(self, model: str, host: str = "127.0.0.1", port: int = 8080) -> None:
+    def __init__(
+        self,
+        model: str,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        context_window_tokens: int = 2048,
+    ) -> None:
         self.model = model
         self.host = host
         self.port = port
+        self.context_window_tokens = max(512, int(context_window_tokens))
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
 
     async def start(self) -> None:
+        await self._stop_server()
         binary = _find_llama_server()
         env = os.environ.copy()
         bin_dir = os.path.dirname(binary)
@@ -116,7 +145,7 @@ class OllamaClient:
         self._proc = await asyncio.create_subprocess_exec(
             binary, "-m", self.model,
             "--host", self.host, "--port", str(self.port),
-            "-ngl", "20", "-c", "2048",
+            "-ngl", "20", "-c", str(self.context_window_tokens),
             env=env,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -137,13 +166,22 @@ class OllamaClient:
         raise TimeoutError("llama-server did not become ready")
 
     async def close(self) -> None:
+        await self._stop_server()
         await self._http.aclose()
+
+    async def reset_kv_cache(self) -> None:
+        # llama.cpp clears KV state on server restart.
+        await self._stop_server()
+        await self.start()
+
+    async def _stop_server(self) -> None:
         if self._proc and self._proc.returncode is None:
             self._proc.send_signal(signal.SIGTERM)
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 self._proc.kill()
+        self._proc = None
 
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True

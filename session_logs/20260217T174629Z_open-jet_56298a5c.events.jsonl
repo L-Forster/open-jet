@@ -1,0 +1,10 @@
+{"timestamp": "2026-02-17T17:46:29.109169+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "session_start", "data": {"session_id": "56298a5caeb64026b02e9b3df377e369", "label": "open-jet", "events_file": "session_logs/20260217T174629Z_open-jet_56298a5c.events.jsonl", "metrics_file": "session_logs/20260217T174629Z_open-jet_56298a5c.metrics.jsonl"}}
+{"timestamp": "2026-02-17T17:46:29.109649+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "app_mount", "data": {"cwd": "/home/louis/open-jet"}}
+{"timestamp": "2026-02-17T17:46:32.324784+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "llm_ready", "data": {"model": "/home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf"}}
+{"timestamp": "2026-02-17T17:46:53.256473+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "user_message", "data": {"text": "What are the use cases for a local LLM CLI tool on nvidia jetsons that cant be dont with online tool"}}
+{"timestamp": "2026-02-17T17:48:14.970301+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "user_message", "data": {"text": "But none of thos thignsare to do with what I said"}}
+{"timestamp": "2026-02-17T17:49:12.724689+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "user_message", "data": {"text": "You are just repeating youself. I specifically said LLM CLI tool."}}
+{"timestamp": "2026-02-17T17:50:15.923477+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "user_message", "data": {"text": "Stop saying the samegeneric bullshit overa nd over again....."}}
+{"timestamp": "2026-02-17T17:51:40.689559+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "user_message", "data": {"text": "Tell me if I;m SSH into a jetson to run The LLM what is the purpose then"}}
+{"timestamp": "2026-02-17T17:52:21.758334+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "agent_error", "data": {"error": ""}}
+{"timestamp": "2026-02-17T17:52:22.349715+00:00", "session_id": "56298a5caeb64026b02e9b3df377e369", "type": "session_end", "data": {"session_id": "56298a5caeb64026b02e9b3df377e369"}}

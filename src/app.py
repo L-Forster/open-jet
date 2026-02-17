@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 
@@ -15,7 +16,9 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, RichLog, Static
 
 from .agent import ActionKind, Agent, ToolCall
-from .executor import read_file, run_shell, write_file
+from .commands import SlashCommandHandler
+from .completion import CompletionEngine, FileMentionCompletionProvider, SlashCompletionProvider
+from .executor import load_file, read_file, run_shell, write_file
 from .ollama_client import OllamaClient
 from .session_logging import SessionLogger
 
@@ -42,7 +45,7 @@ def save_config(cfg: dict) -> None:
 # Block title banner
 # ---------------------------------------------------------------------------
 
-BANNER = r"""[bold cyan]
+BANNER = r"""[bold green]
    ___                   _        _   
   / _ \ _ __   ___ _ __  (_) ___  | |_ 
  | | | | '_ \ / _ \ '_ \ | |/ _ \ | __|
@@ -57,7 +60,7 @@ class SetupScreen(ModalScreen[dict]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static("[bold cyan]First-run setup[/]"),
+            Static("[bold green]First-run setup[/]"),
             Static(""),
             Static("Path to your .gguf model file:"),
             Input(placeholder="/path/to/model.gguf", id="setup-model"),
@@ -98,6 +101,16 @@ Screen {
 #prompt {
     height: 3;
     margin: 0 2;
+}
+#command-suggestions {
+    height: auto;
+    margin: 0 2;
+    color: $text-muted;
+}
+#token-counter {
+    height: 1;
+    margin: 0 2;
+    color: $text-muted;
 }
 #assistant-status {
     height: 1;
@@ -143,14 +156,25 @@ class OpenJetApp(App):
         self.session_logger: SessionLogger | None = None
         self._thinking_timer = None
         self._thinking_idx = 0
+        self._thinking_token = 0
         self._awaiting_approval = False
         self._approval_choice = 0
         self._approval_future: asyncio.Future[bool] | None = None
         self._approval_tool_call: ToolCall | None = None
+        self.commands = SlashCommandHandler(self, banner=BANNER)
+        self.completion = CompletionEngine(
+            [
+                SlashCompletionProvider(self.commands),
+                FileMentionCompletionProvider(Path.cwd()),
+            ]
+        )
 
     async def _init_client(self) -> None:
         mem_cfg = self.cfg.get("memory_guard", {})
-        self.client = OllamaClient(model=self.cfg["model"])
+        self.client = OllamaClient(
+            model=self.cfg["model"],
+            context_window_tokens=int(self.cfg.get("context_window_tokens", 2048)),
+        )
         await self.client.start()
         self.agent = Agent(
             client=self.client,
@@ -175,6 +199,8 @@ class OpenJetApp(App):
         yield Static("", id="assistant-status", classes="hidden")
         yield Static("", id="approval-bar", classes="hidden")
         yield Input(placeholder="> ", id="prompt")
+        yield Static("", id="command-suggestions", classes="hidden")
+        yield Static("", id="token-counter")
 
     async def on_mount(self) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -208,6 +234,7 @@ class OpenJetApp(App):
             self.session_logger.log_event("llm_ready", model=self.cfg["model"])
         log.write(f"  [dim]Ready.[/]")
         log.write("")
+        self._render_token_counter()
         prompt.focus()
 
     async def action_quit(self) -> None:
@@ -218,29 +245,64 @@ class OpenJetApp(App):
         self.exit()
 
     def on_key(self, event: events.Key) -> None:
-        if not self._awaiting_approval:
+        if self._awaiting_approval:
+            if event.key in ("left", "right"):
+                self._approval_choice = 0 if event.key == "left" else 1
+                self._render_approval_bar()
+                event.stop()
+                return
+            if event.key == "y":
+                self._approval_choice = 0
+                self._resolve_approval(True)
+                event.stop()
+                return
+            if event.key in ("n", "escape"):
+                self._approval_choice = 1
+                self._resolve_approval(False)
+                event.stop()
+                return
+            if event.key == "enter":
+                self._resolve_approval(self._approval_choice == 0)
+                event.stop()
             return
 
-        if event.key in ("left", "right"):
-            self._approval_choice = 0 if event.key == "left" else 1
-            self._render_approval_bar()
+        prompt = self.query_one("#prompt", Input)
+        if self.focused is not prompt:
+            return
+
+        if event.key == "up" and self.completion.state:
+            self.completion.cycle(-1)
+            self._render_completion_suggestions()
             event.stop()
             return
-        if event.key == "y":
-            self._approval_choice = 0
-            self._resolve_approval(True)
+        if event.key == "down" and self.completion.state:
+            self.completion.cycle(1)
+            self._render_completion_suggestions()
             event.stop()
             return
-        if event.key in ("n", "escape"):
-            self._approval_choice = 1
-            self._resolve_approval(False)
+        if event.key == "tab":
+            if self.completion.state:
+                prompt.value = self.completion.apply_selected(prompt.value)
+                self._update_completion_suggestions(prompt.value)
+                cursor = len(prompt.value)
+                if hasattr(prompt, "cursor_position"):
+                    prompt.cursor_position = cursor
+                if hasattr(prompt, "selection"):
+                    prompt.selection = (cursor, cursor)
+                prompt.focus()
+            elif prompt.value.lstrip().startswith(("/", "@")):
+                # Keep focus in chat input when tab is used for completion contexts.
+                prompt.focus()
             event.stop()
             return
-        if event.key == "enter":
-            self._resolve_approval(self._approval_choice == 0)
-            event.stop()
 
     # -- Input ---------------------------------------------------------------
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "prompt":
+            return
+        self._update_completion_suggestions(event.value)
+        self._render_token_counter(event.value)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if self._awaiting_approval:
@@ -251,6 +313,11 @@ class OpenJetApp(App):
         if not text:
             return
         event.input.value = ""
+        self._clear_completion_suggestions()
+
+        if await self.commands.maybe_handle(text):
+            self._render_token_counter()
+            return
 
         log = self.query_one("#chat-log", RichLog)
         log.write(f"[bold green]> [/]{text}")
@@ -258,8 +325,98 @@ class OpenJetApp(App):
         if self.session_logger:
             self.session_logger.log_event("user_message", text=text)
 
+        await self._load_mentioned_files_into_context(text, log)
         self.agent.add_user_message(text)
+        self._render_token_counter()
         self.run_agent_turn()
+
+    async def _load_mentioned_files_into_context(self, text: str, log: RichLog) -> None:
+        if not self.agent:
+            return
+
+        paths = _extract_file_mentions(text)
+        if not paths:
+            return
+
+        for mention_path in paths:
+            current_tokens = self.agent.estimated_context_tokens()
+            context_window = self.client.context_window_tokens if self.client else 2048
+            safety_headroom = max(128, int(context_window * 0.12))
+            remaining_tokens = max(128, context_window - current_tokens - safety_headroom)
+            result = await load_file(mention_path, max_tokens=remaining_tokens)
+            if not result.ok:
+                log.write(f"[yellow]@{mention_path}:[/] {result.detail}")
+                continue
+
+            context_text = (
+                "User-loaded file context:\n"
+                f"path: {result.path}\n"
+                f"tokens_estimated: {result.estimated_tokens}\n"
+                f"token_budget: {result.token_budget}\n"
+                f"truncated: {'yes' if result.truncated else 'no'}\n"
+                "content:\n"
+                f"{result.content}"
+            )
+            self.agent.messages.append({"role": "system", "content": context_text})
+            log.write(f"[dim]Loaded @{mention_path} into context ({result.summary}).[/]")
+            if self.session_logger:
+                self.session_logger.log_event(
+                    "context_file_loaded",
+                    mention_path=mention_path,
+                    resolved_path=result.path,
+                    context_tokens_before=current_tokens,
+                    estimated_tokens=result.estimated_tokens,
+                    token_budget=result.token_budget,
+                    truncated=result.truncated,
+                    mem_available_mb=result.mem_available_mb,
+                )
+        self._render_token_counter()
+
+    def _update_completion_suggestions(self, raw_value: str) -> None:
+        if self._awaiting_approval:
+            self._clear_completion_suggestions()
+            return
+        state = self.completion.refresh(raw_value)
+        if not state:
+            self._clear_completion_suggestions()
+            return
+        self._render_completion_suggestions()
+
+    def _render_completion_suggestions(self) -> None:
+        bar = self.query_one("#command-suggestions", Static)
+        state = self.completion.state
+        if not state:
+            bar.add_class("hidden")
+            bar.update("")
+            return
+
+        lines: list[str] = []
+        for idx, item in enumerate(state.items):
+            if idx == state.index:
+                lines.append(f"[black on green] {item.label} [/]")
+            else:
+                lines.append(f"[bold green]{item.label}[/]")
+            if item.detail:
+                lines[-1] += f" [dim]- {item.detail}[/]"
+        bar.remove_class("hidden")
+        bar.update("\n".join(lines) + "\n[dim]Up/Down to select, Tab to autocomplete[/]")
+
+    def _clear_completion_suggestions(self) -> None:
+        self.completion.clear()
+        bar = self.query_one("#command-suggestions", Static)
+        bar.add_class("hidden")
+        bar.update("")
+
+    def _render_token_counter(self, draft_text: str = "") -> None:
+        counter = self.query_one("#token-counter", Static)
+        if not self.agent:
+            counter.update("[dim]tokens: 0/0[/]")
+            return
+        current = self.agent.estimated_context_tokens()
+        draft = _estimate_text_tokens(draft_text)
+        total = current + draft
+        window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
+        counter.update(f"[dim]tokens: {total}/{window}[/]")
 
     # -- Agent turn ----------------------------------------------------------
 
@@ -269,7 +426,7 @@ class OpenJetApp(App):
         pending_tool_calls: list[ToolCall] = []
         text_buf = ""
         assistant_turn_text = ""
-        self._start_thinking()
+        thinking_token = self._start_thinking()
 
         try:
             async for event in self.agent.run_turn():
@@ -303,7 +460,7 @@ class OpenJetApp(App):
             if text_buf:
                 log.write(text_buf)
         finally:
-            self._stop_thinking()
+            self._stop_thinking(thinking_token)
 
         if self.session_logger and assistant_turn_text.strip():
             self.session_logger.log_event("assistant_message", text=assistant_turn_text)
@@ -313,6 +470,8 @@ class OpenJetApp(App):
 
         if pending_tool_calls:
             self.run_agent_turn()
+        else:
+            self._render_token_counter()
 
     async def _handle_tool_call(self, tc: ToolCall, log: RichLog) -> None:
         if self.agent.is_internal_condense_tool(tc):
@@ -368,22 +527,26 @@ class OpenJetApp(App):
         log.write("")
         self.agent.complete_tool_call(tc, result)
 
-    def _start_thinking(self) -> None:
+    def _start_thinking(self) -> int:
         status = self.query_one("#assistant-status", Static)
+        self._thinking_token += 1
         self._thinking_idx = 0
         status.remove_class("hidden")
-        status.update("[bold cyan]Generating .[/]")
+        status.update("[bold green]Generating .[/]")
         if self._thinking_timer:
             self._thinking_timer.stop()
         self._thinking_timer = self.set_interval(0.4, self._tick_thinking)
+        return self._thinking_token
 
     def _tick_thinking(self) -> None:
         status = self.query_one("#assistant-status", Static)
         dots = [".", "..", "..."][self._thinking_idx % 3]
-        status.update(f"[bold cyan]Generating {dots}[/]")
+        status.update(f"[bold green]Generating {dots}[/]")
         self._thinking_idx += 1
 
-    def _stop_thinking(self) -> None:
+    def _stop_thinking(self, token: int | None = None) -> None:
+        if token is not None and token != self._thinking_token:
+            return
         status = self.query_one("#assistant-status", Static)
         if self._thinking_timer:
             self._thinking_timer.stop()
@@ -478,6 +641,27 @@ async def _execute_tool(tc: ToolCall) -> tuple[str, dict]:
             content,
         )
         return text, {"ok": not text.startswith("Error")}
+    elif tc.name == "load_file":
+        path = tc.arguments.get("path", "")
+        max_tokens = tc.arguments.get("max_tokens")
+        if not isinstance(path, str) or not path.strip():
+            return "Error: invalid arguments for load_file (required: path)", {"ok": False}
+        if max_tokens is not None and not isinstance(max_tokens, int):
+            return "Error: invalid arguments for load_file (max_tokens must be int)", {"ok": False}
+        loaded = await load_file(path, max_tokens=max_tokens)
+        if not loaded.ok:
+            return loaded.detail, {"ok": False}
+        payload = (
+            f"{loaded.summary}\n"
+            f"content:\n{loaded.content}"
+        )
+        return payload, {
+            "ok": True,
+            "truncated": loaded.truncated,
+            "estimated_tokens": loaded.estimated_tokens,
+            "token_budget": loaded.token_budget,
+            "mem_available_mb": loaded.mem_available_mb,
+        }
     return f"Unknown tool: {tc.name}", {"ok": False}
 
 
@@ -488,7 +672,29 @@ def _fmt_args(tc: ToolCall) -> str:
         return tc.arguments.get("path", str(tc.arguments))
     if tc.name == "write_file":
         return tc.arguments.get("path", str(tc.arguments))
+    if tc.name == "load_file":
+        return tc.arguments.get("path", str(tc.arguments))
     return str(tc.arguments)
+
+
+def _extract_file_mentions(text: str) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"@\[([^\]]+)\]|(?<!\S)@([^\s]+)", text):
+        bracketed = match.group(1)
+        bare = match.group(2)
+        candidate = (bracketed if bracketed is not None else bare or "").strip()
+        if bracketed is None:
+            candidate = candidate.rstrip(".,;:!?)]}")
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        cleaned.append(candidate)
+    return cleaned
+
+
+def _estimate_text_tokens(text: str) -> int:
+    return max(1, len(text) // 4) if text else 0
 
 
 # ---------------------------------------------------------------------------
