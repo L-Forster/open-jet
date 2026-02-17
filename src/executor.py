@@ -56,7 +56,7 @@ async def run_shell(command: str) -> ExecResult:
 
 async def read_file(path: str) -> str:
     """Read and return file contents."""
-    p = Path(path).expanduser()
+    p = _normalize_tool_path(path)
     if not p.exists():
         return f"Error: file not found: {path}"
     try:
@@ -67,10 +67,30 @@ async def read_file(path: str) -> str:
 
 async def write_file(path: str, content: str) -> str:
     """Write content to a file. Caller must gate on approval first."""
-    p = Path(path).expanduser()
+    raw_path = path.strip()
+    if not raw_path:
+        return "Error writing file: path is empty."
+
+    p = _normalize_tool_path(raw_path)
     try:
+        # Reject directory targets like "." or existing directories.
+        if p.exists() and p.is_dir():
+            return f"Error writing file: path is a directory: {path}"
+        if str(p) in {".", ""}:
+            return f"Error writing file: path is a directory: {path}"
+
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error writing {path}: {e}"
+
+
+def _normalize_tool_path(path: str) -> Path:
+    raw = path.strip()
+    # Common LLM placeholder path; map to actual user home.
+    if raw == "/home/user":
+        raw = str(Path.home())
+    elif raw.startswith("/home/user/"):
+        raw = str(Path.home() / raw.removeprefix("/home/user/"))
+    return Path(raw).expanduser()

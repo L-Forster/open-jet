@@ -30,3 +30,19 @@ Edit `config.yaml` to change the Ollama endpoint, model, or system prompt.
 - When the model proposes a shell command, a confirmation dialog appears.
 - Press `y` to approve or `n` to deny.
 - Press `Ctrl+C` to quit.
+
+## Session Logging
+
+- `open-jet` now writes structured session logs by default to `session_logs/`.
+- Each run creates two labeled files:
+- `*.events.jsonl`: user messages, assistant output, tool requests, approvals, tool results, and errors.
+- `*.metrics.jsonl`: timestamped system samples (CPU/load average/memory/process RSS) at a fixed interval.
+- Configure this in `config.yaml`:
+
+```yaml
+logging:
+  enabled: true
+  directory: session_logs
+  label: open-jet
+  metrics_interval_seconds: 5
+```
