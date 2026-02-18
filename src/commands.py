@@ -263,12 +263,7 @@ class SlashCommandHandler:
 
     def matching_commands(self, prefix: str) -> list[str]:
         needle = prefix.strip().lower()
-        matches: list[str] = []
-        for spec in self.COMMANDS:
-            names = (spec.name, *spec.aliases)
-            if any(name.startswith(needle) for name in names):
-                matches.append(spec.name)
-        return sorted(set(matches))
+        return sorted(spec.name for spec in self.COMMANDS if spec.name.startswith(needle))
 
     def command_description(self, canonical_name: str) -> str:
         for spec in self.COMMANDS:
