@@ -115,7 +115,7 @@ class SlashCommandHandler:
         self.app.loaded_files.clear()
         log.clear()
         log.write(self.banner)
-        log.write("  [dim]Conversation history cleared.[/]")
+        log.write("  [bold bright_white]Conversation history cleared.[/]")
 
         kv_reset_ok = None
         if reset_kv_cache:
@@ -123,10 +123,10 @@ class SlashCommandHandler:
                 log.write("  [bold red]KV cache reset skipped: client unavailable.[/]")
                 kv_reset_ok = False
             else:
-                log.write("  [dim]Resetting llama-server to flush KV cache...[/]")
+                log.write("  [bold bright_white]Resetting llama-server to flush KV cache...[/]")
                 try:
                     await self.app.client.reset_kv_cache()
-                    log.write("  [dim]KV cache reset complete.[/]")
+                    log.write("  [bold bright_white]KV cache reset complete.[/]")
                     kv_reset_ok = True
                 except Exception as exc:
                     log.write(f"  [bold red]KV cache reset failed:[/] {exc}")
@@ -144,18 +144,18 @@ class SlashCommandHandler:
     def _status(self, log: RichLog) -> None:
         snapshot = self.app.runtime_status_snapshot()
         if not snapshot.get("ready"):
-            log.write("[dim]Agent not initialized.[/]")
+            log.write("[bold bright_white]Agent not initialized.[/]")
             log.write("")
             return
 
         log.write(
-            "[dim]"
+            "[bold bright_white]"
             f"Messages: {snapshot['messages']} | "
             f"Generating: {'yes' if snapshot['generating'] else 'no'}"
             "[/]"
         )
         log.write(
-            "[dim]"
+            "[bold bright_white]"
             f"Context tokens: {snapshot['context_tokens']}/{snapshot['context_window_tokens']} | "
             f"Prompt budget: {snapshot['prompt_budget_tokens']} | "
             f"Reserve: {snapshot['reserve_tokens']} | "
@@ -167,7 +167,7 @@ class SlashCommandHandler:
         used_percent = snapshot.get("memory_used_percent")
         if total_mb is not None and available_mb is not None and used_percent is not None:
             log.write(
-                "[dim]"
+                "[bold bright_white]"
                 f"RAM: {available_mb:.0f}MB free / {total_mb:.0f}MB total "
                 f"({used_percent:.1f}% used)"
                 "[/]"
@@ -185,7 +185,7 @@ class SlashCommandHandler:
             return
 
         summary = await self.app.agent.condense_context(force=True)
-        log.write(f"[dim]{summary}[/]")
+        log.write(f"[bold bright_white]{summary}[/]")
         log.write("")
         self.app.refresh_token_counter()
         self.app.persist_session_state(reason="manual_condense")
@@ -194,7 +194,7 @@ class SlashCommandHandler:
 
     def _render_unknown(self, log: RichLog, text: str) -> None:
         log.write(f"[yellow]Unknown command:[/] {text}")
-        log.write("[dim]Run /help to list available commands.[/]")
+        log.write("[bold bright_white]Run /help to list available commands.[/]")
         log.write("")
 
     async def _load(self, log: RichLog, raw_arg: str) -> None:
@@ -211,7 +211,7 @@ class SlashCommandHandler:
 
         ok = await self.app.load_context_file(path, log)
         if not ok:
-            log.write("[dim]Use /status to inspect current budget and memory.[/]")
+            log.write("[bold bright_white]Use /status to inspect current budget and memory.[/]")
             log.write("")
 
     async def _setup(self, log: RichLog) -> None:

@@ -4,9 +4,12 @@ Minimal agentic TUI for offline edge devices (Jetson-class targets).
 
 ## Setup
 
-1. Install `llama-server` (from `llama.cpp`) on your device and ensure it is on `PATH` (or at `~/llama.cpp/build/bin/llama-server`).
-2. Put your `.gguf` model on disk.
-3. Create a venv and install:
+1. Install prerequisites:
+- `llama-server` from `llama.cpp` must be on `PATH` (or at `~/llama.cpp/build/bin/llama-server`).
+- If you plan to use local models, place a `.gguf` file on disk.
+- If you plan to download models in setup, install `ollama`.
+
+2. Create a virtualenv and install:
 
 ```bash
 python -m venv .venv
@@ -14,24 +17,33 @@ source .venv/bin/activate
 python -m pip install -e .
 ```
 
-4. Run:
+3. Start the app:
 
 ```bash
 open-jet
 ```
 
-To force the setup wizard at startup:
+4. Optional: force setup wizard even if config already exists:
 
 ```bash
 open-jet --setup
 ```
 
-On first run, the TUI runs a setup wizard and saves config to `config.yaml`:
-- model selection/path
-- device (`auto` / `cuda` / `cpu`)
-- context window tokens (recommended from current RAM/headless runtime)
-- GPU layers
-- setup navigation uses TUI selects (Tab + Up/Down), with `Ctrl+S` to save
+First run opens a setup wizard and writes `config.yaml` in this order:
+1. Hardware detection:
+Use detected hardware or choose manual.
+2. Hardware override (manual only):
+Select Jetson + RAM profile.
+3. Model source:
+Choose local `.gguf` or Ollama download.
+4. Local model file (local only):
+Pick a detected `.gguf` or enter a path.
+5. Context size:
+Set prompt context window.
+6. GPU offload:
+Set GPU layer count.
+
+Controls: `Up/Down` to change option, `Tab/Enter` next, `Shift+Tab` back, `Enter` on final step saves and restarts.
 
 ## Usage
 

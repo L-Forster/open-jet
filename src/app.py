@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import os
 import re
+import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -34,6 +36,67 @@ from .session_logging import SessionLogger
 # ---------------------------------------------------------------------------
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+
+
+@dataclass(frozen=True)
+class HardwareInfo:
+    label: str
+    total_ram_gb: float
+    has_cuda: bool
+
+
+# Curated, size-banded shortlist used by setup recommendations.
+RECOMMENDED_LLM_BANDS: tuple[tuple[float, tuple[tuple[str, float, str], ...]], ...] = (
+    (
+        2.0,
+        (
+            ("qwen2.5:1.5b", 1.5, "Qwen2.5 1.5B"),
+            ("deepseek-r1:1.5b", 1.5, "DeepSeek R1 1.5B"),
+            ("gemma2:2b", 2.0, "Gemma 2 2B"),
+        ),
+    ),
+    (
+        4.0,
+        (
+            ("qwen2.5:3b", 3.0, "Qwen2.5 3B"),
+            ("qwen2.5:3b-instruct", 3.0, "Qwen2.5 3B Instruct"),
+            ("gemma2:2b", 2.0, "Gemma 2 2B"),
+        ),
+    ),
+    (
+        8.0,
+        (
+            ("qwen2.5:7b", 7.0, "Qwen2.5 7B"),
+            ("mistral:7b", 7.0, "Mistral 7B"),
+            ("deepseek-r1:7b", 7.0, "DeepSeek R1 7B"),
+        ),
+    ),
+    (
+        14.0,
+        (
+            ("qwen2.5:14b", 14.0, "Qwen2.5 14B"),
+            ("deepseek-r1:14b", 14.0, "DeepSeek R1 14B"),
+            ("gemma2:9b", 9.0, "Gemma 2 9B"),
+        ),
+    ),
+    (
+        32.0,
+        (
+            ("qwen2.5:32b", 32.0, "Qwen2.5 32B"),
+            ("qwen2.5-coder:32b", 32.0, "Qwen2.5 Coder 32B"),
+            ("gemma2:27b", 27.0, "Gemma 2 27B"),
+        ),
+    ),
+)
+
+JETSON_OVERRIDE_OPTIONS: tuple[tuple[str, str, float], ...] = (
+    ("jetson_nano_4", "Jetson Nano (4GB RAM)", 4.0),
+    ("jetson_xavier_nx_8", "Jetson Xavier NX (8GB RAM)", 8.0),
+    ("jetson_orin_nano_8", "Jetson Orin Nano (8GB RAM)", 8.0),
+    ("jetson_orin_nx_16", "Jetson Orin NX (16GB RAM)", 16.0),
+    ("jetson_agx_orin_32", "Jetson AGX Orin (32GB RAM)", 32.0),
+    ("jetson_agx_orin_64", "Jetson AGX Orin (64GB RAM)", 64.0),
+)
 
 
 def load_config() -> dict:
@@ -69,14 +132,92 @@ def _recommended_device() -> str:
     return "cpu"
 
 
+def _read_device_model() -> str | None:
+    try:
+        raw = Path("/proc/device-tree/model").read_bytes()
+    except OSError:
+        return None
+    text = raw.decode("utf-8", errors="ignore").replace("\x00", "").strip()
+    return text or None
+
+
+def _detect_hardware_info() -> HardwareInfo:
+    mem = read_memory_snapshot()
+    total_ram_gb = (mem.total_mb / 1024.0) if mem else 0.0
+    has_cuda = bool(Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists())
+    board = _read_device_model()
+    if board:
+        label = board
+    elif has_cuda:
+        label = "CUDA-capable device"
+    else:
+        label = "CPU-only device"
+    return HardwareInfo(label=label, total_ram_gb=total_ram_gb, has_cuda=has_cuda)
+
+
+def _effective_hardware_info(profile: str, detected: HardwareInfo, override_key: str | None = None) -> HardwareInfo:
+    if profile != "other":
+        return detected
+    for key, label, ram_gb in JETSON_OVERRIDE_OPTIONS:
+        if key == override_key:
+            clean_label = label.split(" (", 1)[0]
+            return HardwareInfo(label=clean_label, total_ram_gb=ram_gb, has_cuda=True)
+    return detected
+
+
+def _recommended_device_for_hardware(profile: str, detected: HardwareInfo, override_key: str | None = None) -> str:
+    hw = _effective_hardware_info(profile, detected, override_key)
+    return "cuda" if hw.has_cuda else "cpu"
+
+
+def _recommended_param_budget_b(profile: str, detected: HardwareInfo, override_key: str | None = None) -> float:
+    hw = _effective_hardware_info(profile, detected, override_key)
+    total_gb = hw.total_ram_gb
+    if total_gb < 6:
+        cap = 2.0
+    elif total_gb < 12:
+        cap = 4.0
+    elif total_gb < 24:
+        cap = 8.0
+    elif total_gb < 48:
+        cap = 14.0
+    else:
+        cap = 32.0
+    if not hw.has_cuda:
+        cap = min(cap, 8.0)
+    return cap
+
+
+def _recommended_llm_models(max_params_b: float) -> list[tuple[str, str]]:
+    for band_limit, models in RECOMMENDED_LLM_BANDS:
+        if max_params_b <= band_limit:
+            return [(f"{title} ({params:g}B params)", tag) for tag, params, title in models]
+    models = RECOMMENDED_LLM_BANDS[-1][1]
+    return [(f"{title} ({params:g}B params)", tag) for tag, params, title in models]
+
+
 def _recommended_context_window_tokens() -> int:
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     mem = read_memory_snapshot()
     if not mem:
         return 4096 if headless else 2048
-
     total_gb = mem.total_mb / 1024.0
-    if total_gb >= 24:
+    return _recommended_context_window_tokens_from_total(
+        total_gb,
+        headless=headless,
+        available_mb=mem.available_mb,
+    )
+
+
+def _recommended_context_window_tokens_from_total(
+    total_gb: float,
+    *,
+    headless: bool,
+    available_mb: float | None = None,
+) -> int:
+    if total_gb >= 48:
+        rec = 12288
+    elif total_gb >= 24:
         rec = 8192
     elif total_gb >= 12:
         rec = 6144
@@ -87,14 +228,19 @@ def _recommended_context_window_tokens() -> int:
     else:
         rec = 1024
 
-    # If currently low on free RAM, keep recommendation conservative.
-    if mem.available_mb < 1200:
+    if available_mb is not None and available_mb < 1200:
         rec = min(rec, 2048)
     return rec
 
 
-def _recommended_gpu_layers(device: str) -> int:
-    return 0 if device == "cpu" else 20
+def _recommended_gpu_layers(device: str, total_ram_gb: float | None = None) -> int:
+    if device == "cpu":
+        return 0
+    if total_ram_gb is None or total_ram_gb < 16:
+        return 20
+    if total_ram_gb < 32:
+        return 28
+    return 35
 
 
 def _context_window_options(recommended: int) -> list[int]:
@@ -127,6 +273,8 @@ BANNER = r"""[bold green]
 
 class SetupScreen(ModalScreen[dict]):
     BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit"),
+        Binding("q", "quit", "Quit"),
         Binding("up", "prev_option", "Prev"),
         Binding("down", "next_option", "Next"),
         Binding("enter", "advance", "Next"),
@@ -139,15 +287,16 @@ class SetupScreen(ModalScreen[dict]):
         self,
         *,
         model_options: list[str],
-        recommended_device: str,
+        hardware_info: HardwareInfo,
         recommended_ctx: int,
         exit_on_cancel: bool = True,
     ) -> None:
         super().__init__()
         self.model_options = model_options
-        self.recommended_device = recommended_device if recommended_device in {"auto", "cuda", "cpu"} else "auto"
+        self.hardware_info = hardware_info
         self.recommended_ctx = max(512, int(recommended_ctx))
         self.exit_on_cancel = exit_on_cancel
+        self.ollama_available = shutil.which("ollama") is not None
         self._steps: list[dict] = []
         self._step_index = 0
         self._indices: dict[str, int] = {}
@@ -156,14 +305,17 @@ class SetupScreen(ModalScreen[dict]):
     def compose(self) -> ComposeResult:
         yield Vertical(
             Static("[bold green]First-run setup[/]"),
-            Static(""),
+            Static("", id="setup-description"),
             Static("", id="setup-step"),
             Static("", id="setup-options"),
             Static("Manual model path (.gguf):", id="setup-model-path-label", classes="hidden"),
             Input(placeholder="/path/to/model.gguf", id="setup-model-path", classes="hidden"),
             Static(""),
             Static("", id="setup-error"),
-            Static("[dim]Up/Down select • Tab/Enter next • Shift+Tab back • Enter on final step saves[/]", id="setup-hint"),
+            Static(
+                "[bold bright_white]Up/Down select • Tab/Enter next • Shift+Tab back • Enter on final step saves and restarts[/]",
+                id="setup-hint",
+            ),
             id="setup-box",
         )
 
@@ -195,44 +347,41 @@ class SetupScreen(ModalScreen[dict]):
             return
 
     def _init_steps(self) -> None:
-        model_rows: list[tuple[str, str]] = []
-        for model in self.model_options:
-            model_rows.append((Path(model).name, model))
-        model_rows.append(("Manual path", "__manual__"))
-        default_model = self.model_options[0] if self.model_options else "__manual__"
-
-        device_rows = [("auto", "auto"), ("cuda", "cuda"), ("cpu", "cpu")]
-        device_rows = [
-            (f"{label} (recommended)" if value == self.recommended_device else label, value)
-            for label, value in device_rows
+        ram_text = f"{self.hardware_info.total_ram_gb:.1f} GB RAM" if self.hardware_info.total_ram_gb > 0 else "RAM unknown"
+        hardware_rows: list[tuple[str, str]] = [
+            (f"Use detected hardware ({self.hardware_info.label}, {ram_text})", "auto"),
+            ("Pick hardware profile manually", "other"),
         ]
-
+        hardware_override_rows: list[tuple[str, str]] = [
+            (label, key) for key, label, _ram in JETSON_OVERRIDE_OPTIONS
+        ]
+        local_model_rows: list[tuple[str, str]] = [(Path(model).name, model) for model in self.model_options]
+        local_model_rows.append(("Manual path", "__manual__"))
         context_rows = [
             (f"{value} (recommended)" if value == self.recommended_ctx else str(value), value)
             for value in _context_window_options(self.recommended_ctx)
         ]
-        gpu_recommended = _recommended_gpu_layers(self.recommended_device)
-        gpu_rows = [
-            (f"{value} (recommended)" if value == gpu_recommended else str(value), value)
-            for value in _gpu_layer_options(self.recommended_device, gpu_recommended)
-        ]
 
         self._steps = [
-            {"key": "model", "title": "Model", "options": model_rows},
-            {"key": "device", "title": "Device", "options": device_rows},
-            {"key": "context_window_tokens", "title": "Context Window Tokens", "options": context_rows},
-            {"key": "gpu_layers", "title": "GPU Layers", "options": gpu_rows},
+            {"key": "hardware", "title": "Hardware Detection", "options": hardware_rows},
+            {"key": "hardware_override", "title": "Hardware Override", "options": hardware_override_rows},
+            {"key": "model_plan", "title": "Model Source", "options": []},
+            {"key": "local_model", "title": "Local Model File", "options": local_model_rows},
+            {"key": "context_window_tokens", "title": "Context Size", "options": context_rows},
+            {"key": "gpu_layers", "title": "GPU Offload", "options": []},
         ]
 
         defaults = {
-            "model": default_model,
-            "device": self.recommended_device,
+            "hardware": "auto",
+            "hardware_override": hardware_override_rows[0][1] if hardware_override_rows else "",
+            "local_model": local_model_rows[0][1] if local_model_rows else "__manual__",
             "context_window_tokens": self.recommended_ctx,
-            "gpu_layers": gpu_recommended,
         }
         for step in self._steps:
             key = str(step["key"])
             options = list(step["options"])
+            if not options:
+                continue
             idx = 0
             for i, (_label, value) in enumerate(options):
                 if value == defaults.get(key):
@@ -244,11 +393,111 @@ class SetupScreen(ModalScreen[dict]):
         manual_input = self.query_one("#setup-model-path", Input)
         if self.model_options:
             manual_input.value = self.model_options[0]
+        self._sync_dynamic_steps()
+
+    def _step_by_key(self, key: str) -> dict | None:
+        return next((step for step in self._steps if step["key"] == key), None)
+
+    def _selected_hardware_profile(self) -> str:
+        return str(self._selections.get("hardware", "auto"))
+
+    def _selected_hardware_override(self) -> str:
+        return str(self._selections.get("hardware_override", ""))
+
+    def _effective_hardware(self) -> HardwareInfo:
+        return _effective_hardware_info(
+            self._selected_hardware_profile(),
+            self.hardware_info,
+            self._selected_hardware_override(),
+        )
+
+    def _recommended_context_for_current_hardware(self) -> int:
+        if self._selected_hardware_profile() == "auto":
+            return _recommended_context_window_tokens()
+        hw = self._effective_hardware()
+        headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+        return _recommended_context_window_tokens_from_total(hw.total_ram_gb, headless=headless)
+
+    def _sync_dynamic_steps(self) -> None:
+        self._sync_model_plan_step()
+        self._sync_context_step()
+        self._sync_gpu_step()
+
+    def _sync_model_plan_step(self) -> None:
+        model_step = self._step_by_key("model_plan")
+        if not model_step:
+            return
+        old_value = self._selections.get("model_plan")
+        max_b = _recommended_param_budget_b(
+            self._selected_hardware_profile(),
+            self.hardware_info,
+            self._selected_hardware_override(),
+        )
+        download_rows = [
+            (f"Download with Ollama: {label}", tag)
+            for label, tag in _recommended_llm_models(max_b)[:3]
+        ]
+        rows = [("Use a local .gguf model file", "__local__"), *download_rows]
+        model_step["options"] = rows
+        values = [value for _label, value in rows]
+        if old_value in values:
+            new_value = old_value
+        elif rows:
+            new_value = rows[0][1]
+        else:
+            new_value = "__local__"
+        self._indices["model_plan"] = values.index(new_value)
+        self._selections["model_plan"] = new_value
+
+    def _sync_context_step(self) -> None:
+        context_step = self._step_by_key("context_window_tokens")
+        if not context_step:
+            return
+        old_value = self._selections.get("context_window_tokens")
+        recommended = self._recommended_context_for_current_hardware()
+        values = _context_window_options(recommended)
+        context_step["options"] = [
+            (f"{value} (recommended)" if value == recommended else str(value), value)
+            for value in values
+        ]
+        new_value = old_value if old_value in values else recommended
+        self._indices["context_window_tokens"] = values.index(new_value)
+        self._selections["context_window_tokens"] = new_value
 
     def _current_step(self) -> dict:
         return self._steps[self._step_index]
 
+    def _is_step_enabled(self, key: str) -> bool:
+        if key == "hardware_override":
+            return str(self._selections.get("hardware", "auto")) == "other"
+        if key == "local_model":
+            return str(self._selections.get("model_plan", "")) == "__local__"
+        return True
+
+    def _visible_step_indices(self) -> list[int]:
+        return [i for i, step in enumerate(self._steps) if self._is_step_enabled(str(step["key"]))]
+
+    def _next_step_index(self, *, forward: bool) -> int | None:
+        if forward:
+            for idx in range(self._step_index + 1, len(self._steps)):
+                if self._is_step_enabled(str(self._steps[idx]["key"])):
+                    return idx
+            return None
+        for idx in range(self._step_index - 1, -1, -1):
+            if self._is_step_enabled(str(self._steps[idx]["key"])):
+                return idx
+        return None
+
     def _render_step(self) -> None:
+        current_key = str(self._steps[self._step_index]["key"])
+        if not self._is_step_enabled(current_key):
+            next_idx = self._next_step_index(forward=True)
+            if next_idx is not None:
+                self._step_index = next_idx
+            else:
+                prev_idx = self._next_step_index(forward=False)
+                if prev_idx is not None:
+                    self._step_index = prev_idx
         step = self._current_step()
         key = str(step["key"])
         options = list(step["options"])
@@ -258,27 +507,31 @@ class SetupScreen(ModalScreen[dict]):
         self._selections[key] = options[idx][1]
 
         header = self.query_one("#setup-step", Static)
+        description = self.query_one("#setup-description", Static)
+        visible = self._visible_step_indices()
+        visible_pos = visible.index(self._step_index) + 1 if self._step_index in visible else self._step_index + 1
         header.update(
-            f"[black on green] Step {self._step_index + 1}/{len(self._steps)} [/]"
+            f"[black on green] Step {visible_pos}/{len(visible)} [/]"
             f" [bold green]{step['title']}[/]"
         )
+        description.update(f"[bold bright_white]{self._step_description(key)}[/]")
 
         lines: list[str] = []
         for i, (label, value) in enumerate(options):
             pretty_label = self._compact_text(str(label), 34)
-            detail = self._option_detail(key, value)
             if i == idx:
                 line = f"[black on green] > {pretty_label} [/]"
+                detail = self._option_detail(key, value)
+                if detail:
+                    line += f" [bold bright_white]- {self._compact_text(detail, 26)}[/]"
             else:
                 line = f"[bold green]  {pretty_label}[/]"
-            if detail:
-                line += f" [dim]- {self._compact_text(detail, 26)}[/]"
             lines.append(line)
         self.query_one("#setup-options", Static).update("\n".join(lines))
 
         manual_label = self.query_one("#setup-model-path-label", Static)
         manual_input = self.query_one("#setup-model-path", Input)
-        show_manual = key == "model" and self._selections.get("model") == "__manual__"
+        show_manual = key == "local_model" and self._selections.get("local_model") == "__manual__"
         if show_manual:
             manual_label.remove_class("hidden")
             manual_input.remove_class("hidden")
@@ -296,8 +549,8 @@ class SetupScreen(ModalScreen[dict]):
         options = list(step["options"])
         self._indices[key] = (self._indices[key] + 1) % len(options)
         self._selections[key] = options[self._indices[key]][1]
-        if key == "device":
-            self._sync_gpu_step()
+        if key in {"hardware", "hardware_override"}:
+            self._sync_dynamic_steps()
         self._render_step()
 
     def action_prev_option(self) -> None:
@@ -306,26 +559,29 @@ class SetupScreen(ModalScreen[dict]):
         options = list(step["options"])
         self._indices[key] = (self._indices[key] - 1) % len(options)
         self._selections[key] = options[self._indices[key]][1]
-        if key == "device":
-            self._sync_gpu_step()
+        if key in {"hardware", "hardware_override"}:
+            self._sync_dynamic_steps()
         self._render_step()
 
     def action_advance(self) -> None:
-        if self._step_index < len(self._steps) - 1:
-            self._step_index += 1
+        next_idx = self._next_step_index(forward=True)
+        if next_idx is not None:
+            self._step_index = next_idx
             self._render_step()
             return
         self.action_save()
 
     def action_back(self) -> None:
-        if self._step_index <= 0:
+        prev_idx = self._next_step_index(forward=False)
+        if prev_idx is None:
             return
-        self._step_index -= 1
+        self._step_index = prev_idx
         self._render_step()
 
     def _sync_gpu_step(self) -> None:
-        device = str(self._selections.get("device", "auto"))
-        recommended = _recommended_gpu_layers(device)
+        hw = self._effective_hardware()
+        device = "cuda" if hw.has_cuda else "cpu"
+        recommended = _recommended_gpu_layers(device, hw.total_ram_gb)
         gpu_step = next((step for step in self._steps if step["key"] == "gpu_layers"), None)
         if not gpu_step:
             return
@@ -346,61 +602,117 @@ class SetupScreen(ModalScreen[dict]):
         self.action_advance()
 
     def action_save(self) -> None:
-        model_path = self._selected_model_path()
-        if not model_path:
-            self._set_error("Model path is required.")
-            return
-        model_file = Path(model_path).expanduser()
-        if not model_file.is_file():
-            self._set_error("Model file does not exist.")
-            return
-
-        device = str(self._selections.get("device", "auto"))
-        if device not in {"auto", "cuda", "cpu"}:
-            self._set_error("Invalid device selection.")
-            return
+        model_plan = str(self._selections.get("model_plan", ""))
+        model_source = "local" if model_plan == "__local__" else "ollama"
+        profile = self._selected_hardware_profile()
+        override_key = str(self._selections.get("hardware_override", ""))
+        device = _recommended_device_for_hardware(profile, self.hardware_info, override_key)
+        hw = self._effective_hardware()
+        payload: dict[str, object] = {
+            "model_source": model_source,
+            "hardware_profile": profile,
+            "hardware_override": override_key if profile == "other" else "",
+        }
+        if model_source == "ollama":
+            if not self.ollama_available:
+                self._set_error("Ollama is not installed. Pick 'Use local model' or install Ollama.")
+                return
+            selected_llm = self._selected_model_plan()
+            payload["recommended_llm"] = selected_llm
+            ollama_model = selected_llm
+            if not ollama_model:
+                self._set_error("Ollama model tag is required.")
+                return
+            payload["ollama_model"] = ollama_model
+        else:
+            model_path = self._selected_model_path()
+            if not model_path:
+                self._set_error("Model path is required.")
+                return
+            model_file = Path(model_path).expanduser()
+            if not model_file.is_file():
+                self._set_error("Model file does not exist.")
+                return
+            if model_file.suffix.lower() != ".gguf":
+                self._set_error("Model file must end with .gguf.")
+                return
+            payload["model"] = str(model_file)
 
         context_value = int(self._selections.get("context_window_tokens", self.recommended_ctx))
         if context_value < 512:
             self._set_error("Select a valid context window.")
             return
 
-        gpu_value = int(self._selections.get("gpu_layers", _recommended_gpu_layers(device)))
+        gpu_value = int(self._selections.get("gpu_layers", _recommended_gpu_layers(device, hw.total_ram_gb)))
         if gpu_value < 0:
             self._set_error("Select a valid GPU layer value.")
             return
 
-        self.dismiss(
+        payload.update(
             {
-                "model": str(model_file),
                 "device": device,
                 "context_window_tokens": context_value,
                 "gpu_layers": gpu_value,
                 "setup_complete": True,
             }
         )
+        self.dismiss(payload)
 
     def _selected_model_path(self) -> str:
-        selected = self._selections.get("model")
+        selected = self._selections.get("local_model")
         if isinstance(selected, str) and selected != "__manual__":
             return selected
         return self.query_one("#setup-model-path", Input).value.strip()
 
+    def _selected_model_plan(self) -> str:
+        selected = self._selections.get("model_plan")
+        if isinstance(selected, str) and selected != "__local__":
+            return selected
+        return ""
+
     def _option_detail(self, key: str, value: object) -> str:
-        if key == "model":
+        if key == "hardware":
+            if value == "auto":
+                return "best default"
+            return "manual override"
+        if key == "hardware_override":
+            return "sets memory profile"
+        if key == "model_plan":
+            if value == "__local__":
+                return "use existing file"
+            if not self.ollama_available:
+                return "needs ollama"
+            cap = _recommended_param_budget_b(
+                self._selected_hardware_profile(),
+                self.hardware_info,
+                self._selected_hardware_override(),
+            )
+            return f"fit for this hardware (~{cap:g}B)"
+        if key == "local_model":
             if value == "__manual__":
-                return "enter file path below"
-            return "detected model"
-        if key == "device":
-            if value == self.recommended_device:
-                return "recommended"
-            return "runtime mode"
+                return "enter full path"
+            return "detected file"
         if key == "context_window_tokens":
-            if value == self.recommended_ctx:
-                return "recommended from RAM"
-            return "max prompt window"
+            if value == self._recommended_context_for_current_hardware():
+                return "best default"
+            return "higher uses more memory"
         if key == "gpu_layers":
-            return "GPU offload layers"
+            return "higher may be faster"
+        return ""
+
+    def _step_description(self, key: str) -> str:
+        if key == "hardware":
+            return "Pick auto-detected hardware or switch to manual."
+        if key == "hardware_override":
+            return "Select the closest Jetson and RAM profile."
+        if key == "model_plan":
+            return "Choose local file or Ollama download."
+        if key == "local_model":
+            return "Select a detected .gguf or enter a path."
+        if key == "context_window_tokens":
+            return "Set context size."
+        if key == "gpu_layers":
+            return "Set GPU offload depth."
         return ""
 
     def _compact_text(self, text: str, limit: int) -> str:
@@ -420,41 +732,62 @@ class SetupScreen(ModalScreen[dict]):
             return
         self.dismiss({})
 
+    async def action_quit(self) -> None:
+        await self.app.action_quit()
+
 
 # ---------------------------------------------------------------------------
 # Styles
 # ---------------------------------------------------------------------------
 
 CSS = """
+App {
+    background: #2a2a2a;
+}
 SetupScreen {
-    background: $background;
+    background: #2a2a2a;
+    tint: transparent;
 }
 Screen {
-    background: $background;
+    background: #2a2a2a;
+}
+Vertical {
+    background: transparent;
+}
+RichLog {
+    background: transparent;
+}
+Input {
+    background: transparent;
+}
+Static {
+    background: transparent;
 }
 #chat-log {
     width: 100%;
     height: auto;
     padding: 0 2;
+    color: #ffffff;
 }
 #prompt {
     height: 3;
     margin: 0 2;
+    color: #ffffff;
 }
 #command-suggestions {
     height: auto;
     margin: 0 2;
-    color: $text-muted;
+    color: #ffffff;
 }
 #token-counter {
     height: 1;
     margin: 0 2;
-    color: $text-muted;
+    color: #ffffff;
 }
 #assistant-status {
     height: 1;
     margin: 0 2;
-    color: $accent;
+    color: #ffffff;
 }
 #approval-bar {
     height: auto;
@@ -462,7 +795,7 @@ Screen {
     margin: 0 2;
     padding: 0 1;
     border: round $warning;
-    background: $surface;
+    background: transparent;
 }
 .hidden {
     display: none;
@@ -472,20 +805,24 @@ Screen {
     height: auto;
     margin: 0 2;
     padding: 1 2;
-    background: $surface;
-    color: $text;
+    background: transparent;
+    color: #ffffff;
 }
 #setup-step {
     margin: 0 0;
-    color: $text;
+    color: #ffffff;
+}
+#setup-description {
+    margin: 0 0 1 0;
+    color: #ffffff;
 }
 #setup-options {
     margin: 1 0 0 0;
-    color: $text;
+    color: #ffffff;
 }
 #setup-model-path-label {
     margin: 0 0;
-    color: $text;
+    color: #ffffff;
 }
 #setup-model-path {
     margin: 0 0;
@@ -495,7 +832,7 @@ Screen {
 }
 #setup-hint {
     margin: 1 0 0 0;
-    color: $text-muted;
+    color: #ffffff;
 }
 """
 
@@ -575,7 +912,7 @@ class OpenJetApp(App):
     def _build_setup_screen(self, *, exit_on_cancel: bool) -> SetupScreen:
         return SetupScreen(
             model_options=_discover_model_files(),
-            recommended_device=_recommended_device(),
+            hardware_info=_detect_hardware_info(),
             recommended_ctx=_recommended_context_window_tokens(),
             exit_on_cancel=exit_on_cancel,
         )
@@ -591,6 +928,67 @@ class OpenJetApp(App):
 
         self.push_screen(screen, callback=_on_dismiss)
         return await result_future
+
+    async def _run_command_capture(self, *args: str) -> tuple[int, str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_raw, err_raw = await proc.communicate()
+        return (proc.returncode or 0, out_raw.decode("utf-8", errors="ignore"), err_raw.decode("utf-8", errors="ignore"))
+
+    async def _resolve_ollama_model_file(self, ollama_model: str) -> str:
+        rc, out, err = await self._run_command_capture("ollama", "show", ollama_model, "--modelfile")
+        if rc != 0:
+            detail = (err or out).strip()[:500]
+            raise RuntimeError(f"Unable to inspect pulled model '{ollama_model}': {detail or 'unknown error'}")
+
+        from_ref = ""
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.upper().startswith("FROM "):
+                from_ref = stripped.split(maxsplit=1)[1].strip()
+                break
+        if not from_ref:
+            raise RuntimeError("Could not resolve Ollama model file path from modelfile output.")
+
+        candidates: list[Path] = []
+        ref_path = Path(from_ref).expanduser()
+        if ref_path.is_absolute():
+            candidates.append(ref_path)
+        if from_ref.startswith("sha256:"):
+            candidates.append(Path.home() / ".ollama" / "models" / "blobs" / from_ref.replace("sha256:", "sha256-"))
+        if from_ref.startswith("sha256-"):
+            candidates.append(Path.home() / ".ollama" / "models" / "blobs" / from_ref)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate.resolve())
+        raise RuntimeError(
+            "Pulled model was resolved by Ollama, but no local GGUF/blob path could be found for llama-server."
+        )
+
+    async def _materialize_setup_model(self, setup_result: dict, log: RichLog) -> dict:
+        if str(setup_result.get("model_source", "local")) != "ollama":
+            return setup_result
+
+        ollama_model = str(setup_result.get("ollama_model", "")).strip()
+        if not ollama_model:
+            raise RuntimeError("Ollama model tag is missing.")
+        if not shutil.which("ollama"):
+            raise RuntimeError("`ollama` CLI is not installed or not on PATH.")
+
+        log.write(f"[bold bright_white]Pulling {escape(ollama_model)} from Ollama...[/]")
+        rc, out, err = await self._run_command_capture("ollama", "pull", ollama_model)
+        if rc != 0:
+            detail = (err or out).strip()[:700]
+            raise RuntimeError(f"Ollama pull failed for '{ollama_model}': {detail or 'unknown error'}")
+        resolved_model = await self._resolve_ollama_model_file(ollama_model)
+        log.write(f"[bold bright_white]Pulled {escape(ollama_model)} and resolved local model file.[/]")
+        merged = dict(setup_result)
+        merged["model"] = resolved_model
+        return merged
 
     async def run_setup_command(self, log: RichLog) -> bool:
         previous_cfg = dict(self.cfg)
@@ -616,17 +1014,26 @@ class OpenJetApp(App):
             if had_runtime:
                 try:
                     await self._init_client()
-                    log.write("[dim]Setup cancelled. Previous runtime restored.[/]")
+                    log.write("[bold bright_white]Setup cancelled. Previous runtime restored.[/]")
                 except Exception as exc:
                     log.write(f"[bold red]Setup cancelled; runtime restore failed:[/] {exc}")
                     if self.session_logger:
                         self.session_logger.log_event("setup_restore_failed", error=str(exc))
             else:
-                log.write("[dim]Setup cancelled.[/]")
+                log.write("[bold bright_white]Setup cancelled.[/]")
             log.write("")
             return False
 
-        self.cfg.update(result)
+        try:
+            resolved_result = await self._materialize_setup_model(result, log)
+        except Exception as exc:
+            log.write(f"[bold red]Setup failed:[/] {exc}")
+            log.write("")
+            if self.session_logger:
+                self.session_logger.log_event("setup_apply_failed", error=str(exc))
+            return False
+
+        self.cfg.update(resolved_result)
         save_config(self.cfg)
 
         try:
@@ -649,12 +1056,14 @@ class OpenJetApp(App):
         self._render_token_counter()
         prompt = self.query_one("#prompt", Input)
         prompt.focus()
-        log.write("[dim]Setup applied. Runtime restarted and context reset.[/]")
+        log.write("[bold bright_white]Setup applied. Runtime restarted and context reset.[/]")
         log.write("")
         if self.session_logger:
             self.session_logger.log_event(
                 "setup_applied",
                 model=self.cfg.get("model"),
+                model_source=self.cfg.get("model_source", "local"),
+                ollama_model=self.cfg.get("ollama_model"),
                 device=self.cfg.get("device"),
                 context_window_tokens=self.cfg.get("context_window_tokens"),
                 gpu_layers=self.cfg.get("gpu_layers"),
@@ -700,6 +1109,12 @@ class OpenJetApp(App):
                 self._build_setup_screen(exit_on_cancel=not bool(self.cfg.get("model")))
             )
             if isinstance(setup_result, dict) and setup_result.get("setup_complete"):
+                try:
+                    setup_result = await self._materialize_setup_model(setup_result, log)
+                except Exception as exc:
+                    log.write(f"[bold red]Setup failed:[/] {exc}")
+                    log.write("")
+                    return
                 self.cfg.update(setup_result)
                 save_config(self.cfg)
             elif not self.cfg.get("model"):
@@ -707,12 +1122,27 @@ class OpenJetApp(App):
         elif not self.cfg.get("setup_complete"):
             # Backfill defaults for older configs created before setup wizard existed.
             self.cfg["setup_complete"] = True
+            self.cfg.setdefault("model_source", "local")
             self.cfg.setdefault("device", _recommended_device())
             self.cfg.setdefault("context_window_tokens", _recommended_context_window_tokens())
             self.cfg.setdefault("gpu_layers", _recommended_gpu_layers(str(self.cfg.get("device", "auto"))))
             save_config(self.cfg)
 
-        log.write(f"  [dim]Loading {Path(self.cfg['model']).name}...[/]")
+        if (
+            self.cfg.get("model_source") == "ollama"
+            and self.cfg.get("ollama_model")
+            and (not self.cfg.get("model") or not Path(str(self.cfg.get("model"))).is_file())
+        ):
+            try:
+                resolved = await self._materialize_setup_model(dict(self.cfg), log)
+            except Exception as exc:
+                log.write(f"[bold red]Failed to resolve Ollama model:[/] {exc}")
+                log.write("")
+                return
+            self.cfg.update(resolved)
+            save_config(self.cfg)
+
+        log.write(f"  [bold bright_white]Loading {Path(self.cfg['model']).name}...[/]")
         try:
             await self._init_client()
         except Exception as e:
@@ -729,7 +1159,7 @@ class OpenJetApp(App):
                 gpu_layers=self.cfg.get("gpu_layers", 20),
                 context_window_tokens=self.cfg.get("context_window_tokens", 2048),
             )
-        log.write(f"  [dim]Ready.[/]")
+        log.write(f"  [bold bright_white]Ready.[/]")
         if self.auto_resume:
             self._restore_session_state(log)
         log.write("")
@@ -908,7 +1338,7 @@ class OpenJetApp(App):
             "loaded_tokens": result.returned_tokens,
             "truncated": result.truncated,
         }
-        log.write(f"[dim]Loaded @{mention_path} into context ({result.summary}).[/]")
+        log.write(f"[bold bright_white]Loaded @{mention_path} into context ({result.summary}).[/]")
         if self.session_logger:
             self.session_logger.log_event(
                 "context_file_loaded",
@@ -951,9 +1381,9 @@ class OpenJetApp(App):
             else:
                 lines.append(f"[bold green]{item.label}[/]")
             if item.detail:
-                lines[-1] += f" [dim]- {item.detail}[/]"
+                lines[-1] += f" [bold bright_white]- {item.detail}[/]"
         bar.remove_class("hidden")
-        bar.update("\n".join(lines) + "\n[dim]Up/Down to select, Tab to autocomplete[/]")
+        bar.update("\n".join(lines) + "\n[bold bright_white]Up/Down to select, Tab to autocomplete[/]")
 
     def _clear_completion_suggestions(self) -> None:
         self.completion.clear()
@@ -964,7 +1394,7 @@ class OpenJetApp(App):
     def _render_token_counter(self, draft_text: str = "") -> None:
         counter = self.query_one("#token-counter", Static)
         if not self.agent:
-            counter.update("[dim]tokens: 0/0[/]")
+            counter.update("[bold bright_white]tokens: 0/0[/]")
             return
         current = self.agent.estimated_context_tokens()
         draft = estimate_tokens(draft_text)
@@ -1042,7 +1472,7 @@ class OpenJetApp(App):
         else:
             self.loaded_files = {}
         log.write(
-            "  [dim]"
+            "  [bold bright_white]"
             f"Resumed previous session: {max(0, len(self.agent.messages) - 1)} messages, "
             f"{len(self.loaded_files)} loaded files."
             "[/]"
@@ -1089,9 +1519,9 @@ class OpenJetApp(App):
     def _write_tool_result(self, log: RichLog, result: str) -> None:
         lines = result.splitlines()
         for line in lines[:20]:
-            log.write(f"  [dim]{line}[/]")
+            log.write(f"  [bold bright_white]{line}[/]")
         if len(lines) > 20:
-            log.write(f"  [dim]... ({len(lines) - 20} more lines)[/]")
+            log.write(f"  [bold bright_white]... ({len(lines) - 20} more lines)[/]")
         log.write("")
 
     def persist_session_state(self, *, reason: str) -> None:
@@ -1179,7 +1609,7 @@ class OpenJetApp(App):
         if self.agent.is_internal_condense_tool(tc):
             log.write(f"[yellow]{tc.name}:[/] {_fmt_args(tc)}")
             result = await self.agent.condense_context()
-            log.write(f"  [dim]{result}[/]")
+            log.write(f"  [bold bright_white]{result}[/]")
             log.write("")
             self.agent.complete_tool_call(tc, result)
             self.persist_session_state(reason="auto_condense")
@@ -1190,10 +1620,10 @@ class OpenJetApp(App):
         if needs_confirm:
             log.write(f"[yellow]{tc.name}:[/]")
             for preview_line in self._tool_preview_lines(tc):
-                log.write(f"  [dim]{preview_line}[/]")
+                log.write(f"  [bold bright_white]{preview_line}[/]")
             approved = await self._wait_for_tool_approval(tc)
             if not approved:
-                log.write("[dim red]  denied[/]")
+                log.write("[red]  denied[/]")
                 log.write("")
                 if self.session_logger:
                     self.session_logger.log_event(
@@ -1205,7 +1635,7 @@ class OpenJetApp(App):
                 self.agent.complete_tool_call(tc, "User denied this action.")
                 self.persist_session_state(reason=f"tool_denied:{tc.name}")
                 return
-            log.write("[dim green]  approved[/]")
+            log.write("[green]  approved[/]")
             if self.session_logger:
                 self.session_logger.log_event(
                     "tool_approval",
@@ -1230,9 +1660,9 @@ class OpenJetApp(App):
             )
         # Show output inline in the chat
         for line in result.splitlines()[:20]:
-            log.write(f"  [dim]{line}[/]")
+            log.write(f"  [bold bright_white]{line}[/]")
         if len(result.splitlines()) > 20:
-            log.write(f"  [dim]... ({len(result.splitlines()) - 20} more lines)[/]")
+            log.write(f"  [bold bright_white]... ({len(result.splitlines()) - 20} more lines)[/]")
         log.write("")
         self.agent.complete_tool_call(tc, result)
         self.persist_session_state(reason=f"tool_result:{tc.name}")
@@ -1288,7 +1718,7 @@ class OpenJetApp(App):
             if self.session_logger:
                 self.session_logger.log_event("llm_recovery_failed", error=str(exc))
             return False
-        log.write("[dim]Runtime recovered. Retrying turn.[/]")
+        log.write("[bold bright_white]Runtime recovered. Retrying turn.[/]")
         log.write("")
         if self.session_logger:
             self.session_logger.log_event("llm_recovery_succeeded")

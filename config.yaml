@@ -1,6 +1,8 @@
 context_window_tokens: 4096
 device: cuda
 gpu_layers: 20
+hardware_override: ''
+hardware_profile: auto
 logging:
   directory: session_logs
   enabled: true
@@ -13,6 +15,8 @@ memory_guard:
   max_used_percent: null
   min_available_mb: null
 model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
+model_source: local
+recommended_llm: deepseek-r1:1.5b
 setup_complete: true
 state:
   auto_resume: false
