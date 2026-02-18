@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import yaml
+from rich.markup import escape
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -235,8 +236,8 @@ class SetupScreen(ModalScreen[dict]):
 
         header = self.query_one("#setup-step", Static)
         header.update(
-            f"[bold green]Step {self._step_index + 1}/{len(self._steps)}[/] "
-            f"[dim]- {step['title']}[/]"
+            f"[black on green] Step {self._step_index + 1}/{len(self._steps)} [/]"
+            f" [bold green]{step['title']}[/]"
         )
 
         lines: list[str] = []
@@ -244,9 +245,9 @@ class SetupScreen(ModalScreen[dict]):
             pretty_label = self._compact_text(str(label), 34)
             detail = self._option_detail(key, value)
             if i == idx:
-                line = f"[black on green] {pretty_label} [/]"
+                line = f"[black on green] > {pretty_label} [/]"
             else:
-                line = f"[bold green]{pretty_label}[/]"
+                line = f"[bold green]  {pretty_label}[/]"
             if detail:
                 line += f" [dim]- {self._compact_text(detail, 26)}[/]"
             lines.append(line)
@@ -258,9 +259,12 @@ class SetupScreen(ModalScreen[dict]):
         if show_manual:
             manual_label.remove_class("hidden")
             manual_input.remove_class("hidden")
+            manual_input.focus()
         else:
             manual_label.add_class("hidden")
             manual_input.add_class("hidden")
+            if self.focused is manual_input:
+                self.set_focus(None)
         self.query_one("#setup-error", Static).update("")
 
     def action_next_option(self) -> None:
@@ -453,7 +457,7 @@ Screen {
     color: $text;
 }
 #setup-options {
-    margin: 0 0;
+    margin: 1 0 0 0;
     color: $text;
 }
 #setup-model-path-label {
@@ -467,8 +471,8 @@ Screen {
     margin: 0 0;
 }
 #setup-hint {
-    margin: 0 0;
-    color: $text;
+    margin: 1 0 0 0;
+    color: $text-muted;
 }
 """
 
@@ -566,21 +570,43 @@ class OpenJetApp(App):
         return await result_future
 
     async def run_setup_command(self, log: RichLog) -> bool:
+        previous_cfg = dict(self.cfg)
+        had_runtime = bool(self.client or self.agent)
+        if self.agent:
+            self.persist_session_state(reason="setup_command_start")
+
+        if self.client:
+            try:
+                await self.client.close()
+            except Exception as exc:
+                log.write(f"[yellow]Runtime stop warning:[/] {exc}")
+                if self.session_logger:
+                    self.session_logger.log_event("setup_runtime_stop_warning", error=str(exc))
+        self.client = None
+        self.agent = None
+        self.loaded_files.clear()
+        self.set_focus(None)
+        self._render_token_counter()
+
         result = await self._wait_for_screen_result(self._build_setup_screen(exit_on_cancel=False))
         if not isinstance(result, dict) or not result.get("setup_complete"):
-            log.write("[dim]Setup cancelled.[/]")
+            if had_runtime:
+                try:
+                    await self._init_client()
+                    log.write("[dim]Setup cancelled. Previous runtime restored.[/]")
+                except Exception as exc:
+                    log.write(f"[bold red]Setup cancelled; runtime restore failed:[/] {exc}")
+                    if self.session_logger:
+                        self.session_logger.log_event("setup_restore_failed", error=str(exc))
+            else:
+                log.write("[dim]Setup cancelled.[/]")
             log.write("")
             return False
 
-        previous_cfg = dict(self.cfg)
         self.cfg.update(result)
         save_config(self.cfg)
 
         try:
-            if self.client:
-                await self.client.close()
-            self.client = None
-            self.agent = None
             await self._init_client()
         except Exception as exc:
             self.cfg = previous_cfg
@@ -710,6 +736,32 @@ class OpenJetApp(App):
             if event.key == "enter":
                 self._resolve_approval(self._approval_choice == 0)
                 event.stop()
+            return
+
+        # While setup screen is open, route navigation keys directly to setup
+        # actions so prompt focus can't steal them.
+        if isinstance(self.screen, SetupScreen):
+            setup = self.screen
+            if event.key == "up":
+                setup.action_prev_option()
+                event.stop()
+                return
+            if event.key == "down":
+                setup.action_next_option()
+                event.stop()
+                return
+            if event.key in ("enter", "tab"):
+                setup.action_advance()
+                event.stop()
+                return
+            if event.key == "shift+tab":
+                setup.action_back()
+                event.stop()
+                return
+            if event.key == "escape":
+                setup.action_cancel()
+                event.stop()
+                return
             return
 
         prompt = self.query_one("#prompt", Input)
@@ -1303,20 +1355,16 @@ class OpenJetApp(App):
             path = str(tc.arguments.get("path", "")).strip()
             content = str(tc.arguments.get("content", ""))
             preview = content.replace("\r\n", "\n").replace("\r", "\n")
-            preview_lines = preview.split("\n")
-            compact_preview = " | ".join(preview_lines[:3]).strip()
-            if len(compact_preview) > 180:
-                compact_preview = compact_preview[:177] + "..."
-            return [
-                f"path: {path}",
-                f"bytes: {len(content)}",
-                f"preview: {compact_preview}",
-            ]
+            lines = [f"path: {path}", f"bytes: {len(content)}", "content:"]
+            lines.extend(escape(line) for line in preview.split("\n"))
+            return lines
         return [str(_fmt_args(tc))]
 
     def _approval_preview_text(self, tc: ToolCall) -> str:
         lines = self._tool_preview_lines(tc)
         joined = "\n".join(lines)
+        if tc.name == "write_file":
+            return joined
         if len(joined) > 280:
             return joined[:277] + "..."
         return joined
