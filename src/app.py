@@ -270,8 +270,11 @@ BANNER = r"""[bold green]
        |_|              |__/           
 [/]"""
 
+ACCENT_GREEN = "#88D83F"
+
 
 class SetupScreen(ModalScreen[dict]):
+    SETUP_ACCENT_OPEN = f"[bold {ACCENT_GREEN}]"
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
         Binding("q", "quit", "Quit"),
@@ -304,7 +307,7 @@ class SetupScreen(ModalScreen[dict]):
 
     def compose(self) -> ComposeResult:
         yield Vertical(
-            Static("[bold green]First-run setup[/]"),
+            Static(f"{self.SETUP_ACCENT_OPEN}First-run setup[/]"),
             Static("", id="setup-description"),
             Static("", id="setup-step"),
             Static("", id="setup-options"),
@@ -313,7 +316,7 @@ class SetupScreen(ModalScreen[dict]):
             Static(""),
             Static("", id="setup-error"),
             Static(
-                "[bold bright_white]Up/Down select • Tab/Enter next • Shift+Tab back • Enter on final step saves and restarts[/]",
+                "[dim]Up/Down select • Tab/Enter next • Shift+Tab back • Enter on final step saves and restarts[/]",
                 id="setup-hint",
             ),
             id="setup-box",
@@ -511,21 +514,21 @@ class SetupScreen(ModalScreen[dict]):
         visible = self._visible_step_indices()
         visible_pos = visible.index(self._step_index) + 1 if self._step_index in visible else self._step_index + 1
         header.update(
-            f"[black on green] Step {visible_pos}/{len(visible)} [/]"
-            f" [bold green]{step['title']}[/]"
+            f"{self.SETUP_ACCENT_OPEN}Step {visible_pos}/{len(visible)}[/]"
+            f" {self.SETUP_ACCENT_OPEN}{step['title']}[/]"
         )
-        description.update(f"[bold bright_white]{self._step_description(key)}[/]")
+        description.update(f"[dim]{self._step_description(key)}[/]")
 
         lines: list[str] = []
         for i, (label, value) in enumerate(options):
             pretty_label = self._compact_text(str(label), 34)
             if i == idx:
-                line = f"[black on green] > {pretty_label} [/]"
+                line = f"{self.SETUP_ACCENT_OPEN}[underline]> {pretty_label}[/underline][/]"
                 detail = self._option_detail(key, value)
                 if detail:
-                    line += f" [bold bright_white]- {self._compact_text(detail, 26)}[/]"
+                    line += f" [dim]- {self._compact_text(detail, 26)}[/]"
             else:
-                line = f"[bold green]  {pretty_label}[/]"
+                line = f"{self.SETUP_ACCENT_OPEN}  {pretty_label}[/]"
             lines.append(line)
         self.query_one("#setup-options", Static).update("\n".join(lines))
 
@@ -806,23 +809,18 @@ Static {
     margin: 0 2;
     padding: 1 2;
     background: transparent;
-    color: #ffffff;
 }
 #setup-step {
     margin: 0 0;
-    color: #ffffff;
 }
 #setup-description {
     margin: 0 0 1 0;
-    color: #ffffff;
 }
 #setup-options {
     margin: 1 0 0 0;
-    color: #ffffff;
 }
 #setup-model-path-label {
     margin: 0 0;
-    color: #ffffff;
 }
 #setup-model-path {
     margin: 0 0;
@@ -832,7 +830,6 @@ Static {
 }
 #setup-hint {
     margin: 1 0 0 0;
-    color: #ffffff;
 }
 """
 
@@ -1377,9 +1374,9 @@ class OpenJetApp(App):
         lines: list[str] = []
         for idx, item in enumerate(state.items):
             if idx == state.index:
-                lines.append(f"[black on green] {item.label} [/]")
+                lines.append(f"[bold {ACCENT_GREEN}][underline]{item.label}[/underline][/]")
             else:
-                lines.append(f"[bold green]{item.label}[/]")
+                lines.append(f"[bold {ACCENT_GREEN}]{item.label}[/]")
             if item.detail:
                 lines[-1] += f" [bold bright_white]- {item.detail}[/]"
         bar.remove_class("hidden")
