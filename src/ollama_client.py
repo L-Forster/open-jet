@@ -147,12 +147,40 @@ class OllamaClient:
         env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
 
         resolved_device = self._resolve_device()
-        ngl = self.gpu_layers if resolved_device == "cuda" else 0
+        requested_ngl = self.gpu_layers if resolved_device == "cuda" else 0
+        requested_ctx = self.context_window_tokens
+        await self._start_once(binary=binary, env=env, ngl=requested_ngl, ctx=requested_ctx)
+        self.gpu_layers = requested_ngl
+        self.context_window_tokens = requested_ctx
 
+    async def _start_once(
+        self,
+        *,
+        binary: str,
+        env: dict[str, str],
+        ngl: int,
+        ctx: int,
+    ) -> None:
         self._proc = await asyncio.create_subprocess_exec(
-            binary, "-m", self.model,
-            "--host", self.host, "--port", str(self.port),
-            "-ngl", str(ngl), "-c", str(self.context_window_tokens),
+            binary,
+            "-m",
+            self.model,
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--parallel",
+            "1",
+            "--no-kv-unified",
+            "--no-cont-batching",
+            "-b",
+            "512",
+            "-ub",
+            "128",
+            "-ngl",
+            str(ngl),
+            "-c",
+            str(ctx),
             env=env,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -161,8 +189,19 @@ class OllamaClient:
         deadline = asyncio.get_event_loop().time() + 120.0
         while asyncio.get_event_loop().time() < deadline:
             if self._proc.returncode is not None:
-                err = (await self._proc.stderr.read()).decode()
-                raise RuntimeError(f"llama-server exited: {err[:500]}")
+                err = (await self._proc.stderr.read()).decode(errors="replace").strip()
+                if len(err) > 8000:
+                    keep = 4000
+                    omitted = len(err) - (keep * 2)
+                    err = (
+                        f"{err[:keep]}\n"
+                        f"... <{omitted} chars omitted> ...\n"
+                        f"{err[-keep:]}"
+                    )
+                detail = err or "no stderr output"
+                raise RuntimeError(
+                    f"llama-server exited with code {self._proc.returncode}: {detail}"
+                )
             try:
                 r = await self._http.get(f"{self.base_url}/health")
                 if r.status_code == 200:

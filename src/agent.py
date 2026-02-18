@@ -216,7 +216,10 @@ class Agent:
         history = self.messages[1:]
         transcript = self._history_as_text(history)
         target_tokens = max(96, min(self.condense_target_tokens, total_before // 2))
-        summary = await self._summarize_text(transcript, target_tokens=target_tokens)
+        try:
+            summary = await self._summarize_text(transcript, target_tokens=target_tokens)
+        except Exception as exc:
+            return f"Condense failed: {exc}"
         if not summary:
             return "Condense failed: model returned empty summary."
 
@@ -232,7 +235,10 @@ class Agent:
         total_after = self._estimated_context_tokens()
         if total_after >= total_before:
             tighter_target = max(64, target_tokens // 2)
-            tighter_summary = await self._summarize_text(summary, target_tokens=tighter_target)
+            try:
+                tighter_summary = await self._summarize_text(summary, target_tokens=tighter_target)
+            except Exception:
+                tighter_summary = ""
             if tighter_summary:
                 self.messages = [
                     self.messages[0],

@@ -35,6 +35,7 @@ class SlashCommandHandler:
         CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
         CommandSpec(name="condense", description="Manually condense older context"),
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
+        CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
     )
 
@@ -80,6 +81,9 @@ class SlashCommandHandler:
             return True
         if cmd == "load":
             await self._load(log, arg)
+            return True
+        if cmd == "resume":
+            await self._resume(log)
             return True
         if cmd == "setup":
             await self._setup(log)
@@ -224,6 +228,29 @@ class SlashCommandHandler:
             log.write("")
             return
         self.app.run_setup_command_worker()
+
+    async def _resume(self, log: RichLog) -> None:
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot resume while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+        if not self.app.agent:
+            log.write("[bold red]error:[/] Agent not initialized.")
+            log.write("")
+            return
+
+        self.app.agent.reset_conversation()
+        self.app.loaded_files.clear()
+        log.clear()
+        log.write(self.banner)
+        if not self.app._restore_session_state(log):
+            log.write("  [bold bright_white]No previous session state found.[/]")
+        log.write("")
+        self.app.refresh_token_counter()
 
     def resolve_command(self, token: str) -> str | None:
         needle = token.strip().lower()

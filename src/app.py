@@ -871,16 +871,30 @@ class OpenJetApp(App):
                 FileMentionCompletionProvider(Path.cwd()),
             ]
         )
+        self._prompt_history: list[str] = []
+        self._prompt_history_index: int | None = None
+        self._prompt_history_draft = ""
+        self._history_navigation_active = False
+        self._ignore_prompt_change_events = 0
 
     async def _init_client(self) -> None:
         mem_cfg = self.cfg.get("memory_guard", {})
+        configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
+        configured_gpu_layers = int(self.cfg.get("gpu_layers", 20))
         self.client = OllamaClient(
             model=self.cfg["model"],
-            context_window_tokens=int(self.cfg.get("context_window_tokens", 2048)),
+            context_window_tokens=configured_ctx,
             device=str(self.cfg.get("device", "auto")),
-            gpu_layers=int(self.cfg.get("gpu_layers", 20)),
+            gpu_layers=configured_gpu_layers,
         )
         await self.client.start()
+        if (
+            self.client.context_window_tokens != configured_ctx
+            or self.client.gpu_layers != configured_gpu_layers
+        ):
+            self.cfg["context_window_tokens"] = self.client.context_window_tokens
+            self.cfg["gpu_layers"] = self.client.gpu_layers
+            save_config(self.cfg)
         self.agent = Agent(
             client=self.client,
             system_prompt=self.cfg.get("system_prompt", ""),
@@ -1223,6 +1237,18 @@ class OpenJetApp(App):
         if self.focused is not prompt:
             return
 
+        # While navigating history, arrows should keep navigating history.
+        if event.key == "up" and self._prompt_history_index is not None:
+            event.prevent_default()
+            self._navigate_prompt_history(prompt, direction=-1)
+            event.stop()
+            return
+        if event.key == "down" and self._prompt_history_index is not None:
+            event.prevent_default()
+            self._navigate_prompt_history(prompt, direction=1)
+            event.stop()
+            return
+
         if event.key == "up" and self.completion.state:
             event.prevent_default()
             self.completion.cycle(-1)
@@ -1233,6 +1259,16 @@ class OpenJetApp(App):
             event.prevent_default()
             self.completion.cycle(1)
             self._render_completion_suggestions()
+            event.stop()
+            return
+        if event.key == "up":
+            event.prevent_default()
+            self._navigate_prompt_history(prompt, direction=-1)
+            event.stop()
+            return
+        if event.key == "down":
+            event.prevent_default()
+            self._navigate_prompt_history(prompt, direction=1)
             event.stop()
             return
         if event.key == "tab":
@@ -1255,6 +1291,16 @@ class OpenJetApp(App):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "prompt":
             return
+        if self._history_navigation_active:
+            return
+        if self._ignore_prompt_change_events > 0:
+            self._ignore_prompt_change_events -= 1
+            self._update_completion_suggestions(event.value)
+            self._render_token_counter(event.value)
+            return
+        if self._prompt_history_index is not None:
+            self._prompt_history_index = None
+            self._prompt_history_draft = event.value
         self._update_completion_suggestions(event.value)
         self._render_token_counter(event.value)
 
@@ -1266,6 +1312,7 @@ class OpenJetApp(App):
         text = event.value.strip()
         if not text:
             return
+        self._record_prompt_history(text)
         event.input.value = ""
         self._clear_completion_suggestions()
 
@@ -1463,6 +1510,7 @@ class OpenJetApp(App):
 
         self.agent.messages = valid_messages
         self._replay_restored_history(log, self.agent.messages)
+        self._seed_prompt_history_from_messages(self.agent.messages)
         loaded_files = state.get("loaded_files")
         if isinstance(loaded_files, dict):
             self.loaded_files = loaded_files
@@ -1504,6 +1552,61 @@ class OpenJetApp(App):
                 text = msg.get("content", "")
                 if isinstance(text, str) and text:
                     self._write_tool_result(log, text)
+
+    def _seed_prompt_history_from_messages(self, messages: list[dict]) -> None:
+        self._prompt_history = []
+        for msg in messages:
+            if msg.get("role") != "user":
+                continue
+            text = msg.get("content")
+            if isinstance(text, str):
+                normalized = text.strip()
+                if normalized:
+                    self._prompt_history.append(normalized)
+        self._prompt_history_index = None
+        self._prompt_history_draft = ""
+
+    def _record_prompt_history(self, text: str) -> None:
+        normalized = text.strip()
+        if not normalized:
+            return
+        self._prompt_history.append(normalized)
+        self._prompt_history_index = None
+        self._prompt_history_draft = ""
+
+    def _navigate_prompt_history(self, prompt: Input, *, direction: int) -> None:
+        if not self._prompt_history:
+            return
+        if direction not in (-1, 1):
+            return
+
+        if direction == -1:
+            if self._prompt_history_index is None:
+                self._prompt_history_draft = prompt.value
+                self._prompt_history_index = len(self._prompt_history) - 1
+            elif self._prompt_history_index > 0:
+                self._prompt_history_index -= 1
+            next_value = self._prompt_history[self._prompt_history_index]
+        else:
+            if self._prompt_history_index is None:
+                return
+            if self._prompt_history_index < len(self._prompt_history) - 1:
+                self._prompt_history_index += 1
+                next_value = self._prompt_history[self._prompt_history_index]
+            else:
+                self._prompt_history_index = None
+                next_value = self._prompt_history_draft
+
+        self._history_navigation_active = True
+        try:
+            self._ignore_prompt_change_events += 1
+            prompt.value = next_value
+            self._update_completion_suggestions(prompt.value)
+            self._render_token_counter(prompt.value)
+            prompt.action_end(select=False)
+            self.call_after_refresh(self._collapse_prompt_selection)
+        finally:
+            self._history_navigation_active = False
 
     def _write_text_block(self, log: RichLog, text: str) -> None:
         buf = text
@@ -1593,7 +1696,20 @@ class OpenJetApp(App):
             self.session_logger.log_event("assistant_message", text=assistant_turn_text)
 
         for tc in pending_tool_calls:
-            await self._handle_tool_call(tc, log)
+            try:
+                await self._handle_tool_call(tc, log)
+            except Exception as exc:
+                log.write(f"[bold red]tool error ({tc.name}):[/] {exc}")
+                log.write("")
+                if self.session_logger:
+                    self.session_logger.log_event(
+                        "tool_error",
+                        tool=tc.name,
+                        arguments=tc.arguments,
+                        error=str(exc),
+                    )
+                if self.agent:
+                    self.agent.complete_tool_call(tc, f"Tool execution failed: {exc}")
 
         if pending_tool_calls:
             self.persist_session_state(reason="assistant_turn_with_tools")
