@@ -21,6 +21,7 @@ class CommandSpec:
 class SlashCommandHandler:
     COMMANDS: tuple[CommandSpec, ...] = (
         CommandSpec(name="help", description="Show command help", aliases=("commands", "?")),
+        CommandSpec(name="exit", description="Quit the app", aliases=("quit",)),
         CommandSpec(
             name="clear",
             description="Clear chat and restart llama-server (flush KV cache)",
@@ -61,6 +62,9 @@ class SlashCommandHandler:
         arg = parts[1].strip() if len(parts) > 1 else ""
         if cmd == "help":
             self._render_help(log)
+            return True
+        if cmd == "exit":
+            await self.app.action_quit()
             return True
         if cmd == "clear":
             await self._clear(log, reset_kv_cache=True)

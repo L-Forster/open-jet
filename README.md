@@ -42,11 +42,12 @@ On first run, the TUI runs a setup wizard and saves config to `config.yaml`:
 - A live token counter is shown under the chat input.
 - Tool calls that can change system state still require approval (`y` / `n`).
 - Tool approvals include a compact preview of the exact command/write action.
-- `Ctrl+C` quits.
+- `Ctrl+C` or `/exit` quits.
 
 ## Slash Commands
 
 - `/help`: list commands.
+- `/exit`: quit the app.
 - `/clear`: clear chat and restart `llama-server` (flush KV cache).
 - `/clear-chat`: clear chat only.
 - `/status`: show context and RAM status.
