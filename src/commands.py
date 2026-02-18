@@ -219,7 +219,7 @@ class SlashCommandHandler:
             log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
             log.write("")
             return
-        await self.app.run_setup_command(log)
+        self.app.run_setup_command_worker()
 
     def resolve_command(self, token: str) -> str | None:
         needle = token.strip().lower()

@@ -661,6 +661,11 @@ class OpenJetApp(App):
             )
         return True
 
+    @work(exclusive=True)
+    async def run_setup_command_worker(self) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        await self.run_setup_command(log)
+
     def compose(self) -> ComposeResult:
         yield RichLog(id="chat-log", wrap=True, markup=True)
         yield Static("", id="assistant-status", classes="hidden")
