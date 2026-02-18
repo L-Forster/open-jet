@@ -17,3 +17,5 @@ session_state.json
 .ruff_cache/
 .coverage
 *.log
+test.txt
+testfile

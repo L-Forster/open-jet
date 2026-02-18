@@ -170,6 +170,29 @@ class SetupScreen(ModalScreen[dict]):
     def on_mount(self) -> None:
         self._init_steps()
         self._render_step()
+        self.set_focus(None)
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "up":
+            self.action_prev_option()
+            event.stop()
+            return
+        if event.key == "down":
+            self.action_next_option()
+            event.stop()
+            return
+        if event.key in ("enter", "tab"):
+            self.action_advance()
+            event.stop()
+            return
+        if event.key == "shift+tab":
+            self.action_back()
+            event.stop()
+            return
+        if event.key == "escape":
+            self.action_cancel()
+            event.stop()
+            return
 
     def _init_steps(self) -> None:
         model_rows: list[tuple[str, str]] = []

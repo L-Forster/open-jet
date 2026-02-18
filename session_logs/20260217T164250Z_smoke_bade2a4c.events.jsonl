@@ -1,3 +1,0 @@
-{"timestamp": "2026-02-17T16:42:50.596540+00:00", "session_id": "bade2a4c842742e68f1896f0cff4d719", "type": "session_start", "data": {"session_id": "bade2a4c842742e68f1896f0cff4d719", "label": "smoke", "events_file": "session_logs/20260217T164250Z_smoke_bade2a4c.events.jsonl", "metrics_file": "session_logs/20260217T164250Z_smoke_bade2a4c.metrics.jsonl"}}
-{"timestamp": "2026-02-17T16:42:50.596846+00:00", "session_id": "bade2a4c842742e68f1896f0cff4d719", "type": "test_event", "data": {"message": "hello"}}
-{"timestamp": "2026-02-17T16:42:51.798516+00:00", "session_id": "bade2a4c842742e68f1896f0cff4d719", "type": "session_end", "data": {"session_id": "bade2a4c842742e68f1896f0cff4d719"}}
