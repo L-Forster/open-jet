@@ -440,11 +440,12 @@ class SetupScreen(ModalScreen[dict]):
             self.hardware_info,
             self._selected_hardware_override(),
         )
-        download_rows = [
-            (f"Download with Ollama: {label}", tag)
-            for label, tag in _recommended_llm_models(max_b)[:3]
-        ]
-        rows = [("Use a local .gguf model file", "__local__"), *download_rows]
+        rows: list[tuple[str, str]] = [("Use a local .gguf model file", "__local__")]
+        if self.ollama_available:
+            rows.extend(
+                (f"Download with Ollama: {label}", tag)
+                for label, tag in _recommended_llm_models(max_b)[:3]
+            )
         model_step["options"] = rows
         values = [value for _label, value in rows]
         if old_value in values:
