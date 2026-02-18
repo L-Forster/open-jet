@@ -98,6 +98,9 @@ JETSON_OVERRIDE_OPTIONS: tuple[tuple[str, str, float], ...] = (
     ("jetson_agx_orin_64", "Jetson AGX Orin (64GB RAM)", 64.0),
 )
 
+TOOL_RESULT_SAFE_PADDING_TOKENS = 256
+TOOL_RESULT_MIN_BUDGET_TOKENS = 64
+
 
 def load_config() -> dict:
     for candidate in [Path("config.yaml"), CONFIG_PATH]:
@@ -1763,6 +1766,7 @@ class OpenJetApp(App):
 
         t0 = time.monotonic()
         result, meta = await _execute_tool(tc)
+        result_for_context, clipped_tool_result = self._fit_tool_result_to_budget(result)
         duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
         if self.session_logger:
             self.session_logger.log_tool_result(
@@ -1770,15 +1774,19 @@ class OpenJetApp(App):
                 result,
                 duration_ms=duration_ms,
                 arguments=tc.arguments,
+                context_result_clipped=clipped_tool_result,
                 **meta,
             )
         # Show output inline in the chat
-        for line in result.splitlines()[:20]:
+        for line in result_for_context.splitlines()[:20]:
             log.write(f"  [bold bright_white]{line}[/]")
-        if len(result.splitlines()) > 20:
-            log.write(f"  [bold bright_white]... ({len(result.splitlines()) - 20} more lines)[/]")
+        if len(result_for_context.splitlines()) > 20:
+            log.write(
+                "  [bold bright_white]"
+                f"... ({len(result_for_context.splitlines()) - 20} more lines)[/]"
+            )
         log.write("")
-        self.agent.complete_tool_call(tc, result)
+        self.agent.complete_tool_call(tc, result_for_context)
         self.persist_session_state(reason=f"tool_result:{tc.name}")
 
     def _clamp_load_file_tool_budget(self, tc: ToolCall) -> None:
@@ -1800,6 +1808,30 @@ class OpenJetApp(App):
             window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
             budget = derive_context_budget(window)
         return max(128, budget.prompt_tokens - current)
+
+    def _fit_tool_result_to_budget(self, result: str) -> tuple[str, bool]:
+        if not result:
+            return result, False
+
+        remaining = self._remaining_prompt_tokens()
+        budget_tokens = max(
+            TOOL_RESULT_MIN_BUDGET_TOKENS,
+            remaining - TOOL_RESULT_SAFE_PADDING_TOKENS,
+        )
+        if estimate_tokens(result) <= budget_tokens:
+            return result, False
+
+        suffix = "\n...[tool output truncated for context safety]"
+        max_chars = max(256, budget_tokens * 4)
+        clipped = result[:max_chars]
+        candidate = clipped + suffix
+
+        # Tighten iteratively so the final payload stays within budget.
+        while estimate_tokens(candidate) > budget_tokens and len(clipped) > 64:
+            clipped = clipped[: max(64, int(len(clipped) * 0.85))]
+            candidate = clipped + suffix
+
+        return candidate, True
 
     def _is_recoverable_runtime_error(self, error_text: str) -> bool:
         lowered = error_text.lower()
