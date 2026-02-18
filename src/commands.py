@@ -34,6 +34,7 @@ class SlashCommandHandler:
         CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
         CommandSpec(name="condense", description="Manually condense older context"),
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
+        CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
     )
 
     def __init__(self, app: OpenJetApp, banner: str) -> None:
@@ -76,6 +77,9 @@ class SlashCommandHandler:
         if cmd == "load":
             await self._load(log, arg)
             return True
+        if cmd == "setup":
+            await self._setup(log)
+            return True
 
         self._render_unknown(log, text)
         return True
@@ -104,6 +108,7 @@ class SlashCommandHandler:
             return
 
         self.app.agent.reset_conversation()
+        self.app.loaded_files.clear()
         log.clear()
         log.write(self.banner)
         log.write("  [dim]Conversation history cleared.[/]")
@@ -130,6 +135,7 @@ class SlashCommandHandler:
                 reset_kv_cache=reset_kv_cache,
                 kv_reset_ok=kv_reset_ok,
             )
+        self.app.persist_session_state(reason="clear_command")
 
     def _status(self, log: RichLog) -> None:
         snapshot = self.app.runtime_status_snapshot()
@@ -178,6 +184,7 @@ class SlashCommandHandler:
         log.write(f"[dim]{summary}[/]")
         log.write("")
         self.app.refresh_token_counter()
+        self.app.persist_session_state(reason="manual_condense")
         if self.app.session_logger:
             self.app.session_logger.log_event("manual_condense", summary=summary)
 
@@ -202,6 +209,17 @@ class SlashCommandHandler:
         if not ok:
             log.write("[dim]Use /status to inspect current budget and memory.[/]")
             log.write("")
+
+    async def _setup(self, log: RichLog) -> None:
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot open setup while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+        await self.app.run_setup_command(log)
 
     def resolve_command(self, token: str) -> str | None:
         needle = token.strip().lower()

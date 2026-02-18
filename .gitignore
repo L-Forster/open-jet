@@ -4,3 +4,16 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Runtime/session state
+session_logs/
+session_state.json
+*.events.jsonl
+*.metrics.jsonl
+
+# Local tooling/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+*.log

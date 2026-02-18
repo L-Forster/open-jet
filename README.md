@@ -20,7 +20,18 @@ python -m pip install -e .
 open-jet
 ```
 
-On first run, the TUI asks for your model path and writes it to `config.yaml`.
+To force the setup wizard at startup:
+
+```bash
+open-jet --setup
+```
+
+On first run, the TUI runs a setup wizard and saves config to `config.yaml`:
+- model selection/path
+- device (`auto` / `cuda` / `cpu`)
+- context window tokens (recommended from current RAM/headless runtime)
+- GPU layers
+- setup navigation uses TUI selects (Tab + Up/Down), with `Ctrl+S` to save
 
 ## Usage
 
@@ -30,6 +41,7 @@ On first run, the TUI asks for your model path and writes it to `config.yaml`.
 - `Tab` also autocompletes `@` file paths from the current workspace.
 - A live token counter is shown under the chat input.
 - Tool calls that can change system state still require approval (`y` / `n`).
+- Tool approvals include a compact preview of the exact command/write action.
 - `Ctrl+C` quits.
 
 ## Slash Commands
@@ -40,6 +52,7 @@ On first run, the TUI asks for your model path and writes it to `config.yaml`.
 - `/status`: show context and RAM status.
 - `/condense`: manually condense older context.
 - `/load <path>`: preload a text/code file into context.
+- `/setup`: reopen setup wizard and restart runtime with new config.
 
 ## Edge Device Notes
 
@@ -78,4 +91,17 @@ logging:
   directory: session_logs
   label: open-jet
   metrics_interval_seconds: 5
+```
+
+## Session Resume
+
+- Conversation state is autosaved to `session_state.json` by default.
+- On startup, open-jet does not resume previous session context unless enabled.
+- Configure in `config.yaml`:
+
+```yaml
+state:
+  auto_resume: false
+  enabled: true
+  path: session_state.json
 ```

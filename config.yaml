@@ -1,18 +1,31 @@
-model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-system_prompt: |
-  You are an AI assistant running on a NVIDIA Jetson edge device.
-  You have 4 tools available: shell, read_file, write_file, load_file.
-  Always explain what a command does before proposing it.
-  Never chain destructive commands.
-  Be concise and helpful.
+context_window_tokens: 4096
+device: cuda
+gpu_layers: 20
+logging:
+  directory: session_logs
+  enabled: true
+  label: open-jet
+  metrics_interval_seconds: 5
 memory_guard:
-  min_available_mb: null
-  max_used_percent: null
   check_interval_chunks: 16
   condense_target_tokens: 900
   keep_last_messages: 6
-logging:
+  max_used_percent: null
+  min_available_mb: null
+model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
+setup_complete: true
+state:
+  auto_resume: false
   enabled: true
-  directory: session_logs
-  label: open-jet
-  metrics_interval_seconds: 5
+  path: session_state.json
+system_prompt: 'You are an AI assistant running on a NVIDIA Jetson edge device.
+
+  You have 4 tools available: shell, read_file, write_file, load_file.
+
+  Always explain what a command does before proposing it.
+
+  Never chain destructive commands.
+
+  Be concise and helpful.
+
+  '

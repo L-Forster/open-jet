@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import os
 import re
 import time
 from pathlib import Path
@@ -12,7 +14,7 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import Input, RichLog, Static
 from textual.widgets._input import Selection
 
@@ -22,6 +24,7 @@ from .completion import CompletionEngine, FileMentionCompletionProvider, SlashCo
 from .executor import load_file, read_file, run_shell, write_file
 from .ollama_client import OllamaClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
+from .session_state import SessionStateStore
 from .session_logging import SessionLogger
 
 
@@ -43,6 +46,70 @@ def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(yaml.dump(cfg, default_flow_style=False))
 
 
+def _discover_model_files() -> list[str]:
+    roots = [
+        Path.cwd(),
+        Path.cwd() / "models",
+        Path.home() / "Downloads",
+        Path.home() / "models",
+    ]
+    found: set[str] = set()
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for path in root.glob("*.gguf"):
+            found.add(str(path.resolve()))
+    return sorted(found)
+
+
+def _recommended_device() -> str:
+    if Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists():
+        return "cuda"
+    return "cpu"
+
+
+def _recommended_context_window_tokens() -> int:
+    headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    mem = read_memory_snapshot()
+    if not mem:
+        return 4096 if headless else 2048
+
+    total_gb = mem.total_mb / 1024.0
+    if total_gb >= 24:
+        rec = 8192
+    elif total_gb >= 12:
+        rec = 6144
+    elif total_gb >= 7:
+        rec = 4096 if headless else 3072
+    elif total_gb >= 4:
+        rec = 2048
+    else:
+        rec = 1024
+
+    # If currently low on free RAM, keep recommendation conservative.
+    if mem.available_mb < 1200:
+        rec = min(rec, 2048)
+    return rec
+
+
+def _recommended_gpu_layers(device: str) -> int:
+    return 0 if device == "cpu" else 20
+
+
+def _context_window_options(recommended: int) -> list[int]:
+    options = [1024, 1536, 2048, 3072, 4096, 6144, 8192]
+    if recommended not in options:
+        options.append(recommended)
+    return sorted(set(options))
+
+
+def _gpu_layer_options(device: str, recommended: int) -> list[int]:
+    base = [0] if device == "cpu" else [0, 10, 20, 28, 35]
+    if recommended not in base:
+        base.append(recommended)
+    return sorted(set(base))
+
+
 # ---------------------------------------------------------------------------
 # Block title banner
 # ---------------------------------------------------------------------------
@@ -58,33 +125,273 @@ BANNER = r"""[bold green]
 
 
 class SetupScreen(ModalScreen[dict]):
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+    BINDINGS = [
+        Binding("up", "prev_option", "Prev"),
+        Binding("down", "next_option", "Next"),
+        Binding("enter", "advance", "Next"),
+        Binding("tab", "advance", "Next"),
+        Binding("shift+tab", "back", "Back"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(
+        self,
+        *,
+        model_options: list[str],
+        recommended_device: str,
+        recommended_ctx: int,
+        exit_on_cancel: bool = True,
+    ) -> None:
+        super().__init__()
+        self.model_options = model_options
+        self.recommended_device = recommended_device if recommended_device in {"auto", "cuda", "cpu"} else "auto"
+        self.recommended_ctx = max(512, int(recommended_ctx))
+        self.exit_on_cancel = exit_on_cancel
+        self._steps: list[dict] = []
+        self._step_index = 0
+        self._indices: dict[str, int] = {}
+        self._selections: dict[str, object] = {}
 
     def compose(self) -> ComposeResult:
         yield Vertical(
             Static("[bold green]First-run setup[/]"),
             Static(""),
-            Static("Path to your .gguf model file:"),
-            Input(placeholder="/path/to/model.gguf", id="setup-model"),
+            Static("", id="setup-step"),
+            Static("", id="setup-options"),
+            Static("Manual model path (.gguf):", id="setup-model-path-label", classes="hidden"),
+            Input(placeholder="/path/to/model.gguf", id="setup-model-path", classes="hidden"),
             Static(""),
-            Static("[dim]Press enter to save[/]"),
+            Static("", id="setup-error"),
+            Static("[dim]Up/Down select • Tab/Enter next • Shift+Tab back • Enter on final step saves[/]", id="setup-hint"),
             id="setup-box",
         )
 
     def on_mount(self) -> None:
-        self.query_one("#setup-model", Input).focus()
+        self._init_steps()
+        self._render_step()
+
+    def _init_steps(self) -> None:
+        model_rows: list[tuple[str, str]] = []
+        for model in self.model_options:
+            model_rows.append((Path(model).name, model))
+        model_rows.append(("Manual path", "__manual__"))
+        default_model = self.model_options[0] if self.model_options else "__manual__"
+
+        device_rows = [("auto", "auto"), ("cuda", "cuda"), ("cpu", "cpu")]
+        device_rows = [
+            (f"{label} (recommended)" if value == self.recommended_device else label, value)
+            for label, value in device_rows
+        ]
+
+        context_rows = [
+            (f"{value} (recommended)" if value == self.recommended_ctx else str(value), value)
+            for value in _context_window_options(self.recommended_ctx)
+        ]
+        gpu_recommended = _recommended_gpu_layers(self.recommended_device)
+        gpu_rows = [
+            (f"{value} (recommended)" if value == gpu_recommended else str(value), value)
+            for value in _gpu_layer_options(self.recommended_device, gpu_recommended)
+        ]
+
+        self._steps = [
+            {"key": "model", "title": "Model", "options": model_rows},
+            {"key": "device", "title": "Device", "options": device_rows},
+            {"key": "context_window_tokens", "title": "Context Window Tokens", "options": context_rows},
+            {"key": "gpu_layers", "title": "GPU Layers", "options": gpu_rows},
+        ]
+
+        defaults = {
+            "model": default_model,
+            "device": self.recommended_device,
+            "context_window_tokens": self.recommended_ctx,
+            "gpu_layers": gpu_recommended,
+        }
+        for step in self._steps:
+            key = str(step["key"])
+            options = list(step["options"])
+            idx = 0
+            for i, (_label, value) in enumerate(options):
+                if value == defaults.get(key):
+                    idx = i
+                    break
+            self._indices[key] = idx
+            self._selections[key] = options[idx][1]
+
+        manual_input = self.query_one("#setup-model-path", Input)
+        if self.model_options:
+            manual_input.value = self.model_options[0]
+
+    def _current_step(self) -> dict:
+        return self._steps[self._step_index]
+
+    def _render_step(self) -> None:
+        step = self._current_step()
+        key = str(step["key"])
+        options = list(step["options"])
+        idx = int(self._indices[key])
+        idx = max(0, min(idx, len(options) - 1))
+        self._indices[key] = idx
+        self._selections[key] = options[idx][1]
+
+        header = self.query_one("#setup-step", Static)
+        header.update(
+            f"[bold green]Step {self._step_index + 1}/{len(self._steps)}[/] "
+            f"[dim]- {step['title']}[/]"
+        )
+
+        lines: list[str] = []
+        for i, (label, value) in enumerate(options):
+            pretty_label = self._compact_text(str(label), 34)
+            detail = self._option_detail(key, value)
+            if i == idx:
+                line = f"[black on green] {pretty_label} [/]"
+            else:
+                line = f"[bold green]{pretty_label}[/]"
+            if detail:
+                line += f" [dim]- {self._compact_text(detail, 26)}[/]"
+            lines.append(line)
+        self.query_one("#setup-options", Static).update("\n".join(lines))
+
+        manual_label = self.query_one("#setup-model-path-label", Static)
+        manual_input = self.query_one("#setup-model-path", Input)
+        show_manual = key == "model" and self._selections.get("model") == "__manual__"
+        if show_manual:
+            manual_label.remove_class("hidden")
+            manual_input.remove_class("hidden")
+        else:
+            manual_label.add_class("hidden")
+            manual_input.add_class("hidden")
+        self.query_one("#setup-error", Static).update("")
+
+    def action_next_option(self) -> None:
+        step = self._current_step()
+        key = str(step["key"])
+        options = list(step["options"])
+        self._indices[key] = (self._indices[key] + 1) % len(options)
+        self._selections[key] = options[self._indices[key]][1]
+        if key == "device":
+            self._sync_gpu_step()
+        self._render_step()
+
+    def action_prev_option(self) -> None:
+        step = self._current_step()
+        key = str(step["key"])
+        options = list(step["options"])
+        self._indices[key] = (self._indices[key] - 1) % len(options)
+        self._selections[key] = options[self._indices[key]][1]
+        if key == "device":
+            self._sync_gpu_step()
+        self._render_step()
+
+    def action_advance(self) -> None:
+        if self._step_index < len(self._steps) - 1:
+            self._step_index += 1
+            self._render_step()
+            return
+        self.action_save()
+
+    def action_back(self) -> None:
+        if self._step_index <= 0:
+            return
+        self._step_index -= 1
+        self._render_step()
+
+    def _sync_gpu_step(self) -> None:
+        device = str(self._selections.get("device", "auto"))
+        recommended = _recommended_gpu_layers(device)
+        gpu_step = next((step for step in self._steps if step["key"] == "gpu_layers"), None)
+        if not gpu_step:
+            return
+        old_value = self._selections.get("gpu_layers")
+        values = _gpu_layer_options(device, recommended)
+        gpu_step["options"] = [
+            (f"{value} (recommended)" if value == recommended else str(value), value)
+            for value in values
+        ]
+        if old_value in values:
+            new_value = old_value
+        else:
+            new_value = recommended
+        self._indices["gpu_layers"] = values.index(new_value)
+        self._selections["gpu_layers"] = new_value
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
-        model_path = event.value.strip()
+        self.action_advance()
+
+    def action_save(self) -> None:
+        model_path = self._selected_model_path()
         if not model_path:
+            self._set_error("Model path is required.")
             return
-        if not Path(model_path).is_file():
-            self.query_one("#setup-model", Input).value = ""
+        model_file = Path(model_path).expanduser()
+        if not model_file.is_file():
+            self._set_error("Model file does not exist.")
             return
-        self.dismiss({"model": model_path})
+
+        device = str(self._selections.get("device", "auto"))
+        if device not in {"auto", "cuda", "cpu"}:
+            self._set_error("Invalid device selection.")
+            return
+
+        context_value = int(self._selections.get("context_window_tokens", self.recommended_ctx))
+        if context_value < 512:
+            self._set_error("Select a valid context window.")
+            return
+
+        gpu_value = int(self._selections.get("gpu_layers", _recommended_gpu_layers(device)))
+        if gpu_value < 0:
+            self._set_error("Select a valid GPU layer value.")
+            return
+
+        self.dismiss(
+            {
+                "model": str(model_file),
+                "device": device,
+                "context_window_tokens": context_value,
+                "gpu_layers": gpu_value,
+                "setup_complete": True,
+            }
+        )
+
+    def _selected_model_path(self) -> str:
+        selected = self._selections.get("model")
+        if isinstance(selected, str) and selected != "__manual__":
+            return selected
+        return self.query_one("#setup-model-path", Input).value.strip()
+
+    def _option_detail(self, key: str, value: object) -> str:
+        if key == "model":
+            if value == "__manual__":
+                return "enter file path below"
+            return "detected model"
+        if key == "device":
+            if value == self.recommended_device:
+                return "recommended"
+            return "runtime mode"
+        if key == "context_window_tokens":
+            if value == self.recommended_ctx:
+                return "recommended from RAM"
+            return "max prompt window"
+        if key == "gpu_layers":
+            return "GPU offload layers"
+        return ""
+
+    def _compact_text(self, text: str, limit: int) -> str:
+        src = " ".join(text.split())
+        if len(src) <= limit:
+            return src
+        if limit <= 1:
+            return src[:limit]
+        return src[: limit - 1] + "…"
+
+    def _set_error(self, message: str) -> None:
+        self.query_one("#setup-error", Static).update(f"[bold red]{message}[/]")
 
     def action_cancel(self) -> None:
-        self.app.exit()
+        if self.exit_on_cancel:
+            self.app.exit()
+            return
+        self.dismiss({})
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +399,9 @@ class SetupScreen(ModalScreen[dict]):
 # ---------------------------------------------------------------------------
 
 CSS = """
+SetupScreen {
+    background: $background;
+}
 Screen {
     background: $background;
 }
@@ -131,12 +441,34 @@ Screen {
     display: none;
 }
 #setup-box {
-    width: 70%;
+    width: 100%;
     height: auto;
-    margin: 4 8;
+    margin: 0 2;
     padding: 1 2;
-    border: heavy $accent;
     background: $surface;
+    color: $text;
+}
+#setup-step {
+    margin: 0 0;
+    color: $text;
+}
+#setup-options {
+    margin: 0 0;
+    color: $text;
+}
+#setup-model-path-label {
+    margin: 0 0;
+    color: $text;
+}
+#setup-model-path {
+    margin: 0 0;
+}
+#setup-error {
+    margin: 0 0;
+}
+#setup-hint {
+    margin: 0 0;
+    color: $text;
 }
 """
 
@@ -150,12 +482,20 @@ class OpenJetApp(App):
     CSS = CSS
     BINDINGS = [Binding("ctrl+c", "quit", "Quit")]
 
-    def __init__(self) -> None:
+    def __init__(self, *, force_setup: bool = False) -> None:
         super().__init__()
+        self.force_setup = force_setup
         self.cfg = load_config()
         self.client: OllamaClient | None = None
         self.agent: Agent | None = None
         self.session_logger: SessionLogger | None = None
+        state_cfg = self.cfg.get("state", {})
+        self.state_store = SessionStateStore(
+            path=Path(state_cfg.get("path", "session_state.json")),
+            enabled=bool(state_cfg.get("enabled", True)),
+        )
+        self.auto_resume = bool(state_cfg.get("auto_resume", False))
+        self.loaded_files: dict[str, dict] = {}
         self._thinking_timer = None
         self._thinking_idx = 0
         self._thinking_token = 0
@@ -176,6 +516,8 @@ class OpenJetApp(App):
         self.client = OllamaClient(
             model=self.cfg["model"],
             context_window_tokens=int(self.cfg.get("context_window_tokens", 2048)),
+            device=str(self.cfg.get("device", "auto")),
+            gpu_layers=int(self.cfg.get("gpu_layers", 20)),
         )
         await self.client.start()
         self.agent = Agent(
@@ -203,6 +545,73 @@ class OpenJetApp(App):
             keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
         )
 
+    def _build_setup_screen(self, *, exit_on_cancel: bool) -> SetupScreen:
+        return SetupScreen(
+            model_options=_discover_model_files(),
+            recommended_device=_recommended_device(),
+            recommended_ctx=_recommended_context_window_tokens(),
+            exit_on_cancel=exit_on_cancel,
+        )
+
+    async def _wait_for_screen_result(self, screen: Screen) -> object:
+        """Wait for a screen result without requiring a worker context."""
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[object] = loop.create_future()
+
+        def _on_dismiss(result: object) -> None:
+            if not result_future.done():
+                result_future.set_result(result)
+
+        self.push_screen(screen, callback=_on_dismiss)
+        return await result_future
+
+    async def run_setup_command(self, log: RichLog) -> bool:
+        result = await self._wait_for_screen_result(self._build_setup_screen(exit_on_cancel=False))
+        if not isinstance(result, dict) or not result.get("setup_complete"):
+            log.write("[dim]Setup cancelled.[/]")
+            log.write("")
+            return False
+
+        previous_cfg = dict(self.cfg)
+        self.cfg.update(result)
+        save_config(self.cfg)
+
+        try:
+            if self.client:
+                await self.client.close()
+            self.client = None
+            self.agent = None
+            await self._init_client()
+        except Exception as exc:
+            self.cfg = previous_cfg
+            save_config(self.cfg)
+            try:
+                await self._init_client()
+            except Exception:
+                pass
+            log.write(f"[bold red]Setup failed:[/] {exc}")
+            log.write("")
+            if self.session_logger:
+                self.session_logger.log_event("setup_apply_failed", error=str(exc))
+            return False
+
+        self.loaded_files.clear()
+        self.persist_session_state(reason="setup_command")
+        self._render_token_counter()
+        prompt = self.query_one("#prompt", Input)
+        prompt.focus()
+        log.write("[dim]Setup applied. Runtime restarted and context reset.[/]")
+        log.write("")
+        if self.session_logger:
+            self.session_logger.log_event(
+                "setup_applied",
+                model=self.cfg.get("model"),
+                device=self.cfg.get("device"),
+                context_window_tokens=self.cfg.get("context_window_tokens"),
+                gpu_layers=self.cfg.get("gpu_layers"),
+            )
+        return True
+
     def compose(self) -> ComposeResult:
         yield RichLog(id="chat-log", wrap=True, markup=True)
         yield Static("", id="assistant-status", classes="hidden")
@@ -211,10 +620,15 @@ class OpenJetApp(App):
         yield Static("", id="command-suggestions", classes="hidden")
         yield Static("", id="token-counter")
 
-    async def on_mount(self) -> None:
+    def on_mount(self) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        log.write(BANNER)
+        self._startup_sequence()
+
+    @work(exclusive=True)
+    async def _startup_sequence(self) -> None:
         log = self.query_one("#chat-log", RichLog)
         prompt = self.query_one("#prompt", Input)
-        log.write(BANNER)
         log_cfg = self.cfg.get("logging", {})
         if log_cfg.get("enabled", True):
             self.session_logger = SessionLogger(
@@ -225,9 +639,23 @@ class OpenJetApp(App):
             await self.session_logger.start()
             self.session_logger.log_event("app_mount", cwd=str(Path.cwd()))
 
-        if not self.cfg.get("model"):
-            result = await self.push_screen_wait(SetupScreen())
-            self.cfg["model"] = result["model"]
+        if self.force_setup or not self.cfg.get("model"):
+            # First run without model: cancel exits app.
+            # Explicit --setup mode: cancel returns to startup using existing config.
+            setup_result = await self._wait_for_screen_result(
+                self._build_setup_screen(exit_on_cancel=not bool(self.cfg.get("model")))
+            )
+            if isinstance(setup_result, dict) and setup_result.get("setup_complete"):
+                self.cfg.update(setup_result)
+                save_config(self.cfg)
+            elif not self.cfg.get("model"):
+                return
+        elif not self.cfg.get("setup_complete"):
+            # Backfill defaults for older configs created before setup wizard existed.
+            self.cfg["setup_complete"] = True
+            self.cfg.setdefault("device", _recommended_device())
+            self.cfg.setdefault("context_window_tokens", _recommended_context_window_tokens())
+            self.cfg.setdefault("gpu_layers", _recommended_gpu_layers(str(self.cfg.get("device", "auto"))))
             save_config(self.cfg)
 
         log.write(f"  [dim]Loading {Path(self.cfg['model']).name}...[/]")
@@ -241,12 +669,21 @@ class OpenJetApp(App):
             return
         if self.session_logger:
             self.session_logger.log_event("llm_ready", model=self.cfg["model"])
+            self.session_logger.log_event(
+                "llm_runtime_config",
+                device=self.cfg.get("device", "auto"),
+                gpu_layers=self.cfg.get("gpu_layers", 20),
+                context_window_tokens=self.cfg.get("context_window_tokens", 2048),
+            )
         log.write(f"  [dim]Ready.[/]")
+        if self.auto_resume:
+            self._restore_session_state(log)
         log.write("")
         self._render_token_counter()
         prompt.focus()
 
     async def action_quit(self) -> None:
+        self.persist_session_state(reason="quit")
         if self.client:
             await self.client.close()
         if self.session_logger:
@@ -330,6 +767,12 @@ class OpenJetApp(App):
             return
 
         log = self.query_one("#chat-log", RichLog)
+        if not self.agent:
+            log.write("[yellow]LLM is not ready yet. Wait for Ready, or run /setup.[/]")
+            log.write("")
+            self._render_token_counter()
+            return
+
         log.write(f"[bold green]> [/]{text}")
         log.write("")
         if self.session_logger:
@@ -337,6 +780,7 @@ class OpenJetApp(App):
 
         await self._load_mentioned_files_into_context(text, log)
         self.agent.add_user_message(text)
+        self.persist_session_state(reason="user_message")
         self._render_token_counter()
         self.run_agent_turn()
 
@@ -378,6 +822,12 @@ class OpenJetApp(App):
             f"{result.content}"
         )
         self.agent.messages.append({"role": "system", "content": context_text})
+        self.loaded_files[result.path] = {
+            "path": result.path,
+            "estimated_tokens": result.estimated_tokens,
+            "loaded_tokens": result.returned_tokens,
+            "truncated": result.truncated,
+        }
         log.write(f"[dim]Loaded @{mention_path} into context ({result.summary}).[/]")
         if self.session_logger:
             self.session_logger.log_event(
@@ -392,6 +842,7 @@ class OpenJetApp(App):
                 truncated=result.truncated,
                 mem_available_mb=result.mem_available_mb,
             )
+        self.persist_session_state(reason="context_file_loaded")
         self._render_token_counter()
         return True
 
@@ -477,10 +928,115 @@ class OpenJetApp(App):
     def refresh_token_counter(self) -> None:
         self._render_token_counter()
 
+    def _restore_session_state(self, log: RichLog) -> None:
+        if not self.agent:
+            return
+        state = self.state_store.load()
+        if not state:
+            return
+        messages = state.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return
+        valid_messages: list[dict] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if not isinstance(role, str):
+                continue
+            if "content" in msg and not isinstance(msg.get("content"), str):
+                continue
+            valid_messages.append(msg)
+        if not valid_messages:
+            return
+
+        first = valid_messages[0]
+        if first.get("role") != "system":
+            valid_messages = [{"role": "system", "content": self.cfg.get("system_prompt", "")}, *valid_messages]
+
+        self.agent.messages = valid_messages
+        self._replay_restored_history(log, self.agent.messages)
+        loaded_files = state.get("loaded_files")
+        if isinstance(loaded_files, dict):
+            self.loaded_files = loaded_files
+        else:
+            self.loaded_files = {}
+        log.write(
+            "  [dim]"
+            f"Resumed previous session: {max(0, len(self.agent.messages) - 1)} messages, "
+            f"{len(self.loaded_files)} loaded files."
+            "[/]"
+        )
+        if self.session_logger:
+            self.session_logger.log_event(
+                "session_state_restored",
+                messages=max(0, len(self.agent.messages) - 1),
+                loaded_files=len(self.loaded_files),
+                state_path=str(self.state_store.path),
+            )
+
+    def _replay_restored_history(self, log: RichLog, messages: list[dict]) -> None:
+        for msg in messages:
+            role = msg.get("role")
+            if role == "user":
+                text = msg.get("content", "")
+                if isinstance(text, str) and text.strip():
+                    log.write(f"[bold green]> [/]{text}")
+                    log.write("")
+                continue
+
+            if role == "assistant":
+                text = msg.get("content", "")
+                if isinstance(text, str) and text:
+                    self._write_text_block(log, text)
+                if not msg.get("tool_calls"):
+                    log.write("")
+                continue
+
+            if role == "tool":
+                text = msg.get("content", "")
+                if isinstance(text, str) and text:
+                    self._write_tool_result(log, text)
+
+    def _write_text_block(self, log: RichLog, text: str) -> None:
+        buf = text
+        while "\n" in buf:
+            line, buf = buf.split("\n", 1)
+            log.write(line)
+        if buf:
+            log.write(buf)
+
+    def _write_tool_result(self, log: RichLog, result: str) -> None:
+        lines = result.splitlines()
+        for line in lines[:20]:
+            log.write(f"  [dim]{line}[/]")
+        if len(lines) > 20:
+            log.write(f"  [dim]... ({len(lines) - 20} more lines)[/]")
+        log.write("")
+
+    def persist_session_state(self, *, reason: str) -> None:
+        if not self.agent:
+            return
+        payload = {
+            "version": 1,
+            "saved_at": time.time(),
+            "reason": reason,
+            "model": self.cfg.get("model"),
+            "device": self.cfg.get("device", "auto"),
+            "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
+            "messages": self.agent.messages,
+            "loaded_files": self.loaded_files,
+        }
+        try:
+            self.state_store.save(payload)
+        except Exception as exc:
+            if self.session_logger:
+                self.session_logger.log_event("session_state_save_error", reason=reason, error=str(exc))
+
     # -- Agent turn ----------------------------------------------------------
 
     @work(exclusive=True)
-    async def run_agent_turn(self) -> None:
+    async def run_agent_turn(self, recovery_attempted: bool = False) -> None:
         log = self.query_one("#chat-log", RichLog)
         pending_tool_calls: list[ToolCall] = []
         text_buf = ""
@@ -505,6 +1061,11 @@ class OpenJetApp(App):
                             arguments=event.tool_call.arguments,
                         )
                 elif event.kind == ActionKind.ERROR:
+                    if not recovery_attempted and self._is_recoverable_runtime_error(event.text):
+                        recovered = await self._recover_runtime(log, event.text)
+                        if recovered:
+                            self.run_agent_turn(recovery_attempted=True)
+                            return
                     log.write(f"\n[bold red]error:[/] {event.text}")
                     if self.session_logger:
                         self.session_logger.log_event("agent_error", error=event.text)
@@ -528,8 +1089,10 @@ class OpenJetApp(App):
             await self._handle_tool_call(tc, log)
 
         if pending_tool_calls:
+            self.persist_session_state(reason="assistant_turn_with_tools")
             self.run_agent_turn()
         else:
+            self.persist_session_state(reason="assistant_turn_done")
             self._render_token_counter()
 
     async def _handle_tool_call(self, tc: ToolCall, log: RichLog) -> None:
@@ -539,12 +1102,15 @@ class OpenJetApp(App):
             log.write(f"  [dim]{result}[/]")
             log.write("")
             self.agent.complete_tool_call(tc, result)
+            self.persist_session_state(reason="auto_condense")
             return
 
         needs_confirm = self.agent.needs_confirmation(tc)
 
         if needs_confirm:
-            log.write(f"[yellow]{tc.name}:[/] {_fmt_args(tc)}")
+            log.write(f"[yellow]{tc.name}:[/]")
+            for preview_line in self._tool_preview_lines(tc):
+                log.write(f"  [dim]{preview_line}[/]")
             approved = await self._wait_for_tool_approval(tc)
             if not approved:
                 log.write("[dim red]  denied[/]")
@@ -557,6 +1123,7 @@ class OpenJetApp(App):
                         arguments=tc.arguments,
                     )
                 self.agent.complete_tool_call(tc, "User denied this action.")
+                self.persist_session_state(reason=f"tool_denied:{tc.name}")
                 return
             log.write("[dim green]  approved[/]")
             if self.session_logger:
@@ -588,6 +1155,7 @@ class OpenJetApp(App):
             log.write(f"  [dim]... ({len(result.splitlines()) - 20} more lines)[/]")
         log.write("")
         self.agent.complete_tool_call(tc, result)
+        self.persist_session_state(reason=f"tool_result:{tc.name}")
 
     def _clamp_load_file_tool_budget(self, tc: ToolCall) -> None:
         if not isinstance(tc.arguments, dict):
@@ -608,6 +1176,43 @@ class OpenJetApp(App):
             window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
             budget = derive_context_budget(window)
         return max(128, budget.prompt_tokens - current)
+
+    def _is_recoverable_runtime_error(self, error_text: str) -> bool:
+        lowered = error_text.lower()
+        needles = (
+            "connecterror",
+            "connection refused",
+            "connection reset",
+            "remoteprotocolerror",
+            "readtimeout",
+            "timed out",
+            "server disconnected",
+            "llama-server exited",
+            "502",
+            "503",
+            "504",
+        )
+        return any(needle in lowered for needle in needles)
+
+    async def _recover_runtime(self, log: RichLog, error_text: str) -> bool:
+        if not self.client:
+            return False
+        log.write("[yellow]LLM runtime interrupted. Restarting llama-server once and retrying...[/]")
+        if self.session_logger:
+            self.session_logger.log_event("llm_recovery_attempt", error=error_text)
+        try:
+            await self.client.reset_kv_cache()
+        except Exception as exc:
+            log.write(f"[bold red]Runtime recovery failed:[/] {exc}")
+            log.write("")
+            if self.session_logger:
+                self.session_logger.log_event("llm_recovery_failed", error=str(exc))
+            return False
+        log.write("[dim]Runtime recovered. Retrying turn.[/]")
+        log.write("")
+        if self.session_logger:
+            self.session_logger.log_event("llm_recovery_succeeded")
+        return True
 
     def _start_thinking(self) -> int:
         status = self.query_one("#assistant-status", Static)
@@ -663,9 +1268,7 @@ class OpenJetApp(App):
         if not self._awaiting_approval or not self._approval_tool_call:
             return
         bar = self.query_one("#approval-bar", Static)
-        detail = _fmt_args(self._approval_tool_call)
-        if len(detail) > 100:
-            detail = detail[:97] + "..."
+        preview = self._approval_preview_text(self._approval_tool_call)
         approve = (
             "[black on green] Approve [/]"
             if self._approval_choice == 0
@@ -677,7 +1280,7 @@ class OpenJetApp(App):
             else "[bold red]Deny[/]"
         )
         bar.update(
-            f"[bold yellow]Tool request:[/] {detail}\n"
+            f"[bold yellow]Tool request:[/]\n{preview}\n"
             f"Use [bold]←[/]/[bold]→[/] then [bold]Enter[/]   {approve}  {deny}"
         )
 
@@ -689,6 +1292,34 @@ class OpenJetApp(App):
         prompt = self.query_one("#prompt", Input)
         cursor = prompt.cursor_position
         prompt.selection = Selection(cursor, cursor)
+
+    def _tool_preview_lines(self, tc: ToolCall) -> list[str]:
+        if tc.name == "shell":
+            command = str(tc.arguments.get("command", "")).strip()
+            if len(command) > 200:
+                command = command[:197] + "..."
+            return [f"command: {command}"]
+        if tc.name == "write_file":
+            path = str(tc.arguments.get("path", "")).strip()
+            content = str(tc.arguments.get("content", ""))
+            preview = content.replace("\r\n", "\n").replace("\r", "\n")
+            preview_lines = preview.split("\n")
+            compact_preview = " | ".join(preview_lines[:3]).strip()
+            if len(compact_preview) > 180:
+                compact_preview = compact_preview[:177] + "..."
+            return [
+                f"path: {path}",
+                f"bytes: {len(content)}",
+                f"preview: {compact_preview}",
+            ]
+        return [str(_fmt_args(tc))]
+
+    def _approval_preview_text(self, tc: ToolCall) -> str:
+        lines = self._tool_preview_lines(tc)
+        joined = "\n".join(lines)
+        if len(joined) > 280:
+            return joined[:277] + "..."
+        return joined
 
 
 # ---------------------------------------------------------------------------
@@ -785,8 +1416,16 @@ def _extract_file_mentions(text: str) -> list[str]:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    app = OpenJetApp()
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="open-jet offline agentic TUI")
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="start in setup wizard mode before launching the chat UI",
+    )
+    args = parser.parse_args(argv)
+
+    app = OpenJetApp(force_setup=args.setup)
     app.run()
 
 

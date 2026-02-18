@@ -126,11 +126,15 @@ class OllamaClient:
         host: str = "127.0.0.1",
         port: int = 8080,
         context_window_tokens: int = 2048,
+        device: str = "auto",
+        gpu_layers: int = 20,
     ) -> None:
         self.model = model
         self.host = host
         self.port = port
         self.context_window_tokens = max(512, int(context_window_tokens))
+        self.device = device.strip().lower() if device else "auto"
+        self.gpu_layers = max(0, int(gpu_layers))
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
@@ -142,10 +146,13 @@ class OllamaClient:
         bin_dir = os.path.dirname(binary)
         env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
 
+        resolved_device = self._resolve_device()
+        ngl = self.gpu_layers if resolved_device == "cuda" else 0
+
         self._proc = await asyncio.create_subprocess_exec(
             binary, "-m", self.model,
             "--host", self.host, "--port", str(self.port),
-            "-ngl", "20", "-c", str(self.context_window_tokens),
+            "-ngl", str(ngl), "-c", str(self.context_window_tokens),
             env=env,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -182,6 +189,13 @@ class OllamaClient:
             except asyncio.TimeoutError:
                 self._proc.kill()
         self._proc = None
+
+    def _resolve_device(self) -> str:
+        if self.device in {"cuda", "cpu"}:
+            return self.device
+        if os.path.exists("/usr/local/cuda") or os.path.exists("/dev/nvhost-gpu"):
+            return "cuda"
+        return "cpu"
 
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
