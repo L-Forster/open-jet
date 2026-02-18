@@ -65,6 +65,7 @@ Controls: `Up/Down` to change option, `Tab/Enter` next, `Shift+Tab` back, `Enter
 - `/status`: show context and RAM status.
 - `/condense`: manually condense older context.
 - `/load <path>`: preload a text/code file into context.
+- `/resume`: load previous saved session state into chat.
 - `/setup`: reopen setup wizard and restart runtime with new config.
 
 ## Edge Device Notes

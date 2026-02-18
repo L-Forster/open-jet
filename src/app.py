@@ -1482,15 +1482,15 @@ class OpenJetApp(App):
     def refresh_token_counter(self) -> None:
         self._render_token_counter()
 
-    def _restore_session_state(self, log: RichLog) -> None:
+    def _restore_session_state(self, log: RichLog) -> bool:
         if not self.agent:
-            return
+            return False
         state = self.state_store.load()
         if not state:
-            return
+            return False
         messages = state.get("messages")
         if not isinstance(messages, list) or not messages:
-            return
+            return False
         valid_messages: list[dict] = []
         for msg in messages:
             if not isinstance(msg, dict):
@@ -1502,7 +1502,7 @@ class OpenJetApp(App):
                 continue
             valid_messages.append(msg)
         if not valid_messages:
-            return
+            return False
 
         first = valid_messages[0]
         if first.get("role") != "system":
@@ -1529,6 +1529,7 @@ class OpenJetApp(App):
                 loaded_files=len(self.loaded_files),
                 state_path=str(self.state_store.path),
             )
+        return True
 
     def _replay_restored_history(self, log: RichLog, messages: list[dict]) -> None:
         for msg in messages:
