@@ -18,6 +18,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen, Screen
+from textual.worker import Worker, get_current_worker
 from textual.widgets import Input, RichLog, Static
 from textual.widgets._input import Selection
 
@@ -844,7 +845,10 @@ Static {
 class OpenJetApp(App):
     TITLE = "open-jet"
     CSS = CSS
-    BINDINGS = [Binding("ctrl+c", "quit", "Quit")]
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit"),
+        Binding("escape", "stop_generation", "Stop"),
+    ]
 
     def __init__(self, *, force_setup: bool = False) -> None:
         super().__init__()
@@ -867,6 +871,7 @@ class OpenJetApp(App):
         self._approval_choice = 0
         self._approval_future: asyncio.Future[bool] | None = None
         self._approval_tool_call: ToolCall | None = None
+        self._generation_worker: Worker | None = None
         self.commands = SlashCommandHandler(self, banner=BANNER)
         self.completion = CompletionEngine(
             [
@@ -1339,7 +1344,7 @@ class OpenJetApp(App):
         self.agent.add_user_message(text)
         self.persist_session_state(reason="user_message")
         self._render_token_counter()
-        self.run_agent_turn()
+        self._start_agent_turn()
 
     async def _load_mentioned_files_into_context(self, text: str, log: RichLog) -> None:
         if not self.agent:
@@ -1649,6 +1654,22 @@ class OpenJetApp(App):
 
     # -- Agent turn ----------------------------------------------------------
 
+    def _start_agent_turn(self, recovery_attempted: bool = False) -> None:
+        self._generation_worker = self.run_agent_turn(recovery_attempted=recovery_attempted)
+
+    def action_stop_generation(self) -> None:
+        if self._awaiting_approval or isinstance(self.screen, SetupScreen):
+            return
+        if not self._generation_worker or self._generation_worker.is_finished:
+            return
+        self._generation_worker.cancel()
+        log = self.query_one("#chat-log", RichLog)
+        log.write("[yellow]Generation stopped.[/]")
+        log.write("")
+        if self.session_logger:
+            self.session_logger.log_event("generation_stopped", source="escape")
+        self._render_token_counter()
+
     @work(exclusive=True)
     async def run_agent_turn(self, recovery_attempted: bool = False) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -1656,6 +1677,7 @@ class OpenJetApp(App):
         text_buf = ""
         assistant_turn_text = ""
         thinking_token = self._start_thinking()
+        current_worker = get_current_worker()
 
         try:
             async for event in self.agent.run_turn():
@@ -1678,7 +1700,7 @@ class OpenJetApp(App):
                     if not recovery_attempted and self._is_recoverable_runtime_error(event.text):
                         recovered = await self._recover_runtime(log, event.text)
                         if recovered:
-                            self.run_agent_turn(recovery_attempted=True)
+                            self._start_agent_turn(recovery_attempted=True)
                             return
                     log.write(f"\n[bold red]error:[/] {event.text}")
                     if self.session_logger:
@@ -1693,8 +1715,12 @@ class OpenJetApp(App):
             # Flush any remaining text
             if text_buf:
                 log.write(text_buf)
+        except asyncio.CancelledError:
+            return
         finally:
             self._stop_thinking(thinking_token)
+            if self._generation_worker is current_worker:
+                self._generation_worker = None
 
         if self.session_logger and assistant_turn_text.strip():
             self.session_logger.log_event("assistant_message", text=assistant_turn_text)
@@ -1717,7 +1743,7 @@ class OpenJetApp(App):
 
         if pending_tool_calls:
             self.persist_session_state(reason="assistant_turn_with_tools")
-            self.run_agent_turn()
+            self._start_agent_turn()
         else:
             self.persist_session_state(reason="assistant_turn_done")
             self._render_token_counter()
