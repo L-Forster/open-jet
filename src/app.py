@@ -227,6 +227,10 @@ class OpenJetApp(App):
             else:
                 log.write("[bold bright_white]Setup cancelled.[/]")
             log.write("")
+            prompt = self.query_one("#prompt", Input)
+            prompt.disabled = False
+            prompt.focus()
+            self._render_token_counter(prompt.value)
             return False
 
         try:
