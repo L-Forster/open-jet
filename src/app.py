@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import yaml
 from rich.markup import escape
@@ -101,6 +103,23 @@ JETSON_OVERRIDE_OPTIONS: tuple[tuple[str, str, float], ...] = (
 
 TOOL_RESULT_SAFE_PADDING_TOKENS = 256
 TOOL_RESULT_MIN_BUDGET_TOKENS = 64
+
+
+def _find_ollama_cli() -> str | None:
+    found = shutil.which("ollama")
+    if found:
+        return found
+    # Common install locations when PATH isn't inherited by TUI launchers.
+    for candidate in (
+        "/usr/local/bin/ollama",
+        "/usr/bin/ollama",
+        "/opt/homebrew/bin/ollama",
+        "/snap/bin/ollama",
+    ):
+        path = Path(candidate)
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
 
 
 def load_config() -> dict:
@@ -247,6 +266,55 @@ def _recommended_gpu_layers(device: str, total_ram_gb: float | None = None) -> i
     return 35
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_PULL_PERCENT_RE = re.compile(r"(?P<pct>\d{1,3})%")
+_PULL_SIZE_RE = re.compile(
+    r"(?P<done>\d+(?:\.\d+)?)\s*(?P<done_unit>[KMGTP]B)\s*/\s*(?P<total>\d+(?:\.\d+)?)\s*(?P<total_unit>[KMGTP]B)",
+    flags=re.IGNORECASE,
+)
+_PULL_SPEED_RE = re.compile(r"(?P<speed>\d+(?:\.\d+)?)\s*(?P<speed_unit>[KMGTP]B/s)", flags=re.IGNORECASE)
+_PULL_ETA_RE = re.compile(r"(?P<eta>(?:\d+h)?(?:\d+m)?(?:\d+s)|\d+ms)$", flags=re.IGNORECASE)
+
+
+def _extract_pull_progress(line: str) -> dict[str, str] | None:
+    pct_match = _PULL_PERCENT_RE.search(line)
+    if not pct_match:
+        return None
+    pct = max(0, min(100, int(pct_match.group("pct"))))
+
+    size_match = _PULL_SIZE_RE.search(line)
+    speed_match = _PULL_SPEED_RE.search(line)
+    eta_match = _PULL_ETA_RE.search(line.strip())
+
+    payload: dict[str, str] = {"pct": str(pct)}
+    if size_match:
+        payload["done"] = f"{size_match.group('done')} {size_match.group('done_unit').upper()}"
+        payload["total"] = f"{size_match.group('total')} {size_match.group('total_unit').upper()}"
+    if speed_match:
+        payload["speed"] = f"{speed_match.group('speed')} {speed_match.group('speed_unit').upper()}"
+    if eta_match:
+        payload["eta"] = eta_match.group("eta")
+    return payload
+
+
+def _render_progress_bar(percent: int, width: int = 24) -> str:
+    clamped = max(0, min(100, percent))
+    filled = int(round((clamped / 100) * width))
+    return "#" * filled + "-" * (width - filled)
+
+
+def _is_jetson_label(label: str | None) -> bool:
+    if not label:
+        return False
+    return "jetson" in label.lower()
+
+
+def _running_on_jetson() -> bool:
+    if _is_jetson_label(_read_device_model()):
+        return True
+    return Path("/etc/nv_tegra_release").exists()
+
+
 def _context_window_options(recommended: int) -> list[int]:
     options = [1024, 1536, 2048, 3072, 4096, 6144, 8192]
     if recommended not in options:
@@ -303,7 +371,7 @@ class SetupScreen(ModalScreen[dict]):
         self.hardware_info = hardware_info
         self.recommended_ctx = max(512, int(recommended_ctx))
         self.exit_on_cancel = exit_on_cancel
-        self.ollama_available = shutil.which("ollama") is not None
+        self.ollama_cli = _find_ollama_cli()
         self._steps: list[dict] = []
         self._step_index = 0
         self._indices: dict[str, int] = {}
@@ -417,6 +485,13 @@ class SetupScreen(ModalScreen[dict]):
             self.hardware_info,
             self._selected_hardware_override(),
         )
+
+    def _jetson_target_selected(self) -> bool:
+        profile = self._selected_hardware_profile()
+        override = self._selected_hardware_override()
+        if profile == "other" and override.startswith("jetson_"):
+            return True
+        return _is_jetson_label(self._effective_hardware().label)
 
     def _recommended_context_for_current_hardware(self) -> int:
         if self._selected_hardware_profile() == "auto":
@@ -609,6 +684,7 @@ class SetupScreen(ModalScreen[dict]):
         self.action_advance()
 
     def action_save(self) -> None:
+        self.ollama_cli = _find_ollama_cli()
         model_plan = str(self._selections.get("model_plan", ""))
         model_source = "local" if model_plan == "__local__" else "ollama"
         profile = self._selected_hardware_profile()
@@ -621,8 +697,8 @@ class SetupScreen(ModalScreen[dict]):
             "hardware_override": override_key if profile == "other" else "",
         }
         if model_source == "ollama":
-            if not self.ollama_available:
-                self._set_error("Ollama is not installed. Pick 'Use local model' or install Ollama.")
+            if not self.ollama_cli:
+                self._set_error("Ollama CLI not found. Install Ollama (https://ollama.com/download), then retry.")
                 return
             selected_llm = self._selected_model_plan()
             payload["recommended_llm"] = selected_llm
@@ -687,8 +763,10 @@ class SetupScreen(ModalScreen[dict]):
         if key == "model_plan":
             if value == "__local__":
                 return "use existing file"
-            if not self.ollama_available:
-                return "needs ollama"
+            if not self.ollama_cli:
+                return "install ollama first"
+            if self._jetson_target_selected():
+                return "quantized GGUF required for Jetson"
             cap = _recommended_param_budget_b(
                 self._selected_hardware_profile(),
                 self.hardware_info,
@@ -713,6 +791,10 @@ class SetupScreen(ModalScreen[dict]):
         if key == "hardware_override":
             return "Select the closest Jetson and RAM profile."
         if key == "model_plan":
+            if not self.ollama_cli:
+                return "Choose local file, or install Ollama to enable downloads."
+            if self._jetson_target_selected():
+                return "Choose local file or Ollama download (quantized GGUF only on Jetson)."
             return "Choose local file or Ollama download."
         if key == "local_model":
             return "Select a detected .gguf or enter a path."
@@ -787,6 +869,11 @@ Static {
     color: #ffffff;
 }
 #token-counter {
+    height: 1;
+    margin: 0 2;
+    color: #ffffff;
+}
+#utilization-bar {
     height: 1;
     margin: 0 2;
     color: #ffffff;
@@ -884,6 +971,15 @@ class OpenJetApp(App):
         self._prompt_history_draft = ""
         self._history_navigation_active = False
         self._ignore_prompt_change_events = 0
+        self._utilization_timer = None
+        self._utilization_visible = True
+        self._prev_cpu_sample: tuple[int, int] | None = None
+        self._prev_powercap_sample: dict[str, tuple[float, float, float | None]] = {}
+        self._power_min_watts: float | None = None
+        self._power_max_watts: float | None = None
+        self._generation_started_at: float | None = None
+        self._generation_tokens_streamed = 0
+        self._last_generation_tps: float | None = None
 
     async def _init_client(self) -> None:
         mem_cfg = self.cfg.get("memory_guard", {})
@@ -957,8 +1053,43 @@ class OpenJetApp(App):
         out_raw, err_raw = await proc.communicate()
         return (proc.returncode or 0, out_raw.decode("utf-8", errors="ignore"), err_raw.decode("utf-8", errors="ignore"))
 
+    async def _run_command_stream(
+        self,
+        *args: str,
+        on_chunk: Callable[[str, bool], None] | None = None,
+    ) -> tuple[int, str, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_chunks: list[str] = []
+        err_chunks: list[str] = []
+
+        async def _pump(stream: asyncio.StreamReader | None, sink: list[str], is_stderr: bool) -> None:
+            if stream is None:
+                return
+            while True:
+                raw = await stream.read(4096)
+                if not raw:
+                    break
+                text = raw.decode("utf-8", errors="ignore")
+                sink.append(text)
+                if on_chunk:
+                    on_chunk(text, is_stderr)
+
+        await asyncio.gather(
+            _pump(proc.stdout, out_chunks, False),
+            _pump(proc.stderr, err_chunks, True),
+        )
+        rc = await proc.wait()
+        return rc, "".join(out_chunks), "".join(err_chunks)
+
     async def _resolve_ollama_model_file(self, ollama_model: str) -> str:
-        rc, out, err = await self._run_command_capture("ollama", "show", ollama_model, "--modelfile")
+        ollama_cli = _find_ollama_cli()
+        if not ollama_cli:
+            raise RuntimeError("`ollama` CLI is not installed or not discoverable.")
+        rc, out, err = await self._run_command_capture(ollama_cli, "show", ollama_model, "--modelfile")
         if rc != 0:
             detail = (err or out).strip()[:500]
             raise RuntimeError(f"Unable to inspect pulled model '{ollama_model}': {detail or 'unknown error'}")
@@ -988,6 +1119,68 @@ class OpenJetApp(App):
             "Pulled model was resolved by Ollama, but no local GGUF/blob path could be found for llama-server."
         )
 
+    async def _read_ollama_model_details(self, ollama_cli: str, ollama_model: str) -> dict[str, str]:
+        rc, out, err = await self._run_command_capture(ollama_cli, "show", ollama_model, "--json")
+        if rc != 0:
+            detail = (err or out).strip()[:400]
+            raise RuntimeError(f"Unable to inspect pulled model metadata for '{ollama_model}': {detail or 'unknown error'}")
+        try:
+            payload = json.loads(out)
+        except json.JSONDecodeError:
+            return {}
+        details = payload.get("details")
+        if not isinstance(details, dict):
+            return {}
+        extracted: dict[str, str] = {}
+        for key in ("format", "family", "parameter_size", "quantization_level"):
+            val = details.get(key)
+            if isinstance(val, str):
+                extracted[key] = val.strip()
+        return extracted
+
+    def _file_is_gguf(self, path: str) -> bool:
+        try:
+            with Path(path).open("rb") as fh:
+                return fh.read(4) == b"GGUF"
+        except OSError:
+            return False
+
+    def _jetson_constraints_required(self, setup_result: dict) -> bool:
+        profile = str(setup_result.get("hardware_profile", "")).strip()
+        override = str(setup_result.get("hardware_override", "")).strip()
+        if profile == "other" and override.startswith("jetson_"):
+            return True
+        return _running_on_jetson()
+
+    async def _validate_jetson_ollama_model(
+        self,
+        *,
+        setup_result: dict,
+        ollama_cli: str,
+        ollama_model: str,
+        resolved_model: str,
+    ) -> None:
+        if not self._jetson_constraints_required(setup_result):
+            return
+
+        if not self._file_is_gguf(resolved_model):
+            raise RuntimeError(
+                "Jetson setup requires a quantized GGUF model, but pulled artifact is not GGUF."
+            )
+
+        details = await self._read_ollama_model_details(ollama_cli, ollama_model)
+        model_format = details.get("format", "").lower()
+        quant = details.get("quantization_level", "").upper()
+
+        if model_format and model_format != "gguf":
+            raise RuntimeError(
+                f"Jetson setup requires GGUF format, but Ollama reports format '{details.get('format', 'unknown')}'."
+            )
+        if not quant or quant.startswith(("F16", "F32", "BF16")):
+            raise RuntimeError(
+                "Jetson setup requires a quantized Ollama model (e.g. Q4/Q5 GGUF), not a base/unquantized variant."
+            )
+
     async def _materialize_setup_model(self, setup_result: dict, log: RichLog) -> dict:
         if str(setup_result.get("model_source", "local")) != "ollama":
             return setup_result
@@ -995,16 +1188,87 @@ class OpenJetApp(App):
         ollama_model = str(setup_result.get("ollama_model", "")).strip()
         if not ollama_model:
             raise RuntimeError("Ollama model tag is missing.")
-        if not shutil.which("ollama"):
-            raise RuntimeError("`ollama` CLI is not installed or not on PATH.")
+        ollama_cli = _find_ollama_cli()
+        if not ollama_cli:
+            raise RuntimeError("`ollama` CLI is not installed or not discoverable. Install it and retry setup.")
 
-        log.write(f"[bold bright_white]Pulling {escape(ollama_model)} from Ollama...[/]")
-        rc, out, err = await self._run_command_capture("ollama", "pull", ollama_model)
-        if rc != 0:
-            detail = (err or out).strip()[:700]
-            raise RuntimeError(f"Ollama pull failed for '{ollama_model}': {detail or 'unknown error'}")
-        resolved_model = await self._resolve_ollama_model_file(ollama_model)
-        log.write(f"[bold bright_white]Pulled {escape(ollama_model)} and resolved local model file.[/]")
+        log.write(
+            f"[bold bright_white]Pulling {escape(ollama_model)} from Ollama...[/] "
+            "[dim](this can take several minutes for larger models)[/]"
+        )
+        status = self.query_one("#assistant-status", Static)
+        status.remove_class("hidden")
+
+        def _set_pull_status(text: str) -> None:
+            status.update(f"[bold {ACCENT_GREEN}]{escape(text)}[/]")
+
+        progress_buffer = ""
+        last_percent = -1
+        last_rendered = ""
+        last_emit_t = 0.0
+        last_status = ""
+
+        def _emit_progress(text: str, _is_stderr: bool) -> None:
+            nonlocal progress_buffer, last_percent, last_rendered, last_emit_t, last_status
+            progress_buffer += _ANSI_ESCAPE_RE.sub("", text)
+            chunks = re.split(r"[\r\n]+", progress_buffer)
+            progress_buffer = chunks.pop() if chunks else ""
+
+            for raw_line in chunks:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                parsed = _extract_pull_progress(line)
+                now = time.monotonic()
+                if parsed:
+                    pct = int(parsed["pct"])
+                    if pct < last_percent and pct < 5:
+                        # Some pulls report per-layer progress and reset at the next layer.
+                        last_percent = -1
+                    if pct <= last_percent and (now - last_emit_t) < 1.0:
+                        continue
+                    last_percent = pct
+                    bar = _render_progress_bar(pct)
+                    detail = f"{parsed.get('done', '?')}/{parsed.get('total', '?')}"
+                    speed = parsed.get("speed", "?")
+                    eta = parsed.get("eta", "?")
+                    rendered = f"pull {pct:3d}% |{bar}| {detail} {speed} ETA {eta}"
+                    if rendered != last_rendered or (now - last_emit_t) >= 1.0:
+                        _set_pull_status(rendered)
+                        last_rendered = rendered
+                        last_emit_t = now
+                    continue
+
+                line_low = line.lower()
+                if (
+                    line_low.startswith("pulling")
+                    or line_low.startswith("verifying")
+                    or line_low.startswith("processing")
+                    or line_low.startswith("writing")
+                    or line_low.startswith("success")
+                ) and line != last_status:
+                    _set_pull_status(line)
+                    last_status = line
+                    last_emit_t = now
+
+        try:
+            rc, out, err = await self._run_command_stream(ollama_cli, "pull", ollama_model, on_chunk=_emit_progress)
+            if rc != 0:
+                detail = (err or out).strip()[:700]
+                raise RuntimeError(f"Ollama pull failed for '{ollama_model}': {detail or 'unknown error'}")
+            resolved_model = await self._resolve_ollama_model_file(ollama_model)
+            await self._validate_jetson_ollama_model(
+                setup_result=setup_result,
+                ollama_cli=ollama_cli,
+                ollama_model=ollama_model,
+                resolved_model=resolved_model,
+            )
+            log.write(f"[bold bright_white]Pulled {escape(ollama_model)} and resolved local model file.[/]")
+        finally:
+            status.update("")
+            status.add_class("hidden")
+
         merged = dict(setup_result)
         merged["model"] = resolved_model
         return merged
@@ -1101,10 +1365,13 @@ class OpenJetApp(App):
         yield Input(placeholder="> ", id="prompt")
         yield Static("", id="command-suggestions", classes="hidden")
         yield Static("", id="token-counter")
+        yield Static("", id="utilization-bar")
 
     def on_mount(self) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write(BANNER)
+        self._start_utilization_updates()
+        self._render_utilization_bar()
         self._startup_sequence()
 
     @work(exclusive=True)
@@ -1187,6 +1454,9 @@ class OpenJetApp(App):
 
     async def action_quit(self) -> None:
         self.persist_session_state(reason="quit")
+        if self._utilization_timer:
+            self._utilization_timer.stop()
+            self._utilization_timer = None
         if self.client:
             await self.client.close()
         if self.session_logger:
@@ -1464,6 +1734,411 @@ class OpenJetApp(App):
             f"[{color}]tokens: {total}/{window} | prompt<= {budget.prompt_tokens} | remaining: {remaining}[/]"
         )
 
+    def _start_utilization_updates(self) -> None:
+        if self._utilization_timer:
+            self._utilization_timer.stop()
+        self._utilization_timer = self.set_interval(2.0, self._render_utilization_bar)
+
+    def _render_utilization_bar(self) -> None:
+        bar = self.query_one("#utilization-bar", Static)
+        if not self._utilization_visible:
+            bar.add_class("hidden")
+            bar.update("")
+            return
+        bar.remove_class("hidden")
+        cpu_pct = self._read_cpu_percent()
+        mem = read_memory_snapshot()
+        battery = self._read_battery_metrics()
+        power_watts, power_pct = self._read_power_metrics()
+        self._update_power_minmax(power_watts)
+
+        cpu_text = self._format_percent("cpu", cpu_pct)
+        mem_text = self._format_percent("mem", mem.used_percent if mem else None)
+        tps_text = self._format_tps_text()
+        power_text = self._format_power_text(power_watts, power_pct, battery)
+
+        mem_detail = ""
+        if mem and mem.total_mb is not None and mem.available_mb is not None:
+            used_mb = max(0.0, mem.total_mb - mem.available_mb)
+            mem_detail = f" ({used_mb / 1024.0:.1f}/{mem.total_mb / 1024.0:.1f} GB)"
+
+        bar.update(
+            f"[dim]util: {cpu_text} | {mem_text}{mem_detail} | {tps_text} | {power_text}[/]"
+        )
+
+    def _format_percent(self, label: str, pct: float | None) -> str:
+        if pct is None:
+            return f"{label} n/a"
+        clamped = max(0.0, min(100.0, pct))
+        return f"{label} {clamped:4.1f}%"
+
+    def _format_power_text(
+        self,
+        watts: float | None,
+        pct: float | None,
+        battery: dict[str, float | str | None] | None = None,
+    ) -> str:
+        minmax = self._format_power_minmax()
+        if battery:
+            status_raw = str(battery.get("status") or "").strip().lower()
+            capacity = battery.get("capacity_pct")
+            remaining_hours = battery.get("remaining_hours")
+            watts_now = battery.get("watts")
+
+            base = "batt"
+            if isinstance(capacity, (int, float)):
+                base += f" {float(capacity):4.1f}%"
+
+            if status_raw == "discharging" and isinstance(remaining_hours, (int, float)):
+                base += f" {self._format_hours(float(remaining_hours))} left"
+            elif status_raw == "charging" and isinstance(remaining_hours, (int, float)):
+                base += f" {self._format_hours(float(remaining_hours))} to full"
+            elif status_raw in {"full", "not charging"}:
+                base += " full"
+            elif status_raw:
+                base += f" {status_raw}"
+
+            if isinstance(watts_now, (int, float)):
+                base += f" ({float(watts_now):.1f}W)"
+            if minmax:
+                base += f" {minmax}"
+            return base
+
+        if watts is None:
+            return f"pwr n/a{(' ' + minmax) if minmax else ''}"
+        if pct is not None:
+            base = f"pwr {pct:4.1f}% ({watts:.1f}W)"
+        else:
+            base = f"pwr {watts:.1f}W"
+        if minmax:
+            base += f" {minmax}"
+        return base
+
+    def _format_tps_text(self) -> str:
+        tps = self._current_tps()
+        if tps is None:
+            return "tps n/a"
+        return f"tps {tps:.1f}"
+
+    def _current_tps(self) -> float | None:
+        if self._thinking_timer is not None and self._generation_started_at is not None:
+            elapsed = time.monotonic() - self._generation_started_at
+            if elapsed <= 0:
+                return None
+            return self._generation_tokens_streamed / elapsed
+        return self._last_generation_tps
+
+    def _update_power_minmax(self, watts: float | None) -> None:
+        if watts is None:
+            return
+        if self._power_min_watts is None or watts < self._power_min_watts:
+            self._power_min_watts = watts
+        if self._power_max_watts is None or watts > self._power_max_watts:
+            self._power_max_watts = watts
+
+    def _format_power_minmax(self) -> str:
+        if self._power_min_watts is None or self._power_max_watts is None:
+            return ""
+        return f"[min {self._power_min_watts:.1f}W max {self._power_max_watts:.1f}W]"
+
+    def set_utilization_visible(self, visible: bool) -> None:
+        self._utilization_visible = bool(visible)
+        self._render_utilization_bar()
+
+    def toggle_utilization_visible(self) -> bool:
+        self._utilization_visible = not self._utilization_visible
+        self._render_utilization_bar()
+        return self._utilization_visible
+
+    def is_utilization_visible(self) -> bool:
+        return self._utilization_visible
+
+    def _format_hours(self, hours: float) -> str:
+        if hours <= 0:
+            return "0m"
+        total_minutes = int(round(hours * 60.0))
+        h, m = divmod(total_minutes, 60)
+        if h <= 0:
+            return f"{m}m"
+        return f"{h}h{m:02d}m"
+
+    def _read_battery_metrics(self) -> dict[str, float | str | None] | None:
+        root = Path("/sys/class/power_supply")
+        if not root.exists() or not root.is_dir():
+            return None
+
+        for dev in root.iterdir():
+            if not dev.is_dir():
+                continue
+            dev_type = (self._read_text_file(dev / "type") or "").strip().lower()
+            is_battery = dev_type == "battery" or dev.name.upper().startswith("BAT")
+            if not is_battery:
+                continue
+
+            status = self._read_text_file(dev / "status")
+            capacity = self._read_number_file(dev / "capacity")
+            if capacity is None:
+                energy_now = self._read_number_file(dev / "energy_now")
+                energy_full = self._read_number_file(dev / "energy_full")
+                charge_now = self._read_number_file(dev / "charge_now")
+                charge_full = self._read_number_file(dev / "charge_full")
+                if energy_now is not None and energy_full and energy_full > 0:
+                    capacity = (energy_now / energy_full) * 100.0
+                elif charge_now is not None and charge_full and charge_full > 0:
+                    capacity = (charge_now / charge_full) * 100.0
+
+            watts = self._read_device_watts(dev)
+            remaining_hours = self._estimate_battery_remaining_hours(dev, status)
+            return {
+                "status": status,
+                "capacity_pct": round(capacity, 1) if capacity is not None else None,
+                "remaining_hours": remaining_hours,
+                "watts": round(watts, 2) if watts is not None else None,
+            }
+
+        return None
+
+    def _estimate_battery_remaining_hours(self, dev: Path, status: str | None) -> float | None:
+        status_raw = (status or "").strip().lower()
+
+        # Prefer kernel-provided seconds when available.
+        time_to_empty = self._read_number_file(dev / "time_to_empty_now")
+        if status_raw == "discharging" and time_to_empty is not None:
+            return max(0.0, time_to_empty / 3600.0)
+        time_to_full = self._read_number_file(dev / "time_to_full_now")
+        if status_raw == "charging" and time_to_full is not None:
+            return max(0.0, time_to_full / 3600.0)
+
+        if status_raw not in {"discharging", "charging"}:
+            return None
+
+        energy_now = self._read_number_file(dev / "energy_now")
+        energy_full = self._read_number_file(dev / "energy_full")
+        power_now = self._read_number_file(dev / "power_now")
+        if power_now and power_now > 0:
+            if status_raw == "discharging" and energy_now is not None:
+                return max(0.0, energy_now / power_now)
+            if status_raw == "charging" and energy_now is not None and energy_full is not None:
+                return max(0.0, (energy_full - energy_now) / power_now)
+
+        charge_now = self._read_number_file(dev / "charge_now")
+        charge_full = self._read_number_file(dev / "charge_full")
+        current_now = self._read_number_file(dev / "current_now")
+        if current_now and current_now > 0:
+            if status_raw == "discharging" and charge_now is not None:
+                return max(0.0, charge_now / current_now)
+            if status_raw == "charging" and charge_now is not None and charge_full is not None:
+                return max(0.0, (charge_full - charge_now) / current_now)
+
+        return None
+
+    def _read_cpu_percent(self) -> float | None:
+        try:
+            first = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError):
+            return None
+
+        parts = first.split()
+        if len(parts) < 5 or parts[0] != "cpu":
+            return None
+        try:
+            nums = [int(v) for v in parts[1:]]
+        except ValueError:
+            return None
+
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+        total = sum(nums)
+        prev = self._prev_cpu_sample
+        self._prev_cpu_sample = (total, idle)
+        if prev is None:
+            return None
+
+        total_delta = total - prev[0]
+        idle_delta = idle - prev[1]
+        if total_delta <= 0:
+            return None
+        busy = total_delta - idle_delta
+        return round((busy / total_delta) * 100.0, 1)
+
+    def _read_power_metrics(self) -> tuple[float | None, float | None]:
+        root = Path("/sys/class/power_supply")
+        if not root.exists() or not root.is_dir():
+            rapl_watts = self._read_powercap_watts()
+            if rapl_watts is None:
+                rapl_watts = self._read_hwmon_watts()
+            return (rapl_watts, None)
+
+        watts_total = 0.0
+        watts_max_total = 0.0
+        found_watts = False
+
+        for dev in root.iterdir():
+            if not dev.is_dir():
+                continue
+            watts = self._read_device_watts(dev)
+            if watts is not None:
+                watts_total += watts
+                found_watts = True
+            max_watts = self._read_device_max_watts(dev)
+            if max_watts is not None:
+                watts_max_total += max_watts
+
+        if not found_watts:
+            rapl_watts = self._read_powercap_watts()
+            if rapl_watts is None:
+                rapl_watts = self._read_hwmon_watts()
+            return (rapl_watts, None)
+
+        pct: float | None = None
+        if watts_max_total > 0:
+            pct = round(min(100.0, (watts_total / watts_max_total) * 100.0), 1)
+        return (round(watts_total, 2), pct)
+
+    def _read_powercap_watts(self) -> float | None:
+        root = Path("/sys/class/powercap")
+        if not root.exists() or not root.is_dir():
+            return None
+
+        now = time.monotonic()
+        total_watts = 0.0
+        have_delta = False
+
+        for zone in root.glob("intel-rapl:*"):
+            # Ignore nested subdomains (e.g. intel-rapl:0:0) to avoid double counting.
+            if zone.name.count(":") != 1:
+                continue
+            energy_uj = self._read_number_file(zone / "energy_uj")
+            if energy_uj is None:
+                continue
+            max_energy_uj = self._read_number_file(zone / "max_energy_range_uj")
+            key = str(zone)
+            prev = self._prev_powercap_sample.get(key)
+            self._prev_powercap_sample[key] = (energy_uj, now, max_energy_uj)
+            if prev is None:
+                continue
+
+            prev_energy, prev_time, prev_max = prev
+            dt = now - prev_time
+            if dt <= 0:
+                continue
+            delta = energy_uj - prev_energy
+            wrap = max_energy_uj if max_energy_uj is not None else prev_max
+            if delta < 0 and wrap and wrap > 0:
+                delta += wrap
+            if delta < 0:
+                continue
+
+            watts = (delta / 1_000_000.0) / dt
+            if watts >= 0:
+                total_watts += watts
+                have_delta = True
+
+        if not have_delta:
+            return None
+        return round(total_watts, 2)
+
+    def _read_hwmon_watts(self) -> float | None:
+        root = Path("/sys/class/hwmon")
+        if not root.exists() or not root.is_dir():
+            return None
+
+        # First choice: direct power sensors, typically in microwatts.
+        direct_watts = 0.0
+        found_direct = False
+        for dev in root.glob("hwmon*"):
+            if not dev.is_dir():
+                continue
+            for path in dev.glob("power*_input"):
+                value = self._read_number_file(path)
+                if value is None:
+                    continue
+                direct_watts += value / 1_000_000.0
+                found_direct = True
+        if found_direct:
+            return round(direct_watts, 2)
+
+        # Fallback for INA3221-style rails: W = (mV * mA) / 1_000_000.
+        # Prefer the VDD_IN rail if available; it is usually total input draw.
+        total_pairs_watts = 0.0
+        found_pairs = False
+        for dev in root.glob("hwmon*"):
+            if not dev.is_dir():
+                continue
+            if (self._read_text_file(dev / "name") or "").strip().lower() != "ina3221":
+                continue
+
+            rail_watts: dict[int, float] = {}
+            for in_path in dev.glob("in*_input"):
+                suffix = in_path.name[len("in") : -len("_input")]
+                if not suffix.isdigit():
+                    continue
+                idx = int(suffix)
+                curr_path = dev / f"curr{idx}_input"
+                if not curr_path.is_file():
+                    continue
+                mv = self._read_number_file(in_path)
+                ma = self._read_number_file(curr_path)
+                if mv is None or ma is None:
+                    continue
+                rail_watts[idx] = (mv * ma) / 1_000_000.0
+
+            if not rail_watts:
+                continue
+
+            for idx, watts in rail_watts.items():
+                label = (self._read_text_file(dev / f"in{idx}_label") or "").strip().upper()
+                if "VDD_IN" in label:
+                    return round(max(0.0, watts), 2)
+
+            for idx, watts in rail_watts.items():
+                label = (self._read_text_file(dev / f"in{idx}_label") or "").strip().lower()
+                if "sum of shunt" in label:
+                    continue
+                total_pairs_watts += max(0.0, watts)
+                found_pairs = True
+
+        if found_pairs:
+            return round(total_pairs_watts, 2)
+        return None
+
+    def _read_device_watts(self, dev: Path) -> float | None:
+        power_now = self._read_number_file(dev / "power_now")
+        if power_now is not None:
+            return power_now / 1_000_000.0
+
+        current_now = self._read_number_file(dev / "current_now")
+        voltage_now = self._read_number_file(dev / "voltage_now")
+        if current_now is not None and voltage_now is not None:
+            return (current_now * voltage_now) / 1_000_000_000_000.0
+        return None
+
+    def _read_device_max_watts(self, dev: Path) -> float | None:
+        power_max = self._read_number_file(dev / "power_max_design")
+        if power_max is not None:
+            return power_max / 1_000_000.0
+
+        current_max = self._read_number_file(dev / "current_max")
+        voltage_max = self._read_number_file(dev / "voltage_max")
+        if current_max is not None and voltage_max is not None:
+            return (current_max * voltage_max) / 1_000_000_000_000.0
+        return None
+
+    def _read_number_file(self, path: Path) -> float | None:
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def _read_text_file(self, path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+
     def runtime_status_snapshot(self) -> dict:
         if not self.agent:
             return {"ready": False}
@@ -1684,6 +2359,7 @@ class OpenJetApp(App):
                 if event.kind == ActionKind.TEXT:
                     text_buf += event.text
                     assistant_turn_text += event.text
+                    self._generation_tokens_streamed += estimate_tokens(event.text)
                     # Flush complete lines as they arrive
                     while "\n" in text_buf:
                         line, text_buf = text_buf.split("\n", 1)
@@ -1900,6 +2576,8 @@ class OpenJetApp(App):
         status = self.query_one("#assistant-status", Static)
         self._thinking_token += 1
         self._thinking_idx = 0
+        self._generation_started_at = time.monotonic()
+        self._generation_tokens_streamed = 0
         status.remove_class("hidden")
         status.update("[bold green]Generating .[/]")
         if self._thinking_timer:
@@ -1917,6 +2595,11 @@ class OpenJetApp(App):
         if token is not None and token != self._thinking_token:
             return
         status = self.query_one("#assistant-status", Static)
+        if self._generation_started_at is not None:
+            elapsed = time.monotonic() - self._generation_started_at
+            if elapsed > 0 and self._generation_tokens_streamed > 0:
+                self._last_generation_tps = self._generation_tokens_streamed / elapsed
+        self._generation_started_at = None
         if self._thinking_timer:
             self._thinking_timer.stop()
             self._thinking_timer = None

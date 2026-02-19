@@ -37,6 +37,11 @@ class SlashCommandHandler:
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
+        CommandSpec(
+            name="util",
+            description="Show/hide utilization line: /util [show|hide|toggle|status]",
+            aliases=("usage",),
+        ),
     )
 
     def __init__(self, app: OpenJetApp, banner: str) -> None:
@@ -87,6 +92,9 @@ class SlashCommandHandler:
             return True
         if cmd == "setup":
             await self._setup(log)
+            return True
+        if cmd == "util":
+            self._util(log, arg)
             return True
 
         self._render_unknown(log, text)
@@ -251,6 +259,36 @@ class SlashCommandHandler:
             log.write("  [bold bright_white]No previous session state found.[/]")
         log.write("")
         self.app.refresh_token_counter()
+
+    def _util(self, log: RichLog, raw_arg: str) -> None:
+        action = raw_arg.strip().lower()
+        if not action or action == "toggle":
+            visible = self.app.toggle_utilization_visible()
+            state = "shown" if visible else "hidden"
+            log.write(f"[bold bright_white]Utilization line {state}.[/]")
+            log.write("")
+            return
+
+        if action == "show":
+            self.app.set_utilization_visible(True)
+            log.write("[bold bright_white]Utilization line shown.[/]")
+            log.write("")
+            return
+
+        if action == "hide":
+            self.app.set_utilization_visible(False)
+            log.write("[bold bright_white]Utilization line hidden.[/]")
+            log.write("")
+            return
+
+        if action == "status":
+            state = "shown" if self.app.is_utilization_visible() else "hidden"
+            log.write(f"[bold bright_white]Utilization line is currently {state}.[/]")
+            log.write("")
+            return
+
+        log.write("[yellow]Usage:[/] /util [show|hide|toggle|status]")
+        log.write("")
 
     def resolve_command(self, token: str) -> str | None:
         needle = token.strip().lower()
