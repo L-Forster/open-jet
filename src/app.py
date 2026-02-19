@@ -181,6 +181,24 @@ def _discover_installed_ollama_models() -> list[str]:
     return sorted(found)
 
 
+def _estimate_model_params_b_from_text(text: str) -> float | None:
+    src = text.strip().lower()
+    if not src:
+        return None
+    # Supports forms like "2b", "1.5b", "2B", "500m".
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*([bm])(?!\w)", src)
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    unit = match.group(2)
+    if unit == "b":
+        return value
+    return value / 1000.0
+
+
 def _recommended_device() -> str:
     if Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists():
         return "cuda"
