@@ -7,10 +7,11 @@ import json
 import os
 import re
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .runtime_limits import CpuSample, read_cpu_percent, read_memory_info
 
 
 def _utc_now() -> str:
@@ -30,12 +31,6 @@ def _truncate(value: str, limit: int = 8000) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + f"\n... [truncated {len(value) - limit} chars]"
-
-
-@dataclass
-class CpuSample:
-    total: int
-    idle: int
 
 
 class SessionLogger:
@@ -126,8 +121,8 @@ class SessionLogger:
                 continue
 
     def _build_metrics_sample(self) -> dict[str, Any]:
-        cpu_pct = self._read_cpu_percent()
-        mem = self._read_memory_info()
+        cpu_pct, self._prev_cpu = read_cpu_percent(self._prev_cpu, precision=2)
+        mem = read_memory_info()
         proc = self._read_process_info()
         load_avg = os.getloadavg() if hasattr(os, "getloadavg") else (None, None, None)
         return {
@@ -139,64 +134,6 @@ class SessionLogger:
             "load_avg_15m": load_avg[2],
             **mem,
             **proc,
-        }
-
-    def _read_cpu_percent(self) -> float | None:
-        try:
-            with open("/proc/stat", "r", encoding="utf-8") as f:
-                line = f.readline().strip()
-        except OSError:
-            return None
-        parts = line.split()
-        if len(parts) < 5 or parts[0] != "cpu":
-            return None
-        nums = [int(v) for v in parts[1:]]
-        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
-        total = sum(nums)
-        sample = CpuSample(total=total, idle=idle)
-        if self._prev_cpu is None:
-            self._prev_cpu = sample
-            return None
-        prev = self._prev_cpu
-        self._prev_cpu = sample
-        total_delta = sample.total - prev.total
-        idle_delta = sample.idle - prev.idle
-        if total_delta <= 0:
-            return None
-        busy = total_delta - idle_delta
-        return round((busy / total_delta) * 100.0, 2)
-
-    def _read_memory_info(self) -> dict[str, Any]:
-        mem_total_kb: int | None = None
-        mem_available_kb: int | None = None
-        try:
-            with open("/proc/meminfo", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("MemTotal:"):
-                        mem_total_kb = int(line.split()[1])
-                    elif line.startswith("MemAvailable:"):
-                        mem_available_kb = int(line.split()[1])
-        except OSError:
-            return {
-                "mem_total_mb": None,
-                "mem_used_mb": None,
-                "mem_available_mb": None,
-                "mem_used_percent": None,
-            }
-        if not mem_total_kb or mem_available_kb is None:
-            return {
-                "mem_total_mb": None,
-                "mem_used_mb": None,
-                "mem_available_mb": None,
-                "mem_used_percent": None,
-            }
-        used_kb = mem_total_kb - mem_available_kb
-        used_pct = (used_kb / mem_total_kb) * 100.0
-        return {
-            "mem_total_mb": round(mem_total_kb / 1024.0, 2),
-            "mem_used_mb": round(used_kb / 1024.0, 2),
-            "mem_available_mb": round(mem_available_kb / 1024.0, 2),
-            "mem_used_percent": round(used_pct, 2),
         }
 
     def _read_process_info(self) -> dict[str, Any]:

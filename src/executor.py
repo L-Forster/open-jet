@@ -20,6 +20,8 @@ class ExecResult:
     exit_code: int
     stdout: str
     stderr: str
+    timed_out: bool = False
+    timeout_seconds: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -76,27 +78,70 @@ _TEXT_EXTENSIONS = {
     ".sh", ".bash", ".zsh", ".fish", ".sql",
     ".c", ".h", ".cpp", ".hpp", ".cc", ".go", ".rs", ".java", ".kt", ".swift",
     ".rb", ".php", ".lua", ".pl",
+    ".lock",
     ".dockerfile", ".makefile",
 }
+_TEXT_FILENAMES = {
+    "dockerfile",
+    "makefile",
+    ".env",
+    ".envrc",
+    ".gitignore",
+    ".gitattributes",
+    ".dockerignore",
+    ".editorconfig",
+    ".prettierignore",
+    ".eslintignore",
+    ".npmrc",
+    ".nvmrc",
+    ".pylintrc",
+    ".flake8",
+    ".tool-versions",
+}
 _MAX_READ_BYTES = 2 * 1024 * 1024
+DEFAULT_SHELL_TIMEOUT_SECONDS = 60
+SHELL_TIMEOUT_EXIT_CODE = 124
 
 
 # -- Shell executor ----------------------------------------------------------
 
 
-async def run_shell(command: str) -> ExecResult:
+async def run_shell(command: str, timeout_seconds: int = DEFAULT_SHELL_TIMEOUT_SECONDS) -> ExecResult:
     """Run a shell command and capture output. Caller must gate on approval first."""
+    if timeout_seconds <= 0:
+        timeout_seconds = DEFAULT_SHELL_TIMEOUT_SECONDS
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout_bytes, stderr_bytes = await proc.communicate()
+    timed_out = False
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.kill()
+        stdout_bytes, stderr_bytes = await proc.communicate()
+        timeout_note = (
+            f"Command timed out after {timeout_seconds}s and was terminated."
+        ).encode()
+        if stderr_bytes:
+            stderr_bytes = stderr_bytes + b"\n" + timeout_note
+        else:
+            stderr_bytes = timeout_note
+    exit_code = proc.returncode if proc.returncode is not None else 0
+    if timed_out:
+        exit_code = SHELL_TIMEOUT_EXIT_CODE
     return ExecResult(
         command=command,
-        exit_code=proc.returncode or 0,
+        exit_code=exit_code,
         stdout=stdout_bytes.decode(errors="replace"),
         stderr=stderr_bytes.decode(errors="replace"),
+        timed_out=timed_out,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -108,8 +153,18 @@ async def read_file(path: str) -> str:
     p = _normalize_tool_path(path)
     if not p.exists():
         return f"Error: file not found: {path}"
+    if p.is_dir():
+        return f"Error: path is a directory: {path}"
     try:
-        return p.read_text(errors="replace")
+        raw = p.read_bytes()
+        clipped = False
+        if len(raw) > _MAX_READ_BYTES:
+            raw = raw[:_MAX_READ_BYTES]
+            clipped = True
+        text = raw.decode("utf-8", errors="replace")
+        if clipped:
+            text = f"{text}\n\n...[truncated at {_MAX_READ_BYTES} bytes for safety]"
+        return text
     except Exception as e:
         return f"Error reading {path}: {e}"
 
@@ -203,7 +258,9 @@ async def load_file(path: str, max_tokens: int | None = None) -> LoadFileResult:
 
 def _normalize_tool_path(path: str) -> Path:
     raw = path.strip()
-    # Common LLM placeholder path; map to actual user home.
+    # LLMs often emit "/home/user" as a generic Linux placeholder path.
+    # Normalize that exact placeholder to this machine's real home directory
+    # so tool calls remain usable without leaking hardcoded usernames.
     if raw == "/home/user":
         raw = str(Path.home())
     elif raw.startswith("/home/user/"):
@@ -214,6 +271,8 @@ def _normalize_tool_path(path: str) -> Path:
 def _is_supported_text_file(path: Path) -> bool:
     name = path.name.lower()
     suffix = path.suffix.lower()
-    if name in {"dockerfile", "makefile"}:
+    if name in _TEXT_FILENAMES:
+        return True
+    if name.startswith(".env"):
         return True
     return suffix in _TEXT_EXTENSIONS

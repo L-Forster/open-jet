@@ -1,0 +1,95 @@
+App {
+    background: #2a2a2a;
+}
+SetupScreen {
+    background: #2a2a2a;
+    tint: transparent;
+}
+Screen {
+    background: #2a2a2a;
+}
+Vertical {
+    background: transparent;
+}
+RichLog {
+    background: transparent;
+}
+Input {
+    background: transparent;
+}
+Static {
+    background: transparent;
+}
+#chat-log {
+    width: 100%;
+    height: auto;
+    padding: 0 2;
+    color: #ffffff;
+}
+#prompt {
+    height: 3;
+    margin: 0 2;
+    color: #ffffff;
+}
+#command-suggestions {
+    height: auto;
+    margin: 0 2;
+    color: #ffffff;
+}
+#token-counter {
+    height: 1;
+    margin: 0 2;
+    color: #ffffff;
+}
+#utilization-bar {
+    height: 1;
+    margin: 0 2;
+    color: #ffffff;
+}
+#assistant-status {
+    height: 1;
+    margin: 0 2;
+    color: #ffffff;
+}
+#approval-bar {
+    height: auto;
+    min-height: 3;
+    margin: 0 2;
+    padding: 0 1;
+    border: round $warning;
+    background: transparent;
+}
+.hidden {
+    display: none;
+}
+#setup-box {
+    width: 100%;
+    height: auto;
+    margin: 0 2;
+    padding: 1 2;
+    background: transparent;
+}
+#setup-step {
+    margin: 0 0;
+}
+#setup-description {
+    margin: 0 0 1 0;
+}
+#setup-options {
+    margin: 1 0 0 0;
+}
+#setup-model-path-label {
+    margin: 0 0;
+}
+#setup-model-path {
+    margin: 0 0;
+}
+#setup-error {
+    margin: 0 0;
+}
+#setup-warning {
+    margin: 0 0;
+}
+#setup-hint {
+    margin: 1 0 0 0;
+}

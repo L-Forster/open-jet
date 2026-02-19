@@ -25,7 +25,11 @@ TOOLS = [
                     "command": {
                         "type": "string",
                         "description": "The shell command to execute",
-                    }
+                    },
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds (defaults to 60)",
+                    },
                 },
                 "required": ["command"],
             },
@@ -118,7 +122,7 @@ def _find_llama_server() -> str:
     raise FileNotFoundError("llama-server not found on PATH or ~/llama.cpp/build/bin/")
 
 
-class OllamaClient:
+class LlamaServerClient:
     """Starts llama-server and streams chat completions via its OpenAI API."""
 
     def __init__(

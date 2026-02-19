@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+import os
+
+import tiktoken
+from typing import Any
 
 
 MIN_TOKEN_BUDGET = 128
@@ -16,6 +21,12 @@ class MemorySnapshot:
 
 
 @dataclass(frozen=True)
+class CpuSample:
+    total: int
+    idle: int
+
+
+@dataclass(frozen=True)
 class ContextBudget:
     window_tokens: int
     reserve_tokens: int
@@ -25,7 +36,13 @@ class ContextBudget:
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
-    return max(1, len(text) // 4)
+    return len(_get_encoder().encode_ordinary(text))
+
+
+@lru_cache(maxsize=1)
+def _get_encoder() -> tiktoken.Encoding:
+    encoding_name = os.getenv("OPEN_JET_TOKENIZER", "cl100k_base")
+    return tiktoken.get_encoding(encoding_name)
 
 
 def read_memory_snapshot() -> MemorySnapshot | None:
@@ -48,6 +65,55 @@ def read_memory_snapshot() -> MemorySnapshot | None:
     available_mb = mem_available_kb / 1024.0
     used_percent = ((mem_total_kb - mem_available_kb) / mem_total_kb) * 100.0
     return MemorySnapshot(total_mb=total_mb, available_mb=available_mb, used_percent=used_percent)
+
+
+def read_memory_info() -> dict[str, Any]:
+    snapshot = read_memory_snapshot()
+    if snapshot is None:
+        return {
+            "mem_total_mb": None,
+            "mem_used_mb": None,
+            "mem_available_mb": None,
+            "mem_used_percent": None,
+        }
+    used_mb = snapshot.total_mb - snapshot.available_mb
+    return {
+        "mem_total_mb": round(snapshot.total_mb, 2),
+        "mem_used_mb": round(used_mb, 2),
+        "mem_available_mb": round(snapshot.available_mb, 2),
+        "mem_used_percent": round(snapshot.used_percent, 2),
+    }
+
+
+def read_cpu_percent(
+    previous: CpuSample | None,
+    *,
+    precision: int = 2,
+) -> tuple[float | None, CpuSample | None]:
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            line = f.readline().strip()
+    except OSError:
+        return None, previous
+    parts = line.split()
+    if len(parts) < 5 or parts[0] != "cpu":
+        return None, previous
+    try:
+        nums = [int(v) for v in parts[1:]]
+    except ValueError:
+        return None, previous
+    idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+    total = sum(nums)
+    sample = CpuSample(total=total, idle=idle)
+    if previous is None:
+        return None, sample
+
+    total_delta = sample.total - previous.total
+    idle_delta = sample.idle - previous.idle
+    if total_delta <= 0:
+        return None, sample
+    busy = total_delta - idle_delta
+    return round((busy / total_delta) * 100.0, precision), sample
 
 
 def derive_file_token_budget(mem_available_mb: float | None) -> int:
@@ -81,4 +147,3 @@ def derive_context_budget(
         reserve_tokens=reserve,
         prompt_tokens=prompt_tokens,
     )
-

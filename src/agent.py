@@ -1,4 +1,4 @@
-"""Agent loop: manages conversation, calls Ollama, handles tool proposals."""
+"""Agent loop: manages conversation, calls llama-server, handles tool proposals."""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import AsyncIterator
 
-from .ollama_client import OllamaClient, ToolCall
-from .runtime_limits import ContextBudget, derive_context_budget, read_memory_snapshot
+from .llama_server import LlamaServerClient, ToolCall
+from .runtime_limits import ContextBudget, derive_context_budget, estimate_tokens, read_memory_snapshot
 
 
 class ActionKind(Enum):
     TEXT = auto()         # plain text token to display
+    CONDENSE = auto()     # internal request to condense context
     TOOL_REQUEST = auto() # model wants to run a tool — needs approval
     TOOL_RESULT = auto()  # result after tool execution
     DONE = auto()         # turn finished
@@ -29,15 +30,14 @@ class AgentEvent:
 
 # Tools that require user confirmation before execution
 CONFIRM_TOOLS = {"shell", "write_file"}
-CONDENSE_COMMAND = "open-jet-condense-context"
 
 
 class Agent:
-    """Manages conversation history and drives the Ollama chat loop."""
+    """Manages conversation history and drives the llama-server chat loop."""
 
     def __init__(
         self,
-        client: OllamaClient,
+        client: LlamaServerClient,
         system_prompt: str,
         *,
         context_window_tokens: int | None = None,
@@ -85,23 +85,19 @@ class Agent:
     async def run_turn(self) -> AsyncIterator[AgentEvent]:
         """Run one model turn. Yields events the TUI should handle.
 
-        When a TOOL_REQUEST event is yielded, the caller must:
-        1. Ask the user for approval (if needed).
-        2. Call complete_tool_call() with the result.
-        3. Call run_turn() again to let the model see the result.
+        When a CONDENSE event is yielded, the caller should run condense_context()
+        and then call run_turn() again.
+        When a TOOL_REQUEST event is yielded, the caller must ask for approval
+        (if needed), call complete_tool_call() with the result, and then call
+        run_turn() again so the model can continue.
         """
         pressure_reason = self._resource_pressure_reason()
         if pressure_reason:
-            tool_call = self._build_condense_tool_call()
-            self._append_assistant_tool_call("", tool_call)
             yield AgentEvent(
                 kind=ActionKind.TEXT,
                 text=f"(resource pressure, condensing chat: {pressure_reason})",
             )
-            yield AgentEvent(
-                kind=ActionKind.TOOL_REQUEST,
-                tool_call=tool_call,
-            )
+            yield AgentEvent(kind=ActionKind.CONDENSE, text=pressure_reason)
             return
 
         collected_text = ""
@@ -121,8 +117,8 @@ class Agent:
                 if chunk_count % self.memory_check_interval_chunks == 0:
                     pressure_reason = self._resource_pressure_reason()
                     if pressure_reason:
-                        tool_call = self._build_condense_tool_call()
-                        self._append_assistant_tool_call(collected_text, tool_call)
+                        if collected_text:
+                            self.messages.append({"role": "assistant", "content": collected_text})
                         yield AgentEvent(
                             kind=ActionKind.TEXT,
                             text=(
@@ -130,7 +126,7 @@ class Agent:
                                 f"{pressure_reason})"
                             ),
                         )
-                        yield AgentEvent(kind=ActionKind.TOOL_REQUEST, tool_call=tool_call)
+                        yield AgentEvent(kind=ActionKind.CONDENSE, text=pressure_reason)
                         return
 
         except Exception as e:
@@ -170,41 +166,9 @@ class Agent:
             msg["tool_call_id"] = tool_call.id
         self.messages.append(msg)
 
-    def _build_condense_tool_call(self) -> ToolCall:
-        return ToolCall(
-            name="shell",
-            arguments={"command": CONDENSE_COMMAND},
-            id=f"call_{uuid.uuid4().hex[:12]}",
-        )
-
-    def _append_assistant_tool_call(self, content: str, tool_call: ToolCall) -> None:
-        self.messages.append(
-            {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": [
-                    {
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_call.name,
-                            "arguments": json.dumps(tool_call.arguments, ensure_ascii=True),
-                        }
-                    }
-                ],
-            }
-        )
-
     def needs_confirmation(self, tool_call: ToolCall) -> bool:
         """Return True if this tool call requires user approval."""
-        if self.is_internal_condense_tool(tool_call):
-            return False
         return tool_call.name in CONFIRM_TOOLS
-
-    def is_internal_condense_tool(self, tool_call: ToolCall) -> bool:
-        if tool_call.name != "shell":
-            return False
-        return tool_call.arguments.get("command", "").strip() == CONDENSE_COMMAND
 
     async def condense_context(self, *, force: bool = False) -> str:
         """Condense message history with an LLM-generated summary."""
@@ -253,7 +217,7 @@ class Agent:
                 total_after = self._estimated_context_tokens()
 
         return (
-            "Context condensed via command tool. "
+            "Context condensed automatically. "
             f"messages: {original_messages} -> {len(self.messages)}, "
             f"tokens(est): {total_before} -> {total_after}."
         )
@@ -262,8 +226,7 @@ class Agent:
         total = 0
         for msg in self.messages:
             content = str(msg.get("content", ""))
-            # Fast estimate: roughly 1 token ~= 4 chars + protocol overhead.
-            total += max(1, len(content) // 4) + 8
+            total += estimate_tokens(content) + 8
         return total
 
     def _resource_pressure_reason(self) -> str | None:
