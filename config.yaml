@@ -14,9 +14,10 @@ memory_guard:
   keep_last_messages: 6
   max_used_percent: null
   min_available_mb: null
-model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
-model_source: local
-recommended_llm: deepseek-r1:1.5b
+model: /usr/share/ollama/.ollama/models/blobs/sha256-7462734796d67c40ecec2ca98eddf970e171dbb6b370e43fd633ee75b69abe1b
+model_source: ollama
+ollama_model: gemma2:2b
+recommended_llm: gemma2:2b
 setup_complete: true
 state:
   auto_resume: false

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,6 +147,37 @@ def _discover_model_files() -> list[str]:
             continue
         for path in root.glob("*.gguf"):
             found.add(str(path.resolve()))
+    return sorted(found)
+
+
+def _discover_installed_ollama_models() -> list[str]:
+    ollama_cli = _find_ollama_cli()
+    if not ollama_cli:
+        return []
+    try:
+        proc = subprocess.run(
+            [ollama_cli, "list"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+
+    found: set[str] = set()
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        upper = line.upper()
+        if upper.startswith("NAME") or upper.startswith("MODEL"):
+            continue
+        tag = line.split()[0].strip()
+        if ":" in tag:
+            found.add(tag)
     return sorted(found)
 
 
@@ -362,12 +394,14 @@ class SetupScreen(ModalScreen[dict]):
         self,
         *,
         model_options: list[str],
+        installed_ollama_models: list[str],
         hardware_info: HardwareInfo,
         recommended_ctx: int,
         exit_on_cancel: bool = True,
     ) -> None:
         super().__init__()
         self.model_options = model_options
+        self.installed_ollama_models = sorted(set(installed_ollama_models))
         self.hardware_info = hardware_info
         self.recommended_ctx = max(512, int(recommended_ctx))
         self.exit_on_cancel = exit_on_cancel
@@ -519,7 +553,13 @@ class SetupScreen(ModalScreen[dict]):
             (f"Download with Ollama: {label}", tag)
             for label, tag in _recommended_llm_models(max_b)[:3]
         ]
-        rows = [("Use a local .gguf model file", "__local__"), *download_rows]
+        installed_rows = [
+            (f"Use installed Ollama model: {tag}", tag)
+            for tag in self.installed_ollama_models
+        ]
+        installed_tags = {tag for _label, tag in installed_rows}
+        filtered_download_rows = [row for row in download_rows if row[1] not in installed_tags]
+        rows = [("Use a local .gguf model file", "__local__"), *installed_rows, *filtered_download_rows]
         model_step["options"] = rows
         values = [value for _label, value in rows]
         if old_value in values:
@@ -763,6 +803,8 @@ class SetupScreen(ModalScreen[dict]):
         if key == "model_plan":
             if value == "__local__":
                 return "use existing file"
+            if str(value) in self.installed_ollama_models:
+                return "already downloaded"
             if not self.ollama_cli:
                 return "install ollama first"
             if self._jetson_target_selected():
@@ -794,8 +836,8 @@ class SetupScreen(ModalScreen[dict]):
             if not self.ollama_cli:
                 return "Choose local file, or install Ollama to enable downloads."
             if self._jetson_target_selected():
-                return "Choose local file or Ollama download (quantized GGUF only on Jetson)."
-            return "Choose local file or Ollama download."
+                return "Choose local file, installed Ollama model, or download (quantized GGUF only on Jetson)."
+            return "Choose local file, installed Ollama model, or download."
         if key == "local_model":
             return "Select a detected .gguf or enter a path."
         if key == "context_window_tokens":
@@ -1027,6 +1069,7 @@ class OpenJetApp(App):
     def _build_setup_screen(self, *, exit_on_cancel: bool) -> SetupScreen:
         return SetupScreen(
             model_options=_discover_model_files(),
+            installed_ollama_models=_discover_installed_ollama_models(),
             hardware_info=_detect_hardware_info(),
             recommended_ctx=_recommended_context_window_tokens(),
             exit_on_cancel=exit_on_cancel,
@@ -1109,8 +1152,10 @@ class OpenJetApp(App):
             candidates.append(ref_path)
         if from_ref.startswith("sha256:"):
             candidates.append(Path.home() / ".ollama" / "models" / "blobs" / from_ref.replace("sha256:", "sha256-"))
+            candidates.append(Path("/usr/share/ollama/.ollama/models/blobs") / from_ref.replace("sha256:", "sha256-"))
         if from_ref.startswith("sha256-"):
             candidates.append(Path.home() / ".ollama" / "models" / "blobs" / from_ref)
+            candidates.append(Path("/usr/share/ollama/.ollama/models/blobs") / from_ref)
 
         for candidate in candidates:
             if candidate.is_file():
@@ -1122,8 +1167,14 @@ class OpenJetApp(App):
     async def _read_ollama_model_details(self, ollama_cli: str, ollama_model: str) -> dict[str, str]:
         rc, out, err = await self._run_command_capture(ollama_cli, "show", ollama_model, "--json")
         if rc != 0:
-            detail = (err or out).strip()[:400]
-            raise RuntimeError(f"Unable to inspect pulled model metadata for '{ollama_model}': {detail or 'unknown error'}")
+            detail = (err or out).strip()
+            # Older Ollama builds do not support `ollama show --json`.
+            if "unknown flag: --json" in detail.lower():
+                return {}
+            short = detail[:400]
+            raise RuntimeError(
+                f"Unable to inspect pulled model metadata for '{ollama_model}': {short or 'unknown error'}"
+            )
         try:
             payload = json.loads(out)
         except json.JSONDecodeError:
@@ -1176,7 +1227,8 @@ class OpenJetApp(App):
             raise RuntimeError(
                 f"Jetson setup requires GGUF format, but Ollama reports format '{details.get('format', 'unknown')}'."
             )
-        if not quant or quant.startswith(("F16", "F32", "BF16")):
+        # If metadata is unavailable (older Ollama), we already validated GGUF by file magic.
+        if quant and quant.startswith(("F16", "F32", "BF16")):
             raise RuntimeError(
                 "Jetson setup requires a quantized Ollama model (e.g. Q4/Q5 GGUF), not a base/unquantized variant."
             )
@@ -1191,6 +1243,21 @@ class OpenJetApp(App):
         ollama_cli = _find_ollama_cli()
         if not ollama_cli:
             raise RuntimeError("`ollama` CLI is not installed or not discoverable. Install it and retry setup.")
+
+        try:
+            resolved_model = await self._resolve_ollama_model_file(ollama_model)
+            await self._validate_jetson_ollama_model(
+                setup_result=setup_result,
+                ollama_cli=ollama_cli,
+                ollama_model=ollama_model,
+                resolved_model=resolved_model,
+            )
+            log.write(f"[bold bright_white]Using installed Ollama model {escape(ollama_model)}.[/]")
+            merged = dict(setup_result)
+            merged["model"] = resolved_model
+            return merged
+        except Exception:
+            pass
 
         log.write(
             f"[bold bright_white]Pulling {escape(ollama_model)} from Ollama...[/] "
@@ -1319,9 +1386,17 @@ class OpenJetApp(App):
         self.cfg.update(resolved_result)
         save_config(self.cfg)
 
+        model_name = Path(str(self.cfg.get("model", ""))).name or "model"
+        log.write(f"  [bold bright_white]Applying setup and loading {escape(model_name)}...[/]")
+        status = self.query_one("#assistant-status", Static)
+        status.update(f"[bold {ACCENT_GREEN}]loading {escape(model_name)}...[/]")
+        status.remove_class("hidden")
+
         try:
             await self._init_client()
         except Exception as exc:
+            status.update("")
+            status.add_class("hidden")
             self.cfg = previous_cfg
             save_config(self.cfg)
             try:
@@ -1334,6 +1409,8 @@ class OpenJetApp(App):
                 self.session_logger.log_event("setup_apply_failed", error=str(exc))
             return False
 
+        status.update("")
+        status.add_class("hidden")
         self.loaded_files.clear()
         self.persist_session_state(reason="setup_command")
         self._render_token_counter()
