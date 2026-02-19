@@ -2787,7 +2787,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     app = OpenJetApp(force_setup=args.setup)
-    app.run()
+    app.run(mouse=False)
 
 
 if __name__ == "__main__":

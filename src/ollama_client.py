@@ -151,15 +151,31 @@ class OllamaClient:
         resolved_device = self._resolve_device()
         requested_ngl = self.gpu_layers if resolved_device == "cuda" else 0
         requested_ctx = self.context_window_tokens
-        try:
-            await self._start_once(binary=binary, env=env, ngl=requested_ngl, ctx=requested_ctx)
-        except RuntimeError as exc:
-            # Retry once after aggressive same-user cleanup to release stale CUDA/NvMap allocations.
-            if not self._is_model_load_alloc_failure(str(exc)):
-                raise
-            await self._stop_server()
-            await self._cleanup_stale_inference_processes()
-            await self._start_once(binary=binary, env=env, ngl=requested_ngl, ctx=requested_ctx)
+        # Keep model/offload settings unchanged; only reduce launch batch pressure if KV alloc fails.
+        launch_attempts = ((512, 128), (256, 64), (128, 32))
+        last_err: RuntimeError | None = None
+        for batch, ubatch in launch_attempts:
+            try:
+                await self._start_once(
+                    binary=binary,
+                    env=env,
+                    ngl=requested_ngl,
+                    ctx=requested_ctx,
+                    batch=batch,
+                    ubatch=ubatch,
+                )
+                last_err = None
+                break
+            except RuntimeError as exc:
+                last_err = exc
+                if not self._is_model_load_alloc_failure(str(exc)):
+                    raise
+                await self._stop_server()
+                await self._cleanup_stale_inference_processes()
+                continue
+
+        if last_err is not None:
+            raise last_err
         self.gpu_layers = requested_ngl
         self.context_window_tokens = requested_ctx
 
@@ -170,6 +186,8 @@ class OllamaClient:
         env: dict[str, str],
         ngl: int,
         ctx: int,
+        batch: int,
+        ubatch: int,
     ) -> None:
         self._proc = await asyncio.create_subprocess_exec(
             binary,
@@ -184,9 +202,9 @@ class OllamaClient:
             "--no-kv-unified",
             "--no-cont-batching",
             "-b",
-            "512",
+            str(batch),
             "-ub",
-            "128",
+            str(ubatch),
             "-ngl",
             str(ngl),
             "-c",
