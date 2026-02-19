@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
@@ -141,6 +142,7 @@ class OllamaClient:
 
     async def start(self) -> None:
         await self._stop_server()
+        await self._cleanup_stale_inference_processes()
         binary = _find_llama_server()
         env = os.environ.copy()
         bin_dir = os.path.dirname(binary)
@@ -149,7 +151,15 @@ class OllamaClient:
         resolved_device = self._resolve_device()
         requested_ngl = self.gpu_layers if resolved_device == "cuda" else 0
         requested_ctx = self.context_window_tokens
-        await self._start_once(binary=binary, env=env, ngl=requested_ngl, ctx=requested_ctx)
+        try:
+            await self._start_once(binary=binary, env=env, ngl=requested_ngl, ctx=requested_ctx)
+        except RuntimeError as exc:
+            # Retry once after aggressive same-user cleanup to release stale CUDA/NvMap allocations.
+            if not self._is_model_load_alloc_failure(str(exc)):
+                raise
+            await self._stop_server()
+            await self._cleanup_stale_inference_processes()
+            await self._start_once(binary=binary, env=env, ngl=requested_ngl, ctx=requested_ctx)
         self.gpu_layers = requested_ngl
         self.context_window_tokens = requested_ctx
 
@@ -210,6 +220,99 @@ class OllamaClient:
                 pass
             await asyncio.sleep(1.0)
         raise TimeoutError("llama-server did not become ready")
+
+    async def _cleanup_stale_inference_processes(self) -> None:
+        stale_pids = self._find_stale_inference_pids()
+        if not stale_pids:
+            return
+
+        for pid in stale_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                continue
+
+        await asyncio.sleep(0.8)
+
+        for pid in stale_pids:
+            if not self._pid_exists(pid):
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                continue
+
+        # Give the driver a short window to release CUDA/NvMap allocations.
+        await asyncio.sleep(0.6)
+
+    def _find_stale_inference_pids(self) -> list[int]:
+        stale: list[int] = []
+        uid = os.getuid()
+        current_pid = os.getpid()
+
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == current_pid:
+                continue
+
+            status_path = entry / "status"
+            try:
+                status = status_path.read_text(errors="ignore")
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            uid_line = next((line for line in status.splitlines() if line.startswith("Uid:")), "")
+            if not uid_line:
+                continue
+            parts_uid = uid_line.split()
+            if len(parts_uid) < 2:
+                continue
+            try:
+                real_uid = int(parts_uid[1])
+            except ValueError:
+                continue
+            if real_uid != uid:
+                continue
+
+            cmdline_path = entry / "cmdline"
+            try:
+                raw = cmdline_path.read_bytes()
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            if not raw:
+                continue
+
+            parts = [p for p in raw.decode(errors="ignore").split("\x00") if p]
+            if not parts:
+                continue
+            joined = " ".join(parts).lower()
+            if "llama-server" not in joined and "ollama" not in joined:
+                continue
+
+            stale.append(pid)
+
+        return stale
+
+    def _pid_exists(self, pid: int) -> bool:
+        return Path(f"/proc/{pid}").exists()
+
+    def _is_model_load_alloc_failure(self, message: str) -> bool:
+        lowered = message.lower()
+        markers = (
+            "cudamalloc failed",
+            "failed to allocate cuda",
+            "unable to allocate cuda",
+            "nvmapmemallocinternaltagged",
+            "out of memory",
+            "error loading model",
+            "failed to load model",
+        )
+        return any(marker in lowered for marker in markers)
 
     async def close(self) -> None:
         await self._stop_server()
