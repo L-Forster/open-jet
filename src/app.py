@@ -199,6 +199,13 @@ def _estimate_model_params_b_from_text(text: str) -> float | None:
     return value / 1000.0
 
 
+def _format_error(exc: Exception) -> str:
+    text = str(exc).strip()
+    if text:
+        return text
+    return f"{type(exc).__name__} (no message)"
+
+
 def _recommended_device() -> str:
     if Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists():
         return "cuda"
@@ -438,6 +445,7 @@ class SetupScreen(ModalScreen[dict]):
             Static("Manual model path (.gguf):", id="setup-model-path-label", classes="hidden"),
             Input(placeholder="/path/to/model.gguf", id="setup-model-path", classes="hidden"),
             Static(""),
+            Static("", id="setup-warning"),
             Static("", id="setup-error"),
             Static(
                 "[dim]Up/Down select • Tab/Enter next • Shift+Tab back • Enter on final step saves and restarts[/]",
@@ -681,6 +689,7 @@ class SetupScreen(ModalScreen[dict]):
             manual_input.add_class("hidden")
             if self.focused is manual_input:
                 self.set_focus(None)
+        self.query_one("#setup-warning", Static).update(self._warning_text())
         self.query_one("#setup-error", Static).update("")
 
     def action_next_option(self) -> None:
@@ -740,6 +749,12 @@ class SetupScreen(ModalScreen[dict]):
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         self.action_advance()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "setup-model-path":
+            return
+        # Keep low-parameter warning in sync while typing manual model paths.
+        self._render_step()
 
     def action_save(self) -> None:
         self.ollama_cli = _find_ollama_cli()
@@ -809,6 +824,25 @@ class SetupScreen(ModalScreen[dict]):
         selected = self._selections.get("model_plan")
         if isinstance(selected, str) and selected != "__local__":
             return selected
+        return ""
+
+    def _selected_params_b(self) -> float | None:
+        model_plan = str(self._selections.get("model_plan", ""))
+        if model_plan and model_plan != "__local__":
+            return _estimate_model_params_b_from_text(model_plan)
+
+        # Local path mode: infer from selected file name or typed manual path.
+        local_path = self._selected_model_path()
+        if local_path:
+            return _estimate_model_params_b_from_text(Path(local_path).name)
+        return None
+
+    def _warning_text(self) -> str:
+        params_b = self._selected_params_b()
+        if params_b is None:
+            return ""
+        if params_b <= 2.0:
+            return "[bold yellow]Warning:[/] [yellow]Models with 2B parameters or smaller are not recommended for accurate results.[/]"
         return ""
 
     def _option_detail(self, key: str, value: object) -> str:
@@ -977,6 +1011,9 @@ Static {
     margin: 0 0;
 }
 #setup-error {
+    margin: 0 0;
+}
+#setup-warning {
     margin: 0 0;
 }
 #setup-hint {
@@ -1384,9 +1421,9 @@ class OpenJetApp(App):
                     await self._init_client()
                     log.write("[bold bright_white]Setup cancelled. Previous runtime restored.[/]")
                 except Exception as exc:
-                    log.write(f"[bold red]Setup cancelled; runtime restore failed:[/] {exc}")
+                    log.write(f"[bold red]Setup cancelled; runtime restore failed:[/] {_format_error(exc)}")
                     if self.session_logger:
-                        self.session_logger.log_event("setup_restore_failed", error=str(exc))
+                        self.session_logger.log_event("setup_restore_failed", error=_format_error(exc))
             else:
                 log.write("[bold bright_white]Setup cancelled.[/]")
             log.write("")
@@ -1395,10 +1432,10 @@ class OpenJetApp(App):
         try:
             resolved_result = await self._materialize_setup_model(result, log)
         except Exception as exc:
-            log.write(f"[bold red]Setup failed:[/] {exc}")
+            log.write(f"[bold red]Setup failed:[/] {_format_error(exc)}")
             log.write("")
             if self.session_logger:
-                self.session_logger.log_event("setup_apply_failed", error=str(exc))
+                self.session_logger.log_event("setup_apply_failed", error=_format_error(exc))
             return False
 
         self.cfg.update(resolved_result)
@@ -1421,10 +1458,10 @@ class OpenJetApp(App):
                 await self._init_client()
             except Exception:
                 pass
-            log.write(f"[bold red]Setup failed:[/] {exc}")
+            log.write(f"[bold red]Setup failed:[/] {_format_error(exc)}")
             log.write("")
             if self.session_logger:
-                self.session_logger.log_event("setup_apply_failed", error=str(exc))
+                self.session_logger.log_event("setup_apply_failed", error=_format_error(exc))
             return False
 
         status.update("")
@@ -1493,7 +1530,7 @@ class OpenJetApp(App):
                 try:
                     setup_result = await self._materialize_setup_model(setup_result, log)
                 except Exception as exc:
-                    log.write(f"[bold red]Setup failed:[/] {exc}")
+                    log.write(f"[bold red]Setup failed:[/] {_format_error(exc)}")
                     log.write("")
                     return
                 self.cfg.update(setup_result)
@@ -1517,7 +1554,7 @@ class OpenJetApp(App):
             try:
                 resolved = await self._materialize_setup_model(dict(self.cfg), log)
             except Exception as exc:
-                log.write(f"[bold red]Failed to resolve Ollama model:[/] {exc}")
+                log.write(f"[bold red]Failed to resolve Ollama model:[/] {_format_error(exc)}")
                 log.write("")
                 return
             self.cfg.update(resolved)
@@ -1527,9 +1564,9 @@ class OpenJetApp(App):
         try:
             await self._init_client()
         except Exception as e:
-            log.write(f"\n[bold red]Failed to start LLM:[/] {e}")
+            log.write(f"\n[bold red]Failed to start LLM:[/] {_format_error(e)}")
             if self.session_logger:
-                self.session_logger.log_event("llm_start_error", error=str(e))
+                self.session_logger.log_event("llm_start_error", error=_format_error(e))
             prompt.focus()
             return
         if self.session_logger:

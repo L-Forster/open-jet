@@ -234,7 +234,14 @@ class OllamaClient:
                 r = await self._http.get(f"{self.base_url}/health")
                 if r.status_code == 200:
                     return
-            except httpx.ConnectError:
+            except (
+                httpx.ConnectError,
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpx.TimeoutException,
+            ):
+                # During startup, the socket may accept then drop before readiness.
+                # Treat transient transport errors the same as "not ready yet".
                 pass
             await asyncio.sleep(1.0)
         raise TimeoutError("llama-server did not become ready")
@@ -308,8 +315,8 @@ class OllamaClient:
             parts = [p for p in raw.decode(errors="ignore").split("\x00") if p]
             if not parts:
                 continue
-            joined = " ".join(parts).lower()
-            if "llama-server" not in joined and "ollama" not in joined:
+            exe_name = Path(parts[0]).name.lower()
+            if exe_name not in {"llama-server", "ollama"}:
                 continue
 
             stale.append(pid)
