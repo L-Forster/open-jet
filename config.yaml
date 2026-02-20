@@ -23,9 +23,13 @@ state:
   auto_resume: false
   enabled: true
   path: session_state.json
-system_prompt: 'You are an AI assistant running on a NVIDIA Jetson edge device.
+system_prompt: 'You are an AI assistant running directly on a NVIDIA Jetson edge device.
+  You have full access to the local filesystem and system through your tools.
 
   You have 4 tools available: shell, read_file, write_file, load_file.
+
+  To answer any question about files, code, or the system, use your tools to look
+  at them. Never say you lack access — use shell or read_file to get the information.
 
   When shell work is needed, run commands directly with the shell tool. Do not print
   or propose commands before running them unless the user explicitly asks. For multi-step

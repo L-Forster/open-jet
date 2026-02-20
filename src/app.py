@@ -1169,23 +1169,18 @@ class OpenJetApp(App):
         if not result:
             return result, False
 
-        remaining = self._remaining_prompt_tokens()
-        budget_tokens = max(
-            TOOL_RESULT_MIN_BUDGET_TOKENS,
-            remaining - TOOL_RESULT_SAFE_PADDING_TOKENS,
-        )
+        budget_tokens = self._remaining_prompt_tokens()
         if estimate_tokens(result) <= budget_tokens:
             return result, False
 
-        suffix = "\n...[tool output truncated for context safety]"
+        prefix = "...[tool output truncated]\n"
         max_chars = max(256, budget_tokens * 4)
-        clipped = result[:max_chars]
-        candidate = clipped + suffix
+        clipped = result[-max_chars:]
+        candidate = prefix + clipped
 
-        # Tighten iteratively so the final payload stays within budget.
         while estimate_tokens(candidate) > budget_tokens and len(clipped) > 64:
-            clipped = clipped[: max(64, int(len(clipped) * 0.85))]
-            candidate = clipped + suffix
+            clipped = clipped[max(64, int(len(clipped) * 0.85)):]
+            candidate = prefix + clipped
 
         return candidate, True
 

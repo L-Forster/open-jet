@@ -7,6 +7,7 @@ SetupScreen {
 }
 Screen {
     background: #2a2a2a;
+    layout: vertical;
 }
 Vertical {
     background: transparent;
@@ -22,7 +23,9 @@ Static {
 }
 #chat-log {
     width: 100%;
-    height: auto;
+    height: 1fr;
+    min-height: 0;
+    overflow-y: auto;
     padding: 0 2;
     color: #ffffff;
 }
