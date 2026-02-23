@@ -486,8 +486,16 @@ class OpenJetApp(App):
             event.stop()
             return
         if event.key in ("tab", "enter") and self.completion.state:
+            next_value = self.completion.apply_selected(prompt.value)
+            if next_value == prompt.value:
+                # If completion has nothing new to apply, allow Enter to submit.
+                if event.key == "enter":
+                    return
+                event.prevent_default()
+                event.stop()
+                return
             event.prevent_default()
-            prompt.value = self.completion.apply_selected(prompt.value)
+            prompt.value = next_value
             self._update_completion_suggestions(prompt.value)
             prompt.action_end(select=False)
             self.call_after_refresh(self._collapse_prompt_selection)
