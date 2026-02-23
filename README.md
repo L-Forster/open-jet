@@ -49,8 +49,8 @@ Controls: `Up/Down` to change option, `Tab/Enter` next, `Shift+Tab` back, `Enter
 
 - Chat normally with Enter.
 - `@file` or `@[path with spaces]` loads file content into context automatically.
-- Typing `/` shows slash command suggestions; `Up/Down` cycles and `Tab` autocompletes.
-- `Tab` also autocompletes `@` file paths from the current workspace.
+- Typing `/` shows slash command suggestions; `Up/Down` cycles and `Tab` or `Enter` autocompletes.
+- `Tab` or `Enter` also autocompletes `@` file paths from the current workspace.
 - A live token counter is shown under the chat input.
 - Tool calls that can change system state still require approval (`y` / `n`).
 - Tool approvals include a compact preview of the exact command/write action.

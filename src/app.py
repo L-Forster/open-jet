@@ -485,15 +485,19 @@ class OpenJetApp(App):
             self._navigate_prompt_history(prompt, direction=1)
             event.stop()
             return
+        if event.key in ("tab", "enter") and self.completion.state:
+            event.prevent_default()
+            prompt.value = self.completion.apply_selected(prompt.value)
+            self._update_completion_suggestions(prompt.value)
+            prompt.action_end(select=False)
+            self.call_after_refresh(self._collapse_prompt_selection)
+            if event.key == "tab":
+                prompt.focus()
+            event.stop()
+            return
         if event.key == "tab":
             event.prevent_default()
-            if self.completion.state:
-                prompt.value = self.completion.apply_selected(prompt.value)
-                self._update_completion_suggestions(prompt.value)
-                prompt.action_end(select=False)
-                self.call_after_refresh(self._collapse_prompt_selection)
-                prompt.focus()
-            elif prompt.value.lstrip().startswith(("/", "@")):
+            if prompt.value.lstrip().startswith(("/", "@")):
                 # Keep focus in chat input when tab is used for completion contexts.
                 prompt.focus()
                 self.call_after_refresh(self._collapse_prompt_selection)
@@ -641,7 +645,7 @@ class OpenJetApp(App):
             if item.detail:
                 lines[-1] += f" [bold bright_white]- {item.detail}[/]"
         bar.remove_class("hidden")
-        bar.update("\n".join(lines) + "\n[bold bright_white]Up/Down to select, Tab to autocomplete[/]")
+        bar.update("\n".join(lines) + "\n[bold bright_white]Up/Down to select, Tab or Enter to autocomplete[/]")
 
     def _clear_completion_suggestions(self) -> None:
         self.completion.clear()

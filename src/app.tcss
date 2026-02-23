@@ -23,7 +23,8 @@ Static {
 }
 #chat-log {
     width: 100%;
-    height: 1fr;
+    height: auto;
+    max-height: 1fr;
     min-height: 0;
     overflow-y: auto;
     padding: 0 2;
