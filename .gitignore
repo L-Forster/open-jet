@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+src/*.c
 
 # Runtime/session state
 session_logs/

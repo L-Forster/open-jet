@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Auto-bump package version, publish distribution, and push git changes.
+# Usage:
+#   ./jet-push            # publish to PyPI
+#   ./jet-push pypi
+#   ./jet-push testpypi
+
+TARGET="${1:-pypi}"
+if [[ "$TARGET" != "pypi" && "$TARGET" != "testpypi" ]]; then
+  echo "Usage: $0 [pypi|testpypi]" >&2
+  exit 1
+fi
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"
+
+if [[ ! -f pyproject.toml ]]; then
+  echo "pyproject.toml not found in $ROOT_DIR" >&2
+  exit 1
+fi
+
+if [[ ! -x scripts/release_pypi.sh ]]; then
+  echo "scripts/release_pypi.sh is missing or not executable." >&2
+  exit 1
+fi
+
+CURRENT_VERSION="$(python - <<'PY'
+from pathlib import Path
+import re
+
+text = Path("pyproject.toml").read_text()
+m = re.search(r'^version\s*=\s*"([^"]+)"\s*$', text, flags=re.M)
+if not m:
+    raise SystemExit(1)
+print(m.group(1))
+PY
+)"
+
+NEW_VERSION="$(python - "$CURRENT_VERSION" <<'PY'
+import re
+import sys
+
+v = sys.argv[1]
+m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", v)
+if not m:
+    raise SystemExit("Version must be semver x.y.z")
+major, minor, patch = map(int, m.groups())
+print(f"{major}.{minor}.{patch + 1}")
+PY
+)"
+
+python - "$CURRENT_VERSION" "$NEW_VERSION" <<'PY'
+from pathlib import Path
+import sys
+
+old = f'version = "{sys.argv[1]}"'
+new = f'version = "{sys.argv[2]}"'
+p = Path("pyproject.toml")
+t = p.read_text()
+if old not in t:
+    raise SystemExit("Could not find version line to replace")
+p.write_text(t.replace(old, new, 1))
+PY
+
+echo "Version bumped: $CURRENT_VERSION -> $NEW_VERSION"
+
+scripts/release_pypi.sh "$TARGET"
+
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git add pyproject.toml
+  git commit -m "release: v$NEW_VERSION"
+  git push origin HEAD
+fi
+
+echo "Done: released v$NEW_VERSION to $TARGET"

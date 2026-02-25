@@ -1,8 +1,26 @@
 [project]
 name = "open-jet"
-version = "0.1.0"
-description = "Minimal agentic TUI for running LLMs on edge devices"
+version = "0.1.1"
+description = "Offline local-LLM terminal app for Jetson and edge Linux: chat with on-device models, run agent tools, and manage context safely."
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
+authors = [
+    { name = "Louis" }
+]
+keywords = ["llm", "local-llm", "ai-agent", "tui", "jetson", "edge-ai", "offline", "llama.cpp"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: User Interfaces",
+    "Typing :: Typed",
+]
 dependencies = [
     "textual>=3.0",
     "httpx>=0.27",
@@ -10,12 +28,24 @@ dependencies = [
     "tiktoken>=0.7",
 ]
 
+[project.urls]
+Homepage = "https://web-open-jet.vercel.app/"
+Website = "https://web-open-jet.vercel.app/"
+Repository = "https://github.com/louis/open-jet"
+Issues = "https://github.com/louis/open-jet/issues"
+
 [project.scripts]
 open-jet = "src.app:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68,<80", "wheel", "Cython>=3.0"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
-include = ["src*"]
+include = ["src"]
+
+[tool.setuptools.package-data]
+src = ["app.tcss"]
