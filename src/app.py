@@ -1541,7 +1541,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     app = OpenJetApp(force_setup=args.setup)
-    app.run(mouse=False)
+    app.run(mouse=False, inline=True, inline_no_clear=True)
 
 
 if __name__ == "__main__":

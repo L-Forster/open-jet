@@ -7,45 +7,48 @@ import yaml
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 # Curated, size-banded shortlist used by setup recommendations.
+# Band limit = max param budget in billions for that RAM tier.
+# Disk/RAM sizes (Q4_K_M): 0.6B~523MB, 1.7B~1.4GB, 4B~2.6GB, 8B~5.2GB,
+# 14B~9.3GB, 27B~17GB, 32B~20GB, 35B-A3B~24GB, 122B-A10B~81GB.
 RECOMMENDED_LLM_BANDS: tuple[tuple[float, tuple[tuple[str, float, str], ...]], ...] = (
     (
         2.0,
         (
-            ("qwen2.5:1.5b", 1.5, "Qwen2.5 1.5B"),
+            ("qwen3:1.7b", 1.7, "Qwen3 1.7B"),
+            ("qwen3:0.6b", 0.6, "Qwen3 0.6B"),
             ("deepseek-r1:1.5b", 1.5, "DeepSeek R1 1.5B"),
-            ("gemma2:2b", 2.0, "Gemma 2 2B"),
         ),
     ),
     (
         4.0,
         (
-            ("qwen2.5:3b", 3.0, "Qwen2.5 3B"),
-            ("qwen2.5:3b-instruct", 3.0, "Qwen2.5 3B Instruct"),
+            ("qwen3:4b", 4.0, "Qwen3 4B"),
+            ("qwen3:1.7b", 1.7, "Qwen3 1.7B"),
             ("gemma2:2b", 2.0, "Gemma 2 2B"),
         ),
     ),
     (
         8.0,
         (
-            ("qwen2.5:7b", 7.0, "Qwen2.5 7B"),
-            ("mistral:7b", 7.0, "Mistral 7B"),
+            ("qwen3:8b", 8.0, "Qwen3 8B"),
+            ("qwen3:4b", 4.0, "Qwen3 4B"),
             ("deepseek-r1:7b", 7.0, "DeepSeek R1 7B"),
         ),
     ),
     (
         14.0,
         (
-            ("qwen2.5:14b", 14.0, "Qwen2.5 14B"),
+            ("qwen3:14b", 14.0, "Qwen3 14B"),
+            ("qwen3:8b", 8.0, "Qwen3 8B"),
             ("deepseek-r1:14b", 14.0, "DeepSeek R1 14B"),
-            ("gemma2:9b", 9.0, "Gemma 2 9B"),
         ),
     ),
     (
         32.0,
         (
-            ("qwen2.5:32b", 32.0, "Qwen2.5 32B"),
-            ("qwen2.5-coder:32b", 32.0, "Qwen2.5 Coder 32B"),
-            ("gemma2:27b", 27.0, "Gemma 2 27B"),
+            ("qwen3.5:27b", 27.0, "Qwen3.5 27B"),
+            ("qwen3.5:35b-a3b", 35.0, "Qwen3.5 35B MoE"),
+            ("qwen3:32b", 32.0, "Qwen3 32B"),
         ),
     ),
 )
