@@ -29,7 +29,7 @@ class AgentEvent:
 
 
 # Tools that require user confirmation before execution
-CONFIRM_TOOLS = {"shell", "write_file"}
+CONFIRM_TOOLS = {"shell", "write_file", "edit_file"}
 
 
 class Agent:

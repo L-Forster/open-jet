@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -254,6 +257,211 @@ async def load_file(path: str, max_tokens: int | None = None) -> LoadFileResult:
         truncated=truncated,
         mem_available_mb=mem_available_mb,
     )
+
+
+# -- Edit file tool ----------------------------------------------------------
+
+
+async def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
+    """Replace exact string occurrences in a file."""
+    raw_path = path.strip()
+    if not raw_path:
+        return "Error: path is empty."
+
+    p = _normalize_tool_path(raw_path)
+    if not p.exists():
+        return f"Error: file not found: {path}"
+    if p.is_dir():
+        return f"Error: path is a directory: {path}"
+
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"Error reading {path}: {e}"
+
+    if old_string not in content:
+        return f"Error: old_string not found in {path}"
+
+    if not replace_all:
+        count = content.count(old_string)
+        if count > 1:
+            return (
+                f"Error: old_string appears {count} times in {path}. "
+                "Provide more surrounding context to make it unique, or set replace_all=true."
+            )
+        new_content = content.replace(old_string, new_string, 1)
+    else:
+        new_content = content.replace(old_string, new_string)
+
+    try:
+        p.write_text(new_content, encoding="utf-8")
+    except Exception as e:
+        return f"Error writing {path}: {e}"
+
+    replacements = content.count(old_string) if replace_all else 1
+    return f"Edited {path}: {replacements} replacement(s) made."
+
+
+# -- Glob tool ---------------------------------------------------------------
+
+_DEFAULT_GLOB_IGNORE = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "dist", "build", ".eggs", "*.egg-info",
+}
+
+_MAX_GLOB_RESULTS = 200
+
+
+async def glob_files(pattern: str, path: str | None = None) -> str:
+    """Find files matching a glob pattern."""
+    base = Path(path).expanduser() if path else Path.cwd()
+    if not base.exists():
+        return f"Error: directory not found: {base}"
+    if not base.is_dir():
+        return f"Error: not a directory: {base}"
+
+    matches: list[str] = []
+    try:
+        for match in sorted(base.glob(pattern)):
+            # Skip ignored directories
+            parts = match.relative_to(base).parts
+            if any(part in _DEFAULT_GLOB_IGNORE for part in parts):
+                continue
+            if any(fnmatch.fnmatch(part, p) for part in parts for p in _DEFAULT_GLOB_IGNORE):
+                continue
+            matches.append(str(match))
+            if len(matches) >= _MAX_GLOB_RESULTS:
+                break
+    except Exception as e:
+        return f"Error: {e}"
+
+    if not matches:
+        return f"No files matched pattern: {pattern}"
+
+    result = "\n".join(matches)
+    if len(matches) >= _MAX_GLOB_RESULTS:
+        result += f"\n... (truncated at {_MAX_GLOB_RESULTS} results)"
+    return result
+
+
+# -- Grep tool ---------------------------------------------------------------
+
+_MAX_GREP_MATCHES = 100
+_MAX_GREP_LINE_LEN = 500
+
+
+async def grep_files(
+    pattern: str,
+    path: str | None = None,
+    glob_filter: str | None = None,
+    ignore_case: bool = False,
+) -> str:
+    """Search file contents with regex."""
+    base = Path(path).expanduser() if path else Path.cwd()
+    if not base.exists():
+        return f"Error: path not found: {base}"
+
+    try:
+        flags = re.IGNORECASE if ignore_case else 0
+        regex = re.compile(pattern, flags)
+    except re.error as e:
+        return f"Error: invalid regex: {e}"
+
+    matches: list[str] = []
+
+    if base.is_file():
+        files = [base]
+    else:
+        files = sorted(base.rglob(glob_filter or "*"))
+
+    for fp in files:
+        if not fp.is_file():
+            continue
+        # Skip ignored directories
+        try:
+            rel_parts = fp.relative_to(base).parts if base.is_dir() else ()
+        except ValueError:
+            rel_parts = ()
+        if any(part in _DEFAULT_GLOB_IGNORE for part in rel_parts):
+            continue
+        if any(fnmatch.fnmatch(part, p) for part in rel_parts for p in _DEFAULT_GLOB_IGNORE):
+            continue
+
+        # Skip binary files
+        try:
+            head = fp.read_bytes()[:4096]
+            if b"\x00" in head:
+                continue
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except (PermissionError, OSError):
+            continue
+
+        for line_no, line in enumerate(text.splitlines(), 1):
+            if regex.search(line):
+                display_line = line[:_MAX_GREP_LINE_LEN]
+                if len(line) > _MAX_GREP_LINE_LEN:
+                    display_line += "..."
+                matches.append(f"{fp}:{line_no}: {display_line}")
+                if len(matches) >= _MAX_GREP_MATCHES:
+                    break
+        if len(matches) >= _MAX_GREP_MATCHES:
+            break
+
+    if not matches:
+        return f"No matches for pattern: {pattern}"
+
+    result = "\n".join(matches)
+    if len(matches) >= _MAX_GREP_MATCHES:
+        result += f"\n... (truncated at {_MAX_GREP_MATCHES} matches)"
+    return result
+
+
+# -- List directory tool -----------------------------------------------------
+
+_MAX_LS_ENTRIES = 200
+
+
+async def list_directory(path: str | None = None) -> str:
+    """List directory contents with file types and sizes."""
+    base = Path(path).expanduser() if path else Path.cwd()
+    if not base.exists():
+        return f"Error: path not found: {base}"
+    if not base.is_dir():
+        return f"Error: not a directory: {base}"
+
+    entries: list[str] = []
+    try:
+        for item in sorted(base.iterdir()):
+            if item.name.startswith(".") and item.name in {".git"}:
+                continue
+            try:
+                if item.is_dir():
+                    entries.append(f"  {item.name}/")
+                else:
+                    size = item.stat().st_size
+                    if size < 1024:
+                        size_str = f"{size}B"
+                    elif size < 1024 * 1024:
+                        size_str = f"{size / 1024:.1f}KB"
+                    else:
+                        size_str = f"{size / (1024 * 1024):.1f}MB"
+                    entries.append(f"  {item.name}  ({size_str})")
+            except OSError:
+                entries.append(f"  {item.name}  (error)")
+            if len(entries) >= _MAX_LS_ENTRIES:
+                entries.append(f"  ... (truncated at {_MAX_LS_ENTRIES} entries)")
+                break
+    except PermissionError:
+        return f"Error: permission denied: {base}"
+
+    if not entries:
+        return f"{base}/  (empty)"
+
+    return f"{base}/\n" + "\n".join(entries)
+
+
+# -- Helpers -----------------------------------------------------------------
 
 
 def _normalize_tool_path(path: str) -> Path:

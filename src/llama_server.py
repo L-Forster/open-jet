@@ -94,6 +94,117 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": (
+                "Edit a file by replacing an exact string with a new string. "
+                "Requires user confirmation. The old_string must match exactly "
+                "(including whitespace and indentation). If old_string appears "
+                "multiple times, provide more context to make it unique or set "
+                "replace_all to true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to edit",
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "The exact text to find and replace",
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "The replacement text",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace all occurrences (default: false)",
+                    },
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": (
+                "Find files matching a glob pattern (e.g. '**/*.py', 'src/**/*.ts'). "
+                "Returns matching file paths. Use this instead of shell find."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern to match (e.g. '**/*.py')",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in (defaults to current directory)",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": (
+                "Search file contents using a regex pattern. Returns matching lines "
+                "with file paths and line numbers. Use this instead of shell grep/rg."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search in (defaults to current directory)",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Glob filter for files (e.g. '*.py')",
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Case insensitive search (default: false)",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_directory",
+            "description": (
+                "List contents of a directory with file types and sizes. "
+                "Use this instead of shell ls."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path (defaults to current directory)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 

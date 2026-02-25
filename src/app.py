@@ -20,7 +20,17 @@ from textual.widgets.input import Selection
 from .agent import ActionKind, Agent, ToolCall
 from .commands import SlashCommandHandler
 from .completion import CompletionEngine, FileMentionCompletionProvider, SlashCompletionProvider
-from .executor import DEFAULT_SHELL_TIMEOUT_SECONDS, load_file, read_file, run_shell, write_file
+from .executor import (
+    DEFAULT_SHELL_TIMEOUT_SECONDS,
+    edit_file,
+    glob_files,
+    grep_files,
+    list_directory,
+    load_file,
+    read_file,
+    run_shell,
+    write_file,
+)
 from .llama_server import LlamaServerClient
 from .config import load_config, save_config
 from .hardware import (
@@ -1335,12 +1345,25 @@ class OpenJetApp(App):
             lines = [f"path: {path}", f"bytes: {len(content)}", "content:"]
             lines.extend(escape(line) for line in preview.split("\n"))
             return lines
+        if tc.name == "edit_file":
+            path = str(tc.arguments.get("path", "")).strip()
+            old_s = str(tc.arguments.get("old_string", ""))
+            new_s = str(tc.arguments.get("new_string", ""))
+            replace_all_flag = tc.arguments.get("replace_all", False)
+            lines = [f"path: {path}"]
+            if replace_all_flag:
+                lines.append("replace_all: true")
+            lines.append("old_string:")
+            lines.extend(f"  {escape(l)}" for l in old_s.split("\n"))
+            lines.append("new_string:")
+            lines.extend(f"  {escape(l)}" for l in new_s.split("\n"))
+            return lines
         return [str(_fmt_args(tc))]
 
     def _approval_preview_text(self, tc: ToolCall) -> str:
         lines = self._tool_preview_lines(tc)
         joined = "\n".join(lines)
-        if tc.name == "write_file":
+        if tc.name in ("write_file", "edit_file"):
             return joined
         if len(joined) > 280:
             return joined[:277] + "..."
@@ -1423,6 +1446,44 @@ async def _execute_tool(tc: ToolCall) -> tuple[str, dict]:
             "token_budget": loaded.token_budget,
             "mem_available_mb": loaded.mem_available_mb,
         }
+    elif tc.name == "edit_file":
+        path = tc.arguments.get("path", "")
+        old_string = tc.arguments.get("old_string", "")
+        new_string = tc.arguments.get("new_string", "")
+        replace_all_flag = tc.arguments.get("replace_all", False)
+        if not isinstance(path, str) or not path.strip():
+            return "Error: invalid arguments for edit_file (required: path, old_string, new_string)", {"ok": False}
+        if not isinstance(old_string, str) or not old_string:
+            return "Error: invalid arguments for edit_file (required: old_string)", {"ok": False}
+        if not isinstance(new_string, str):
+            return "Error: invalid arguments for edit_file (required: new_string)", {"ok": False}
+        text = await edit_file(path, old_string, new_string, replace_all=bool(replace_all_flag))
+        return text, {"ok": not text.startswith("Error")}
+    elif tc.name == "glob":
+        pattern = tc.arguments.get("pattern", "")
+        search_path = tc.arguments.get("path")
+        if not isinstance(pattern, str) or not pattern.strip():
+            return "Error: invalid arguments for glob (required: pattern)", {"ok": False}
+        text = await glob_files(pattern, path=search_path)
+        return text, {"ok": not text.startswith("Error")}
+    elif tc.name == "grep":
+        pattern = tc.arguments.get("pattern", "")
+        search_path = tc.arguments.get("path")
+        glob_filter = tc.arguments.get("glob")
+        ignore_case = tc.arguments.get("ignore_case", False)
+        if not isinstance(pattern, str) or not pattern.strip():
+            return "Error: invalid arguments for grep (required: pattern)", {"ok": False}
+        text = await grep_files(
+            pattern,
+            path=search_path,
+            glob_filter=glob_filter,
+            ignore_case=bool(ignore_case),
+        )
+        return text, {"ok": not text.startswith("Error")}
+    elif tc.name == "list_directory":
+        dir_path = tc.arguments.get("path")
+        text = await list_directory(path=dir_path)
+        return text, {"ok": not text.startswith("Error")}
     return f"Unknown tool: {tc.name}", {"ok": False}
 
 
@@ -1439,6 +1500,14 @@ def _fmt_args(tc: ToolCall) -> str:
         return tc.arguments.get("path", str(tc.arguments))
     if tc.name == "load_file":
         return tc.arguments.get("path", str(tc.arguments))
+    if tc.name == "edit_file":
+        return tc.arguments.get("path", str(tc.arguments))
+    if tc.name == "glob":
+        return tc.arguments.get("pattern", str(tc.arguments))
+    if tc.name == "grep":
+        return tc.arguments.get("pattern", str(tc.arguments))
+    if tc.name == "list_directory":
+        return tc.arguments.get("path", ".") or "."
     return str(tc.arguments)
 
 
