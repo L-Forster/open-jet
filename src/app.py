@@ -308,7 +308,7 @@ class OpenJetApp(App):
     def compose(self) -> ComposeResult:
         yield RichLog(id="chat-log", wrap=True, markup=True, auto_scroll=True)
         yield Static("", id="assistant-status", classes="hidden")
-        yield RichLog(id="approval-bar", wrap=True, markup=True, auto_scroll=True, classes="hidden")
+        yield Static("", id="approval-bar", classes="hidden")
         with Container(id="bottom-stack"):
             yield Input(placeholder="> ", id="prompt")
             yield Static("", id="utilization-bar")
@@ -1281,7 +1281,7 @@ class OpenJetApp(App):
         status.update("")
 
     async def _wait_for_tool_approval(self, tc: ToolCall) -> bool:
-        bar = self.query_one("#approval-bar", RichLog)
+        bar = self.query_one("#approval-bar", Static)
         prompt = self.query_one("#prompt", Input)
 
         self._awaiting_approval = True
@@ -1299,15 +1299,15 @@ class OpenJetApp(App):
             self._approval_tool_call = None
             self._approval_future = None
             bar.add_class("hidden")
-            bar.clear()
+            bar.update("")
             prompt.disabled = False
             prompt.focus()
 
     def _render_approval_bar(self) -> None:
         if not self._awaiting_approval or not self._approval_tool_call:
             return
-        bar = self.query_one("#approval-bar", RichLog)
-        preview = self._approval_preview_text(self._approval_tool_call)
+        bar = self.query_one("#approval-bar", Static)
+        summary = self._approval_summary_text(self._approval_tool_call)
         approve = (
             "[black on green] Approve [/]"
             if self._approval_choice == 0
@@ -1318,11 +1318,25 @@ class OpenJetApp(App):
             if self._approval_choice == 1
             else "[bold red]Deny[/]"
         )
-        bar.clear()
-        bar.write(
-            f"[bold yellow]Tool request:[/]\n{preview}\n"
+        bar.update(
+            f"[bold yellow]Tool request:[/] {summary}\n"
             f"Use [bold]←[/]/[bold]→[/] then [bold]Enter[/]   {approve}  {deny}"
         )
+
+    def _approval_summary_text(self, tc: ToolCall) -> str:
+        if tc.name == "write_file":
+            path = str(tc.arguments.get("path", "")).strip()
+            content = str(tc.arguments.get("content", ""))
+            return f"write_file -> {escape(path)} ({len(content)} bytes)"
+        if tc.name == "edit_file":
+            path = str(tc.arguments.get("path", "")).strip()
+            return f"edit_file -> {escape(path)}"
+        if tc.name == "shell":
+            command = str(tc.arguments.get("command", "")).strip()
+            if len(command) > 120:
+                command = command[:117] + "..."
+            return f"shell -> {escape(command)}"
+        return escape(f"{tc.name} -> {_fmt_args(tc)}")
 
     def _resolve_approval(self, approved: bool) -> None:
         if self._approval_future and not self._approval_future.done():
