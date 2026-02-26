@@ -256,6 +256,49 @@ class LlamaServerClient:
         self._proc: asyncio.subprocess.Process | None = None
 
     @staticmethod
+    def _ensure_jetson_clocks_sudoers() -> None:
+        """Install a passwordless sudoers rule for jetson_clocks.
+
+        Only runs once — skipped if the rule already exists.
+        Prompts the user for their password via ``sudo`` on first install.
+        """
+        import subprocess
+
+        sudoers_file = Path("/etc/sudoers.d/open-jet-clocks")
+        if sudoers_file.exists():
+            return
+
+        rule = "ALL ALL=(ALL) NOPASSWD: /usr/bin/jetson_clocks\n"
+        try:
+            subprocess.run(
+                ["sudo", "tee", str(sudoers_file)],
+                input=rule.encode(), capture_output=True, timeout=30,
+            )
+            subprocess.run(
+                ["sudo", "chmod", "0440", str(sudoers_file)],
+                capture_output=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    @staticmethod
+    def _maximize_gpu_clocks() -> None:
+        """Pin GPU and EMC clocks to maximum frequency on Jetson."""
+        import subprocess
+        result = subprocess.run(
+            ["sudo", "-n", "jetson_clocks"],
+            timeout=5, capture_output=True,
+        )
+        if result.returncode != 0:
+            # Fallback: write directly to GPU devfreq sysfs.
+            gpu_devfreq = Path("/sys/devices/platform/bus@0/17000000.gpu/devfreq/17000000.gpu")
+            try:
+                max_freq = (gpu_devfreq / "max_freq").read_text().strip()
+                (gpu_devfreq / "min_freq").write_text(max_freq)
+            except (PermissionError, OSError):
+                pass
+
+    @staticmethod
     def _compact_memory() -> None:
         """Drop filesystem caches and compact free memory.
 
@@ -280,6 +323,8 @@ class LlamaServerClient:
     async def start(self) -> None:
         await self._stop_server()
         await self._cleanup_stale_inference_processes()
+        self._ensure_jetson_clocks_sudoers()
+        self._maximize_gpu_clocks()
         self._compact_memory()
         binary = _find_llama_server()
         env = os.environ.copy()
@@ -341,7 +386,9 @@ class LlamaServerClient:
             "--parallel",
             "1",
             "--no-mmap",
-            "--no-kv-offload",
+            "--flash-attn", "on",
+            "-ctk", "q8_0",
+            "-ctv", "q8_0",
             "-b",
             str(batch),
             "-ub",

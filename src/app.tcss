@@ -8,6 +8,7 @@ SetupScreen {
 Screen {
     background: #2a2a2a;
     layout: vertical;
+    overflow: hidden;
     scrollbar-size: 0 0;
 }
 Vertical {
@@ -24,8 +25,7 @@ Static {
 }
 #chat-log {
     width: 100%;
-    height: auto;
-    max-height: 1fr;
+    height: 1fr;
     min-height: 0;
     overflow-y: auto;
     scrollbar-size: 0 0;

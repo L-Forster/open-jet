@@ -11,9 +11,59 @@ It provides:
 
 ## Requirements
 
-Before running `open-jet`, make sure:
-- `llama-server` from `llama.cpp` is installed and available on `PATH`
-- you have a local `.gguf` model file, or `ollama` installed for model download
+- `llama-server` from `llama.cpp` built for your device (see below)
+- a local `.gguf` model file, or `ollama` installed for model download
+
+## Building llama-server
+
+`open-jet` uses `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) as its inference backend. Pre-built binaries are available for x86, but on Jetson/ARM64 you need to build from source with the right flags.
+
+### Jetson (Orin Nano, Orin NX, AGX Orin)
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp.git
+cd llama.cpp
+mkdir build && cd build
+
+cmake .. \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=87 \
+  -DGGML_CUDA_FA_ALL_QUANTS=ON
+
+cmake --build . --target llama-server -j$(nproc)
+```
+
+Key flags:
+
+| Flag | Why |
+|------|-----|
+| `GGML_CUDA=ON` | Enable CUDA backend |
+| `CMAKE_CUDA_ARCHITECTURES=87` | Target SM 8.7 (Orin). Use `72` for Xavier. |
+| `GGML_CUDA_FA_ALL_QUANTS=ON` | Enable flash attention for all KV cache quantizations (q8_0, q4_0), not just f16. Required for fast inference with quantized KV cache. |
+
+The built binary will be at `build/bin/llama-server`. Either add it to your `PATH` or leave it at `~/llama.cpp/build/bin/` where `open-jet` will find it automatically.
+
+### Other Linux (x86_64 with NVIDIA GPU)
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp.git
+cd llama.cpp
+mkdir build && cd build
+
+cmake .. -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON
+cmake --build . --target llama-server -j$(nproc)
+```
+
+### CPU only
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp.git
+cd llama.cpp
+mkdir build && cd build
+
+cmake ..
+cmake --build . --target llama-server -j$(nproc)
+```
 
 ## Install
 

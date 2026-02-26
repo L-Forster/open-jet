@@ -125,11 +125,7 @@ def recommended_context_window_tokens_from_total(
 def recommended_gpu_layers(device: str, total_ram_gb: float | None = None) -> int:
     if device == "cpu":
         return 0
-    if total_ram_gb is None or total_ram_gb < 16:
-        return 20
-    if total_ram_gb < 32:
-        return 28
-    return 35
+    return 99
 
 
 def is_jetson_label(label: str | None) -> bool:
