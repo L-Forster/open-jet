@@ -308,7 +308,7 @@ class OpenJetApp(App):
     def compose(self) -> ComposeResult:
         yield RichLog(id="chat-log", wrap=True, markup=True, auto_scroll=True)
         yield Static("", id="assistant-status", classes="hidden")
-        yield Static("", id="approval-bar", classes="hidden")
+        yield RichLog(id="approval-bar", wrap=True, markup=True, auto_scroll=True, classes="hidden")
         with Container(id="bottom-stack"):
             yield Input(placeholder="> ", id="prompt")
             yield Static("", id="utilization-bar")
@@ -1281,7 +1281,7 @@ class OpenJetApp(App):
         status.update("")
 
     async def _wait_for_tool_approval(self, tc: ToolCall) -> bool:
-        bar = self.query_one("#approval-bar", Static)
+        bar = self.query_one("#approval-bar", RichLog)
         prompt = self.query_one("#prompt", Input)
 
         self._awaiting_approval = True
@@ -1299,14 +1299,14 @@ class OpenJetApp(App):
             self._approval_tool_call = None
             self._approval_future = None
             bar.add_class("hidden")
-            bar.update("")
+            bar.clear()
             prompt.disabled = False
             prompt.focus()
 
     def _render_approval_bar(self) -> None:
         if not self._awaiting_approval or not self._approval_tool_call:
             return
-        bar = self.query_one("#approval-bar", Static)
+        bar = self.query_one("#approval-bar", RichLog)
         preview = self._approval_preview_text(self._approval_tool_call)
         approve = (
             "[black on green] Approve [/]"
@@ -1318,7 +1318,8 @@ class OpenJetApp(App):
             if self._approval_choice == 1
             else "[bold red]Deny[/]"
         )
-        bar.update(
+        bar.clear()
+        bar.write(
             f"[bold yellow]Tool request:[/]\n{preview}\n"
             f"Use [bold]←[/]/[bold]→[/] then [bold]Enter[/]   {approve}  {deny}"
         )
