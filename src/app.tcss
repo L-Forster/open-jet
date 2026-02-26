@@ -69,8 +69,6 @@ Static {
 #approval-bar {
     height: auto;
     min-height: 3;
-    max-height: 8;
-    overflow-y: auto;
     margin: 0 2;
     padding: 0 1;
     border: round $warning;
