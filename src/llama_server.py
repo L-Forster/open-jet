@@ -243,7 +243,7 @@ class LlamaServerClient:
         port: int = 8080,
         context_window_tokens: int = 2048,
         device: str = "auto",
-        gpu_layers: int = 20,
+        gpu_layers: int = 99,
     ) -> None:
         self.model = model
         self.host = host
@@ -255,13 +255,39 @@ class LlamaServerClient:
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
 
+    @staticmethod
+    def _compact_memory() -> None:
+        """Drop filesystem caches and compact free memory.
+
+        On Jetson (unified memory) CUDA needs large contiguous allocations.
+        Dropping caches frees pagecache/slab memory so the kernel can coalesce
+        free pages into larger contiguous regions.
+        """
+        try:
+            Path("/proc/sys/vm/drop_caches").write_text("3")
+            Path("/proc/sys/vm/compact_memory").write_text("1")
+        except PermissionError:
+            # Not running as root — try via sudo non-interactively.
+            import subprocess
+            subprocess.run(
+                ["sudo", "-n", "sh", "-c",
+                 "echo 3 > /proc/sys/vm/drop_caches && echo 1 > /proc/sys/vm/compact_memory"],
+                timeout=5, capture_output=True,
+            )
+        except OSError:
+            pass
+
     async def start(self) -> None:
         await self._stop_server()
         await self._cleanup_stale_inference_processes()
+        self._compact_memory()
         binary = _find_llama_server()
         env = os.environ.copy()
         bin_dir = os.path.dirname(binary)
         env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
+        # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
+        # need physically contiguous pages for large allocations.
+        env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
 
         resolved_device = self._resolve_device()
         requested_ngl = self.gpu_layers if resolved_device == "cuda" else 0
@@ -314,8 +340,8 @@ class LlamaServerClient:
             str(self.port),
             "--parallel",
             "1",
-            "--no-kv-unified",
-            "--no-cont-batching",
+            "--no-mmap",
+            "--no-kv-offload",
             "-b",
             str(batch),
             "-ub",

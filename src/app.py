@@ -126,7 +126,7 @@ class OpenJetApp(App):
     async def _init_client(self) -> None:
         mem_cfg = self.cfg.get("memory_guard", {})
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
-        configured_gpu_layers = int(self.cfg.get("gpu_layers", 20))
+        configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
         self.client = LlamaServerClient(
             model=self.cfg["model"],
             context_window_tokens=configured_ctx,

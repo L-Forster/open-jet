@@ -1,6 +1,6 @@
 context_window_tokens: 4096
 device: cuda
-gpu_layers: 20
+gpu_layers: 99
 hardware_override: ''
 hardware_profile: auto
 logging:
