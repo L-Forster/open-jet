@@ -25,7 +25,8 @@ Static {
 }
 #chat-log {
     width: 100%;
-    height: 1fr;
+    height: auto;
+    max-height: 1fr;
     min-height: 0;
     overflow-y: auto;
     scrollbar-size: 0 0;
@@ -33,8 +34,9 @@ Static {
     color: #ffffff;
 }
 #prompt {
+    dock: bottom;
     height: 3;
-    margin: 0 2;
+    margin: 0 2 2 2;
     color: #ffffff;
 }
 #command-suggestions {
@@ -43,11 +45,13 @@ Static {
     color: #ffffff;
 }
 #token-counter {
+    dock: bottom;
     height: 1;
     margin: 0 2;
     color: #ffffff;
 }
 #utilization-bar {
+    dock: bottom;
     height: 1;
     margin: 0 2;
     color: #ffffff;

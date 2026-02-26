@@ -305,7 +305,7 @@ class OpenJetApp(App):
         await self.run_setup_command(log)
 
     def compose(self) -> ComposeResult:
-        yield RichLog(id="chat-log", wrap=True, markup=True)
+        yield RichLog(id="chat-log", wrap=True, markup=True, auto_scroll=True)
         yield Static("", id="assistant-status", classes="hidden")
         yield Static("", id="approval-bar", classes="hidden")
         yield Input(placeholder="> ", id="prompt")
