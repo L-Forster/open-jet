@@ -30,28 +30,33 @@ Static {
     min-height: 0;
     overflow-y: auto;
     scrollbar-size: 0 0;
-    padding: 0 2;
+    padding: 0 2 2 2;
     color: #ffffff;
 }
-#prompt {
+#bottom-stack {
     dock: bottom;
+    height: auto;
+    max-height: 8;
+    background: transparent;
+}
+#prompt {
     height: 3;
-    margin: 0 2 2 2;
+    margin: 0 2;
     color: #ffffff;
 }
 #command-suggestions {
     height: auto;
+    max-height: 3;
+    overflow-y: auto;
     margin: 0 2;
     color: #ffffff;
 }
 #token-counter {
-    dock: bottom;
     height: 1;
     margin: 0 2;
     color: #ffffff;
 }
 #utilization-bar {
-    dock: bottom;
     height: 1;
     margin: 0 2;
     color: #ffffff;

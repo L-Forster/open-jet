@@ -12,6 +12,7 @@ from rich.markup import escape
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.containers import Container
 from textual.screen import Screen
 from textual.worker import Worker, get_current_worker
 from textual.widgets import Input, RichLog, Static
@@ -308,10 +309,11 @@ class OpenJetApp(App):
         yield RichLog(id="chat-log", wrap=True, markup=True, auto_scroll=True)
         yield Static("", id="assistant-status", classes="hidden")
         yield Static("", id="approval-bar", classes="hidden")
-        yield Input(placeholder="> ", id="prompt")
-        yield Static("", id="command-suggestions", classes="hidden")
-        yield Static("", id="token-counter")
-        yield Static("", id="utilization-bar")
+        with Container(id="bottom-stack"):
+            yield Input(placeholder="> ", id="prompt")
+            yield Static("", id="utilization-bar")
+            yield Static("", id="token-counter")
+            yield Static("", id="command-suggestions", classes="hidden")
 
     def on_mount(self) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -687,7 +689,7 @@ class OpenJetApp(App):
         elif remaining <= 256:
             color = "yellow"
         else:
-            color = "dim"
+            color = "bright_white"
         counter.update(
             f"[{color}]tokens: {total}/{window} | prompt<= {budget.prompt_tokens} | remaining: {remaining}[/]"
         )
@@ -1164,6 +1166,7 @@ class OpenJetApp(App):
                 f"... ({len(result_for_context.splitlines()) - 20} more lines)[/]"
             )
         log.write("")
+        log.scroll_end(animate=False)
         self.agent.complete_tool_call(tc, result_for_context)
         self.persist_session_state(reason=f"tool_result:{tc.name}")
 
