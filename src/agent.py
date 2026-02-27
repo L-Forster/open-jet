@@ -1,4 +1,4 @@
-"""Agent loop: manages conversation, calls llama-server, handles tool proposals."""
+"""Agent loop: manages conversation, calls runtime, handles tool proposals."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import AsyncIterator
 
-from .llama_server import LlamaServerClient, ToolCall
+from .llama_server import ToolCall
+from .runtime_client import RuntimeClient
 from .runtime_limits import ContextBudget, derive_context_budget, estimate_tokens, read_memory_snapshot
 
 
@@ -33,11 +34,11 @@ CONFIRM_TOOLS = {"shell", "write_file", "edit_file"}
 
 
 class Agent:
-    """Manages conversation history and drives the llama-server chat loop."""
+    """Manages conversation history and drives the chat loop."""
 
     def __init__(
         self,
-        client: LlamaServerClient,
+        client: RuntimeClient,
         system_prompt: str,
         *,
         context_window_tokens: int | None = None,

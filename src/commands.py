@@ -23,7 +23,7 @@ class SlashCommandHandler:
         CommandSpec(name="exit", description="Quit the app", aliases=("quit",)),
         CommandSpec(
             name="clear",
-            description="Clear chat and restart llama-server (flush KV cache)",
+            description="Clear chat and restart runtime (flush KV cache)",
             aliases=("reset",),
         ),
         CommandSpec(
@@ -134,7 +134,7 @@ class SlashCommandHandler:
                 log.write("  [bold red]KV cache reset skipped: client unavailable.[/]")
                 kv_reset_ok = False
             else:
-                log.write("  [bold bright_white]Resetting llama-server to flush KV cache...[/]")
+                log.write("  [bold bright_white]Resetting runtime to flush KV cache...[/]")
                 try:
                     await self.app.client.reset_kv_cache()
                     log.write("  [bold bright_white]KV cache reset complete.[/]")

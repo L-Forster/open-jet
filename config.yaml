@@ -3,6 +3,7 @@ device: cuda
 gpu_layers: 99
 hardware_override: ''
 hardware_profile: auto
+llama_model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 logging:
   directory: session_logs
   enabled: true
@@ -18,6 +19,7 @@ model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 model_source: local
 ollama_model: gemma2:2b
 recommended_llm: gemma2:2b
+runtime: llama_cpp
 setup_complete: true
 state:
   auto_resume: false
@@ -33,3 +35,6 @@ system_prompt: 'AI assistant on a Jetson edge device with filesystem access.
   Act directly with tools. Be concise. Never chain destructive commands.
 
   '
+trtllm_backend: pytorch
+trtllm_model: /home/louis/models/Qwen3-4B-Instruct-2507-unsloth-bnb-4bit
+trtllm_trust_remote_code: true

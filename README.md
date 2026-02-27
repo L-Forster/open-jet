@@ -106,7 +106,7 @@ It then saves your configuration and starts the runtime.
 
 - `/help` show commands
 - `/exit` quit app
-- `/clear` clear chat and restart `llama-server`
+- `/clear` clear chat and restart runtime (flush KV cache)
 - `/clear-chat` clear chat only
 - `/status` show context/RAM status
 - `/condense` condense older context
@@ -122,9 +122,42 @@ Main settings are stored in `config.yaml`, including:
 - logging settings
 - session state/resume settings
 
+### TensorRT-LLM (PyTorch runtime) with Qwen
+
+`open-jet` can run against `trtllm-serve` instead of `llama-server`.
+
+1. Install TensorRT-LLM so `trtllm-serve` is on your `PATH`.
+2. Set your config to use the TensorRT-LLM runtime.
+
+Example `config.yaml` values:
+
+```yaml
+runtime: trtllm_pytorch
+model: Qwen/Qwen2.5-7B-Instruct
+trtllm_backend: pytorch
+trtllm_trust_remote_code: true
+# optional: pass a trtllm-serve YAML file
+# trtllm_config_path: /home/you/qwen-fast.yml
+context_window_tokens: 4096
+gpu_layers: 0
+```
+
+When `runtime` is `trtllm_pytorch`, `open-jet` launches:
+
+```bash
+trtllm-serve <model> --backend pytorch --host 127.0.0.1 --port 8080
+```
+
+and then connects through the same OpenAI-compatible chat API path.
+
 ## Logging and Session State
 
 When enabled:
 - session events are written to `session_logs/*.events.jsonl`
 - system metrics are written to `session_logs/*.metrics.jsonl`
 - conversation state is saved to `session_state.json`
+
+## Contact
+
+- Website: https://www.openjet.dev/
+- X: https://x.com/flouislf

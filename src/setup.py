@@ -44,6 +44,25 @@ def discover_model_files() -> list[str]:
     return sorted(found)
 
 
+def discover_trt_model_dirs() -> list[str]:
+    roots = [
+        Path.cwd(),
+        Path.cwd() / "models",
+        Path.home() / "models",
+    ]
+    found: set[str] = set()
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        for path in root.iterdir():
+            if not path.is_dir():
+                continue
+            # Typical HF local checkpoints include config + tokenizer files.
+            if (path / "config.json").is_file() and (path / "tokenizer_config.json").is_file():
+                found.add(str(path.resolve()))
+    return sorted(found)
+
+
 def estimate_model_params_b_from_text(text: str) -> float | None:
     src = text.strip().lower()
     if not src:
@@ -163,8 +182,16 @@ class SetupScreen(ModalScreen[dict]):
         hardware_override_rows: list[tuple[str, str]] = [
             (label, key) for key, label, _ram in JETSON_OVERRIDE_OPTIONS
         ]
+        runtime_rows: list[tuple[str, str]] = [
+            ("llama.cpp (GGUF)", "llama_cpp"),
+            ("TensorRT-LLM (PyTorch runtime)", "trtllm_pytorch"),
+        ]
         local_model_rows: list[tuple[str, str]] = [(Path(model).name, model) for model in self.model_options]
         local_model_rows.append(("Manual path", "__manual__"))
+        trt_model_rows: list[tuple[str, str]] = [
+            (Path(model).name, model) for model in discover_trt_model_dirs()
+        ]
+        trt_model_rows.append(("Manual path or HF model id", "__manual__"))
         context_rows = [
             (f"{value} (recommended)" if value == self.recommended_ctx else str(value), value)
             for value in context_window_options(self.recommended_ctx)
@@ -173,8 +200,10 @@ class SetupScreen(ModalScreen[dict]):
         self._steps = [
             {"key": "hardware", "title": "Hardware Detection", "options": hardware_rows},
             {"key": "hardware_override", "title": "Hardware Override", "options": hardware_override_rows},
+            {"key": "runtime", "title": "Runtime", "options": runtime_rows},
             {"key": "model_plan", "title": "Model Source", "options": []},
             {"key": "local_model", "title": "Local Model File", "options": local_model_rows},
+            {"key": "trt_model", "title": "TensorRT Model", "options": trt_model_rows},
             {"key": "context_window_tokens", "title": "Context Size", "options": context_rows},
             {"key": "gpu_layers", "title": "GPU Offload", "options": []},
         ]
@@ -182,7 +211,9 @@ class SetupScreen(ModalScreen[dict]):
         defaults = {
             "hardware": "auto",
             "hardware_override": hardware_override_rows[0][1] if hardware_override_rows else "",
+            "runtime": "llama_cpp",
             "local_model": local_model_rows[0][1] if local_model_rows else "__manual__",
+            "trt_model": trt_model_rows[0][1] if trt_model_rows else "__manual__",
             "context_window_tokens": self.recommended_ctx,
         }
         for step in self._steps:
@@ -201,6 +232,8 @@ class SetupScreen(ModalScreen[dict]):
         manual_input = self.query_one("#setup-model-path", Input)
         if self.model_options:
             manual_input.value = self.model_options[0]
+        elif trt_model_rows:
+            manual_input.value = trt_model_rows[0][1]
         self._sync_dynamic_steps()
 
     def _step_by_key(self, key: str) -> dict | None:
@@ -211,6 +244,9 @@ class SetupScreen(ModalScreen[dict]):
 
     def _selected_hardware_override(self) -> str:
         return str(self._selections.get("hardware_override", ""))
+
+    def _selected_runtime(self) -> str:
+        return str(self._selections.get("runtime", "llama_cpp"))
 
     def _effective_hardware(self) -> HardwareInfo:
         return effective_hardware_info(
@@ -242,6 +278,7 @@ class SetupScreen(ModalScreen[dict]):
         model_step = self._step_by_key("model_plan")
         if not model_step:
             return
+        # TRT runtime branch temporarily disabled.
         old_value = self._selections.get("model_plan")
         max_b = recommended_param_budget_b(
             self._selected_hardware_profile(),
@@ -291,6 +328,13 @@ class SetupScreen(ModalScreen[dict]):
     def _is_step_enabled(self, key: str) -> bool:
         if key == "hardware_override":
             return str(self._selections.get("hardware", "auto")) == "other"
+        # TRT runtime temporarily disabled — always use llama.cpp / GGUF.
+        if key == "runtime":
+            return False
+        if key == "trt_model":
+            return False
+        if key == "model_plan":
+            return True
         if key == "local_model":
             return str(self._selections.get("model_plan", "")) == "__local__"
         return True
@@ -352,7 +396,15 @@ class SetupScreen(ModalScreen[dict]):
 
         manual_label = self.query_one("#setup-model-path-label", Static)
         manual_input = self.query_one("#setup-model-path", Input)
-        show_manual = key == "local_model" and self._selections.get("local_model") == "__manual__"
+        show_manual = False
+        if key == "local_model" and self._selections.get("local_model") == "__manual__":
+            show_manual = True
+            manual_label.update("Manual model path (.gguf):")
+            manual_input.placeholder = "/path/to/model.gguf"
+        elif key == "trt_model" and self._selections.get("trt_model") == "__manual__":
+            show_manual = True
+            manual_label.update("TensorRT model path or HF model id:")
+            manual_input.placeholder = "/path/to/model-dir or org/model"
         if show_manual:
             manual_label.remove_class("hidden")
             manual_input.remove_class("hidden")
@@ -371,7 +423,7 @@ class SetupScreen(ModalScreen[dict]):
         options = list(step["options"])
         self._indices[key] = (self._indices[key] + 1) % len(options)
         self._selections[key] = options[self._indices[key]][1]
-        if key in {"hardware", "hardware_override"}:
+        if key in {"hardware", "hardware_override", "runtime"}:
             self._sync_dynamic_steps()
         self._render_step()
 
@@ -381,7 +433,7 @@ class SetupScreen(ModalScreen[dict]):
         options = list(step["options"])
         self._indices[key] = (self._indices[key] - 1) % len(options)
         self._selections[key] = options[self._indices[key]][1]
-        if key in {"hardware", "hardware_override"}:
+        if key in {"hardware", "hardware_override", "runtime"}:
             self._sync_dynamic_steps()
         self._render_step()
 
@@ -430,6 +482,8 @@ class SetupScreen(ModalScreen[dict]):
 
     def action_save(self) -> None:
         self.ollama_cli = find_ollama_cli()
+        # TRT runtime temporarily disabled — always use llama_cpp.
+        runtime = "llama_cpp"
         model_plan = str(self._selections.get("model_plan", ""))
         model_source = "local" if model_plan == "__local__" else "ollama"
         profile = self._selected_hardware_profile()
@@ -437,6 +491,7 @@ class SetupScreen(ModalScreen[dict]):
         device = recommended_device_for_hardware(profile, self.hardware_info, override_key)
         hw = self._effective_hardware()
         payload: dict[str, object] = {
+            "runtime": runtime,
             "model_source": model_source,
             "hardware_profile": profile,
             "hardware_override": override_key if profile == "other" else "",
@@ -465,6 +520,7 @@ class SetupScreen(ModalScreen[dict]):
                 self._set_error("Model file must end with .gguf.")
                 return
             payload["model"] = str(model_file)
+            payload["llama_model"] = str(model_file)
 
         context_value = int(self._selections.get("context_window_tokens", self.recommended_ctx))
         if context_value < 512:
@@ -497,6 +553,12 @@ class SetupScreen(ModalScreen[dict]):
         if isinstance(selected, str) and selected != "__local__":
             return selected
         return ""
+
+    def _selected_trt_model(self) -> str:
+        selected = self._selections.get("trt_model")
+        if isinstance(selected, str) and selected != "__manual__":
+            return selected
+        return self.query_one("#setup-model-path", Input).value.strip()
 
     def _selected_params_b(self) -> float | None:
         model_plan = str(self._selections.get("model_plan", ""))
@@ -542,6 +604,10 @@ class SetupScreen(ModalScreen[dict]):
             if value == "__manual__":
                 return "enter full path"
             return "detected file"
+        if key == "trt_model":
+            if value == "__manual__":
+                return "path or HF model id"
+            return "detected checkpoint"
         if key == "context_window_tokens":
             if value == self._recommended_context_for_current_hardware():
                 return "best default"
@@ -555,6 +621,8 @@ class SetupScreen(ModalScreen[dict]):
             return "Pick auto-detected hardware or switch to manual."
         if key == "hardware_override":
             return "Select the closest Jetson and RAM profile."
+        if key == "runtime":
+            return "Choose inference backend runtime."
         if key == "model_plan":
             if not self.ollama_cli:
                 return "Choose local file, or install Ollama to enable downloads."
@@ -563,6 +631,8 @@ class SetupScreen(ModalScreen[dict]):
             return "Choose local file, installed Ollama model, or download."
         if key == "local_model":
             return "Select a detected .gguf or enter a path."
+        if key == "trt_model":
+            return "Select a local checkpoint dir or enter a HF model id/path."
         if key == "context_window_tokens":
             return "Set context size."
         if key == "gpu_layers":
