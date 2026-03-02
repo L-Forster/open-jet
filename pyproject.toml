@@ -30,8 +30,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://web-open-jet.vercel.app/"
-Website = "https://web-open-jet.vercel.app/"
+Homepage = "https://openjet.dev/"
+Website = "https://openjet.dev/"
 Repository = "https://github.com/louis/open-jet"
 Issues = "https://github.com/louis/open-jet/issues"
 
