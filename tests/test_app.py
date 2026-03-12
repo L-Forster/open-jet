@@ -17,6 +17,13 @@ class FakeAgent:
         return 256
 
 
+class FakeReasoningClient:
+    context_window_tokens = 4096
+
+    def reasoning_status(self) -> str:
+        return "on"
+
+
 class AppStatusTests(unittest.TestCase):
     def test_format_command_status_label_compacts_and_truncates(self) -> None:
         label = OpenJetApp._format_command_status_label(
@@ -38,3 +45,13 @@ class AppStatusTests(unittest.TestCase):
         self.assertTrue(snapshot["command_in_progress"])
         self.assertEqual(snapshot["active_command"], "pytest tests/test_app.py")
         self.assertFalse(snapshot["generating"])
+
+    def test_runtime_status_snapshot_reports_reasoning_mode(self) -> None:
+        app = OpenJetApp()
+        app.agent = FakeAgent()
+        app.client = FakeReasoningClient()
+
+        with patch("src.app.read_memory_snapshot", return_value=None):
+            snapshot = app.runtime_status_snapshot()
+
+        self.assertEqual(snapshot["reasoning_mode"], "on")

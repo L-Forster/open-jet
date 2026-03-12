@@ -14,6 +14,13 @@ Screen {
 Vertical {
     background: transparent;
 }
+#app-shell {
+    width: 100%;
+    height: auto;
+    layout: vertical;
+    overflow: hidden;
+    background: transparent;
+}
 RichLog {
     background: transparent;
 }
@@ -30,13 +37,18 @@ Static {
     min-height: 0;
     overflow-y: auto;
     scrollbar-size: 0 0;
-    padding: 0 2 2 2;
+    padding: 0 2 1 2;
     color: #ffffff;
 }
 #bottom-stack {
-    dock: bottom;
+    width: 100%;
     height: auto;
-    max-height: 8;
+    min-height: 4;
+    max-height: 10;
+    layout: vertical;
+    overflow: hidden;
+    border-top: solid #4a4a4a;
+    padding: 1 0 0 0;
     background: transparent;
 }
 #prompt {

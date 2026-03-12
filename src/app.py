@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -41,7 +42,6 @@ from .harness import (
     active_step,
     advance_step,
     allowed_tools_for_mode,
-    append_memory_entry,
     available_skill_names,
     build_turn_context,
     clear_preferred_skills,
@@ -69,6 +69,7 @@ from .multimodal import (
     is_supported_message_content,
 )
 from .ollama_setup import discover_installed_ollama_models, materialize_setup_model
+from .persistent_memory import build_system_prompt
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
 from .runtime_registry import active_model_ref, create_runtime_client
@@ -167,6 +168,30 @@ class PromptInput(Input):
         super().action_paste()
 
 
+class HistoryLog(RichLog):
+    def write(
+        self,
+        content,
+        width=None,
+        expand: bool = False,
+        shrink: bool = True,
+        scroll_end: bool | None = None,
+        animate: bool = False,
+    ):
+        pinned_to_bottom = self.is_vertical_scroll_end or self.max_scroll_y <= 0
+        super().write(
+            content,
+            width=width,
+            expand=expand,
+            shrink=shrink,
+            scroll_end=False,
+            animate=animate,
+        )
+        if scroll_end is True or (scroll_end is None and pinned_to_bottom):
+            self.scroll_end(animate=False)
+        return self
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -177,6 +202,10 @@ class OpenJetApp(App):
     BINDINGS = [
         Binding("ctrl+c", "quit", "Quit"),
         Binding("escape", "stop_generation", "Stop"),
+        Binding("pageup", "history_page_up", "History Up", show=False),
+        Binding("pagedown", "history_page_down", "History Down", show=False),
+        Binding("home", "history_home", "History Home", show=False),
+        Binding("end", "history_end", "History End", show=False),
     ]
 
     def __init__(self, *, force_setup: bool = False) -> None:
@@ -331,7 +360,7 @@ class OpenJetApp(App):
             save_config(self.cfg)
         self.agent = Agent(
             client=self.client,
-            system_prompt=self.cfg.get("system_prompt", ""),
+            system_prompt=await build_system_prompt(str(self.cfg.get("system_prompt", "")), Path.cwd()),
             context_window_tokens=self.client.context_window_tokens,
             context_reserved_tokens=(
                 int(mem_cfg["context_reserved_tokens"])
@@ -494,14 +523,15 @@ class OpenJetApp(App):
         await self.run_setup_command(log)
 
     def compose(self) -> ComposeResult:
-        yield RichLog(id="chat-log", wrap=True, markup=True, auto_scroll=True)
-        yield Static("", id="assistant-status", classes="hidden")
-        yield Static("", id="approval-bar", classes="hidden")
-        with Container(id="bottom-stack"):
-            yield PromptInput(placeholder="> ", id="prompt")
-            yield Static("", id="utilization-bar")
-            yield Static("", id="token-counter")
-            yield Static("", id="command-suggestions", classes="hidden")
+        with Container(id="app-shell"):
+            yield HistoryLog(id="chat-log", wrap=True, markup=True, auto_scroll=False)
+            with Container(id="bottom-stack"):
+                yield Static("", id="assistant-status", classes="hidden")
+                yield Static("", id="approval-bar", classes="hidden")
+                yield Static("", id="command-suggestions", classes="hidden")
+                yield Static("", id="token-counter")
+                yield Static("", id="utilization-bar")
+                yield PromptInput(placeholder="> ", id="prompt")
 
     def on_mount(self) -> None:
         log = self.query_one("#chat-log", RichLog)
@@ -600,7 +630,22 @@ class OpenJetApp(App):
             await self.client.close()
         if self.session_logger:
             await self.session_logger.stop()
+        if self.is_inline:
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
         self.exit()
+
+    def action_history_page_up(self) -> None:
+        self.query_one("#chat-log", RichLog).scroll_page_up(animate=False)
+
+    def action_history_page_down(self) -> None:
+        self.query_one("#chat-log", RichLog).scroll_page_down(animate=False)
+
+    def action_history_home(self) -> None:
+        self.query_one("#chat-log", RichLog).scroll_home(animate=False)
+
+    def action_history_end(self) -> None:
+        self.query_one("#chat-log", RichLog).scroll_end(animate=False)
 
     def on_key(self, event: events.Key) -> None:
         if self._awaiting_approval:
@@ -1057,12 +1102,19 @@ class OpenJetApp(App):
         remaining = max(0, budget.prompt_tokens - current)
         mem = read_memory_snapshot()
         active = active_step(self.harness_state)
+        reasoning_mode = None
+        if self.client and hasattr(self.client, "reasoning_status"):
+            try:
+                reasoning_mode = getattr(self.client, "reasoning_status")()
+            except Exception:
+                reasoning_mode = None
         return {
             "ready": True,
             "messages": self.agent.conversation_message_count(),
             "generating": self._thinking_timer is not None,
             "command_in_progress": self._assistant_status_kind == "command",
             "active_command": self._assistant_status_command,
+            "reasoning_mode": reasoning_mode,
             "context_tokens": current,
             "context_window_tokens": window,
             "prompt_budget_tokens": budget.prompt_tokens,
@@ -1333,54 +1385,6 @@ class OpenJetApp(App):
         self.persist_session_state(reason="harness_step_split")
         self._render_token_counter()
 
-    def _append_harness_memory(
-        self,
-        previous_state: HarnessState,
-        current_state: HarnessState,
-        *,
-        tool_events: list[dict],
-        assistant_text: str,
-    ) -> None:
-        root = Path.cwd()
-        prev_active = active_step(previous_state)
-        curr_active = active_step(current_state)
-        if prev_active and prev_active.status != "done":
-            now_done = next((step for step in current_state.plan if step.id == prev_active.id and step.status == "done"), None)
-            if now_done:
-                append_memory_entry(
-                    root,
-                    "session.md",
-                    [
-                        f"- completed_step: {prev_active.title}",
-                        f"- mode: {current_state.mode}",
-                        f"- files: {', '.join(prev_active.files) if prev_active.files else 'n/a'}",
-                        f"- next: {curr_active.title if curr_active else 'n/a'}",
-                    ],
-                )
-        verification = current_state.last_verification
-        if verification.get("status") == "fail":
-            append_memory_entry(
-                root,
-                "failures.md",
-                [
-                    f"- mode: {current_state.mode}",
-                    f"- step: {prev_active.title if prev_active else 'n/a'}",
-                    f"- pattern: verification failed",
-                    f"- detail: {verification.get('summary', 'n/a')}",
-                    f"- command: {verification.get('command', 'n/a')}",
-                ],
-            )
-        if any(token in current_state.goal.lower() for token in ("architecture", "design", "harness")) and tool_events:
-            append_memory_entry(
-                root,
-                "decisions.md",
-                [
-                    f"- goal: {current_state.goal}",
-                    f"- last_action: {current_state.last_action.get('summary', 'n/a')}",
-                    f"- verification: {verification.get('status', 'not_run')}",
-                ],
-            )
-
     # -- Agent turn ----------------------------------------------------------
 
     def _start_agent_turn(self, recovery_attempted: bool = False) -> None:
@@ -1544,24 +1548,20 @@ class OpenJetApp(App):
                     self.agent.complete_tool_call(tc, f"Tool execution failed: {exc}")
 
         if pending_tool_calls:
-            previous_state = HarnessState.from_dict(self.harness_state.to_dict())
             self.harness_state = update_state_after_turn(
                 self.harness_state,
                 tool_events=tool_events,
                 assistant_text=assistant_turn_text,
             )
-            self._append_harness_memory(previous_state, self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
             self.persist_harness_state()
             self.persist_session_state(reason="assistant_turn_with_tools")
             self._start_agent_turn()
         else:
-            previous_state = HarnessState.from_dict(self.harness_state.to_dict())
             self.harness_state = update_state_after_turn(
                 self.harness_state,
                 tool_events=tool_events,
                 assistant_text=assistant_turn_text,
             )
-            self._append_harness_memory(previous_state, self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
             self.persist_harness_state()
             self.persist_session_state(reason="assistant_turn_done")
             self._finish_turn_trace(success=True, status="completed")
@@ -1886,6 +1886,10 @@ class OpenJetApp(App):
         if tc.name == "edit_file":
             path = str(tc.arguments.get("path", "")).strip()
             return f"edit_file -> {escape(path)}"
+        if tc.name == "memory":
+            scope = str(tc.arguments.get("scope", "")).strip()
+            action = str(tc.arguments.get("action", "")).strip()
+            return f"memory -> {escape(action)} {escape(scope)}".strip()
         if tc.name == "shell":
             command = str(tc.arguments.get("command", "")).strip()
             if len(command) > 120:
@@ -1930,6 +1934,15 @@ class OpenJetApp(App):
             lines.extend(f"  {escape(l)}" for l in old_s.split("\n"))
             lines.append("new_string:")
             lines.extend(f"  {escape(l)}" for l in new_s.split("\n"))
+            return lines
+        if tc.name == "memory":
+            scope = str(tc.arguments.get("scope", "")).strip()
+            action = str(tc.arguments.get("action", "")).strip()
+            content = str(tc.arguments.get("content", ""))
+            lines = [f"scope: {scope}", f"action: {action}"]
+            if content:
+                lines.append("content:")
+                lines.extend(f"  {escape(line)}" for line in content.split("\n"))
             return lines
         return [str(format_tool_args(tc))]
 
