@@ -1,0 +1,14 @@
+{
+  "case_id": "manufacturing_threshold_grep",
+  "description": "Find threshold logic in an inspection pipeline repo.",
+  "prompt": "Use grep to find every occurrence of DEFECT_SCORE_THRESHOLD and report the matching files. Do not use shell.",
+  "template_dir": "manufacturing_inspection_pipeline",
+  "mode": "chat",
+  "allowed_tools": ["grep"],
+  "tags": ["manufacturing", "search", "tool"],
+  "expectations": [
+    {"kind": "tool_used", "target": "grep"},
+    {"kind": "assistant_contains", "value": "src/scoring.py"},
+    {"kind": "assistant_contains", "value": "configs/inspection.yaml"}
+  ]
+}

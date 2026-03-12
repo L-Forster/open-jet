@@ -8,6 +8,7 @@ It provides:
 - slash commands for session control
 - first-run setup for model/runtime configuration
 - optional session logging and resume
+- a Python SDK for driving the agent backend without the TUI
 
 ## Requirements
 
@@ -81,6 +82,48 @@ Optional setup screen on launch:
 
 ```bash
 open-jet --setup
+```
+
+## Python SDK
+
+`open-jet` also exposes a programmatic session API so you can drive the same agent backend from your own scripts.
+
+```python
+import asyncio
+
+from src import OpenJetSession
+
+
+async def main() -> None:
+    session = await OpenJetSession.create()
+    try:
+        response = await session.run("Summarize the current README")
+        print(response.text)
+
+        async for event in session.stream("Inspect README.md with tools if needed"):
+            if event.text:
+                print(event.text, end="")
+            if event.tool_result:
+                print(f"\n[{event.tool_result.tool_call.name}] {event.tool_result.output}")
+    finally:
+        await session.close()
+
+
+asyncio.run(main())
+```
+
+Tools that mutate state or run shell commands require an approval handler:
+
+```python
+session = await OpenJetSession.create(
+    approval_handler=lambda tool_call: tool_call.name == "shell"
+)
+```
+
+You can also restrict the tool surface for embedded use:
+
+```python
+session = await OpenJetSession.create(allowed_tools={"read_file", "load_file", "grep"})
 ```
 
 ## First-Run Setup

@@ -36,6 +36,10 @@ class SlashCommandHandler:
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
+        CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]"),
+        CommandSpec(name="skills", description="Show or clear selected harness skills: /skills [status|list|clear]"),
+        CommandSpec(name="skill", description="Pin one or more harness skills: /skill <name[,name...]>"),
+        CommandSpec(name="step", description="Inspect or control the active step: /step [status|next|split]"),
         CommandSpec(
             name="util",
             description="Show/hide utilization line: /util [show|hide|toggle|status]",
@@ -92,6 +96,18 @@ class SlashCommandHandler:
         if cmd == "setup":
             await self._setup(log)
             return True
+        if cmd == "mode":
+            self._mode(log, arg)
+            return True
+        if cmd == "skills":
+            self._skills(log, arg)
+            return True
+        if cmd == "skill":
+            self._skill(log, arg)
+            return True
+        if cmd == "step":
+            self._step(log, arg)
+            return True
         if cmd == "util":
             self._util(log, arg)
             return True
@@ -123,7 +139,11 @@ class SlashCommandHandler:
             return
 
         self.app.agent.reset_conversation()
+        self.app.agent.clear_turn_context()
         self.app.loaded_files.clear()
+        self.app.harness_state = type(self.app.harness_state)()
+        self.app._turn_context_docs = []
+        self.app._turn_context_tokens = 0
         log.clear()
         log.write(self.banner)
         log.write("  [bold bright_white]Conversation history cleared.[/]")
@@ -150,6 +170,7 @@ class SlashCommandHandler:
                 reset_kv_cache=reset_kv_cache,
                 kv_reset_ok=kv_reset_ok,
             )
+        self.app.persist_harness_state()
         self.app.persist_session_state(reason="clear_command")
 
     def _status(self, log: RichLog) -> None:
@@ -183,6 +204,21 @@ class SlashCommandHandler:
                 f"({used_percent:.1f}% used)"
                 "[/]"
             )
+        if snapshot.get("harness_mode"):
+            log.write(
+                "[bold bright_white]"
+                f"Harness: mode={snapshot['harness_mode']} | "
+                f"active_step={snapshot.get('harness_active_step') or 'n/a'} | "
+                f"docs={snapshot.get('harness_doc_tokens', 0)}t"
+                "[/]"
+            )
+            docs = snapshot.get("harness_docs") or []
+            if docs:
+                log.write(
+                    "[bold bright_white]"
+                    f"Loaded harness docs: {', '.join(str(doc) for doc in docs)}"
+                    "[/]"
+                )
         log.write("")
 
     async def _condense(self, log: RichLog) -> None:
@@ -258,6 +294,80 @@ class SlashCommandHandler:
             log.write("  [bold bright_white]No previous session state found.[/]")
         log.write("")
         self.app.refresh_token_counter()
+
+    def _mode(self, log: RichLog, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        if not arg or arg == "status":
+            log.write(f"[bold bright_white]Harness mode: {self.app.harness_state.mode}[/]")
+            log.write("")
+            return
+        if arg not in {"chat", "code", "review", "debug"}:
+            log.write("[yellow]Usage:[/] /mode [chat|code|review|debug|status]")
+            log.write("")
+            return
+        self.app.set_harness_mode(arg)
+        log.write(f"[bold bright_white]Harness mode set to {arg}.[/]")
+        log.write("")
+
+    def _skills(self, log: RichLog, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        if not arg or arg == "status":
+            selected = self.app.harness_state.preferred_skills
+            available = ", ".join(self.app.available_harness_skills()) or "none"
+            log.write(
+                "[bold bright_white]"
+                f"Selected skills: {', '.join(selected) if selected else 'none'}"
+                "[/]"
+            )
+            log.write(f"[bold bright_white]Available skills: {available}[/]")
+            log.write("")
+            return
+        if arg == "list":
+            available = self.app.available_harness_skills()
+            log.write(f"[bold bright_white]Available skills: {', '.join(available) if available else 'none'}[/]")
+            log.write("")
+            return
+        if arg == "clear":
+            self.app.clear_harness_skills()
+            log.write("[bold bright_white]Selected harness skills cleared.[/]")
+            log.write("")
+            return
+        log.write("[yellow]Usage:[/] /skills [status|list|clear]")
+        log.write("")
+
+    def _skill(self, log: RichLog, raw_arg: str) -> None:
+        names = [part.strip() for part in raw_arg.split(",") if part.strip()]
+        if not names:
+            log.write("[yellow]Usage:[/] /skill <name[,name...]>")
+            log.write("")
+            return
+        applied, missing = self.app.set_harness_skills(names)
+        if applied:
+            log.write(f"[bold bright_white]Selected skills: {', '.join(applied)}[/]")
+        if missing:
+            log.write(f"[yellow]Unknown skills:[/] {', '.join(missing)}")
+        log.write("")
+
+    def _step(self, log: RichLog, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        if not arg or arg == "status":
+            active = self.app.harness_active_step()
+            log.write(f"[bold bright_white]Active step: {active or 'n/a'}[/]")
+            log.write(f"[bold bright_white]Next action: {self.app.harness_state.next_action or 'n/a'}[/]")
+            log.write("")
+            return
+        if arg == "next":
+            self.app.advance_harness_step()
+            log.write("[bold bright_white]Advanced to the next step.[/]")
+            log.write("")
+            return
+        if arg == "split":
+            self.app.split_harness_step()
+            log.write("[bold bright_white]Split the active step into smaller turns.[/]")
+            log.write("")
+            return
+        log.write("[yellow]Usage:[/] /step [status|next|split]")
+        log.write("")
 
     def _util(self, log: RichLog, raw_arg: str) -> None:
         action = raw_arg.strip().lower()

@@ -1,0 +1,14 @@
+{
+  "case_id": "manufacturing_edit_threshold",
+  "description": "Adjust a defect threshold in a realistic inspection stack.",
+  "prompt": "Use edit_file to change DEFECT_SCORE_THRESHOLD from 0.82 to 0.87 in src/scoring.py, then report the new threshold.",
+  "template_dir": "manufacturing_inspection_pipeline",
+  "mode": "code",
+  "allowed_tools": ["edit_file"],
+  "tags": ["manufacturing", "write", "tool"],
+  "expectations": [
+    {"kind": "tool_used", "target": "edit_file"},
+    {"kind": "file_contains", "target": "src/scoring.py", "value": "DEFECT_SCORE_THRESHOLD = 0.87"},
+    {"kind": "assistant_contains", "value": "0.87"}
+  ]
+}

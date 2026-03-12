@@ -61,6 +61,7 @@ class Agent:
         self.memory_check_interval_chunks = max(1, int(memory_check_interval_chunks))
         self.condense_target_tokens = condense_target_tokens
         self.keep_last_messages = keep_last_messages
+        self.turn_context_messages: list[dict] = []
 
     def add_user_message(self, text: str) -> None:
         self.messages.append({"role": "user", "content": text})
@@ -72,7 +73,10 @@ class Agent:
         return max(0, len(self.messages) - 1)
 
     def estimated_context_tokens(self) -> int:
-        return self._estimated_context_tokens()
+        return self._estimated_context_tokens(include_turn_context=True)
+
+    def persistent_context_tokens(self) -> int:
+        return self._estimated_context_tokens(include_turn_context=False)
 
     def context_budget(self) -> ContextBudget | None:
         if not self.context_window_tokens:
@@ -106,7 +110,7 @@ class Agent:
         chunk_count = 0
 
         try:
-            async for chunk in self.client.chat_stream(self.messages):
+            async for chunk in self.client.chat_stream(self.messages + self.turn_context_messages):
                 chunk_count += 1
                 if chunk.text:
                     collected_text += chunk.text
@@ -176,7 +180,7 @@ class Agent:
         if len(self.messages) <= 1:
             return "No message history to condense."
 
-        total_before = self._estimated_context_tokens()
+        total_before = self._estimated_context_tokens(include_turn_context=True)
         original_messages = len(self.messages)
         history = self.messages[1:]
         transcript = self._history_as_text(history)
@@ -197,7 +201,7 @@ class Agent:
         }
         self.messages = [self.messages[0], summary_msg]
 
-        total_after = self._estimated_context_tokens()
+        total_after = self._estimated_context_tokens(include_turn_context=True)
         if total_after >= total_before:
             tighter_target = max(64, target_tokens // 2)
             try:
@@ -215,7 +219,7 @@ class Agent:
                         ),
                     },
                 ]
-                total_after = self._estimated_context_tokens()
+                total_after = self._estimated_context_tokens(include_turn_context=True)
 
         return (
             "Context condensed automatically. "
@@ -223,11 +227,21 @@ class Agent:
             f"tokens(est): {total_before} -> {total_after}."
         )
 
-    def _estimated_context_tokens(self) -> int:
+    def set_turn_context(self, messages: list[dict]) -> None:
+        self.turn_context_messages = [msg for msg in messages if isinstance(msg, dict)]
+
+    def clear_turn_context(self) -> None:
+        self.turn_context_messages = []
+
+    def _estimated_context_tokens(self, *, include_turn_context: bool = True) -> int:
         total = 0
-        for msg in self.messages:
-            content = str(msg.get("content", ""))
-            total += estimate_tokens(content) + 8
+        message_sets = [self.messages]
+        if include_turn_context:
+            message_sets.append(self.turn_context_messages)
+        for batch in message_sets:
+            for msg in batch:
+                content = str(msg.get("content", ""))
+                total += estimate_tokens(content) + 8
         return total
 
     def _resource_pressure_reason(self) -> str | None:
@@ -240,7 +254,7 @@ class Agent:
         budget = self.context_budget()
         if not budget:
             return None
-        current = self._estimated_context_tokens()
+        current = self._estimated_context_tokens(include_turn_context=True)
         if current <= budget.prompt_tokens:
             return None
         return (

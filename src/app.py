@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import re
+import shlex
+import shutil
 import time
 from pathlib import Path
 
@@ -32,6 +35,24 @@ from .executor import (
     run_shell,
     write_file,
 )
+from .harness import (
+    HarnessSessionStore,
+    HarnessState,
+    active_step,
+    advance_step,
+    allowed_tools_for_mode,
+    append_memory_entry,
+    available_skill_names,
+    build_turn_context,
+    clear_preferred_skills,
+    normalize_skill_name,
+    set_mode,
+    set_preferred_skills,
+    shell_command_is_verification,
+    split_active_step,
+    update_state_after_turn,
+    update_state_for_user_message,
+)
 from .config import load_config, save_config
 from .hardware import (
     detect_hardware_info,
@@ -47,6 +68,7 @@ from .session_logging import SessionLogger
 from .session_state import SessionStateStore
 from .setup import ACCENT_GREEN, SetupScreen, discover_model_files
 from .system_metrics import SystemMetricsReader, format_hours
+from .tool_executor import execute_tool, format_tool_args
 
 
 def _format_error(exc: Exception) -> str:
@@ -54,6 +76,58 @@ def _format_error(exc: Exception) -> str:
     if text:
         return text
     return f"{type(exc).__name__} (no message)"
+
+
+_SHELL_BUILTINS = {
+    ".", ":", "alias", "bg", "bind", "break", "builtin", "caller", "cd", "command",
+    "compgen", "complete", "compopt", "continue", "declare", "dirs", "disown", "echo",
+    "enable", "eval", "exec", "exit", "export", "fc", "fg", "getopts", "hash", "help",
+    "history", "jobs", "kill", "let", "local", "logout", "mapfile", "popd", "printf",
+    "pushd", "pwd", "read", "readarray", "readonly", "return", "set", "shift", "shopt",
+    "source", "suspend", "test", "times", "trap", "type", "typeset", "ulimit", "umask",
+    "unalias", "unset", "wait",
+}
+
+
+def _classify_shell_command(command: str) -> dict[str, object]:
+    stripped = command.strip()
+    if not stripped:
+        return {
+            "primary_command": "",
+            "classified_verification": False,
+            "hallucinated_command": False,
+            "false_positive_proposal": True,
+            "classification_reason": "empty command",
+        }
+
+    try:
+        parts = shlex.split(stripped)
+    except ValueError:
+        parts = stripped.split()
+    primary = parts[0] if parts else ""
+    verification = shell_command_is_verification(stripped)
+    builtin = primary in _SHELL_BUILTINS
+    executable_found = builtin or bool(shutil.which(primary)) or "/" in primary
+    false_positive = False
+    reasons: list[str] = []
+
+    if primary in {"cat", "ls", "find", "grep"}:
+        false_positive = True
+        reasons.append("covered by dedicated tool")
+    if primary == "echo" and not verification:
+        false_positive = True
+        reasons.append("non-actionable shell proposal")
+
+    if not executable_found:
+        reasons.append("command not found on PATH")
+
+    return {
+        "primary_command": primary,
+        "classified_verification": verification,
+        "hallucinated_command": not executable_found,
+        "false_positive_proposal": false_positive,
+        "classification_reason": ", ".join(reasons) if reasons else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +168,24 @@ class OpenJetApp(App):
             path=Path(state_cfg.get("path", "session_state.json")),
             enabled=bool(state_cfg.get("enabled", True)),
         )
+        self.harness_store = HarnessSessionStore()
+        self.harness_state = HarnessState()
+        self._turn_context_docs: list[str] = []
+        self._turn_context_tokens = 0
         self.auto_resume = bool(state_cfg.get("auto_resume", False))
+        self._session_was_resumed = False
+        self._turn_counter = 0
+        self._active_turn_id: str | None = None
+        self._active_turn_started_at: float | None = None
+        self._active_turn_prompt = ""
+        self._active_turn_generation_tokens = 0
+        self._active_turn_tool_attempts = 0
+        self._active_turn_tool_successes = 0
+        self._active_turn_approval_requests = 0
+        self._active_turn_approval_grants = 0
+        self._active_turn_false_positive_commands = 0
+        self._active_turn_hallucinated_commands = 0
+        self._active_turn_recovered_after_resume = False
         self.loaded_files: dict[str, dict] = {}
         self._thinking_timer = None
         self._thinking_idx = 0
@@ -103,6 +194,7 @@ class OpenJetApp(App):
         self._approval_choice = 0
         self._approval_future: asyncio.Future[bool] | None = None
         self._approval_tool_call: ToolCall | None = None
+        self._approval_started_at: float | None = None
         self._generation_worker: Worker | None = None
         self.commands = SlashCommandHandler(self, banner=BANNER)
         self.completion = CompletionEngine(
@@ -127,6 +219,71 @@ class OpenJetApp(App):
 
     def _active_model_ref(self) -> str:
         return active_model_ref(self.cfg)
+
+    def _trace_runtime_context(self) -> dict[str, object]:
+        return {
+            "runtime": self.cfg.get("runtime", "llama_cpp"),
+            "model": self._active_model_ref(),
+            "device_profile": self.cfg.get("device", "auto"),
+            "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
+            "gpu_layers": self.cfg.get("gpu_layers", 0),
+            "host_arch": os.uname().machine if hasattr(os, "uname") else None,
+        }
+
+    def _begin_turn_trace(self, prompt: str) -> None:
+        self._turn_counter += 1
+        self._active_turn_id = f"turn-{int(time.time() * 1000)}-{self._turn_counter}"
+        self._active_turn_started_at = time.monotonic()
+        self._active_turn_prompt = prompt
+        self._active_turn_generation_tokens = 0
+        self._active_turn_tool_attempts = 0
+        self._active_turn_tool_successes = 0
+        self._active_turn_approval_requests = 0
+        self._active_turn_approval_grants = 0
+        self._active_turn_false_positive_commands = 0
+        self._active_turn_hallucinated_commands = 0
+        self._active_turn_recovered_after_resume = False
+        if self.session_logger:
+            self.session_logger.log_event(
+                "turn_start",
+                turn_id=self._active_turn_id,
+                goal=prompt,
+                mode=self.harness_state.mode,
+                resumed_session=self._session_was_resumed,
+                active_step=active.title if (active := active_step(self.harness_state)) else None,
+                files_in_play=self.harness_state.files_in_play,
+                **self._trace_runtime_context(),
+            )
+
+    def _finish_turn_trace(self, *, success: bool, status: str, error: str | None = None) -> None:
+        if not self._active_turn_id:
+            return
+        resolution_ms = None
+        if self._active_turn_started_at is not None:
+            resolution_ms = round((time.monotonic() - self._active_turn_started_at) * 1000.0, 2)
+        if self.session_logger:
+            self.session_logger.log_event(
+                "task_outcome",
+                turn_id=self._active_turn_id,
+                goal=self._active_turn_prompt,
+                success=success,
+                status=status,
+                error=error,
+                resolution_ms=resolution_ms,
+                generation_tokens=self._active_turn_generation_tokens,
+                tool_attempts=self._active_turn_tool_attempts,
+                tool_successes=self._active_turn_tool_successes,
+                approval_requests=self._active_turn_approval_requests,
+                approval_grants=self._active_turn_approval_grants,
+                false_positive_command_proposals=self._active_turn_false_positive_commands,
+                hallucinated_command_proposals=self._active_turn_hallucinated_commands,
+                recovered_after_resumed_session=self._active_turn_recovered_after_resume,
+                **self._trace_runtime_context(),
+            )
+        self._active_turn_id = None
+        self._active_turn_started_at = None
+        self._active_turn_prompt = ""
+        self._session_was_resumed = False
 
     def _has_any_configured_model(self) -> bool:
         return bool(self._active_model_ref())
@@ -396,19 +553,19 @@ class OpenJetApp(App):
             self.session_logger.log_event("llm_ready", model=active_model)
             self.session_logger.log_event(
                 "llm_runtime_config",
-                runtime=self.cfg.get("runtime", "llama_cpp"),
-                device=self.cfg.get("device", "auto"),
-                gpu_layers=self.cfg.get("gpu_layers", 20),
-                context_window_tokens=self.cfg.get("context_window_tokens", 2048),
+                **self._trace_runtime_context(),
             )
         log.write(f"  [bold bright_white]Ready.[/]")
         if self.auto_resume:
             self._restore_session_state(log)
+        self._restore_harness_state()
         log.write("")
         self._render_token_counter()
         prompt.focus()
 
     async def action_quit(self) -> None:
+        if self._active_turn_id:
+            self._finish_turn_trace(success=False, status="abandoned", error="application quit")
         self.persist_session_state(reason="quit")
         if self._utilization_timer:
             self._utilization_timer.stop()
@@ -575,9 +732,23 @@ class OpenJetApp(App):
 
         log.write(f"[bold green]> [/]{text}")
         log.write("")
-        if self.session_logger:
-            self.session_logger.log_event("user_message", text=text)
 
+        mentioned_files = _extract_file_mentions(text)
+        self.harness_state = update_state_for_user_message(
+            self.harness_state,
+            text,
+            files=mentioned_files,
+        )
+        self._begin_turn_trace(text)
+        self.persist_harness_state()
+        if self.session_logger:
+            self.session_logger.log_event(
+                "user_message",
+                turn_id=self._active_turn_id,
+                text=text,
+                mentioned_files=mentioned_files,
+                mode=self.harness_state.mode,
+            )
         await self._load_mentioned_files_into_context(text, log)
         self.agent.add_user_message(text)
         self.persist_session_state(reason="user_message")
@@ -628,6 +799,12 @@ class OpenJetApp(App):
             "loaded_tokens": result.returned_tokens,
             "truncated": result.truncated,
         }
+        if result.path not in self.harness_state.files_in_play:
+            self.harness_state.files_in_play.append(result.path)
+            active = active_step(self.harness_state)
+            if active and result.path not in active.files:
+                active.files.append(result.path)
+            self.persist_harness_state()
         log.write(f"[bold bright_white]Loaded @{mention_path} into context ({result.summary}).[/]")
         if self.session_logger:
             self.session_logger.log_event(
@@ -699,7 +876,7 @@ class OpenJetApp(App):
         else:
             color = "bright_white"
         counter.update(
-            f"[{color}]tokens: {total}/{window} | prompt<= {budget.prompt_tokens} | remaining: {remaining}[/]"
+            f"[{color}]tokens: {total}/{window} | prompt<= {budget.prompt_tokens} | remaining: {remaining} | harness: {self._turn_context_tokens}[/]"
         )
 
     def _start_utilization_updates(self) -> None:
@@ -830,6 +1007,7 @@ class OpenJetApp(App):
         current = self.agent.estimated_context_tokens()
         remaining = max(0, budget.prompt_tokens - current)
         mem = read_memory_snapshot()
+        active = active_step(self.harness_state)
         return {
             "ready": True,
             "messages": self.agent.conversation_message_count(),
@@ -842,6 +1020,10 @@ class OpenJetApp(App):
             "memory_total_mb": mem.total_mb if mem else None,
             "memory_available_mb": mem.available_mb if mem else None,
             "memory_used_percent": mem.used_percent if mem else None,
+            "harness_mode": self.harness_state.mode,
+            "harness_active_step": active.title if active else None,
+            "harness_docs": list(self._turn_context_docs),
+            "harness_doc_tokens": self._turn_context_tokens,
         }
 
     def refresh_token_counter(self) -> None:
@@ -881,6 +1063,9 @@ class OpenJetApp(App):
             self.loaded_files = loaded_files
         else:
             self.loaded_files = {}
+        harness_payload = state.get("harness_state")
+        if isinstance(harness_payload, dict):
+            self.harness_state = HarnessState.from_dict(harness_payload)
         log.write(
             "  [bold bright_white]"
             f"Resumed previous session: {max(0, len(self.agent.messages) - 1)} messages, "
@@ -889,12 +1074,28 @@ class OpenJetApp(App):
         )
         if self.session_logger:
             self.session_logger.log_event(
-                "session_state_restored",
+                "session_resume",
                 messages=max(0, len(self.agent.messages) - 1),
                 loaded_files=len(self.loaded_files),
                 state_path=str(self.state_store.path),
+                restored_ok=True,
+                prior_session_id=state.get("session_id"),
+                prior_saved_at=state.get("saved_at"),
+                resume_gap_seconds=(
+                    round(max(0.0, time.time() - float(state.get("saved_at", 0.0))), 2)
+                    if state.get("saved_at")
+                    else None
+                ),
+                **self._trace_runtime_context(),
             )
+        self._session_was_resumed = True
         return True
+
+    def _restore_harness_state(self) -> None:
+        try:
+            self.harness_state = self.harness_store.load()
+        except Exception:
+            self.harness_state = HarnessState()
 
     def _replay_restored_history(self, log: RichLog, messages: list[dict]) -> None:
         for msg in messages:
@@ -997,11 +1198,13 @@ class OpenJetApp(App):
             "version": 1,
             "saved_at": time.time(),
             "reason": reason,
+            "session_id": self.session_logger.session_id if self.session_logger else None,
             "model": self.cfg.get("model"),
             "device": self.cfg.get("device", "auto"),
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
             "messages": self.agent.messages,
             "loaded_files": self.loaded_files,
+            "harness_state": self.harness_state.to_dict(),
         }
         try:
             self.state_store.save(payload)
@@ -1009,10 +1212,135 @@ class OpenJetApp(App):
             if self.session_logger:
                 self.session_logger.log_event("session_state_save_error", reason=reason, error=str(exc))
 
+    def persist_harness_state(self) -> None:
+        self.harness_state.updated_at = time.time()
+        try:
+            self.harness_store.save(self.harness_state)
+        except Exception as exc:
+            if self.session_logger:
+                self.session_logger.log_event("harness_state_save_error", error=str(exc))
+
+    def available_harness_skills(self) -> list[str]:
+        return available_skill_names(Path.cwd())
+
+    def set_harness_mode(self, mode: str) -> None:
+        self.harness_state = set_mode(self.harness_state, mode)
+        self.persist_harness_state()
+        self.persist_session_state(reason=f"harness_mode:{mode}")
+        self._render_token_counter()
+
+    def set_harness_skills(self, names: list[str]) -> tuple[list[str], list[str]]:
+        available = set(self.available_harness_skills())
+        normalized = [normalize_skill_name(name) for name in names]
+        applied = [name for name in normalized if name in available]
+        missing = [name for name in normalized if name and name not in available]
+        self.harness_state = set_preferred_skills(self.harness_state, applied)
+        self.persist_harness_state()
+        self.persist_session_state(reason="harness_skills_set")
+        self._render_token_counter()
+        return applied, missing
+
+    def clear_harness_skills(self) -> None:
+        self.harness_state = clear_preferred_skills(self.harness_state)
+        self.persist_harness_state()
+        self.persist_session_state(reason="harness_skills_cleared")
+        self._render_token_counter()
+
+    def harness_active_step(self) -> str | None:
+        active = active_step(self.harness_state)
+        return active.title if active else None
+
+    def advance_harness_step(self) -> None:
+        self.harness_state = advance_step(self.harness_state)
+        self.persist_harness_state()
+        self.persist_session_state(reason="harness_step_advanced")
+        self._render_token_counter()
+
+    def split_harness_step(self) -> None:
+        self.harness_state = split_active_step(self.harness_state)
+        self.persist_harness_state()
+        self.persist_session_state(reason="harness_step_split")
+        self._render_token_counter()
+
+    def _append_harness_memory(
+        self,
+        previous_state: HarnessState,
+        current_state: HarnessState,
+        *,
+        tool_events: list[dict],
+        assistant_text: str,
+    ) -> None:
+        root = Path.cwd()
+        prev_active = active_step(previous_state)
+        curr_active = active_step(current_state)
+        if prev_active and prev_active.status != "done":
+            now_done = next((step for step in current_state.plan if step.id == prev_active.id and step.status == "done"), None)
+            if now_done:
+                append_memory_entry(
+                    root,
+                    "session.md",
+                    [
+                        f"- completed_step: {prev_active.title}",
+                        f"- mode: {current_state.mode}",
+                        f"- files: {', '.join(prev_active.files) if prev_active.files else 'n/a'}",
+                        f"- next: {curr_active.title if curr_active else 'n/a'}",
+                    ],
+                )
+        verification = current_state.last_verification
+        if verification.get("status") == "fail":
+            append_memory_entry(
+                root,
+                "failures.md",
+                [
+                    f"- mode: {current_state.mode}",
+                    f"- step: {prev_active.title if prev_active else 'n/a'}",
+                    f"- pattern: verification failed",
+                    f"- detail: {verification.get('summary', 'n/a')}",
+                    f"- command: {verification.get('command', 'n/a')}",
+                ],
+            )
+        if any(token in current_state.goal.lower() for token in ("architecture", "design", "harness")) and tool_events:
+            append_memory_entry(
+                root,
+                "decisions.md",
+                [
+                    f"- goal: {current_state.goal}",
+                    f"- last_action: {current_state.last_action.get('summary', 'n/a')}",
+                    f"- verification: {verification.get('status', 'not_run')}",
+                ],
+            )
+
     # -- Agent turn ----------------------------------------------------------
 
     def _start_agent_turn(self, recovery_attempted: bool = False) -> None:
+        self._prepare_turn_context()
         self._generation_worker = self.run_agent_turn(recovery_attempted=recovery_attempted)
+
+    def _prepare_turn_context(self) -> None:
+        if not self.agent:
+            return
+        window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
+        context = build_turn_context(
+            root=Path.cwd(),
+            state=self.harness_state,
+            current_context_tokens=self.agent.persistent_context_tokens(),
+            effective_window=window,
+            memory_snapshot=read_memory_snapshot(),
+        )
+        self.agent.set_turn_context(context.messages)
+        self._turn_context_docs = context.docs_loaded
+        self._turn_context_tokens = context.docs_tokens
+        if self.session_logger:
+            self.session_logger.log_event(
+                "turn_context_prepared",
+                mode=self.harness_state.mode,
+                active_step=active.title if (active := active_step(self.harness_state)) else None,
+                docs=context.docs_loaded,
+                docs_tokens=context.docs_tokens,
+                usable_prompt_budget=context.budget.usable_prompt_budget,
+                remaining_budget=context.budget.remaining_budget,
+                ram_factor=context.budget.ram_factor,
+            )
 
     def action_stop_generation(self) -> None:
         if self._awaiting_approval or isinstance(self.screen, SetupScreen):
@@ -1024,13 +1352,21 @@ class OpenJetApp(App):
         log.write("[yellow]Generation stopped.[/]")
         log.write("")
         if self.session_logger:
-            self.session_logger.log_event("generation_stopped", source="escape")
+            self.session_logger.log_event(
+                "generation_interrupted",
+                turn_id=self._active_turn_id,
+                source="escape",
+                during_generation=True,
+                during_tool=self._awaiting_approval,
+            )
+        self._finish_turn_trace(success=False, status="interrupted", error="generation stopped by user")
         self._render_token_counter()
 
     @work(exclusive=True)
     async def run_agent_turn(self, recovery_attempted: bool = False) -> None:
         log = self.query_one("#chat-log", RichLog)
         pending_tool_calls: list[ToolCall] = []
+        tool_events: list[dict] = []
         condense_requested = False
         text_buf = ""
         assistant_turn_text = ""
@@ -1043,6 +1379,7 @@ class OpenJetApp(App):
                     text_buf += event.text
                     assistant_turn_text += event.text
                     self._generation_tokens_streamed += estimate_tokens(event.text)
+                    self._active_turn_generation_tokens += estimate_tokens(event.text)
                     # Flush complete lines as they arrive
                     while "\n" in text_buf:
                         line, text_buf = text_buf.split("\n", 1)
@@ -1050,24 +1387,39 @@ class OpenJetApp(App):
                 elif event.kind == ActionKind.TOOL_REQUEST:
                     pending_tool_calls.append(event.tool_call)
                     if self.session_logger and event.tool_call:
+                        event_data = {
+                            "turn_id": self._active_turn_id,
+                            "proposal_id": event.tool_call.id,
+                            "tool": event.tool_call.name,
+                            "arguments": event.tool_call.arguments,
+                        }
+                        if event.tool_call.name == "shell":
+                            classification = _classify_shell_command(str(event.tool_call.arguments.get("command", "")))
+                            if classification["false_positive_proposal"]:
+                                self._active_turn_false_positive_commands += 1
+                            if classification["hallucinated_command"]:
+                                self._active_turn_hallucinated_commands += 1
+                            event_data.update(classification)
+                            self.session_logger.log_event("command_eval", **event_data)
                         self.session_logger.log_event(
                             "tool_request",
-                            tool=event.tool_call.name,
-                            arguments=event.tool_call.arguments,
+                            **event_data,
                         )
                 elif event.kind == ActionKind.CONDENSE:
                     condense_requested = True
                     if self.session_logger:
-                        self.session_logger.log_event("auto_condense_requested", reason=event.text)
+                        self.session_logger.log_event("auto_condense_requested", turn_id=self._active_turn_id, reason=event.text)
                 elif event.kind == ActionKind.ERROR:
                     if not recovery_attempted and self._is_recoverable_runtime_error(event.text):
                         recovered = await self._recover_runtime(log, event.text)
                         if recovered:
+                            self._active_turn_recovered_after_resume = self._session_was_resumed
                             self._start_agent_turn(recovery_attempted=True)
                             return
                     log.write(f"\n[bold red]error:[/] {event.text}")
                     if self.session_logger:
-                        self.session_logger.log_event("agent_error", error=event.text)
+                        self.session_logger.log_event("agent_error", turn_id=self._active_turn_id, error=event.text)
+                    self._finish_turn_trace(success=False, status="agent_error", error=event.text)
                     return
                 elif event.kind == ActionKind.DONE:
                     if text_buf:
@@ -1086,19 +1438,27 @@ class OpenJetApp(App):
                 self._generation_worker = None
 
         if self.session_logger and assistant_turn_text.strip():
-            self.session_logger.log_event("assistant_message", text=assistant_turn_text)
+            self.session_logger.log_event(
+                "assistant_message",
+                turn_id=self._active_turn_id,
+                text=assistant_turn_text,
+                output_tokens=estimate_tokens(assistant_turn_text),
+            )
 
         if condense_requested:
             result = await self.agent.condense_context()
             log.write(f"  [bold bright_white]{result}[/]")
             log.write("")
             self.persist_session_state(reason="auto_condense")
+            self.persist_harness_state()
             self._start_agent_turn()
             return
 
         for tc in pending_tool_calls:
             try:
-                await self._handle_tool_call(tc, log)
+                event = await self._handle_tool_call(tc, log)
+                if event:
+                    tool_events.append(event)
             except Exception as exc:
                 log.write(f"[bold red]tool error ({tc.name}):[/] {exc}")
                 log.write("")
@@ -1113,53 +1473,101 @@ class OpenJetApp(App):
                     self.agent.complete_tool_call(tc, f"Tool execution failed: {exc}")
 
         if pending_tool_calls:
+            previous_state = HarnessState.from_dict(self.harness_state.to_dict())
+            self.harness_state = update_state_after_turn(
+                self.harness_state,
+                tool_events=tool_events,
+                assistant_text=assistant_turn_text,
+            )
+            self._append_harness_memory(previous_state, self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
+            self.persist_harness_state()
             self.persist_session_state(reason="assistant_turn_with_tools")
             self._start_agent_turn()
         else:
+            previous_state = HarnessState.from_dict(self.harness_state.to_dict())
+            self.harness_state = update_state_after_turn(
+                self.harness_state,
+                tool_events=tool_events,
+                assistant_text=assistant_turn_text,
+            )
+            self._append_harness_memory(previous_state, self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
+            self.persist_harness_state()
             self.persist_session_state(reason="assistant_turn_done")
+            self._finish_turn_trace(success=True, status="completed")
             self._render_token_counter()
 
-    async def _handle_tool_call(self, tc: ToolCall, log: RichLog) -> None:
+    async def _handle_tool_call(self, tc: ToolCall, log: RichLog) -> dict | None:
+        if tc.name not in allowed_tools_for_mode(self.harness_state.mode):
+            denied = f"Tool {tc.name} is not allowed in {self.harness_state.mode} mode."
+            log.write(f"[yellow]{denied}[/]")
+            log.write("")
+            if self.agent:
+                self.agent.complete_tool_call(tc, denied)
+            return {"tool": tc.name, "ok": False, "summary": denied, "target": format_tool_args(tc)}
         needs_confirm = self.agent.needs_confirmation(tc)
 
         if needs_confirm:
+            self._active_turn_approval_requests += 1
             log.write(f"[yellow]{tc.name}:[/]")
             for preview_line in self._tool_preview_lines(tc):
                 log.write(f"  [bold bright_white]{preview_line}[/]")
             approved = await self._wait_for_tool_approval(tc)
+            approval_latency_ms = None
+            if self._approval_started_at is not None:
+                approval_latency_ms = round((time.monotonic() - self._approval_started_at) * 1000.0, 2)
+            self._approval_started_at = None
             if not approved:
                 log.write("[red]  denied[/]")
                 log.write("")
                 if self.session_logger:
                     self.session_logger.log_event(
                         "tool_approval",
+                        turn_id=self._active_turn_id,
+                        proposal_id=tc.id,
                         tool=tc.name,
                         approved=False,
+                        human_latency_ms=approval_latency_ms,
                         arguments=tc.arguments,
                     )
                 self.agent.complete_tool_call(tc, "User denied this action.")
                 self.persist_session_state(reason=f"tool_denied:{tc.name}")
-                return
+                return {
+                    "tool": tc.name,
+                    "ok": False,
+                    "summary": "User denied this action.",
+                    "target": format_tool_args(tc),
+                }
             log.write("[green]  approved[/]")
+            self._active_turn_approval_grants += 1
             if self.session_logger:
                 self.session_logger.log_event(
                     "tool_approval",
+                    turn_id=self._active_turn_id,
+                    proposal_id=tc.id,
                     tool=tc.name,
                     approved=True,
+                    human_latency_ms=approval_latency_ms,
                     arguments=tc.arguments,
                 )
 
         if tc.name == "load_file":
             self._clamp_load_file_tool_budget(tc)
 
+        self._active_turn_tool_attempts += 1
         t0 = time.monotonic()
-        result, meta = await _execute_tool(tc)
+        execution = await execute_tool(tc)
+        result = execution.output
+        meta = execution.meta
         result_for_context, clipped_tool_result = self._fit_tool_result_to_budget(result)
         duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
+        if execution.ok:
+            self._active_turn_tool_successes += 1
         if self.session_logger:
             self.session_logger.log_tool_result(
                 tc.name,
                 result,
+                turn_id=self._active_turn_id,
+                proposal_id=tc.id,
                 duration_ms=duration_ms,
                 arguments=tc.arguments,
                 context_result_clipped=clipped_tool_result,
@@ -1177,6 +1585,14 @@ class OpenJetApp(App):
         log.scroll_end(animate=False)
         self.agent.complete_tool_call(tc, result_for_context)
         self.persist_session_state(reason=f"tool_result:{tc.name}")
+        return {
+            "tool": tc.name,
+            "ok": bool(meta.get("ok", True)),
+            "summary": result.splitlines()[0] if result else "",
+            "target": format_tool_args(tc),
+            "verification": tc.name == "shell" and shell_command_is_verification(str(tc.arguments.get("command", ""))),
+            "command": tc.arguments.get("command") if isinstance(tc.arguments, dict) else None,
+        }
 
     def _clamp_load_file_tool_budget(self, tc: ToolCall) -> None:
         if not isinstance(tc.arguments, dict):
@@ -1296,6 +1712,7 @@ class OpenJetApp(App):
         self._awaiting_approval = True
         self._approval_choice = 0
         self._approval_tool_call = tc
+        self._approval_started_at = time.monotonic()
         self._approval_future = asyncio.get_running_loop().create_future()
         bar.remove_class("hidden")
         prompt.disabled = True
@@ -1307,6 +1724,7 @@ class OpenJetApp(App):
             self._awaiting_approval = False
             self._approval_tool_call = None
             self._approval_future = None
+            self._approval_started_at = None
             bar.add_class("hidden")
             bar.update("")
             prompt.disabled = False
@@ -1345,7 +1763,7 @@ class OpenJetApp(App):
             if len(command) > 120:
                 command = command[:117] + "..."
             return f"shell -> {escape(command)}"
-        return escape(f"{tc.name} -> {_fmt_args(tc)}")
+        return escape(f"{tc.name} -> {format_tool_args(tc)}")
 
     def _resolve_approval(self, approved: bool) -> None:
         if self._approval_future and not self._approval_future.done():
@@ -1385,7 +1803,7 @@ class OpenJetApp(App):
             lines.append("new_string:")
             lines.extend(f"  {escape(l)}" for l in new_s.split("\n"))
             return lines
-        return [str(_fmt_args(tc))]
+        return [str(format_tool_args(tc))]
 
     def _approval_preview_text(self, tc: ToolCall) -> str:
         lines = self._tool_preview_lines(tc)
@@ -1395,147 +1813,6 @@ class OpenJetApp(App):
         if len(joined) > 280:
             return joined[:277] + "..."
         return joined
-
-
-# ---------------------------------------------------------------------------
-# Tool dispatch
-# ---------------------------------------------------------------------------
-
-async def _execute_tool(tc: ToolCall) -> tuple[str, dict]:
-    if not isinstance(tc.arguments, dict):
-        return f"Error: invalid arguments for {tc.name}", {"ok": False}
-
-    if tc.name == "shell":
-        command = tc.arguments.get("command", "")
-        timeout_seconds = tc.arguments.get("timeout_seconds")
-        if not isinstance(command, str) or not command.strip():
-            return "Error: invalid arguments for shell (required: command)", {"ok": False}
-        if timeout_seconds is not None:
-            if not isinstance(timeout_seconds, int):
-                return (
-                    "Error: invalid arguments for shell (timeout_seconds must be int)",
-                    {"ok": False},
-                )
-            if timeout_seconds <= 0:
-                return (
-                    "Error: invalid arguments for shell (timeout_seconds must be > 0)",
-                    {"ok": False},
-                )
-        res = await run_shell(
-            command,
-            timeout_seconds=timeout_seconds or DEFAULT_SHELL_TIMEOUT_SECONDS,
-        )
-        return res.summary, {
-            "ok": res.ok,
-            "exit_code": res.exit_code,
-            "stdout": res.stdout,
-            "stderr": res.stderr,
-            "timed_out": res.timed_out,
-            "timeout_seconds": res.timeout_seconds,
-        }
-    elif tc.name == "read_file":
-        path = tc.arguments.get("path", "")
-        if not isinstance(path, str) or not path.strip():
-            return "Error: invalid arguments for read_file (required: path)", {"ok": False}
-        text = await read_file(path)
-        return text, {"ok": not text.startswith("Error:")}
-    elif tc.name == "write_file":
-        path = tc.arguments.get("path", "")
-        content = tc.arguments.get("content", "")
-        if not isinstance(path, str) or not path.strip():
-            return "Error: invalid arguments for write_file (required: path, content)", {"ok": False}
-        if not isinstance(content, str):
-            return "Error: invalid arguments for write_file (required: path, content)", {"ok": False}
-        text = await write_file(
-            path,
-            content,
-        )
-        return text, {"ok": not text.startswith("Error")}
-    elif tc.name == "load_file":
-        path = tc.arguments.get("path", "")
-        max_tokens = tc.arguments.get("max_tokens")
-        if not isinstance(path, str) or not path.strip():
-            return "Error: invalid arguments for load_file (required: path)", {"ok": False}
-        if max_tokens is not None and not isinstance(max_tokens, int):
-            return "Error: invalid arguments for load_file (max_tokens must be int)", {"ok": False}
-        loaded = await load_file(path, max_tokens=max_tokens)
-        if not loaded.ok:
-            return loaded.detail, {"ok": False}
-        payload = (
-            f"{loaded.summary}\n"
-            f"content:\n{loaded.content}"
-        )
-        return payload, {
-            "ok": True,
-            "truncated": loaded.truncated,
-            "estimated_tokens": loaded.estimated_tokens,
-            "returned_tokens": loaded.returned_tokens,
-            "token_budget": loaded.token_budget,
-            "mem_available_mb": loaded.mem_available_mb,
-        }
-    elif tc.name == "edit_file":
-        path = tc.arguments.get("path", "")
-        old_string = tc.arguments.get("old_string", "")
-        new_string = tc.arguments.get("new_string", "")
-        replace_all_flag = tc.arguments.get("replace_all", False)
-        if not isinstance(path, str) or not path.strip():
-            return "Error: invalid arguments for edit_file (required: path, old_string, new_string)", {"ok": False}
-        if not isinstance(old_string, str) or not old_string:
-            return "Error: invalid arguments for edit_file (required: old_string)", {"ok": False}
-        if not isinstance(new_string, str):
-            return "Error: invalid arguments for edit_file (required: new_string)", {"ok": False}
-        text = await edit_file(path, old_string, new_string, replace_all=bool(replace_all_flag))
-        return text, {"ok": not text.startswith("Error")}
-    elif tc.name == "glob":
-        pattern = tc.arguments.get("pattern", "")
-        search_path = tc.arguments.get("path")
-        if not isinstance(pattern, str) or not pattern.strip():
-            return "Error: invalid arguments for glob (required: pattern)", {"ok": False}
-        text = await glob_files(pattern, path=search_path)
-        return text, {"ok": not text.startswith("Error")}
-    elif tc.name == "grep":
-        pattern = tc.arguments.get("pattern", "")
-        search_path = tc.arguments.get("path")
-        glob_filter = tc.arguments.get("glob")
-        ignore_case = tc.arguments.get("ignore_case", False)
-        if not isinstance(pattern, str) or not pattern.strip():
-            return "Error: invalid arguments for grep (required: pattern)", {"ok": False}
-        text = await grep_files(
-            pattern,
-            path=search_path,
-            glob_filter=glob_filter,
-            ignore_case=bool(ignore_case),
-        )
-        return text, {"ok": not text.startswith("Error")}
-    elif tc.name == "list_directory":
-        dir_path = tc.arguments.get("path")
-        text = await list_directory(path=dir_path)
-        return text, {"ok": not text.startswith("Error")}
-    return f"Unknown tool: {tc.name}", {"ok": False}
-
-
-def _fmt_args(tc: ToolCall) -> str:
-    if tc.name == "shell":
-        command = tc.arguments.get("command", str(tc.arguments))
-        timeout_seconds = tc.arguments.get("timeout_seconds")
-        if isinstance(timeout_seconds, int):
-            return f"$ {command} (timeout: {timeout_seconds}s)"
-        return f"$ {command}"
-    if tc.name == "read_file":
-        return tc.arguments.get("path", str(tc.arguments))
-    if tc.name == "write_file":
-        return tc.arguments.get("path", str(tc.arguments))
-    if tc.name == "load_file":
-        return tc.arguments.get("path", str(tc.arguments))
-    if tc.name == "edit_file":
-        return tc.arguments.get("path", str(tc.arguments))
-    if tc.name == "glob":
-        return tc.arguments.get("pattern", str(tc.arguments))
-    if tc.name == "grep":
-        return tc.arguments.get("pattern", str(tc.arguments))
-    if tc.name == "list_directory":
-        return tc.arguments.get("path", ".") or "."
-    return str(tc.arguments)
 
 
 def _extract_file_mentions(text: str) -> list[str]:
