@@ -46,6 +46,16 @@ class LlamaServerClient:
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
+        self.reasoning_mode = "default"
+
+    def set_reasoning_mode(self, mode: str) -> None:
+        normalized = mode.strip().lower()
+        if normalized not in {"default", "on", "off"}:
+            raise ValueError("reasoning mode must be one of: default, on, off")
+        self.reasoning_mode = normalized
+
+    def reasoning_status(self) -> str:
+        return self.reasoning_mode
 
     @staticmethod
     def _ensure_jetson_clocks_sudoers() -> None:
@@ -347,11 +357,23 @@ class LlamaServerClient:
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
+        extra_body: dict[str, object] | None = None
+        if self.reasoning_mode == "on":
+            extra_body = {
+                "reasoning_format": "auto",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        elif self.reasoning_mode == "off":
+            extra_body = {
+                "reasoning_format": "none",
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
         async for chunk in stream_openai_chat(
             self._http,
             base_url=self.base_url,
             model="local",
             messages=messages,
             use_tools=use_tools,
+            extra_body=extra_body,
         ):
             yield chunk

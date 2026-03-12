@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from .executor import (
     DEFAULT_SHELL_TIMEOUT_SECONDS,
@@ -13,6 +14,7 @@ from .executor import (
     run_shell,
     write_file,
 )
+from .persistent_memory import update_persistent_memory
 from .runtime_protocol import ToolCall
 
 
@@ -74,6 +76,31 @@ async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
             )
         text = await read_file(path)
         return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error:")})
+
+    if tool_call.name == "memory":
+        scope = tool_call.arguments.get("scope", "")
+        action = tool_call.arguments.get("action", "")
+        content = tool_call.arguments.get("content", "")
+        if not isinstance(scope, str) or not scope.strip() or not isinstance(action, str) or not action.strip():
+            return ToolExecutionResult(
+                output="Error: invalid arguments for memory (required: scope, action)",
+                meta={"ok": False},
+            )
+        if not isinstance(content, str):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for memory (content must be string)",
+                meta={"ok": False},
+            )
+        try:
+            text = await update_persistent_memory(
+                Path.cwd(),
+                scope=scope,
+                action=action,
+                content=content,
+            )
+        except ValueError as exc:
+            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
+        return ToolExecutionResult(output=text, meta={"ok": True, "scope": scope, "action": action})
 
     if tool_call.name == "write_file":
         path = tool_call.arguments.get("path", "")
@@ -182,6 +209,10 @@ def format_tool_args(tool_call: ToolCall) -> str:
         if isinstance(timeout_seconds, int):
             return f"$ {command} (timeout: {timeout_seconds}s)"
         return f"$ {command}"
+    if tool_call.name == "memory":
+        scope = str(tool_call.arguments.get("scope", ""))
+        action = str(tool_call.arguments.get("action", ""))
+        return f"{action} {scope}".strip()
     if tool_call.name in {"read_file", "write_file", "load_file", "edit_file"}:
         return str(tool_call.arguments.get("path", str(tool_call.arguments)))
     if tool_call.name in {"glob", "grep"}:

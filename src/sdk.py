@@ -8,6 +8,7 @@ from typing import Awaitable, Callable
 
 from .agent import ActionKind, Agent
 from .config import load_config
+from .persistent_memory import build_system_prompt
 from .runtime_limits import derive_context_budget, estimate_tokens
 from .runtime_protocol import ToolCall
 from .runtime_registry import create_runtime_client
@@ -80,7 +81,10 @@ class OpenJetSession:
         await client.start()
         agent = Agent(
             client=client,
-            system_prompt=system_prompt if system_prompt is not None else str(resolved_cfg.get("system_prompt", "")),
+            system_prompt=await build_system_prompt(
+                system_prompt if system_prompt is not None else str(resolved_cfg.get("system_prompt", "")),
+                Path.cwd(),
+            ),
             context_window_tokens=client.context_window_tokens,
             context_reserved_tokens=(
                 int(mem_cfg["context_reserved_tokens"])

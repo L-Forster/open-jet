@@ -31,6 +31,31 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "memory",
+            "description": "Read or update persistent cross-session memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Memory scope: user or agent",
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Operation: read, append, replace, or clear",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Memory content for append or replace",
+                    },
+                },
+                "required": ["scope", "action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": "Read a file.",
             "parameters": {
@@ -207,6 +232,7 @@ async def stream_openai_chat(
     model: str,
     messages: list[dict],
     use_tools: bool = True,
+    extra_body: dict | None = None,
 ) -> AsyncIterator[StreamChunk]:
     payload: dict = {
         "model": model,
@@ -215,6 +241,8 @@ async def stream_openai_chat(
     }
     if use_tools:
         payload["tools"] = TOOLS
+    if extra_body:
+        payload.update(extra_body)
 
     tool_id_by_index: dict[int, str] = {}
     tool_name_by_index: dict[int, str] = {}

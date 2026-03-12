@@ -10,7 +10,6 @@ from src.harness import (
     HarnessState,
     active_step,
     advance_step,
-    append_memory_entry,
     build_turn_context,
     clear_preferred_skills,
     set_preferred_skills,
@@ -18,6 +17,7 @@ from src.harness import (
     update_state_after_turn,
     update_state_for_user_message,
 )
+from src.persistent_memory import build_system_prompt, update_persistent_memory
 from src.runtime_limits import MemorySnapshot
 from src.runtime_protocol import StreamChunk, ToolCall
 from src.sdk import OpenJetSession, SDKEventKind
@@ -71,17 +71,15 @@ class SequencedRuntimeClient:
 
 
 class HarnessContextTests(unittest.TestCase):
-    def test_build_turn_context_loads_preferred_skill_and_memory_within_budget(self) -> None:
+    def test_build_turn_context_loads_preferred_skill_within_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".openjet" / "agents").mkdir(parents=True)
             (root / ".openjet" / "skills").mkdir(parents=True)
-            (root / ".openjet" / "memory").mkdir(parents=True)
             (root / ".openjet" / "projects").mkdir(parents=True)
 
             (root / ".openjet" / "agents" / "base.md").write_text("base guidance", encoding="utf-8")
             (root / ".openjet" / "agents" / "coder.md").write_text("coder guidance", encoding="utf-8")
-            (root / ".openjet" / "memory" / "session.md").write_text("recent session note", encoding="utf-8")
             (root / ".openjet" / "skills" / "python-refactor.md").write_text(
                 "---\ntags:\n  - python\n  - refactor\nmode: code\n---\npreferred refactor skill",
                 encoding="utf-8",
@@ -107,7 +105,6 @@ class HarnessContextTests(unittest.TestCase):
             joined = "\n".join(message["content"] for message in context.messages)
             self.assertIn("python-refactor.md", ",".join(context.docs_loaded))
             self.assertIn("preferred refactor skill", joined)
-            self.assertIn("recent session note", joined)
             self.assertNotIn("review docs", joined)
             self.assertLessEqual(context.docs_tokens, context.budget.docs_budget + 64)
 
@@ -168,15 +165,6 @@ class HarnessStateTests(unittest.TestCase):
         self.assertEqual(active_step(split).id, "change_a")
         self.assertEqual(len(split.plan), 5)
         self.assertIn("inspect narrowly", active_step(split).title)
-
-    def test_append_memory_entry_appends_markdown_entry(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            append_memory_entry(root, "session.md", ["- completed_step: inspect", "- next: verify"])
-            body = (root / ".openjet" / "memory" / "session.md").read_text(encoding="utf-8")
-            self.assertIn("completed_step: inspect", body)
-            self.assertIn("next: verify", body)
-
 
 class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_turn_context_is_sent_to_runtime_but_not_persisted_in_history(self) -> None:
@@ -298,6 +286,21 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.text, "done")
         self.assertIsInstance(client.last_messages[-1]["content"], list)
+
+
+class PersistentMemoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_build_system_prompt_includes_persistent_memory_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            await update_persistent_memory(root, scope="user", action="replace", content="- prefers concise answers")
+            await update_persistent_memory(root, scope="agent", action="replace", content="- repo uses apply_patch")
+
+            prompt = await build_system_prompt("base system", root)
+
+        self.assertIn("Persistent user preferences", prompt)
+        self.assertIn("prefers concise answers", prompt)
+        self.assertIn("Persistent agent memory", prompt)
+        self.assertIn("repo uses apply_patch", prompt)
 
 
 if __name__ == "__main__":

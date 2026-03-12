@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 from textual.widgets import RichLog
+
+from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
 
 if TYPE_CHECKING:
     from .app import OpenJetApp
@@ -34,6 +37,8 @@ class SlashCommandHandler:
         CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
         CommandSpec(name="condense", description="Manually condense older context"),
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
+        CommandSpec(name="memory", description="Inspect or update persistent memory: /memory [show|clear <user|agent>]"),
+        CommandSpec(name="reasoning", description="Show or set llama.cpp reasoning mode: /reasoning [status|on|off|default]"),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
         CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
@@ -90,6 +95,12 @@ class SlashCommandHandler:
         if cmd == "load":
             await self._load(log, arg)
             return True
+        if cmd == "memory":
+            await self._memory(log, arg)
+            return True
+        if cmd == "reasoning":
+            self._reasoning(log, arg)
+            return True
         if cmd == "resume":
             await self._resume(log)
             return True
@@ -138,6 +149,10 @@ class SlashCommandHandler:
             log.write("")
             return
 
+        self.app.agent.system_prompt = await build_system_prompt(
+            str(self.app.cfg.get("system_prompt", "")),
+            Path.cwd(),
+        )
         self.app.agent.reset_conversation()
         self.app.agent.clear_turn_context()
         self.app.loaded_files.clear()
@@ -191,6 +206,12 @@ class SlashCommandHandler:
             log.write(
                 "[bold bright_white]"
                 f"Command: {snapshot.get('active_command') or 'running'}"
+                "[/]"
+            )
+        if snapshot.get("reasoning_mode"):
+            log.write(
+                "[bold bright_white]"
+                f"Reasoning mode: {snapshot.get('reasoning_mode')}"
                 "[/]"
             )
         log.write(
@@ -278,6 +299,36 @@ class SlashCommandHandler:
             return
         self.app.run_setup_command_worker()
 
+    async def _memory(self, log: RichLog, raw_arg: str) -> None:
+        arg = raw_arg.strip()
+        if not arg or arg == "show":
+            snapshot = await load_persistent_memory(Path.cwd())
+            log.write("[bold bright_white]Persistent user preferences:[/]")
+            log.write(snapshot.user or "(empty)")
+            log.write("")
+            log.write("[bold bright_white]Persistent agent memory:[/]")
+            log.write(snapshot.agent or "(empty)")
+            log.write("")
+            return
+
+        parts = arg.split(maxsplit=1)
+        if parts[0] != "clear" or len(parts) != 2:
+            log.write("[yellow]Usage:[/] /memory [show|clear <user|agent>]")
+            log.write("")
+            return
+        try:
+            result = await update_persistent_memory(
+                Path.cwd(),
+                scope=parts[1],
+                action="clear",
+            )
+        except ValueError as exc:
+            log.write(f"[yellow]{exc}[/]")
+            log.write("")
+            return
+        log.write(f"[bold bright_white]{result}[/]")
+        log.write("")
+
     async def _resume(self, log: RichLog) -> None:
         if self.app._awaiting_approval:
             log.write("[yellow]Cannot resume while a tool approval prompt is active.[/]")
@@ -301,6 +352,28 @@ class SlashCommandHandler:
             log.write("  [bold bright_white]No previous session state found.[/]")
         log.write("")
         self.app.refresh_token_counter()
+
+    def _reasoning(self, log: RichLog, raw_arg: str) -> None:
+        client = self.app.client
+        setter = getattr(client, "set_reasoning_mode", None) if client else None
+        getter = getattr(client, "reasoning_status", None) if client else None
+        if not callable(setter) or not callable(getter):
+            log.write("[yellow]Reasoning mode is only available for the llama.cpp runtime in this app.[/]")
+            log.write("")
+            return
+
+        arg = raw_arg.strip().lower() or "status"
+        if arg == "status":
+            log.write(f"[bold bright_white]Reasoning mode: {getter()}[/]")
+            log.write("")
+            return
+        if arg not in {"on", "off", "default"}:
+            log.write("[yellow]Usage:[/] /reasoning [status|on|off|default]")
+            log.write("")
+            return
+        setter(arg)
+        log.write(f"[bold bright_white]Reasoning mode set to {arg}. Applies to future turns with the current model.[/]")
+        log.write("")
 
     def _mode(self, log: RichLog, raw_arg: str) -> None:
         arg = raw_arg.strip().lower()

@@ -13,6 +13,9 @@ session_state.json
 *.metrics.jsonl
 .openjet/state/
 .openjet/memory/
+.openjet/memories/
+AGENTS.md
+claude.md
 
 # Local tooling/cache artifacts
 .pytest_cache/

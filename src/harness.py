@@ -20,10 +20,10 @@ ROLE_BY_MODE = {
 }
 
 TOOL_BUNDLES = {
-    "chat": {"read_file", "load_file", "glob", "grep", "list_directory", "shell"},
-    "code": {"read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},
-    "review": {"read_file", "load_file", "glob", "grep", "list_directory", "shell"},
-    "debug": {"read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},
+    "chat": {"memory", "read_file", "load_file", "glob", "grep", "list_directory", "shell"},
+    "code": {"memory", "read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},
+    "review": {"memory", "read_file", "load_file", "glob", "grep", "list_directory", "shell"},
+    "debug": {"memory", "read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},
 }
 
 DEFAULT_BASE_PROMPT = """You are operating inside open-jet on an edge Linux device.
@@ -434,16 +434,6 @@ def split_active_step(state: HarnessState) -> HarnessState:
     return next_state
 
 
-def append_memory_entry(root: Path, name: str, lines: list[str]) -> None:
-    memory_dir = root / ".openjet" / "memory"
-    memory_dir.mkdir(parents=True, exist_ok=True)
-    path = memory_dir / name
-    timestamp = time.strftime("%Y-%m-%d")
-    entry = [f"## {timestamp}", *[line.rstrip() for line in lines if line.strip()], ""]
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write("\n".join(entry))
-
-
 def normalize_skill_name(name: str) -> str:
     return Path(str(name).strip()).stem
 
@@ -506,9 +496,6 @@ def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list
     selected_skills = _select_skills(root, state, window_tokens)
     candidates.extend(selected_skills)
 
-    memory_doc = _select_memory_doc(root, state)
-    if memory_doc:
-        candidates.append(memory_doc)
     return [(label, _format_doc(label, body)) for label, body in candidates if body.strip()]
 
 
@@ -551,22 +538,6 @@ def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[
     if active and active.skill:
         limit = max(limit, 1)
     return [(f"skills/{name}", body) for _, name, body in scored[:limit]]
-
-
-def _select_memory_doc(root: Path, state: HarnessState) -> tuple[str, str] | None:
-    memory_dir = root / ".openjet" / "memory"
-    if not memory_dir.exists():
-        return None
-    if state.mode == "debug":
-        name = "failures.md"
-    elif state.mode in {"code", "review"} and any(token in state.goal.lower() for token in ("architecture", "design", "refactor")):
-        name = "decisions.md"
-    else:
-        name = "session.md"
-    body = _load_doc(memory_dir / name)
-    if not body:
-        return None
-    return (f"memory/{name}", body)
 
 
 def _load_doc(path: Path) -> str:
