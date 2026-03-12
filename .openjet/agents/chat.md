@@ -1,5 +1,3 @@
-You are in chat mode.
-
 Focus:
 - answer directly
 - avoid unnecessary tool use

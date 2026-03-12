@@ -1,5 +1,3 @@
-You are in coder mode.
-
 Focus:
 - implement the active step only
 - keep edits narrow

@@ -14,3 +14,23 @@ Keep entries short and current.
 - mode: code
 - files: n/a
 - next: Implement the requested change in the relevant area
+## 2026-03-12
+- completed_step: Why
+- mode: chat
+- files: n/a
+- next: n/a
+## 2026-03-12
+- completed_step: Inspect the relevant area
+- mode: code
+- files: n/a
+- next: Implement the requested change in the relevant area
+## 2026-03-12
+- completed_step: ..
+- mode: chat
+- files: n/a
+- next: n/a
+## 2026-03-12
+- completed_step: check
+- mode: chat
+- files: n/a
+- next: n/a

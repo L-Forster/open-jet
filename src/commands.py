@@ -36,7 +36,7 @@ class SlashCommandHandler:
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
-        CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]"),
+        CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
         CommandSpec(name="skills", description="Show or clear selected harness skills: /skills [status|list|clear]"),
         CommandSpec(name="skill", description="Pin one or more harness skills: /skill <name[,name...]>"),
         CommandSpec(name="step", description="Inspect or control the active step: /step [status|next|split]"),
@@ -207,8 +207,7 @@ class SlashCommandHandler:
         if snapshot.get("harness_mode"):
             log.write(
                 "[bold bright_white]"
-                f"Harness: mode={snapshot['harness_mode']} | "
-                f"active_step={snapshot.get('harness_active_step') or 'n/a'} | "
+                f"Workflow: active_step={snapshot.get('harness_active_step') or 'n/a'} | "
                 f"docs={snapshot.get('harness_doc_tokens', 0)}t"
                 "[/]"
             )

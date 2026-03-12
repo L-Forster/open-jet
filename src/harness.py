@@ -20,7 +20,7 @@ ROLE_BY_MODE = {
 }
 
 TOOL_BUNDLES = {
-    "chat": {"read_file", "load_file", "glob", "grep", "list_directory"},
+    "chat": {"read_file", "load_file", "glob", "grep", "list_directory", "shell"},
     "code": {"read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},
     "review": {"read_file", "load_file", "glob", "grep", "list_directory", "shell"},
     "debug": {"read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},

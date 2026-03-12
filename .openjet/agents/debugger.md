@@ -1,5 +1,3 @@
-You are in debugger mode.
-
 Primary loop:
 1. localize the failure
 2. form the smallest plausible fix

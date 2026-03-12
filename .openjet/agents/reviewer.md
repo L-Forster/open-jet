@@ -1,5 +1,3 @@
-You are in reviewer mode.
-
 Primary goal:
 - find bugs
 - identify behavioral regressions

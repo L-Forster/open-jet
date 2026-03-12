@@ -1498,7 +1498,10 @@ class OpenJetApp(App):
 
     async def _handle_tool_call(self, tc: ToolCall, log: RichLog) -> dict | None:
         if tc.name not in allowed_tools_for_mode(self.harness_state.mode):
-            denied = f"Tool {tc.name} is not allowed in {self.harness_state.mode} mode."
+            denied = (
+                f"Tool {tc.name} is not available for this request. "
+                "Use an approved tool or ask for a different approach."
+            )
             log.write(f"[yellow]{denied}[/]")
             log.write("")
             if self.agent:
