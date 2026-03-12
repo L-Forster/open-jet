@@ -1,14 +1,25 @@
 # open-jet
 
-`open-jet` is an offline-first terminal app for running local LLM workflows on edge Linux devices (including Jetson-class hardware).
+`open-jet` is an offline-first agent runtime for edge Linux devices with tight memory budgets.
+
+It is built for Jetson-class and other edge systems where the hard part is not just running a local model, but keeping the agent useful under constrained RAM, limited context windows, interrupted sessions, and hardware-specific failure modes.
 
 It provides:
-- local chat with your on-device model
-- safe file-context loading with token/memory guards
-- slash commands for session control
-- first-run setup for model/runtime configuration
-- optional session logging and resume
-- a Python SDK for driving the agent backend without the TUI
+- bounded-context local chat with your on-device model
+- safe file and doc loading with token and memory guards
+- automatic context condensing under pressure
+- session resume and harness state recovery
+- replayable JSONL event traces for evals and debugging
+- hardware-aware runtime setup for Jetson and edge Linux
+- slash commands and harness modes for controlled workflows
+- a Python SDK for driving the same agent backend without the TUI
+
+`open-jet` is positioned around five practical problems:
+- managing limited prompt memory on-device
+- resuming interrupted work instead of starting over
+- enforcing deterministic tool and approval boundaries
+- capturing real traces for evaluation instead of guessing from vibes
+- turning constrained local models into reliable operator workflows
 
 ## Requirements
 
@@ -84,9 +95,20 @@ Optional setup screen on launch:
 open-jet --setup
 ```
 
+## Why It Exists
+
+Most local LLM tools stop at "chat with a model on your box." That breaks down quickly on edge hardware:
+- context windows are small relative to the task
+- available RAM moves around under real workloads
+- long tasks get interrupted
+- shell and file actions need deterministic approval paths
+- failures differ by runtime, model, quant, and device profile
+
+`open-jet` is designed around those constraints. The goal is to keep an on-device agent productive when memory is bounded and recovery matters more than demos.
+
 ## Python SDK
 
-`open-jet` also exposes a programmatic session API so you can drive the same agent backend from your own scripts.
+`open-jet` also exposes a programmatic session API so you can drive the same bounded-memory agent backend from your own scripts.
 
 ```python
 import asyncio
@@ -135,7 +157,7 @@ On first run, `open-jet` guides you through:
 4. context window size
 5. GPU offload configuration
 
-It then saves your configuration and starts the runtime.
+It then saves your configuration and starts the runtime with a device-appropriate memory profile.
 
 ## Basic Use
 
@@ -144,6 +166,8 @@ It then saves your configuration and starts the runtime.
 - Type `/` to open slash-command suggestions
 - `Tab`/`Enter` can autocomplete slash commands and file mentions
 - `Ctrl+C` or `/exit` quits
+
+The app is designed to keep work decomposed into small recoverable turns instead of trying to hold an entire task in prompt memory at once.
 
 ## Slash Commands
 
@@ -156,6 +180,16 @@ It then saves your configuration and starts the runtime.
 - `/load <path>` load a file into context
 - `/resume` load previous saved session
 - `/setup` reopen setup wizard
+
+## Workflow Harness
+
+`open-jet` includes a lightweight harness layer for keeping agent work structured under constrained context:
+- modes for `chat`, `code`, `review`, and `debug`
+- step-oriented state so the agent can continue work across turns
+- skill docs and project docs loaded into bounded turn context
+- persistent harness state stored under `.openjet/`
+
+This is there to reduce prompt drift and keep limited-context models on the current task.
 
 ## Configuration
 
@@ -234,6 +268,30 @@ When enabled:
 - session events are written to `session_logs/*.events.jsonl`
 - system metrics are written to `session_logs/*.metrics.jsonl`
 - conversation state is saved to `session_state.json`
+
+The event log is the main reliability artifact. It captures replayable traces for things like:
+- tool call success rate
+- approval and denial decisions
+- interrupted generation and resumed sessions
+- time-to-resolution
+- token usage for successful tasks
+- hallucinated or low-value command proposals
+- hardware and runtime-specific failure analysis
+
+This is meant to support evaluation from real traces, not just subjective testing.
+
+## Benchmarks and Eval Traces
+
+`open-jet` now includes benchmark environments and harness-driven eval cases under `benchmarks/`.
+
+The point of these is not abstract leaderboard work. They are for checking whether the agent:
+- stays useful under limited context
+- resumes interrupted work
+- follows deterministic tool constraints
+- succeeds across different local workflows
+- behaves differently across hardware, runtimes, and model profiles
+
+If you care about edge agents in production, replayable traces and task artifacts matter more than one-off demo prompts.
 
 ## Contact
 
