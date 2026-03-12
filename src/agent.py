@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import AsyncIterator
 
-from .llama_server import ToolCall
+from .runtime_protocol import ToolCall
 from .runtime_client import RuntimeClient
 from .runtime_limits import ContextBudget, derive_context_budget, estimate_tokens, read_memory_snapshot
 

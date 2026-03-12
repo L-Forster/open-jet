@@ -32,8 +32,6 @@ from .executor import (
     run_shell,
     write_file,
 )
-from .llama_server import LlamaServerClient
-from .runtime_client import RuntimeClient
 from .config import load_config, save_config
 from .hardware import (
     detect_hardware_info,
@@ -42,12 +40,13 @@ from .hardware import (
     recommended_gpu_layers,
 )
 from .ollama_setup import discover_installed_ollama_models, materialize_setup_model
+from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
+from .runtime_registry import active_model_ref, create_runtime_client
 from .session_logging import SessionLogger
 from .session_state import SessionStateStore
 from .setup import ACCENT_GREEN, SetupScreen, discover_model_files
 from .system_metrics import SystemMetricsReader, format_hours
-from .trtllm_server import TrtllmServerClient
 
 
 def _format_error(exc: Exception) -> str:
@@ -127,10 +126,7 @@ class OpenJetApp(App):
         self._last_generation_tps: float | None = None
 
     def _active_model_ref(self) -> str:
-        runtime = str(self.cfg.get("runtime", "llama_cpp")).strip().lower()
-        if runtime == "trtllm_pytorch":
-            return str(self.cfg.get("trtllm_model") or self.cfg.get("model") or "").strip()
-        return str(self.cfg.get("llama_model") or self.cfg.get("model") or "").strip()
+        return active_model_ref(self.cfg)
 
     def _has_any_configured_model(self) -> bool:
         return bool(self._active_model_ref())
@@ -138,30 +134,10 @@ class OpenJetApp(App):
     async def _init_client(self) -> None:
         mem_cfg = self.cfg.get("memory_guard", {})
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
-        runtime = str(self.cfg.get("runtime", "llama_cpp")).strip().lower()
         configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
-        if runtime == "trtllm_pytorch":
-            trt_model = str(self.cfg.get("trtllm_model", self.cfg.get("model", ""))).strip()
-            if not trt_model:
-                raise ValueError("Missing model for trtllm runtime (`trtllm_model` or `model`).")
-            self.client = TrtllmServerClient(
-                model=trt_model,
-                context_window_tokens=configured_ctx,
-                backend=str(self.cfg.get("trtllm_backend", "pytorch")),
-                config_path=str(self.cfg.get("trtllm_config_path", "")).strip() or None,
-                trust_remote_code=bool(self.cfg.get("trtllm_trust_remote_code", True)),
-            )
+        self.client = create_runtime_client(self.cfg)
+        if self.client.gpu_layers == 0:
             configured_gpu_layers = 0
-        else:
-            llama_model = str(self.cfg.get("llama_model", self.cfg.get("model", ""))).strip()
-            if not llama_model:
-                raise ValueError("Missing model for llama.cpp runtime (`llama_model` or `model`).")
-            self.client = LlamaServerClient(
-                model=llama_model,
-                context_window_tokens=configured_ctx,
-                device=str(self.cfg.get("device", "auto")),
-                gpu_layers=configured_gpu_layers,
-            )
         await self.client.start()
         if (
             self.client.context_window_tokens != configured_ctx

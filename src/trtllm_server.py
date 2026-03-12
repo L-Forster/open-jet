@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import sysconfig
@@ -12,7 +11,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from .llama_server import TOOLS, StreamChunk, ToolCall
+from .runtime_protocol import StreamChunk, stream_openai_chat
 
 
 def _find_trtllm_serve() -> str:
@@ -133,80 +132,11 @@ class TrtllmServerClient:
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
-        payload: dict = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-        }
-        if use_tools:
-            payload["tools"] = TOOLS
-
-        tool_id_by_index: dict[int, str] = {}
-        tool_name_by_index: dict[int, str] = {}
-        tool_args_by_index: dict[int, str] = {}
-
-        async with self._http.stream(
-            "POST", f"{self.base_url}/v1/chat/completions", json=payload
-        ) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                line = line.strip()
-                if not line or line == "data: [DONE]":
-                    continue
-                if line.startswith("data: "):
-                    line = line[6:]
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                choices = data.get("choices", [])
-                if not choices:
-                    continue
-
-                choice = choices[0]
-                delta = choice.get("delta", {}) or {}
-                finish_reason = choice.get("finish_reason")
-
-                text = delta.get("content", "") or ""
-                if text:
-                    yield StreamChunk(text=text)
-
-                for tc in delta.get("tool_calls", []) or []:
-                    idx = int(tc.get("index", 0))
-                    tc_id = tc.get("id", "")
-                    if tc_id:
-                        tool_id_by_index[idx] = tc_id
-                    fn = tc.get("function", {}) or {}
-                    name_part = fn.get("name", "")
-                    args_part = fn.get("arguments", "")
-                    if name_part:
-                        tool_name_by_index[idx] = name_part
-                    if isinstance(args_part, str) and args_part:
-                        tool_args_by_index[idx] = tool_args_by_index.get(idx, "") + args_part
-
-                if finish_reason is None:
-                    continue
-
-                tool_calls: list[ToolCall] = []
-                for idx in sorted(tool_name_by_index):
-                    name = tool_name_by_index.get(idx, "")
-                    if not name:
-                        continue
-                    args_raw = tool_args_by_index.get(idx, "")
-                    if args_raw:
-                        try:
-                            args = json.loads(args_raw)
-                        except json.JSONDecodeError:
-                            args = {"raw": args_raw}
-                    else:
-                        args = {}
-                    tool_calls.append(
-                        ToolCall(
-                            name=name,
-                            arguments=args,
-                            id=tool_id_by_index.get(idx),
-                        )
-                    )
-
-                yield StreamChunk(tool_calls=tool_calls, done=True)
-                return
+        async for chunk in stream_openai_chat(
+            self._http,
+            base_url=self.base_url,
+            model=self.model,
+            messages=messages,
+            use_tools=use_tools,
+        ):
+            yield chunk

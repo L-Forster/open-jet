@@ -122,6 +122,41 @@ Main settings are stored in `config.yaml`, including:
 - logging settings
 - session state/resume settings
 
+### SGLang
+
+`open-jet` can also connect to `SGLang` through its OpenAI-compatible server.
+
+On Jetson, prefer running SGLang in a local container. This keeps inference fully local while avoiding host-side Python dependency issues like missing `triton`.
+
+Example `config.yaml` values:
+
+```yaml
+runtime: sglang
+model: /home/you/models/Qwen3.5-4B-AWQ-4bit
+sglang_model: /home/you/models/Qwen3.5-4B-AWQ-4bit
+sglang_launch_mode: docker
+sglang_base_url: http://127.0.0.1:30000
+sglang_docker_image: your-local-sglang-image
+sglang_docker_container_name: open-jet-sglang
+sglang_docker_runtime: nvidia
+sglang_served_model_name: local
+sglang_reasoning_parser: qwen3
+sglang_tool_call_parser: qwen3_coder
+sglang_mem_fraction_static: 0.8
+context_window_tokens: 8192
+gpu_layers: 0
+```
+
+In `docker` mode, `open-jet` starts the local container itself and waits for the OpenAI-compatible API on `127.0.0.1`.
+
+In `external` mode, `open-jet` does not import or launch SGLang from the host environment. It only connects to an already-running local server:
+
+```bash
+http://127.0.0.1:30000
+```
+
+Use `managed` mode only when SGLang is installed in the same Python environment as `open-jet`.
+
 ### TensorRT-LLM (PyTorch runtime) with Qwen
 
 `open-jet` can run against `trtllm-serve` instead of `llama-server`.

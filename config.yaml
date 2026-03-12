@@ -3,7 +3,7 @@ device: cuda
 gpu_layers: 99
 hardware_override: ''
 hardware_profile: auto
-llama_model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
+llama_model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
 logging:
   directory: session_logs
   enabled: true
@@ -15,12 +15,15 @@ memory_guard:
   keep_last_messages: 6
   max_used_percent: null
   min_available_mb: null
-model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
+model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
 model_source: local
 ollama_model: gemma2:2b
 recommended_llm: gemma2:2b
 runtime: llama_cpp
 setup_complete: true
+sglang_launch_mode: jetson_container
+sglang_model: /home/louis/open-jet/Qwen3.5-4B-AWQ-4bit
+sglang_served_model_name: local
 state:
   auto_resume: false
   enabled: true

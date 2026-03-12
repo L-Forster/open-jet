@@ -19,4 +19,8 @@ session_state.json
 .coverage
 *.log
 test.txt
+Qwen3.5-4B-AWQ-4bit/
+Qwen3.5-4B-Q4_K_M.gguf
+hello_world.py
+
 testfile
