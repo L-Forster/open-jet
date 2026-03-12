@@ -110,7 +110,7 @@ class Agent:
         chunk_count = 0
 
         try:
-            async for chunk in self.client.chat_stream(self.messages + self.turn_context_messages):
+            async for chunk in self.client.chat_stream(self._messages_for_runtime()):
                 chunk_count += 1
                 if chunk.text:
                     collected_text += chunk.text
@@ -232,6 +232,28 @@ class Agent:
 
     def clear_turn_context(self) -> None:
         self.turn_context_messages = []
+
+    def _messages_for_runtime(self) -> list[dict]:
+        combined = self.messages + self.turn_context_messages
+        system_parts: list[str] = []
+        runtime_messages: list[dict] = []
+
+        for msg in combined:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", ""))
+            if role == "system":
+                content = str(msg.get("content", "")).strip()
+                if content:
+                    system_parts.append(content)
+                continue
+            runtime_messages.append(msg)
+
+        if not system_parts:
+            return runtime_messages
+
+        merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+        return [merged_system, *runtime_messages]
 
     def _estimated_context_tokens(self, *, include_turn_context: bool = True) -> int:
         total = 0

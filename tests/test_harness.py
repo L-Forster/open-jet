@@ -187,7 +187,10 @@ class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
         events = [event async for event in agent.run_turn()]
 
         self.assertIsNotNone(client.last_messages)
-        self.assertEqual(client.last_messages[-1]["content"], "temporary harness doc")
+        self.assertEqual(client.last_messages[0]["role"], "system")
+        self.assertIn("system", client.last_messages[0]["content"])
+        self.assertIn("temporary harness doc", client.last_messages[0]["content"])
+        self.assertEqual(client.last_messages[-1]["content"], "hello")
         self.assertEqual(events[-1].kind, ActionKind.DONE)
         self.assertEqual(agent.messages[-1]["role"], "assistant")
         self.assertNotIn("temporary harness doc", [msg.get("content", "") for msg in agent.messages])

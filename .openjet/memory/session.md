@@ -9,3 +9,8 @@ Keep entries short and current.
 - Harness runtime added.
 - Markdown-backed agents, skills, project defaults, and memory are now expected under `.openjet/`.
 - Next likely work: tune step advancement, compaction thresholds, and skill selection from real usage.
+## 2026-03-12
+- completed_step: Inspect the relevant area
+- mode: code
+- files: n/a
+- next: Implement the requested change in the relevant area
