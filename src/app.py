@@ -60,6 +60,14 @@ from .hardware import (
     recommended_device,
     recommended_gpu_layers,
 )
+from .multimodal import (
+    build_user_content,
+    content_to_plain_text,
+    estimate_message_content_tokens,
+    extract_pasted_image_paths,
+    is_image_path,
+    is_supported_message_content,
+)
 from .ollama_setup import discover_installed_ollama_models, materialize_setup_model
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
@@ -144,6 +152,21 @@ BANNER = r"""[bold green]
 [/]"""
 
 
+class PromptInput(Input):
+    def _on_paste(self, event: events.Paste) -> None:
+        app = self.app
+        if isinstance(app, OpenJetApp) and app.handle_prompt_paste(event.text):
+            event.stop()
+            return
+        super()._on_paste(event)
+
+    def action_paste(self) -> None:
+        app = self.app
+        if isinstance(app, OpenJetApp) and app.handle_prompt_paste(app.clipboard):
+            return
+        super().action_paste()
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -190,6 +213,8 @@ class OpenJetApp(App):
         self._thinking_timer = None
         self._thinking_idx = 0
         self._thinking_token = 0
+        self._assistant_status_kind: str | None = None
+        self._assistant_status_command: str | None = None
         self._awaiting_approval = False
         self._approval_choice = 0
         self._approval_future: asyncio.Future[bool] | None = None
@@ -216,6 +241,7 @@ class OpenJetApp(App):
         self._generation_started_at: float | None = None
         self._generation_tokens_streamed = 0
         self._last_generation_tps: float | None = None
+        self._pending_image_paths: list[str] = []
 
     def _active_model_ref(self) -> str:
         return active_model_ref(self.cfg)
@@ -472,7 +498,7 @@ class OpenJetApp(App):
         yield Static("", id="assistant-status", classes="hidden")
         yield Static("", id="approval-bar", classes="hidden")
         with Container(id="bottom-stack"):
-            yield Input(placeholder="> ", id="prompt")
+            yield PromptInput(placeholder="> ", id="prompt")
             yield Static("", id="utilization-bar")
             yield Static("", id="token-counter")
             yield Static("", id="command-suggestions", classes="hidden")
@@ -713,13 +739,16 @@ class OpenJetApp(App):
             return
 
         text = event.value.strip()
-        if not text:
+        attached_images = list(self._pending_image_paths)
+        if not text and not attached_images:
             return
-        self._record_prompt_history(text)
+        history_text = text if text else "\n".join(f"Attached image: {path}" for path in attached_images)
+        self._record_prompt_history(history_text)
         event.input.value = ""
+        self._pending_image_paths.clear()
         self._clear_completion_suggestions()
 
-        if await self.commands.maybe_handle(text):
+        if text and await self.commands.maybe_handle(text):
             self._render_token_counter()
             return
 
@@ -730,27 +759,39 @@ class OpenJetApp(App):
             self._render_token_counter()
             return
 
-        log.write(f"[bold green]> [/]{text}")
+        display_text = text if text else "[image attachment]"
+        log.write(f"[bold green]> [/]{display_text}")
+        for image_path in attached_images:
+            log.write(f"  [bold bright_white]attached image:[/] {escape(image_path)}")
         log.write("")
 
         mentioned_files = _extract_file_mentions(text)
+        attached_from_mentions = [
+            str(Path(path).expanduser().resolve())
+            for path in mentioned_files
+            if is_image_path(path)
+        ]
+        for image_path in attached_from_mentions:
+            if image_path not in attached_images:
+                attached_images.append(image_path)
         self.harness_state = update_state_for_user_message(
             self.harness_state,
-            text,
+            history_text,
             files=mentioned_files,
         )
-        self._begin_turn_trace(text)
+        self._begin_turn_trace(history_text)
         self.persist_harness_state()
         if self.session_logger:
             self.session_logger.log_event(
                 "user_message",
                 turn_id=self._active_turn_id,
-                text=text,
+                text=history_text,
                 mentioned_files=mentioned_files,
                 mode=self.harness_state.mode,
+                attached_images=attached_images,
             )
         await self._load_mentioned_files_into_context(text, log)
-        self.agent.add_user_message(text)
+        self.agent.add_user_message(text, image_paths=attached_images)
         self.persist_session_state(reason="user_message")
         self._render_token_counter()
         self._start_agent_turn()
@@ -764,6 +805,8 @@ class OpenJetApp(App):
             return
 
         for mention_path in paths:
+            if is_image_path(mention_path):
+                continue
             await self.load_context_file(mention_path, log)
         self._render_token_counter()
 
@@ -773,6 +816,12 @@ class OpenJetApp(App):
         mention_path = path.strip()
         if not mention_path:
             log.write("[yellow]load:[/] empty path")
+            return False
+        if is_image_path(mention_path):
+            log.write(
+                f"[yellow]load:[/] {escape(mention_path)} is an image. "
+                "Attach it in a chat turn with @path or paste its file path into the prompt."
+            )
             return False
 
         current_tokens = self.agent.estimated_context_tokens()
@@ -864,7 +913,7 @@ class OpenJetApp(App):
             counter.update("[bold bright_white]tokens: 0/0[/]")
             return
         current = self.agent.estimated_context_tokens()
-        draft = estimate_tokens(draft_text)
+        draft = estimate_message_content_tokens(build_user_content(draft_text, self._pending_image_paths))
         total = current + draft
         window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
         budget = self.agent.context_budget() or derive_context_budget(window)
@@ -1012,6 +1061,8 @@ class OpenJetApp(App):
             "ready": True,
             "messages": self.agent.conversation_message_count(),
             "generating": self._thinking_timer is not None,
+            "command_in_progress": self._assistant_status_kind == "command",
+            "active_command": self._assistant_status_command,
             "context_tokens": current,
             "context_window_tokens": window,
             "prompt_budget_tokens": budget.prompt_tokens,
@@ -1045,7 +1096,7 @@ class OpenJetApp(App):
             role = msg.get("role")
             if not isinstance(role, str):
                 continue
-            if "content" in msg and not isinstance(msg.get("content"), str):
+            if "content" in msg and not is_supported_message_content(msg.get("content")):
                 continue
             valid_messages.append(msg)
         if not valid_messages:
@@ -1101,23 +1152,23 @@ class OpenJetApp(App):
         for msg in messages:
             role = msg.get("role")
             if role == "user":
-                text = msg.get("content", "")
-                if isinstance(text, str) and text.strip():
+                text = content_to_plain_text(msg.get("content", ""))
+                if text.strip():
                     log.write(f"[bold green]> [/]{text}")
                     log.write("")
                 continue
 
             if role == "assistant":
-                text = msg.get("content", "")
-                if isinstance(text, str) and text:
+                text = content_to_plain_text(msg.get("content", ""))
+                if text:
                     self._write_text_block(log, text)
                 if not msg.get("tool_calls"):
                     log.write("")
                 continue
 
             if role == "tool":
-                text = msg.get("content", "")
-                if isinstance(text, str) and text:
+                text = content_to_plain_text(msg.get("content", ""))
+                if text:
                     self._write_tool_result(log, text)
 
     def _seed_prompt_history_from_messages(self, messages: list[dict]) -> None:
@@ -1125,13 +1176,33 @@ class OpenJetApp(App):
         for msg in messages:
             if msg.get("role") != "user":
                 continue
-            text = msg.get("content")
-            if isinstance(text, str):
-                normalized = text.strip()
-                if normalized:
-                    self._prompt_history.append(normalized)
+            normalized = content_to_plain_text(msg.get("content", "")).strip()
+            if normalized:
+                self._prompt_history.append(normalized)
         self._prompt_history_index = None
         self._prompt_history_draft = ""
+
+    def handle_prompt_paste(self, text: str) -> bool:
+        prompt = self.query_one("#prompt", Input)
+        if self.focused is not prompt:
+            return False
+        image_paths = extract_pasted_image_paths(text)
+        if not image_paths:
+            return False
+        added = 0
+        for path in image_paths:
+            if path in self._pending_image_paths:
+                continue
+            self._pending_image_paths.append(path)
+            added += 1
+        if added <= 0:
+            return True
+        self._render_token_counter(prompt.value)
+        status = self.query_one("#assistant-status", Static)
+        noun = "image" if added == 1 else "images"
+        status.remove_class("hidden")
+        status.update(f"[bold green]Attached {added} pasted {noun}. Enter a prompt to analyze them.[/]")
+        return True
 
     def _record_prompt_history(self, text: str) -> None:
         normalized = text.strip()
@@ -1558,7 +1629,11 @@ class OpenJetApp(App):
 
         self._active_turn_tool_attempts += 1
         t0 = time.monotonic()
-        execution = await execute_tool(tc)
+        tool_status_token = self._start_tool_status(tc)
+        try:
+            execution = await execute_tool(tc)
+        finally:
+            self._stop_tool_status(tool_status_token)
         result = execution.output
         meta = execution.meta
         result_for_context, clipped_tool_result = self._fit_tool_result_to_budget(result)
@@ -1675,28 +1750,25 @@ class OpenJetApp(App):
         return True
 
     def _start_thinking(self) -> int:
-        status = self.query_one("#assistant-status", Static)
         self._thinking_token += 1
         self._thinking_idx = 0
+        self._assistant_status_kind = "generating"
+        self._assistant_status_command = None
         self._generation_started_at = time.monotonic()
         self._generation_tokens_streamed = 0
-        status.remove_class("hidden")
-        status.update("[bold green]Generating .[/]")
+        self._render_assistant_status()
         if self._thinking_timer:
             self._thinking_timer.stop()
         self._thinking_timer = self.set_interval(0.4, self._tick_thinking)
         return self._thinking_token
 
     def _tick_thinking(self) -> None:
-        status = self.query_one("#assistant-status", Static)
-        dots = [".", "..", "..."][self._thinking_idx % 3]
-        status.update(f"[bold green]Generating {dots}[/]")
+        self._render_assistant_status()
         self._thinking_idx += 1
 
     def _stop_thinking(self, token: int | None = None) -> None:
         if token is not None and token != self._thinking_token:
             return
-        status = self.query_one("#assistant-status", Static)
         if self._generation_started_at is not None:
             elapsed = time.monotonic() - self._generation_started_at
             if elapsed > 0 and self._generation_tokens_streamed > 0:
@@ -1705,8 +1777,61 @@ class OpenJetApp(App):
         if self._thinking_timer:
             self._thinking_timer.stop()
             self._thinking_timer = None
+        self._assistant_status_kind = None
+        self._assistant_status_command = None
+        self._clear_assistant_status()
+
+    def _start_tool_status(self, tc: ToolCall) -> int | None:
+        if tc.name != "shell" or not isinstance(tc.arguments, dict):
+            return None
+        command = str(tc.arguments.get("command", "")).strip()
+        if not command:
+            return None
+        self._thinking_token += 1
+        self._thinking_idx = 0
+        self._assistant_status_kind = "command"
+        self._assistant_status_command = command
+        self._render_assistant_status()
+        if self._thinking_timer:
+            self._thinking_timer.stop()
+        self._thinking_timer = self.set_interval(0.4, self._tick_thinking)
+        return self._thinking_token
+
+    def _stop_tool_status(self, token: int | None = None) -> None:
+        if token is None or token != self._thinking_token:
+            return
+        if self._thinking_timer:
+            self._thinking_timer.stop()
+            self._thinking_timer = None
+        self._assistant_status_kind = None
+        self._assistant_status_command = None
+        self._clear_assistant_status()
+
+    def _render_assistant_status(self) -> None:
+        status = self.query_one("#assistant-status", Static)
+        dots = [".", "..", "..."][self._thinking_idx % 3]
+        if self._assistant_status_kind == "command" and self._assistant_status_command:
+            label = self._format_command_status_label(self._assistant_status_command)
+            status.remove_class("hidden")
+            status.update(f"[bold yellow]Running {escape(label)} {dots}[/]")
+            return
+        if self._assistant_status_kind == "generating":
+            status.remove_class("hidden")
+            status.update(f"[bold green]Generating {dots}[/]")
+            return
+        self._clear_assistant_status()
+
+    def _clear_assistant_status(self) -> None:
+        status = self.query_one("#assistant-status", Static)
         status.add_class("hidden")
         status.update("")
+
+    @staticmethod
+    def _format_command_status_label(command: str, max_len: int = 72) -> str:
+        compact = " ".join(command.split())
+        if len(compact) <= max_len:
+            return compact
+        return compact[: max_len - 3] + "..."
 
     async def _wait_for_tool_approval(self, tc: ToolCall) -> bool:
         bar = self.query_one("#approval-bar", Static)

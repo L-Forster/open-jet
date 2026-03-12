@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -211,6 +212,29 @@ class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.messages[-1]["role"], "tool")
         self.assertEqual(agent.messages[-1]["tool_call_id"], tool_call.id)
 
+    async def test_image_attachment_is_serialized_for_runtime(self) -> None:
+        client = FakeRuntimeClient([StreamChunk(text="vision done")])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "sample.png"
+            image_path.write_bytes(
+                base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS2kAAAAASUVORK5CYII="
+                )
+            )
+            agent.add_user_message("describe this", image_paths=[str(image_path)])
+
+            events = [event async for event in agent.run_turn()]
+
+        self.assertEqual(events[-1].kind, ActionKind.DONE)
+        self.assertIsNotNone(client.last_messages)
+        content = client.last_messages[-1]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertIn("Attached image:", content[0]["text"])
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
 
 class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_collects_text_and_tool_results(self) -> None:
@@ -258,6 +282,22 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
         tool_result = next(event.tool_result for event in events if event.kind == SDKEventKind.TOOL_RESULT)
         self.assertTrue(tool_result.approved)
         self.assertTrue(tool_result.ok)
+
+    async def test_run_accepts_image_paths(self) -> None:
+        client = SequencedRuntimeClient([[StreamChunk(text="done")]])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        session = OpenJetSession(agent)
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "sample.png"
+            image_path.write_bytes(
+                base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS2kAAAAASUVORK5CYII="
+                )
+            )
+            response = await session.run("inspect", image_paths=[str(image_path)])
+
+        self.assertEqual(response.text, "done")
+        self.assertIsInstance(client.last_messages[-1]["content"], list)
 
 
 if __name__ == "__main__":

@@ -113,8 +113,8 @@ class OpenJetSession:
     def clear_turn_context(self) -> None:
         self.agent.clear_turn_context()
 
-    async def stream(self, prompt: str):
-        self.agent.add_user_message(prompt)
+    async def stream(self, prompt: str, *, image_paths: list[str] | None = None):
+        self.agent.add_user_message(prompt, image_paths=image_paths)
         while True:
             pending_tool_calls: list[ToolCall] = []
             async for event in self.agent.run_turn():
@@ -151,12 +151,12 @@ class OpenJetSession:
                     tool_result=tool_result,
                 )
 
-    async def run(self, prompt: str) -> SDKResponse:
+    async def run(self, prompt: str, *, image_paths: list[str] | None = None) -> SDKResponse:
         text_parts: list[str] = []
         tool_results: list[ToolResult] = []
         condense_messages: list[str] = []
 
-        async for event in self.stream(prompt):
+        async for event in self.stream(prompt, image_paths=image_paths):
             if event.kind == SDKEventKind.TEXT:
                 text_parts.append(event.text)
             elif event.kind == SDKEventKind.TOOL_RESULT and event.tool_result:

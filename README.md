@@ -122,6 +122,9 @@ async def main() -> None:
         response = await session.run("Summarize the current README")
         print(response.text)
 
+        vision = await session.run("Describe this image", image_paths=["./example.png"])
+        print(vision.text)
+
         async for event in session.stream("Inspect README.md with tools if needed"):
             if event.text:
                 print(event.text, end="")
@@ -163,6 +166,7 @@ It then saves your configuration and starts the runtime with a device-appropriat
 
 - Type normally and press Enter to chat
 - Use `@file` or `@[path with spaces]` to add file content to context
+- Use `@image.png` or paste local image file paths into the prompt to attach images to the next turn
 - Type `/` to open slash-command suggestions
 - `Tab`/`Enter` can autocomplete slash commands and file mentions
 - `Ctrl+C` or `/exit` quits

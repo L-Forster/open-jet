@@ -11,6 +11,8 @@ session_logs/
 session_state.json
 *.events.jsonl
 *.metrics.jsonl
+.openjet/state/
+.openjet/memory/
 
 # Local tooling/cache artifacts
 .pytest_cache/

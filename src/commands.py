@@ -141,6 +141,7 @@ class SlashCommandHandler:
         self.app.agent.reset_conversation()
         self.app.agent.clear_turn_context()
         self.app.loaded_files.clear()
+        self.app._pending_image_paths.clear()
         self.app.harness_state = type(self.app.harness_state)()
         self.app._turn_context_docs = []
         self.app._turn_context_tokens = 0
@@ -186,6 +187,12 @@ class SlashCommandHandler:
             f"Generating: {'yes' if snapshot['generating'] else 'no'}"
             "[/]"
         )
+        if snapshot.get("command_in_progress"):
+            log.write(
+                "[bold bright_white]"
+                f"Command: {snapshot.get('active_command') or 'running'}"
+                "[/]"
+            )
         log.write(
             "[bold bright_white]"
             f"Context tokens: {snapshot['context_tokens']}/{snapshot['context_window_tokens']} | "
@@ -287,6 +294,7 @@ class SlashCommandHandler:
 
         self.app.agent.reset_conversation()
         self.app.loaded_files.clear()
+        self.app._pending_image_paths.clear()
         log.clear()
         log.write(self.banner)
         if not self.app._restore_session_state(log):

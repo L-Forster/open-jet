@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import AsyncIterator
 
+from .multimodal import content_to_plain_text, estimate_message_content_tokens, runtime_content
 from .runtime_protocol import ToolCall
 from .runtime_client import RuntimeClient
 from .runtime_limits import ContextBudget, derive_context_budget, estimate_tokens, read_memory_snapshot
@@ -63,8 +64,10 @@ class Agent:
         self.keep_last_messages = keep_last_messages
         self.turn_context_messages: list[dict] = []
 
-    def add_user_message(self, text: str) -> None:
-        self.messages.append({"role": "user", "content": text})
+    def add_user_message(self, text: str, *, image_paths: list[str] | None = None) -> None:
+        from .multimodal import build_user_content
+
+        self.messages.append({"role": "user", "content": build_user_content(text, image_paths)})
 
     def reset_conversation(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
@@ -243,11 +246,13 @@ class Agent:
                 continue
             role = str(msg.get("role", ""))
             if role == "system":
-                content = str(msg.get("content", "")).strip()
+                content = content_to_plain_text(msg.get("content", "")).strip()
                 if content:
                     system_parts.append(content)
                 continue
-            runtime_messages.append(msg)
+            runtime_msg = dict(msg)
+            runtime_msg["content"] = runtime_content(msg.get("content", ""))
+            runtime_messages.append(runtime_msg)
 
         if not system_parts:
             return runtime_messages
@@ -262,8 +267,7 @@ class Agent:
             message_sets.append(self.turn_context_messages)
         for batch in message_sets:
             for msg in batch:
-                content = str(msg.get("content", ""))
-                total += estimate_tokens(content) + 8
+                total += estimate_message_content_tokens(msg.get("content", "")) + 8
         return total
 
     def _resource_pressure_reason(self) -> str | None:
@@ -316,7 +320,7 @@ class Agent:
         lines: list[str] = []
         for msg in older_messages:
             role = str(msg.get("role", "unknown")).upper()
-            text = " ".join(str(msg.get("content", "")).split())
+            text = " ".join(content_to_plain_text(msg.get("content", "")).split())
             if text:
                 lines.append(f"{role}: {text}")
         return "\n".join(lines)
