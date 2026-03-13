@@ -1,6 +1,6 @@
 [project]
 name = "open-jet"
-version = "0.1.8"
+version = "0.1.9"
 description = "Offline local-LLM terminal app for Jetson and edge Linux: chat with on-device models, run agent tools, and manage context safely."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -13,7 +13,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -47,6 +46,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = false
+license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 include = ["src"]
