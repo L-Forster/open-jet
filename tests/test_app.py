@@ -61,6 +61,40 @@ class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("run_turn_done", names)
         self.assertIn("DONE", result_kinds)
 
+    async def test_persistent_context_tokens_counts_assistant_tool_calls(self) -> None:
+        agent = Agent(
+            client=FakeRuntimeClient(),
+            system_prompt="system",
+            context_window_tokens=4096,
+        )
+        base = agent.persistent_context_tokens()
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": "Inspecting files before patching.",
+                "tool_calls": [
+                    {
+                        "id": "call_read",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps(
+                                {
+                                    "path": "src/harness.py",
+                                    "detail": "read the layered budget path and candidate admission flow",
+                                },
+                                ensure_ascii=True,
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+
+        with_tool_calls = agent.persistent_context_tokens()
+
+        self.assertGreater(with_tool_calls, base + 10)
+
 
 class AppStatusTests(unittest.TestCase):
     def test_format_command_status_label_compacts_and_truncates(self) -> None:

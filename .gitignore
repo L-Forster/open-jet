@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 src/*.c
+benchmark_results/
 
 # Runtime/session state
 session_logs/

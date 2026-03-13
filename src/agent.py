@@ -311,7 +311,17 @@ class Agent:
         for batch in message_sets:
             for msg in batch:
                 total += estimate_message_content_tokens(msg.get("content", "")) + 8
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    total += self._estimate_tool_call_tokens(tool_calls)
         return total
+
+    def _estimate_tool_call_tokens(self, tool_calls: list[dict]) -> int:
+        try:
+            payload = json.dumps(tool_calls, ensure_ascii=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            payload = str(tool_calls)
+        return estimate_tokens(payload)
 
     def _resource_pressure_reason(self) -> str | None:
         context_pressure = self._context_pressure_reason()

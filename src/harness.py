@@ -148,12 +148,32 @@ class LayeredContextConfig:
 @dataclass(frozen=True)
 class HarnessContext:
     messages: list[dict[str, str]]
+    state_summary: str
+    state_summary_tokens: int
     docs_loaded: list[str]
     docs_tokens: int
     budget: TurnBudget
     layer_tokens: dict[str, int]
     layer_docs: dict[str, list[str]]
     budget_alerts: list[str]
+    candidate_decisions: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class HarnessDocCandidate:
+    layer: str
+    label: str
+    body: str
+    token_count: int
+
+
+@dataclass(frozen=True)
+class HarnessDocDecision:
+    layer: str
+    label: str
+    token_count: int
+    admitted: bool
+    skipped_reason: str | None = None
 
 
 class HarnessSessionStore:
@@ -307,20 +327,25 @@ def build_turn_context(
     layer_tokens = {"layer1": 0, "layer2": 0, "layer3": 0}
     layer_docs = {"layer1": [], "layer2": [], "layer3": []}
     budget_alerts: list[str] = []
+    candidate_decisions: list[dict[str, Any]] = []
 
     state_summary = build_state_summary(state, budget)
+    state_summary_tokens = estimate_tokens(state_summary)
     messages.append({"role": "system", "content": state_summary})
 
-    remaining = max(0, budget.docs_budget - estimate_tokens(state_summary))
+    remaining = max(0, budget.docs_budget - state_summary_tokens)
     if remaining <= 0:
         return HarnessContext(
             messages=messages,
+            state_summary=state_summary,
+            state_summary_tokens=state_summary_tokens,
             docs_loaded=docs_loaded,
-            docs_tokens=estimate_tokens(state_summary),
+            docs_tokens=state_summary_tokens,
             budget=budget,
             layer_tokens=layer_tokens,
             layer_docs=layer_docs,
             budget_alerts=budget_alerts,
+            candidate_decisions=candidate_decisions,
         )
 
     per_layer_remaining = {
@@ -328,24 +353,95 @@ def build_turn_context(
         "layer2": min(remaining, budget.layer2_budget),
         "layer3": min(remaining, budget.layer3_budget),
     }
+    stop_after_global_floor = False
 
-    for layer_name, label, body in _candidate_docs(root, state, effective_window):
-        if not _layer_enabled(config, layer_name):
+    for candidate in _candidate_docs(root, state, effective_window):
+        if not candidate.body.strip():
+            candidate_decisions.append(
+                asdict(
+                    HarnessDocDecision(
+                        layer=candidate.layer,
+                        label=candidate.label,
+                        token_count=candidate.token_count,
+                        admitted=False,
+                        skipped_reason="empty_body",
+                    )
+                )
+            )
             continue
-        doc_tokens = estimate_tokens(body)
+        if stop_after_global_floor:
+            candidate_decisions.append(
+                asdict(
+                    HarnessDocDecision(
+                        layer=candidate.layer,
+                        label=candidate.label,
+                        token_count=candidate.token_count,
+                        admitted=False,
+                        skipped_reason="remaining_global_floor_reached",
+                    )
+                )
+            )
+            continue
+        layer_name = candidate.layer
+        if not _layer_enabled(config, layer_name):
+            candidate_decisions.append(
+                asdict(
+                    HarnessDocDecision(
+                        layer=layer_name,
+                        label=candidate.label,
+                        token_count=candidate.token_count,
+                        admitted=False,
+                        skipped_reason="disabled_layer",
+                    )
+                )
+            )
+            continue
+        doc_tokens = candidate.token_count
         if doc_tokens > remaining:
+            candidate_decisions.append(
+                asdict(
+                    HarnessDocDecision(
+                        layer=layer_name,
+                        label=candidate.label,
+                        token_count=doc_tokens,
+                        admitted=False,
+                        skipped_reason="exceeds_remaining_global_budget",
+                    )
+                )
+            )
             continue
         if doc_tokens > per_layer_remaining.get(layer_name, remaining):
+            candidate_decisions.append(
+                asdict(
+                    HarnessDocDecision(
+                        layer=layer_name,
+                        label=candidate.label,
+                        token_count=doc_tokens,
+                        admitted=False,
+                        skipped_reason="exceeds_remaining_per_layer_budget",
+                    )
+                )
+            )
             continue
-        messages.append({"role": "system", "content": body})
-        docs_loaded.append(label)
+        messages.append({"role": "system", "content": candidate.body})
+        docs_loaded.append(candidate.label)
         docs_tokens += doc_tokens
         layer_tokens[layer_name] = layer_tokens.get(layer_name, 0) + doc_tokens
-        layer_docs.setdefault(layer_name, []).append(label)
+        layer_docs.setdefault(layer_name, []).append(candidate.label)
+        candidate_decisions.append(
+            asdict(
+                HarnessDocDecision(
+                    layer=layer_name,
+                    label=candidate.label,
+                    token_count=doc_tokens,
+                    admitted=True,
+                )
+            )
+        )
         remaining -= doc_tokens
         per_layer_remaining[layer_name] = max(0, per_layer_remaining.get(layer_name, 0) - doc_tokens)
         if remaining < 128:
-            break
+            stop_after_global_floor = True
 
     for layer_name, used in layer_tokens.items():
         if used > budget.layer_alert_tokens:
@@ -353,15 +449,18 @@ def build_turn_context(
                 f"{layer_name} exceeded 40% of the context window: used={used} threshold={budget.layer_alert_tokens}"
             )
 
-    docs_tokens += estimate_tokens(state_summary)
+    docs_tokens += state_summary_tokens
     return HarnessContext(
         messages=messages,
+        state_summary=state_summary,
+        state_summary_tokens=state_summary_tokens,
         docs_loaded=docs_loaded,
         docs_tokens=docs_tokens,
         budget=budget,
         layer_tokens=layer_tokens,
         layer_docs=layer_docs,
         budget_alerts=budget_alerts,
+        candidate_decisions=candidate_decisions,
     )
 
 
@@ -561,7 +660,7 @@ def _complete_and_advance(state: HarnessState, step_id: str) -> None:
     state.active_step_id = None
 
 
-def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str, str]]:
+def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list[HarnessDocCandidate]:
     role_name = ROLE_BY_MODE.get(state.mode, "coder")
     candidates: list[tuple[str, str, str]] = []
     repo_index = load_repo_context_index(root)
@@ -582,7 +681,18 @@ def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list
     candidates.extend(selected_skills)
     candidates.extend(_recent_context_docs(state))
 
-    return [(layer_name, label, _format_doc(label, body)) for layer_name, label, body in candidates if body.strip()]
+    formatted: list[HarnessDocCandidate] = []
+    for layer_name, label, body in candidates:
+        rendered = _format_doc(label, body) if body.strip() else ""
+        formatted.append(
+            HarnessDocCandidate(
+                layer=layer_name,
+                label=label,
+                body=rendered,
+                token_count=estimate_tokens(rendered),
+            )
+        )
+    return formatted
 
 
 def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str, str]]:

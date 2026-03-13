@@ -1102,9 +1102,12 @@ class OpenJetApp:
                     snapshot={
                         "docs_loaded": context.docs_loaded,
                         "docs_tokens": context.docs_tokens,
+                        "state_summary": context.state_summary,
+                        "state_summary_tokens": context.state_summary_tokens,
                         "layer_tokens": context.layer_tokens,
                         "layer_docs": context.layer_docs,
                         "budget_alerts": context.budget_alerts,
+                        "candidate_decisions": context.candidate_decisions,
                         "budget": {
                             "effective_window": context.budget.effective_window,
                             "usable_prompt_budget": context.budget.usable_prompt_budget,

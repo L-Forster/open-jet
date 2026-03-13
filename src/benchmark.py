@@ -11,10 +11,18 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import sys
 from typing import Any, Callable
 
 from .agent import ActionKind, Agent
 from .config import load_config
+from .context_benchmark import (
+    available_context_suites,
+    compare_context_runs,
+    run_context_suite,
+    run_jetson_4k_suites,
+    summarize_context_run,
+)
 from .executor import (
     DEFAULT_SHELL_TIMEOUT_SECONDS,
     edit_file,
@@ -697,15 +705,81 @@ def select_cases(names: list[str] | None) -> list[BenchmarkCase]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    args = list(argv if argv is not None else sys.argv[1:])
+    commands = {"context-suite", "jetson-4k", "compare", "summary", "context-tests"}
+    if args and args[0] in commands:
+        _run_context_cli(args)
+        return
+
     parser = argparse.ArgumentParser(description="Run open-jet eval benchmarks in isolated environments.")
     parser.add_argument("--cases", type=str, default="", help="Comma-separated case ids. Default: all.")
     parser.add_argument("--repeats", type=int, default=3, help="How many times to run each case.")
     parser.add_argument("--output-dir", type=str, default="benchmark_runs", help="Directory for benchmark artifacts.")
-    args = parser.parse_args(argv)
+    parsed = parser.parse_args(args)
 
-    case_names = [item.strip() for item in args.cases.split(",") if item.strip()]
+    case_names = [item.strip() for item in parsed.cases.split(",") if item.strip()]
     cases = select_cases(case_names)
-    asyncio.run(run_benchmark_suite(cases=cases, repeats=max(1, args.repeats), output_dir=Path(args.output_dir)))
+    asyncio.run(run_benchmark_suite(cases=cases, repeats=max(1, parsed.repeats), output_dir=Path(parsed.output_dir)))
+
+
+def _run_context_cli(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(description="Run layered-context benchmarks and comparisons.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    suite_parser = subparsers.add_parser("context-suite", help="Run a named layered-context benchmark suite.")
+    suite_parser.add_argument("name", choices=available_context_suites())
+    suite_parser.add_argument("--output-root", default="benchmark_results/context", help="Artifact root directory.")
+
+    jetson_parser = subparsers.add_parser("jetson-4k", help="Run the Jetson-focused 4k layered-context suites.")
+    jetson_parser.add_argument("--output-root", default="benchmark_results/context", help="Artifact root directory.")
+
+    compare_parser = subparsers.add_parser("compare", help="Compare two or more saved layered-context benchmark runs.")
+    compare_parser.add_argument("runs", nargs="+", help="Run directories to compare.")
+    compare_parser.add_argument("--markdown-output", default="", help="Optional markdown output path.")
+
+    summary_parser = subparsers.add_parser("summary", help="Print a concise summary for a saved layered-context run.")
+    summary_parser.add_argument("run", help="Run directory to summarize.")
+
+    tests_parser = subparsers.add_parser("context-tests", help="Run the context-only verification test modules.")
+    tests_parser.add_argument("--verbose", action="store_true", help="Enable verbose unittest output.")
+
+    parsed = parser.parse_args(argv)
+    if parsed.command == "context-suite":
+        run_dir = run_context_suite(parsed.name, output_root=Path(parsed.output_root))
+        print(run_dir)
+        print(summarize_context_run(run_dir))
+        return
+    if parsed.command == "jetson-4k":
+        run_dirs = run_jetson_4k_suites(output_root=Path(parsed.output_root))
+        for run_dir in run_dirs:
+            print(run_dir)
+            print(summarize_context_run(run_dir))
+        return
+    if parsed.command == "compare":
+        markdown_path = Path(parsed.markdown_output) if parsed.markdown_output else None
+        print(compare_context_runs([Path(item) for item in parsed.runs], markdown_path=markdown_path))
+        return
+    if parsed.command == "summary":
+        print(summarize_context_run(Path(parsed.run)))
+        return
+    if parsed.command == "context-tests":
+        _run_context_tests(verbose=parsed.verbose)
+        return
+
+
+def _run_context_tests(*, verbose: bool) -> None:
+    import unittest
+
+    test_names = [
+        "tests.test_context_harness",
+        "tests.test_context_index",
+        "tests.test_context_memory",
+        "tests.test_context_benchmark",
+    ]
+    suite = unittest.defaultTestLoader.loadTestsFromNames(test_names)
+    result = unittest.TextTestRunner(verbosity=2 if verbose else 1).run(suite)
+    if not result.wasSuccessful():
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

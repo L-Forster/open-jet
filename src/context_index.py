@@ -41,7 +41,7 @@ def lookup_file_summary(index: RepoContextIndex, path: str) -> RepoFileSummary |
         return None
     if normalized in index.files:
         return index.files[normalized]
-    if normalized.startswith("tests/"):
+    if normalized.startswith("tests/") or normalized.startswith("../open-jet-internal/tests/"):
         return RepoFileSummary(
             path=normalized,
             purpose="Test file used for focused verification in the current task scope.",
@@ -172,8 +172,15 @@ def _compact_lines(lines: list[str], *, limit: int) -> list[str]:
 def _related_tests_for_file(path: str) -> list[str]:
     if path.startswith("src/") and path.endswith(".py"):
         stem = Path(path).stem
+        repo_root = Path(__file__).resolve().parent.parent
+        local_test = repo_root / "tests" / f"test_{stem}.py"
+        if local_test.exists():
+            return [f"tests/test_{stem}.py"]
+        internal_test = repo_root.parent / "open-jet-internal" / "tests" / f"test_{stem}.py"
+        if internal_test.exists():
+            return [f"../open-jet-internal/tests/test_{stem}.py"]
         return [f"tests/test_{stem}.py"]
-    if path.startswith("tests/"):
+    if path.startswith("tests/") or path.startswith("../open-jet-internal/tests/"):
         return [path]
     return []
 

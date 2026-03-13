@@ -83,7 +83,7 @@ class BenchmarkRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(artifact.tool_counts["write_file"], 1)
             result_path = output_dir / case.case_id / f"run_01_{artifact.run_id}" / "result.json"
             payload = json.loads(result_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["filesystem_snapshot"][0]["path"], "note.txt")
+            self.assertIn("note.txt", {item["path"] for item in payload["filesystem_snapshot"]})
             self.assertEqual(payload["evaluation"]["score"], 1.0)
             judge_packet = json.loads((output_dir / case.case_id / f"run_01_{artifact.run_id}" / "judge_packet.json").read_text(encoding="utf-8"))
             self.assertEqual(judge_packet["case"]["case_id"], "write_case")

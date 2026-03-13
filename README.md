@@ -286,16 +286,31 @@ This is meant to support evaluation from real traces, not just subjective testin
 
 ## Benchmarks and Eval Traces
 
-`open-jet` now includes benchmark environments and harness-driven eval cases under `benchmarks/`.
+`open-jet` has two different benchmark surfaces:
 
-The point of these is not abstract leaderboard work. They are for checking whether the agent:
-- stays useful under limited context
-- resumes interrupted work
-- follows deterministic tool constraints
-- succeeds across different local workflows
-- behaves differently across hardware, runtimes, and model profiles
+- agent-eval cases under `benchmarks/` for end-to-end tool/task behavior
+- layered-context benchmarks for the harness doc-admission path itself
 
-If you care about edge agents in production, replayable traces and task artifacts matter more than one-off demo prompts.
+The layered context system in `open-jet` is not a generic chat-history memory feature. It is a bounded, layered document-admission pipeline in `src/harness.py` that:
+- computes a per-turn prompt/docs budget from window size, reserves, RAM pressure, and current persistent context tokens
+- injects a structured harness state summary first
+- considers ordered layer1/layer2/layer3 candidate docs
+- admits only docs that fit both the remaining global docs budget and the remaining per-layer budget
+- skips oversized docs instead of truncating them inside the harness path
+
+Context benchmark commands:
+
+```bash
+open-jet-bench context-tests
+open-jet-bench context-suite jetson_4k_baseline
+open-jet-bench jetson-4k
+open-jet-bench compare benchmark_results/context/<run_a> benchmark_results/context/<run_b>
+open-jet-bench summary benchmark_results/context/<run>
+```
+
+Context benchmark artifacts are written under `benchmark_results/context/<timestamp>_<run_name>/`.
+
+For artifact format, suite names, turn-by-turn timelines, and comparison workflow, see `benchmarks/context/README.md`.
 
 ## Contact
 
