@@ -15,6 +15,8 @@ from .runtime_protocol import StreamChunk, stream_openai_chat
 
 
 _FRAGMENTED_LFB_MB = 64
+_JETSON_VMM_CHUNK_MB = "1"
+_JETSON_VMM_RESERVE_MB = "4096"
 
 
 def _find_llama_server() -> str:
@@ -126,6 +128,10 @@ class LlamaServerClient:
             return
 
     @staticmethod
+    def _is_jetson_platform() -> bool:
+        return Path("/etc/nv_tegra_release").exists() or Path("/dev/nvhost-gpu").exists()
+
+    @staticmethod
     def _largest_free_block_mb_from_text(text: str, *, page_size_kb: int) -> float | None:
         max_order = -1
         for raw_line in text.splitlines():
@@ -187,6 +193,12 @@ class LlamaServerClient:
         env.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
         resolved_device = self._resolve_device()
+        if resolved_device == "cuda" and self._is_jetson_platform():
+            # Jetson can fail large unified-memory allocations even when total
+            # RAM is available. A patched llama.cpp build uses these knobs to
+            # back CUDA/VMM buffers with 1 MiB chunks and smaller VA reserves.
+            env.setdefault("GGML_CUDA_VMM_CHUNK_MB", _JETSON_VMM_CHUNK_MB)
+            env.setdefault("GGML_CUDA_VMM_RESERVE_MB", _JETSON_VMM_RESERVE_MB)
         lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
         requested_ngl = self.gpu_layers if resolved_device == "cuda" else 0
         requested_ctx = self.context_window_tokens
@@ -363,19 +375,6 @@ class LlamaServerClient:
 
     def _pid_exists(self, pid: int) -> bool:
         return Path(f"/proc/{pid}").exists()
-
-    def _is_model_load_alloc_failure(self, message: str) -> bool:
-        lowered = message.lower()
-        markers = (
-            "cudamalloc failed",
-            "failed to allocate cuda",
-            "unable to allocate cuda",
-            "nvmapmemallocinternaltagged",
-            "out of memory",
-            "error loading model",
-            "failed to load model",
-        )
-        return any(marker in lowered for marker in markers)
 
     async def close(self) -> None:
         await self._stop_server()

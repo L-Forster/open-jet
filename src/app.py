@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -330,6 +331,45 @@ class OpenJetApp:
     def exit(self) -> None:
         self._quit_requested = True
 
+    def _request_terminal_exit(self, prompt_app: object | None = None) -> None:
+        if self._quit_requested:
+            return
+        app = prompt_app
+        if app is None and self._session is not None:
+            app = getattr(self._session, "app", None)
+        if app is not None and getattr(app, "is_running", False):
+            app.exit(exception=KeyboardInterrupt())
+            return
+        asyncio.create_task(self.action_quit())
+
+    @staticmethod
+    def _install_quit_signal_handlers(callback) -> list[signal.Signals]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return []
+
+        installed: list[signal.Signals] = []
+        for sig in (signal.SIGINT, signal.SIGTSTP):
+            try:
+                loop.add_signal_handler(sig, callback)
+            except (NotImplementedError, RuntimeError, ValueError):
+                continue
+            installed.append(sig)
+        return installed
+
+    @staticmethod
+    def _remove_signal_handlers(signals_to_remove: list[signal.Signals]) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for sig in signals_to_remove:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                continue
+
     def _active_model_ref(self) -> str:
         return active_model_ref(self.cfg)
 
@@ -600,6 +640,9 @@ class OpenJetApp:
         self._render_token_counter()
 
     async def action_quit(self) -> None:
+        if self._quit_requested:
+            return
+        self._quit_requested = True
         if self._active_turn_id:
             self._finish_turn_trace(success=False, status="abandoned", error="application quit")
         self.persist_session_state(reason="quit")
@@ -609,7 +652,6 @@ class OpenJetApp:
             await self.client.close()
         if self.session_logger:
             await self.session_logger.stop()
-        self._quit_requested = True
 
     def _record_prompt_history(self, text: str) -> None:
         normalized = text.strip()
@@ -1459,8 +1501,11 @@ class OpenJetApp:
 
         @bindings.add("c-c")
         def _ctrl_c(event) -> None:
-            del event
-            asyncio.create_task(self.action_quit())
+            self._request_terminal_exit(event.app)
+
+        @bindings.add("c-z")
+        def _ctrl_z(event) -> None:
+            self._request_terminal_exit(event.app)
 
         @bindings.add("escape", filter=awaiting_approval)
         def _escape_approval(event) -> None:
@@ -1519,6 +1564,7 @@ class OpenJetApp:
                 self._session.app.invalidate()
 
     async def run_async(self) -> None:
+        installed_signals = self._install_quit_signal_handlers(self._request_terminal_exit)
         self._session = PromptSession(
             history=InMemoryHistory(),
             completer=OpenJetCompleter(self),
@@ -1529,21 +1575,29 @@ class OpenJetApp:
             bottom_toolbar=self._toolbar_text,
         )
         self._toolbar_task = asyncio.create_task(self._toolbar_updater())
-        await self._startup_sequence()
-        if self._quit_requested:
+        try:
+            try:
+                await self._startup_sequence()
+            except (EOFError, KeyboardInterrupt):
+                await self.action_quit()
+                return
+            if self._quit_requested:
+                return
+            with patch_stdout(raw=True):
+                while not self._quit_requested:
+                    try:
+                        text = await self._session.prompt_async(
+                            self._prompt_message,
+                            enable_suspend=False,
+                        )
+                    except (EOFError, KeyboardInterrupt):
+                        await self.action_quit()
+                        break
+                    await self.submit_text(text)
+        finally:
+            self._remove_signal_handlers(installed_signals)
             if self._toolbar_task:
                 self._toolbar_task.cancel()
-            return
-        with patch_stdout(raw=True):
-            while not self._quit_requested:
-                try:
-                    text = await self._session.prompt_async(self._prompt_message)
-                except (EOFError, KeyboardInterrupt):
-                    await self.action_quit()
-                    break
-                await self.submit_text(text)
-        if self._toolbar_task:
-            self._toolbar_task.cancel()
 
 
 def _extract_file_mentions(text: str) -> list[str]:

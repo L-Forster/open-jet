@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.agent import Agent
 from src.app import OpenJetApp
-from src.llama_server import LlamaServerClient
+from src.llama_server import (
+    LlamaServerClient,
+    _JETSON_VMM_CHUNK_MB,
+    _JETSON_VMM_RESERVE_MB,
+)
 from src.runtime_protocol import StreamChunk
 
 
@@ -129,6 +134,29 @@ class AppStatusTests(unittest.TestCase):
         self.assertEqual(snapshot["reasoning_mode"], "on")
 
 
+class AppQuitTests(unittest.TestCase):
+    def test_request_terminal_exit_exits_active_prompt_app(self) -> None:
+        app = OpenJetApp()
+        prompt_app = Mock()
+        prompt_app.is_running = True
+
+        app._request_terminal_exit(prompt_app)
+
+        prompt_app.exit.assert_called_once()
+        self.assertIsInstance(prompt_app.exit.call_args.kwargs["exception"], KeyboardInterrupt)
+
+    def test_request_terminal_exit_schedules_action_quit_without_prompt_app(self) -> None:
+        app = OpenJetApp()
+
+        with patch("asyncio.create_task") as create_task:
+            app._request_terminal_exit()
+
+        create_task.assert_called_once()
+        scheduled = create_task.call_args.args[0]
+        self.assertTrue(asyncio.iscoroutine(scheduled))
+        scheduled.close()
+
+
 class LlamaServerStartupTests(unittest.TestCase):
     def test_largest_free_block_parser_uses_highest_available_order(self) -> None:
         buddyinfo = (
@@ -144,6 +172,43 @@ class LlamaServerStartupTests(unittest.TestCase):
         profile = LlamaServerClient._startup_profile_for_lfb(4.0)
 
         self.assertEqual(profile, (128, 32, True, True))
+
+
+class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_sets_jetson_vmm_env_for_cuda(self) -> None:
+        client = LlamaServerClient(
+            model="model.gguf",
+            device="cuda",
+            gpu_layers=99,
+            context_window_tokens=4096,
+        )
+        start_once = AsyncMock()
+        stop_server = AsyncMock()
+        cleanup = AsyncMock()
+        prepare = AsyncMock(return_value=4.0)
+
+        with patch.object(client, "_stop_server", stop_server), patch.object(
+            client, "_cleanup_stale_inference_processes", cleanup
+        ), patch.object(client, "_prepare_memory_for_launch", prepare), patch.object(
+            client, "_start_once", start_once
+        ), patch.object(
+            client, "_ensure_jetson_clocks_sudoers", return_value=None
+        ), patch.object(
+            client, "_maximize_gpu_clocks", return_value=None
+        ), patch.object(
+            client, "_is_jetson_platform", return_value=True
+        ), patch(
+            "src.llama_server._find_llama_server", return_value="/usr/bin/llama-server"
+        ):
+            await client.start()
+
+        kwargs = start_once.await_args.kwargs
+        self.assertEqual(kwargs["env"]["GGML_CUDA_VMM_CHUNK_MB"], _JETSON_VMM_CHUNK_MB)
+        self.assertEqual(kwargs["env"]["GGML_CUDA_VMM_RESERVE_MB"], _JETSON_VMM_RESERVE_MB)
+        self.assertEqual(kwargs["ngl"], 99)
+        self.assertEqual(kwargs["ctx"], 4096)
+        self.assertEqual(prepare.await_count, 1)
+        self.assertEqual(cleanup.await_count, 1)
 
 
 class DebugPromptLoggingTests(unittest.TestCase):
