@@ -8,11 +8,12 @@ authors = [
     { name = "Louis" }
 ]
 keywords = ["llm", "local-llm", "ai-agent", "tui", "jetson", "edge-ai", "offline", "llama.cpp"]
+license = "AGPL-3.0-only"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",

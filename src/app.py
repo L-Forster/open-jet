@@ -165,16 +165,16 @@ class LogView:
         self._entries.clear()
 
     def scroll_page_up(self, animate: bool = False) -> None:
-        del animate
+        return
 
     def scroll_page_down(self, animate: bool = False) -> None:
-        del animate
+        return
 
     def scroll_home(self, animate: bool = False) -> None:
-        del animate
+        return
 
     def scroll_end(self, animate: bool = False) -> None:
-        del animate
+        return
 
 
 class StatusWidget:
@@ -206,7 +206,7 @@ class PromptWidget:
         return len(self.value)
 
     def action_end(self, select: bool = False) -> None:
-        del select
+        return
 
     def focus(self) -> None:
         return

@@ -95,6 +95,15 @@ Optional setup screen on launch:
 open-jet --setup
 ```
 
+## License
+
+`open-jet` is licensed under `AGPL-3.0-only`.
+
+Commercial licensing is also available for organizations that want to use
+`open-jet` under different terms.
+
+See [LICENSE](LICENSE).
+
 ## Why It Exists
 
 Most local LLM tools stop at "chat with a model on your box." That breaks down quickly on edge hardware:

@@ -59,7 +59,7 @@ class SlashCommandHandler:
         if not text.startswith("/"):
             return False
 
-        log = self.app.query_one("#chat-log", RichLog)
+        log = self.app.query_one("#chat-log")
         log.write(f"[bold green]> [/]{text}")
         log.write("")
         if self.app.session_logger:
