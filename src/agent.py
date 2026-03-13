@@ -6,8 +6,9 @@ import json
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
+from .multimodal import content_to_plain_text, estimate_message_content_tokens, runtime_content
 from .runtime_protocol import ToolCall
 from .runtime_client import RuntimeClient
 from .runtime_limits import ContextBudget, derive_context_budget, estimate_tokens, read_memory_snapshot
@@ -30,7 +31,7 @@ class AgentEvent:
 
 
 # Tools that require user confirmation before execution
-CONFIRM_TOOLS = {"shell", "write_file", "edit_file"}
+CONFIRM_TOOLS = {"shell", "write_file", "edit_file", "memory"}
 
 
 class Agent:
@@ -49,6 +50,7 @@ class Agent:
         memory_check_interval_chunks: int = 16,
         condense_target_tokens: int = 900,
         keep_last_messages: int = 6,
+        trace_hook: Callable[[str, dict[str, object]], None] | None = None,
     ) -> None:
         self.client = client
         self.system_prompt = system_prompt
@@ -61,9 +63,13 @@ class Agent:
         self.memory_check_interval_chunks = max(1, int(memory_check_interval_chunks))
         self.condense_target_tokens = condense_target_tokens
         self.keep_last_messages = keep_last_messages
+        self.turn_context_messages: list[dict] = []
+        self.trace_hook = trace_hook
 
-    def add_user_message(self, text: str) -> None:
-        self.messages.append({"role": "user", "content": text})
+    def add_user_message(self, text: str, *, image_paths: list[str] | None = None) -> None:
+        from .multimodal import build_user_content
+
+        self.messages.append({"role": "user", "content": build_user_content(text, image_paths)})
 
     def reset_conversation(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
@@ -72,7 +78,10 @@ class Agent:
         return max(0, len(self.messages) - 1)
 
     def estimated_context_tokens(self) -> int:
-        return self._estimated_context_tokens()
+        return self._estimated_context_tokens(include_turn_context=True)
+
+    def persistent_context_tokens(self) -> int:
+        return self._estimated_context_tokens(include_turn_context=False)
 
     def context_budget(self) -> ContextBudget | None:
         if not self.context_window_tokens:
@@ -92,8 +101,15 @@ class Agent:
         (if needed), call complete_tool_call() with the result, and then call
         run_turn() again so the model can continue.
         """
+        self._trace(
+            "run_turn_start",
+            message_count=len(self.messages),
+            turn_context_count=len(self.turn_context_messages),
+            estimated_tokens=self._estimated_context_tokens(include_turn_context=True),
+        )
         pressure_reason = self._resource_pressure_reason()
         if pressure_reason:
+            self._trace("run_turn_condense_before_stream", reason=pressure_reason)
             yield AgentEvent(
                 kind=ActionKind.TEXT,
                 text=f"(resource pressure, condensing chat: {pressure_reason})",
@@ -106,8 +122,15 @@ class Agent:
         chunk_count = 0
 
         try:
-            async for chunk in self.client.chat_stream(self.messages):
+            async for chunk in self.client.chat_stream(self._messages_for_runtime()):
                 chunk_count += 1
+                if chunk_count == 1:
+                    self._trace(
+                        "stream_first_chunk",
+                        text_len=len(chunk.text),
+                        tool_call_count=len(chunk.tool_calls),
+                        done=chunk.done,
+                    )
                 if chunk.text:
                     collected_text += chunk.text
                     yield AgentEvent(kind=ActionKind.TEXT, text=chunk.text)
@@ -120,6 +143,12 @@ class Agent:
                     if pressure_reason:
                         if collected_text:
                             self.messages.append({"role": "assistant", "content": collected_text})
+                        self._trace(
+                            "run_turn_condense_mid_stream",
+                            reason=pressure_reason,
+                            chunk_count=chunk_count,
+                            collected_text_len=len(collected_text),
+                        )
                         yield AgentEvent(
                             kind=ActionKind.TEXT,
                             text=(
@@ -131,6 +160,12 @@ class Agent:
                         return
 
         except Exception as e:
+            self._trace(
+                "run_turn_error",
+                error=str(e),
+                chunk_count=chunk_count,
+                collected_text_len=len(collected_text),
+            )
             yield AgentEvent(kind=ActionKind.ERROR, text=str(e))
             return
 
@@ -152,13 +187,28 @@ class Agent:
                 for tc in pending_tool_calls
             ]
         self.messages.append(assistant_msg)
+        self._trace(
+            "run_turn_complete",
+            chunk_count=chunk_count,
+            collected_text_len=len(collected_text),
+            pending_tool_call_count=len(pending_tool_calls),
+        )
 
         # Yield tool requests for the TUI to handle
         for tc in pending_tool_calls:
             yield AgentEvent(kind=ActionKind.TOOL_REQUEST, tool_call=tc)
 
         if not pending_tool_calls:
+            self._trace("run_turn_done", assistant_text_len=len(collected_text))
             yield AgentEvent(kind=ActionKind.DONE)
+
+    def _trace(self, event: str, **data: object) -> None:
+        if not self.trace_hook:
+            return
+        try:
+            self.trace_hook(event, dict(data))
+        except Exception:
+            return
 
     def complete_tool_call(self, tool_call: ToolCall, result: str) -> None:
         """Record a tool result in conversation history so the model sees it."""
@@ -176,7 +226,7 @@ class Agent:
         if len(self.messages) <= 1:
             return "No message history to condense."
 
-        total_before = self._estimated_context_tokens()
+        total_before = self._estimated_context_tokens(include_turn_context=True)
         original_messages = len(self.messages)
         history = self.messages[1:]
         transcript = self._history_as_text(history)
@@ -197,7 +247,7 @@ class Agent:
         }
         self.messages = [self.messages[0], summary_msg]
 
-        total_after = self._estimated_context_tokens()
+        total_after = self._estimated_context_tokens(include_turn_context=True)
         if total_after >= total_before:
             tighter_target = max(64, target_tokens // 2)
             try:
@@ -215,7 +265,7 @@ class Agent:
                         ),
                     },
                 ]
-                total_after = self._estimated_context_tokens()
+                total_after = self._estimated_context_tokens(include_turn_context=True)
 
         return (
             "Context condensed automatically. "
@@ -223,12 +273,55 @@ class Agent:
             f"tokens(est): {total_before} -> {total_after}."
         )
 
-    def _estimated_context_tokens(self) -> int:
+    def set_turn_context(self, messages: list[dict]) -> None:
+        self.turn_context_messages = [msg for msg in messages if isinstance(msg, dict)]
+
+    def clear_turn_context(self) -> None:
+        self.turn_context_messages = []
+
+    def _messages_for_runtime(self) -> list[dict]:
+        combined = self.messages + self.turn_context_messages
+        system_parts: list[str] = []
+        runtime_messages: list[dict] = []
+
+        for msg in combined:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role", ""))
+            if role == "system":
+                content = content_to_plain_text(msg.get("content", "")).strip()
+                if content:
+                    system_parts.append(content)
+                continue
+            runtime_msg = dict(msg)
+            runtime_msg["content"] = runtime_content(msg.get("content", ""))
+            runtime_messages.append(runtime_msg)
+
+        if not system_parts:
+            return runtime_messages
+
+        merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+        return [merged_system, *runtime_messages]
+
+    def _estimated_context_tokens(self, *, include_turn_context: bool = True) -> int:
         total = 0
-        for msg in self.messages:
-            content = str(msg.get("content", ""))
-            total += estimate_tokens(content) + 8
+        message_sets = [self.messages]
+        if include_turn_context:
+            message_sets.append(self.turn_context_messages)
+        for batch in message_sets:
+            for msg in batch:
+                total += estimate_message_content_tokens(msg.get("content", "")) + 8
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    total += self._estimate_tool_call_tokens(tool_calls)
         return total
+
+    def _estimate_tool_call_tokens(self, tool_calls: list[dict]) -> int:
+        try:
+            payload = json.dumps(tool_calls, ensure_ascii=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            payload = str(tool_calls)
+        return estimate_tokens(payload)
 
     def _resource_pressure_reason(self) -> str | None:
         context_pressure = self._context_pressure_reason()
@@ -240,7 +333,7 @@ class Agent:
         budget = self.context_budget()
         if not budget:
             return None
-        current = self._estimated_context_tokens()
+        current = self._estimated_context_tokens(include_turn_context=True)
         if current <= budget.prompt_tokens:
             return None
         return (
@@ -280,7 +373,7 @@ class Agent:
         lines: list[str] = []
         for msg in older_messages:
             role = str(msg.get("role", "unknown")).upper()
-            text = " ".join(str(msg.get("content", "")).split())
+            text = " ".join(content_to_plain_text(msg.get("content", "")).split())
             if text:
                 lines.append(f"{role}: {text}")
         return "\n".join(lines)

@@ -1,0 +1,3 @@
+uplink_mode: intermittent
+retention_hours: 72
+operator_notes_dir: reports

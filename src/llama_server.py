@@ -14,6 +14,9 @@ import httpx
 from .runtime_protocol import StreamChunk, stream_openai_chat
 
 
+_FRAGMENTED_LFB_MB = 64
+
+
 def _find_llama_server() -> str:
     path = shutil.which("llama-server")
     if path:
@@ -46,6 +49,16 @@ class LlamaServerClient:
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
+        self.reasoning_mode = "default"
+
+    def set_reasoning_mode(self, mode: str) -> None:
+        normalized = mode.strip().lower()
+        if normalized not in {"default", "on", "off"}:
+            raise ValueError("reasoning mode must be one of: default, on, off")
+        self.reasoning_mode = normalized
+
+    def reasoning_status(self) -> str:
+        return self.reasoning_mode
 
     @staticmethod
     def _ensure_jetson_clocks_sudoers() -> None:
@@ -59,7 +72,6 @@ class LlamaServerClient:
         sudoers_file = Path("/etc/sudoers.d/open-jet-clocks")
         if sudoers_file.exists():
             return
-
         rule = "ALL ALL=(ALL) NOPASSWD: /usr/bin/jetson_clocks\n"
         try:
             subprocess.run(
@@ -98,26 +110,73 @@ class LlamaServerClient:
         Dropping caches frees pagecache/slab memory so the kernel can coalesce
         free pages into larger contiguous regions.
         """
+        import subprocess
+
+        try:
+            subprocess.run(["sync"], timeout=5, capture_output=True)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
         try:
             Path("/proc/sys/vm/drop_caches").write_text("3")
             Path("/proc/sys/vm/compact_memory").write_text("1")
         except PermissionError:
-            # Not running as root — try via sudo non-interactively.
-            import subprocess
-            subprocess.run(
-                ["sudo", "-n", "sh", "-c",
-                 "echo 3 > /proc/sys/vm/drop_caches && echo 1 > /proc/sys/vm/compact_memory"],
-                timeout=5, capture_output=True,
-            )
+            return
         except OSError:
-            pass
+            return
+
+    @staticmethod
+    def _largest_free_block_mb_from_text(text: str, *, page_size_kb: int) -> float | None:
+        max_order = -1
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith("Node "):
+                continue
+            parts = line.split()
+            counts = parts[4:]
+            for order, count_text in enumerate(counts):
+                try:
+                    count = int(count_text)
+                except ValueError:
+                    continue
+                if count > 0:
+                    max_order = max(max_order, order)
+        if max_order < 0:
+            return None
+        return (page_size_kb * (2 ** max_order)) / 1024.0
+
+    @classmethod
+    def _largest_free_block_mb(cls) -> float | None:
+        try:
+            buddyinfo = Path("/proc/buddyinfo").read_text(encoding="utf-8")
+        except OSError:
+            return None
+        page_size_kb = int(os.sysconf("SC_PAGE_SIZE")) // 1024
+        if page_size_kb <= 0:
+            page_size_kb = 4
+        return cls._largest_free_block_mb_from_text(buddyinfo, page_size_kb=page_size_kb)
+
+    @staticmethod
+    def _startup_profile_for_lfb(lfb_mb: float | None) -> tuple[int, int, bool, bool]:
+        if lfb_mb is not None and lfb_mb < _FRAGMENTED_LFB_MB:
+            return (128, 32, True, True)
+        return (128, 32, True, False)
+
+    async def _prepare_memory_for_launch(self) -> float | None:
+        lfb_mb = self._largest_free_block_mb()
+        for _ in range(3):
+            if lfb_mb is not None and lfb_mb >= _FRAGMENTED_LFB_MB:
+                return lfb_mb
+            self._compact_memory()
+            await asyncio.sleep(0.4)
+            lfb_mb = self._largest_free_block_mb()
+        return lfb_mb
 
     async def start(self) -> None:
         await self._stop_server()
         await self._cleanup_stale_inference_processes()
         self._ensure_jetson_clocks_sudoers()
         self._maximize_gpu_clocks()
-        self._compact_memory()
         binary = _find_llama_server()
         env = os.environ.copy()
         bin_dir = os.path.dirname(binary)
@@ -125,35 +184,23 @@ class LlamaServerClient:
         # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
         # need physically contiguous pages for large allocations.
         env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
+        env.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
         resolved_device = self._resolve_device()
+        lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
         requested_ngl = self.gpu_layers if resolved_device == "cuda" else 0
         requested_ctx = self.context_window_tokens
-        # Keep model/offload settings unchanged; only reduce launch batch pressure if KV alloc fails.
-        launch_attempts = ((512, 128), (256, 64), (128, 32))
-        last_err: RuntimeError | None = None
-        for batch, ubatch in launch_attempts:
-            try:
-                await self._start_once(
-                    binary=binary,
-                    env=env,
-                    ngl=requested_ngl,
-                    ctx=requested_ctx,
-                    batch=batch,
-                    ubatch=ubatch,
-                )
-                last_err = None
-                break
-            except RuntimeError as exc:
-                last_err = exc
-                if not self._is_model_load_alloc_failure(str(exc)):
-                    raise
-                await self._stop_server()
-                await self._cleanup_stale_inference_processes()
-                continue
-
-        if last_err is not None:
-            raise last_err
+        batch, ubatch, fit_off, no_warmup = self._startup_profile_for_lfb(lfb_mb)
+        await self._start_once(
+            binary=binary,
+            env=env,
+            ngl=requested_ngl,
+            ctx=requested_ctx,
+            batch=batch,
+            ubatch=ubatch,
+            fit_off=fit_off,
+            no_warmup=no_warmup,
+        )
         self.gpu_layers = requested_ngl
         self.context_window_tokens = requested_ctx
 
@@ -166,8 +213,10 @@ class LlamaServerClient:
         ctx: int,
         batch: int,
         ubatch: int,
+        fit_off: bool,
+        no_warmup: bool,
     ) -> None:
-        self._proc = await asyncio.create_subprocess_exec(
+        cmd = [
             binary,
             "-m",
             self.model,
@@ -178,6 +227,12 @@ class LlamaServerClient:
             "--parallel",
             "1",
             "--no-mmap",
+        ]
+        if fit_off:
+            cmd.extend(["--fit", "off"])
+        if no_warmup:
+            cmd.append("--no-warmup")
+        cmd.extend([
             "--flash-attn", "on",
             "-ctk", "q8_0",
             "-ctv", "q8_0",
@@ -189,6 +244,9 @@ class LlamaServerClient:
             str(ngl),
             "-c",
             str(ctx),
+        ])
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd,
             env=env,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
@@ -347,11 +405,23 @@ class LlamaServerClient:
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
+        extra_body: dict[str, object] | None = None
+        if self.reasoning_mode == "on":
+            extra_body = {
+                "reasoning_format": "auto",
+                "chat_template_kwargs": {"enable_thinking": True},
+            }
+        elif self.reasoning_mode == "off":
+            extra_body = {
+                "reasoning_format": "none",
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
         async for chunk in stream_openai_chat(
             self._http,
             base_url=self.base_url,
             model="local",
             messages=messages,
             use_tools=use_tools,
+            extra_body=extra_body,
         ):
             yield chunk

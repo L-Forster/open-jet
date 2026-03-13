@@ -8,8 +8,6 @@ SetupScreen {
 Screen {
     background: #2a2a2a;
     layout: vertical;
-    overflow: hidden;
-    scrollbar-size: 0 0;
 }
 Vertical {
     background: transparent;
@@ -26,17 +24,18 @@ Static {
 #chat-log {
     width: 100%;
     height: auto;
-    max-height: 1fr;
     min-height: 0;
-    overflow-y: auto;
+    overflow-y: hidden;
     scrollbar-size: 0 0;
-    padding: 0 2 2 2;
+    padding: 0 2 1 2;
     color: #ffffff;
 }
 #bottom-stack {
-    dock: bottom;
     height: auto;
-    max-height: 8;
+    min-height: 4;
+    layout: vertical;
+    border-top: solid #4a4a4a;
+    padding: 1 0 0 0;
     background: transparent;
 }
 #prompt {

@@ -1,0 +1,14 @@
+{
+  "case_id": "robotics_python_glob",
+  "description": "Locate Python modules in a robotics control stack.",
+  "prompt": "Use glob to find all Python files under this robotics command-layer repo, then answer with their relative paths. Do not use shell.",
+  "template_dir": "robotics_control_stack",
+  "mode": "chat",
+  "allowed_tools": ["glob"],
+  "tags": ["robotics", "inventory", "tool"],
+  "expectations": [
+    {"kind": "tool_used", "target": "glob"},
+    {"kind": "assistant_contains", "value": "src/control_loop.py"},
+    {"kind": "assistant_contains", "value": "src/sensor_bridge.py"}
+  ]
+}

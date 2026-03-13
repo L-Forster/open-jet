@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-from textual.widgets import RichLog
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
 
 if TYPE_CHECKING:
     from .app import OpenJetApp
@@ -34,8 +36,14 @@ class SlashCommandHandler:
         CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
         CommandSpec(name="condense", description="Manually condense older context"),
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
+        CommandSpec(name="memory", description="Inspect or update persistent memory: /memory [show|clear <user|agent>]"),
+        CommandSpec(name="reasoning", description="Show or set llama.cpp reasoning mode: /reasoning [status|on|off|default]"),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
+        CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
+        CommandSpec(name="skills", description="Show or clear selected harness skills: /skills [status|list|clear]"),
+        CommandSpec(name="skill", description="Pin one or more harness skills: /skill <name[,name...]>"),
+        CommandSpec(name="step", description="Inspect or control the active step: /step [status|next|split]"),
         CommandSpec(
             name="util",
             description="Show/hide utilization line: /util [show|hide|toggle|status]",
@@ -86,11 +94,29 @@ class SlashCommandHandler:
         if cmd == "load":
             await self._load(log, arg)
             return True
+        if cmd == "memory":
+            await self._memory(log, arg)
+            return True
+        if cmd == "reasoning":
+            self._reasoning(log, arg)
+            return True
         if cmd == "resume":
             await self._resume(log)
             return True
         if cmd == "setup":
             await self._setup(log)
+            return True
+        if cmd == "mode":
+            self._mode(log, arg)
+            return True
+        if cmd == "skills":
+            self._skills(log, arg)
+            return True
+        if cmd == "skill":
+            self._skill(log, arg)
+            return True
+        if cmd == "step":
+            self._step(log, arg)
             return True
         if cmd == "util":
             self._util(log, arg)
@@ -99,7 +125,7 @@ class SlashCommandHandler:
         self._render_unknown(log, text)
         return True
 
-    def _render_help(self, log: RichLog) -> None:
+    def _render_help(self, log: Any) -> None:
         lines = ["[bold]Slash commands[/]"]
         for spec in self.COMMANDS:
             aliases = f" (aliases: {', '.join(f'/{a}' for a in spec.aliases)})" if spec.aliases else ""
@@ -108,7 +134,7 @@ class SlashCommandHandler:
             log.write(line)
         log.write("")
 
-    async def _clear(self, log: RichLog, *, reset_kv_cache: bool) -> None:
+    async def _clear(self, log: Any, *, reset_kv_cache: bool) -> None:
         if self.app._awaiting_approval:
             log.write("[yellow]Cannot clear while a tool approval prompt is active.[/]")
             log.write("")
@@ -122,8 +148,17 @@ class SlashCommandHandler:
             log.write("")
             return
 
+        self.app.agent.system_prompt = await build_system_prompt(
+            str(self.app.cfg.get("system_prompt", "")),
+            Path.cwd(),
+        )
         self.app.agent.reset_conversation()
+        self.app.agent.clear_turn_context()
         self.app.loaded_files.clear()
+        self.app._pending_image_paths.clear()
+        self.app.harness_state = type(self.app.harness_state)()
+        self.app._turn_context_docs = []
+        self.app._turn_context_tokens = 0
         log.clear()
         log.write(self.banner)
         log.write("  [bold bright_white]Conversation history cleared.[/]")
@@ -150,9 +185,10 @@ class SlashCommandHandler:
                 reset_kv_cache=reset_kv_cache,
                 kv_reset_ok=kv_reset_ok,
             )
+        self.app.persist_harness_state()
         self.app.persist_session_state(reason="clear_command")
 
-    def _status(self, log: RichLog) -> None:
+    def _status(self, log: Any) -> None:
         snapshot = self.app.runtime_status_snapshot()
         if not snapshot.get("ready"):
             log.write("[bold bright_white]Agent not initialized.[/]")
@@ -165,6 +201,18 @@ class SlashCommandHandler:
             f"Generating: {'yes' if snapshot['generating'] else 'no'}"
             "[/]"
         )
+        if snapshot.get("command_in_progress"):
+            log.write(
+                "[bold bright_white]"
+                f"Command: {snapshot.get('active_command') or 'running'}"
+                "[/]"
+            )
+        if snapshot.get("reasoning_mode"):
+            log.write(
+                "[bold bright_white]"
+                f"Reasoning mode: {snapshot.get('reasoning_mode')}"
+                "[/]"
+            )
         log.write(
             "[bold bright_white]"
             f"Context tokens: {snapshot['context_tokens']}/{snapshot['context_window_tokens']} | "
@@ -183,9 +231,23 @@ class SlashCommandHandler:
                 f"({used_percent:.1f}% used)"
                 "[/]"
             )
+        if snapshot.get("harness_mode"):
+            log.write(
+                "[bold bright_white]"
+                f"Workflow: active_step={snapshot.get('harness_active_step') or 'n/a'} | "
+                f"docs={snapshot.get('harness_doc_tokens', 0)}t"
+                "[/]"
+            )
+            docs = snapshot.get("harness_docs") or []
+            if docs:
+                log.write(
+                    "[bold bright_white]"
+                    f"Loaded harness docs: {', '.join(str(doc) for doc in docs)}"
+                    "[/]"
+                )
         log.write("")
 
-    async def _condense(self, log: RichLog) -> None:
+    async def _condense(self, log: Any) -> None:
         if self.app._thinking_timer:
             log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
             log.write("")
@@ -203,12 +265,12 @@ class SlashCommandHandler:
         if self.app.session_logger:
             self.app.session_logger.log_event("manual_condense", summary=summary)
 
-    def _render_unknown(self, log: RichLog, text: str) -> None:
+    def _render_unknown(self, log: Any, text: str) -> None:
         log.write(f"[yellow]Unknown command:[/] {text}")
         log.write("[bold bright_white]Run /help to list available commands.[/]")
         log.write("")
 
-    async def _load(self, log: RichLog, raw_arg: str) -> None:
+    async def _load(self, log: Any, raw_arg: str) -> None:
         path = raw_arg.strip()
         if not path:
             log.write("[yellow]Usage:[/] /load <path>")
@@ -225,7 +287,7 @@ class SlashCommandHandler:
             log.write("[bold bright_white]Use /status to inspect current budget and memory.[/]")
             log.write("")
 
-    async def _setup(self, log: RichLog) -> None:
+    async def _setup(self, log: Any) -> None:
         if self.app._awaiting_approval:
             log.write("[yellow]Cannot open setup while a tool approval prompt is active.[/]")
             log.write("")
@@ -236,7 +298,37 @@ class SlashCommandHandler:
             return
         self.app.run_setup_command_worker()
 
-    async def _resume(self, log: RichLog) -> None:
+    async def _memory(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip()
+        if not arg or arg == "show":
+            snapshot = await load_persistent_memory(Path.cwd())
+            log.write("[bold bright_white]Persistent user preferences:[/]")
+            log.write(snapshot.user or "(empty)")
+            log.write("")
+            log.write("[bold bright_white]Persistent agent memory:[/]")
+            log.write(snapshot.agent or "(empty)")
+            log.write("")
+            return
+
+        parts = arg.split(maxsplit=1)
+        if parts[0] != "clear" or len(parts) != 2:
+            log.write("[yellow]Usage:[/] /memory [show|clear <user|agent>]")
+            log.write("")
+            return
+        try:
+            result = await update_persistent_memory(
+                Path.cwd(),
+                scope=parts[1],
+                action="clear",
+            )
+        except ValueError as exc:
+            log.write(f"[yellow]{exc}[/]")
+            log.write("")
+            return
+        log.write(f"[bold bright_white]{result}[/]")
+        log.write("")
+
+    async def _resume(self, log: Any) -> None:
         if self.app._awaiting_approval:
             log.write("[yellow]Cannot resume while a tool approval prompt is active.[/]")
             log.write("")
@@ -252,6 +344,7 @@ class SlashCommandHandler:
 
         self.app.agent.reset_conversation()
         self.app.loaded_files.clear()
+        self.app._pending_image_paths.clear()
         log.clear()
         log.write(self.banner)
         if not self.app._restore_session_state(log):
@@ -259,7 +352,103 @@ class SlashCommandHandler:
         log.write("")
         self.app.refresh_token_counter()
 
-    def _util(self, log: RichLog, raw_arg: str) -> None:
+    def _reasoning(self, log: Any, raw_arg: str) -> None:
+        client = self.app.client
+        setter = getattr(client, "set_reasoning_mode", None) if client else None
+        getter = getattr(client, "reasoning_status", None) if client else None
+        if not callable(setter) or not callable(getter):
+            log.write("[yellow]Reasoning mode is only available for the llama.cpp runtime in this app.[/]")
+            log.write("")
+            return
+
+        arg = raw_arg.strip().lower() or "status"
+        if arg == "status":
+            log.write(f"[bold bright_white]Reasoning mode: {getter()}[/]")
+            log.write("")
+            return
+        if arg not in {"on", "off", "default"}:
+            log.write("[yellow]Usage:[/] /reasoning [status|on|off|default]")
+            log.write("")
+            return
+        setter(arg)
+        log.write(f"[bold bright_white]Reasoning mode set to {arg}. Applies to future turns with the current model.[/]")
+        log.write("")
+
+    def _mode(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        if not arg or arg == "status":
+            log.write(f"[bold bright_white]Harness mode: {self.app.harness_state.mode}[/]")
+            log.write("")
+            return
+        if arg not in {"chat", "code", "review", "debug"}:
+            log.write("[yellow]Usage:[/] /mode [chat|code|review|debug|status]")
+            log.write("")
+            return
+        self.app.set_harness_mode(arg)
+        log.write(f"[bold bright_white]Harness mode set to {arg}.[/]")
+        log.write("")
+
+    def _skills(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        if not arg or arg == "status":
+            selected = self.app.harness_state.preferred_skills
+            available = ", ".join(self.app.available_harness_skills()) or "none"
+            log.write(
+                "[bold bright_white]"
+                f"Selected skills: {', '.join(selected) if selected else 'none'}"
+                "[/]"
+            )
+            log.write(f"[bold bright_white]Available skills: {available}[/]")
+            log.write("")
+            return
+        if arg == "list":
+            available = self.app.available_harness_skills()
+            log.write(f"[bold bright_white]Available skills: {', '.join(available) if available else 'none'}[/]")
+            log.write("")
+            return
+        if arg == "clear":
+            self.app.clear_harness_skills()
+            log.write("[bold bright_white]Selected harness skills cleared.[/]")
+            log.write("")
+            return
+        log.write("[yellow]Usage:[/] /skills [status|list|clear]")
+        log.write("")
+
+    def _skill(self, log: Any, raw_arg: str) -> None:
+        names = [part.strip() for part in raw_arg.split(",") if part.strip()]
+        if not names:
+            log.write("[yellow]Usage:[/] /skill <name[,name...]>")
+            log.write("")
+            return
+        applied, missing = self.app.set_harness_skills(names)
+        if applied:
+            log.write(f"[bold bright_white]Selected skills: {', '.join(applied)}[/]")
+        if missing:
+            log.write(f"[yellow]Unknown skills:[/] {', '.join(missing)}")
+        log.write("")
+
+    def _step(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        if not arg or arg == "status":
+            active = self.app.harness_active_step()
+            log.write(f"[bold bright_white]Active step: {active or 'n/a'}[/]")
+            log.write(f"[bold bright_white]Next action: {self.app.harness_state.next_action or 'n/a'}[/]")
+            log.write("")
+            return
+        if arg == "next":
+            self.app.advance_harness_step()
+            log.write("[bold bright_white]Advanced to the next step.[/]")
+            log.write("")
+            return
+        if arg == "split":
+            self.app.split_harness_step()
+            log.write("[bold bright_white]Split the active step into smaller turns.[/]")
+            log.write("")
+            return
+        log.write("[yellow]Usage:[/] /step [status|next|split]")
+        log.write("")
+
+    def _util(self, log: Any, raw_arg: str) -> None:
         action = raw_arg.strip().lower()
         if not action or action == "toggle":
             visible = self.app.toggle_utilization_visible()

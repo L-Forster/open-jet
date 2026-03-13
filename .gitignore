@@ -5,12 +5,18 @@ __pycache__/
 dist/
 build/
 src/*.c
+benchmark_results/
 
 # Runtime/session state
 session_logs/
 session_state.json
 *.events.jsonl
 *.metrics.jsonl
+.openjet/state/
+.openjet/memory/
+.openjet/memories/
+AGENTS.md
+claude.md
 
 # Local tooling/cache artifacts
 .pytest_cache/

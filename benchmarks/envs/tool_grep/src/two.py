@@ -1,0 +1,1 @@
+print(TARGET_FLAG)

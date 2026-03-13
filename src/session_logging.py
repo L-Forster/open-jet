@@ -54,6 +54,7 @@ class SessionLogger:
         self._metrics_task: asyncio.Task[None] | None = None
         self._stop_metrics = asyncio.Event()
         self._prev_cpu: CpuSample | None = None
+        self._event_index = 0
 
     async def start(self) -> None:
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -77,9 +78,12 @@ class SessionLogger:
         self.log_event("session_end", session_id=self.session_id)
 
     def log_event(self, event_type: str, **data: Any) -> None:
+        self._event_index += 1
         payload = {
             "timestamp": _utc_now(),
             "session_id": self.session_id,
+            "event_index": self._event_index,
+            "schema_version": 2,
             "type": event_type,
             "data": self._normalize(data),
         }

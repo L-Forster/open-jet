@@ -1,13 +1,25 @@
 # open-jet
 
-`open-jet` is an offline-first terminal app for running local LLM workflows on edge Linux devices (including Jetson-class hardware).
+`open-jet` is an offline-first agent runtime for edge Linux devices with tight memory budgets.
+
+It is built for Jetson-class and other edge systems where the hard part is not just running a local model, but keeping the agent useful under constrained RAM, limited context windows, interrupted sessions, and hardware-specific failure modes.
 
 It provides:
-- local chat with your on-device model
-- safe file-context loading with token/memory guards
-- slash commands for session control
-- first-run setup for model/runtime configuration
-- optional session logging and resume
+- bounded-context local chat with your on-device model
+- safe file and doc loading with token and memory guards
+- automatic context condensing under pressure
+- session resume and harness state recovery
+- replayable JSONL event traces for evals and debugging
+- hardware-aware runtime setup for Jetson and edge Linux
+- slash commands and harness modes for controlled workflows
+- a Python SDK for driving the same agent backend without the TUI
+
+`open-jet` is positioned around five practical problems:
+- managing limited prompt memory on-device
+- resuming interrupted work instead of starting over
+- enforcing deterministic tool and approval boundaries
+- capturing real traces for evaluation instead of guessing from vibes
+- turning constrained local models into reliable operator workflows
 
 ## Requirements
 
@@ -83,6 +95,62 @@ Optional setup screen on launch:
 open-jet --setup
 ```
 
+## Why It Exists
+
+Most local LLM tools stop at "chat with a model on your box." That breaks down quickly on edge hardware:
+- context windows are small relative to the task
+- available RAM moves around under real workloads
+- long tasks get interrupted
+- shell and file actions need deterministic approval paths
+- failures differ by runtime, model, quant, and device profile
+
+`open-jet` is designed around those constraints. The goal is to keep an on-device agent productive when memory is bounded and recovery matters more than demos.
+
+## Python SDK
+
+`open-jet` also exposes a programmatic session API so you can drive the same bounded-memory agent backend from your own scripts.
+
+```python
+import asyncio
+
+from src import OpenJetSession
+
+
+async def main() -> None:
+    session = await OpenJetSession.create()
+    try:
+        response = await session.run("Summarize the current README")
+        print(response.text)
+
+        vision = await session.run("Describe this image", image_paths=["./example.png"])
+        print(vision.text)
+
+        async for event in session.stream("Inspect README.md with tools if needed"):
+            if event.text:
+                print(event.text, end="")
+            if event.tool_result:
+                print(f"\n[{event.tool_result.tool_call.name}] {event.tool_result.output}")
+    finally:
+        await session.close()
+
+
+asyncio.run(main())
+```
+
+Tools that mutate state or run shell commands require an approval handler:
+
+```python
+session = await OpenJetSession.create(
+    approval_handler=lambda tool_call: tool_call.name == "shell"
+)
+```
+
+You can also restrict the tool surface for embedded use:
+
+```python
+session = await OpenJetSession.create(allowed_tools={"read_file", "load_file", "grep"})
+```
+
 ## First-Run Setup
 
 On first run, `open-jet` guides you through:
@@ -92,15 +160,18 @@ On first run, `open-jet` guides you through:
 4. context window size
 5. GPU offload configuration
 
-It then saves your configuration and starts the runtime.
+It then saves your configuration and starts the runtime with a device-appropriate memory profile.
 
 ## Basic Use
 
 - Type normally and press Enter to chat
 - Use `@file` or `@[path with spaces]` to add file content to context
+- Use `@image.png` or paste local image file paths into the prompt to attach images to the next turn
 - Type `/` to open slash-command suggestions
 - `Tab`/`Enter` can autocomplete slash commands and file mentions
 - `Ctrl+C` or `/exit` quits
+
+The app is designed to keep work decomposed into small recoverable turns instead of trying to hold an entire task in prompt memory at once.
 
 ## Slash Commands
 
@@ -113,6 +184,16 @@ It then saves your configuration and starts the runtime.
 - `/load <path>` load a file into context
 - `/resume` load previous saved session
 - `/setup` reopen setup wizard
+
+## Workflow Harness
+
+`open-jet` includes a lightweight harness layer for keeping agent work structured under constrained context:
+- modes for `chat`, `code`, `review`, and `debug`
+- step-oriented state so the agent can continue work across turns
+- skill docs and project docs loaded into bounded turn context
+- persistent harness state stored under `.openjet/`
+
+This is there to reduce prompt drift and keep limited-context models on the current task.
 
 ## Configuration
 
@@ -191,6 +272,45 @@ When enabled:
 - session events are written to `session_logs/*.events.jsonl`
 - system metrics are written to `session_logs/*.metrics.jsonl`
 - conversation state is saved to `session_state.json`
+
+The event log is the main reliability artifact. It captures replayable traces for things like:
+- tool call success rate
+- approval and denial decisions
+- interrupted generation and resumed sessions
+- time-to-resolution
+- token usage for successful tasks
+- hallucinated or low-value command proposals
+- hardware and runtime-specific failure analysis
+
+This is meant to support evaluation from real traces, not just subjective testing.
+
+## Benchmarks and Eval Traces
+
+`open-jet` has two different benchmark surfaces:
+
+- agent-eval cases under `benchmarks/` for end-to-end tool/task behavior
+- layered-context benchmarks for the harness doc-admission path itself
+
+The layered context system in `open-jet` is not a generic chat-history memory feature. It is a bounded, layered document-admission pipeline in `src/harness.py` that:
+- computes a per-turn prompt/docs budget from window size, reserves, RAM pressure, and current persistent context tokens
+- injects a structured harness state summary first
+- considers ordered layer1/layer2/layer3 candidate docs
+- admits only docs that fit both the remaining global docs budget and the remaining per-layer budget
+- skips oversized docs instead of truncating them inside the harness path
+
+Context benchmark commands:
+
+```bash
+open-jet-bench context-tests
+open-jet-bench context-suite jetson_4k_baseline
+open-jet-bench jetson-4k
+open-jet-bench compare benchmark_results/context/<run_a> benchmark_results/context/<run_b>
+open-jet-bench summary benchmark_results/context/<run>
+```
+
+Context benchmark artifacts are written under `benchmark_results/context/<timestamp>_<run_name>/`.
+
+For artifact format, suite names, turn-by-turn timelines, and comparison workflow, see `benchmarks/context/README.md`.
 
 ## Contact
 

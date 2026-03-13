@@ -31,6 +31,31 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "memory",
+            "description": "Read or update persistent cross-session memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Memory scope: user or agent",
+                    },
+                    "action": {
+                        "type": "string",
+                        "description": "Operation: read, append, replace, or clear",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Memory content for append or replace",
+                    },
+                },
+                "required": ["scope", "action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": "Read a file.",
             "parameters": {
@@ -91,7 +116,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Edit a file by exact string replacement.",
+            "description": (
+                "Edit a file using one or more strict SEARCH/REPLACE blocks. "
+                "Prefer patch over full rewrites. Use this exact format: "
+                "<<<<<<< SEARCH\\n...existing text...\\n=======\\n...replacement text...\\n>>>>>>> REPLACE"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -99,20 +128,27 @@ TOOLS = [
                         "type": "string",
                         "description": "File path",
                     },
+                    "patch": {
+                        "type": "string",
+                        "description": (
+                            "One or more SEARCH/REPLACE blocks. "
+                            "This is the preferred edit format."
+                        ),
+                    },
                     "old_string": {
                         "type": "string",
-                        "description": "Exact text to replace",
+                        "description": "Deprecated legacy exact text to replace",
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "Replacement text",
+                        "description": "Deprecated legacy replacement text",
                     },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "Replace all matches",
+                        "description": "Replace all matches for the legacy fields",
                     },
                 },
-                "required": ["path", "old_string", "new_string"],
+                "required": ["path", "patch"],
             },
         },
     },
@@ -207,6 +243,7 @@ async def stream_openai_chat(
     model: str,
     messages: list[dict],
     use_tools: bool = True,
+    extra_body: dict | None = None,
 ) -> AsyncIterator[StreamChunk]:
     payload: dict = {
         "model": model,
@@ -215,6 +252,8 @@ async def stream_openai_chat(
     }
     if use_tools:
         payload["tools"] = TOOLS
+    if extra_body:
+        payload.update(extra_body)
 
     tool_id_by_index: dict[int, str] = {}
     tool_name_by_index: dict[int, str] = {}

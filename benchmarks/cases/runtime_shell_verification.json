@@ -1,0 +1,13 @@
+{
+  "case_id": "runtime_shell_verification",
+  "description": "Run a bounded verification command in an edge runtime repo.",
+  "prompt": "Run a shell command to execute the runtime diagnostics check script and summarize whether the system passes. Keep it bounded.",
+  "template_dir": "edge_runtime_diagnostics",
+  "mode": "debug",
+  "allowed_tools": ["shell"],
+  "tags": ["runtime", "verification", "tool"],
+  "expectations": [
+    {"kind": "tool_used", "target": "shell"},
+    {"kind": "assistant_contains", "value": "PASS"}
+  ]
+}

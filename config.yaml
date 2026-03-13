@@ -3,6 +3,15 @@ device: cuda
 gpu_layers: 99
 hardware_override: ''
 hardware_profile: auto
+layered_context:
+  alert_ratio: 0.4
+  enabled: true
+  layer1_enabled: true
+  layer1_ratio: 0.15
+  layer2_enabled: true
+  layer2_ratio: 0.2
+  layer3_enabled: true
+  layer3_ratio: 0.1
 llama_model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
 logging:
   directory: session_logs
@@ -34,6 +43,13 @@ system_prompt: 'AI assistant on a Jetson edge device with filesystem access.
 
   Prefer dedicated tools over shell (e.g. grep not shell grep, glob not shell find,
   edit_file not write_file for edits). Use shell only for git, builds, installs.
+
+  For complex or multi-step tasks, first plan the operations you will take, then execute
+  them in a deliberate order. Keep the plan short and concrete, and update it if new
+  information changes the task.
+
+  Before making one or more tool calls, first write one brief sentence explaining
+  what you are about to do and why, then make the tool calls.
 
   Act directly with tools. Be concise. Never chain destructive commands.
 

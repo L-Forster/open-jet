@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import difflib
 import fnmatch
 import os
 import re
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,6 +77,16 @@ class LoadFileResult:
         )
 
 
+@dataclass(frozen=True)
+class EditFileResult:
+    ok: bool
+    output: str
+    internal_retry: bool = False
+    replacements: int = 0
+    match_strategy: str | None = None
+    validation_error: str | None = None
+
+
 _TEXT_EXTENSIONS = {
     ".txt", ".md", ".rst", ".log",
     ".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".yaml", ".yml", ".toml",
@@ -104,6 +117,11 @@ _TEXT_FILENAMES = {
 _MAX_READ_BYTES = 2 * 1024 * 1024
 DEFAULT_SHELL_TIMEOUT_SECONDS = 60
 SHELL_TIMEOUT_EXIT_CODE = 124
+_SEARCH_BLOCK_HEADER = "<<<<<<< SEARCH"
+_SEARCH_BLOCK_DIVIDER = "======="
+_SEARCH_BLOCK_FOOTER = ">>>>>>> REPLACE"
+_FUZZY_MATCH_THRESHOLD = 0.92
+_FUZZY_AMBIGUITY_DELTA = 0.02
 
 
 # -- Shell executor ----------------------------------------------------------
@@ -262,44 +280,273 @@ async def load_file(path: str, max_tokens: int | None = None) -> LoadFileResult:
 # -- Edit file tool ----------------------------------------------------------
 
 
-async def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
-    """Replace exact string occurrences in a file."""
+async def edit_file(
+    path: str,
+    old_string: str | None = None,
+    new_string: str | None = None,
+    replace_all: bool = False,
+    *,
+    patch: str | None = None,
+    return_result: bool = False,
+) -> EditFileResult | str:
+    """Apply a SEARCH/REPLACE patch or legacy exact string replacement."""
     raw_path = path.strip()
     if not raw_path:
-        return "Error: path is empty."
+        result = EditFileResult(ok=False, output="Error: path is empty.")
+        return result if return_result else result.output
 
     p = _normalize_tool_path(raw_path)
     if not p.exists():
-        return f"Error: file not found: {path}"
+        result = EditFileResult(ok=False, output=f"Error: file not found: {path}")
+        return result if return_result else result.output
     if p.is_dir():
-        return f"Error: path is a directory: {path}"
+        result = EditFileResult(ok=False, output=f"Error: path is a directory: {path}")
+        return result if return_result else result.output
 
     try:
         content = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
-        return f"Error reading {path}: {e}"
+        result = EditFileResult(ok=False, output=f"Error reading {path}: {e}")
+        return result if return_result else result.output
 
-    if old_string not in content:
-        return f"Error: old_string not found in {path}"
-
-    if not replace_all:
-        count = content.count(old_string)
-        if count > 1:
-            return (
-                f"Error: old_string appears {count} times in {path}. "
-                "Provide more surrounding context to make it unique, or set replace_all=true."
+    try:
+        if patch is not None:
+            new_content, replacements, match_strategy = _apply_search_replace_blocks(content, patch)
+        else:
+            if old_string is None or new_string is None:
+                result = EditFileResult(
+                    ok=False,
+                    output="Error: edit_file requires either patch or old_string/new_string.",
+                )
+                return result if return_result else result.output
+            new_content, replacements, match_strategy = _apply_legacy_string_edit(
+                content,
+                old_string,
+                new_string,
+                replace_all=replace_all,
+                path=path,
             )
-        new_content = content.replace(old_string, new_string, 1)
-    else:
-        new_content = content.replace(old_string, new_string)
+    except ValueError as exc:
+        result = EditFileResult(ok=False, output=f"Error: {exc}")
+        return result if return_result else result.output
+
+    validation_error = _validate_edited_content(p, new_content)
+    if validation_error:
+        result = EditFileResult(
+            ok=False,
+            output=validation_error,
+            internal_retry=True,
+            replacements=replacements,
+            match_strategy=match_strategy,
+            validation_error=validation_error,
+        )
+        return result if return_result else result.output
 
     try:
         p.write_text(new_content, encoding="utf-8")
     except Exception as e:
-        return f"Error writing {path}: {e}"
+        result = EditFileResult(ok=False, output=f"Error writing {path}: {e}")
+        return result if return_result else result.output
 
-    replacements = content.count(old_string) if replace_all else 1
-    return f"Edited {path}: {replacements} replacement(s) made."
+    strategy_suffix = f" via {match_strategy}" if match_strategy else ""
+    result = EditFileResult(
+        ok=True,
+        output=f"Edited {path}: {replacements} replacement(s) made{strategy_suffix}.",
+        replacements=replacements,
+        match_strategy=match_strategy,
+    )
+    return result if return_result else result.output
+
+
+def _apply_legacy_string_edit(
+    content: str,
+    old_string: str,
+    new_string: str,
+    *,
+    replace_all: bool,
+    path: str,
+) -> tuple[str, int, str]:
+    if old_string not in content:
+        raise ValueError(f"old_string not found in {path}")
+
+    if not replace_all:
+        count = content.count(old_string)
+        if count > 1:
+            raise ValueError(
+                f"old_string appears {count} times in {path}. "
+                "Provide more surrounding context to make it unique, or set replace_all=true."
+            )
+        return content.replace(old_string, new_string, 1), 1, "exact"
+
+    replacements = content.count(old_string)
+    return content.replace(old_string, new_string), replacements, "exact"
+
+
+def _apply_search_replace_blocks(content: str, patch: str) -> tuple[str, int, str]:
+    blocks = _parse_search_replace_blocks(patch)
+    new_content = content
+    strategies: list[str] = []
+
+    for search_text, replace_text in blocks:
+        new_content, strategy = _replace_search_block(new_content, search_text, replace_text)
+        strategies.append(strategy)
+
+    match_strategy = "exact"
+    if any(strategy == "fuzzy" for strategy in strategies):
+        match_strategy = "fuzzy"
+    elif any(strategy == "line-normalized" for strategy in strategies):
+        match_strategy = "line-normalized"
+    return new_content, len(blocks), match_strategy
+
+
+def _parse_search_replace_blocks(patch: str) -> list[tuple[str, str]]:
+    lines = patch.splitlines(keepends=True)
+    blocks: list[tuple[str, str]] = []
+    idx = 0
+
+    while idx < len(lines):
+        if not lines[idx].strip():
+            idx += 1
+            continue
+        if lines[idx].rstrip("\r\n") != _SEARCH_BLOCK_HEADER:
+            raise ValueError(
+                "patch must use strict SEARCH/REPLACE blocks with "
+                f"{_SEARCH_BLOCK_HEADER}, {_SEARCH_BLOCK_DIVIDER}, {_SEARCH_BLOCK_FOOTER}."
+            )
+        idx += 1
+        search_lines: list[str] = []
+        while idx < len(lines) and lines[idx].rstrip("\r\n") != _SEARCH_BLOCK_DIVIDER:
+            search_lines.append(lines[idx])
+            idx += 1
+        if idx >= len(lines):
+            raise ValueError("patch is missing the ======= divider.")
+        idx += 1
+        replace_lines: list[str] = []
+        while idx < len(lines) and lines[idx].rstrip("\r\n") != _SEARCH_BLOCK_FOOTER:
+            replace_lines.append(lines[idx])
+            idx += 1
+        if idx >= len(lines):
+            raise ValueError("patch is missing the >>>>>>> REPLACE footer.")
+        idx += 1
+        search_text = "".join(search_lines)
+        if not search_text:
+            raise ValueError("SEARCH blocks must not be empty.")
+        blocks.append((search_text, "".join(replace_lines)))
+
+    if not blocks:
+        raise ValueError("patch did not contain any SEARCH/REPLACE blocks.")
+    return blocks
+
+
+def _replace_search_block(content: str, search_text: str, replace_text: str) -> tuple[str, str]:
+    exact_count = content.count(search_text)
+    if exact_count == 1:
+        return content.replace(search_text, replace_text, 1), "exact"
+    if exact_count > 1:
+        raise ValueError(
+            "SEARCH block matched multiple locations exactly. Add more surrounding context to make it unique."
+        )
+
+    line_match = _find_line_normalized_match(content, search_text)
+    if line_match is not None:
+        start, end = line_match
+        return content[:start] + replace_text + content[end:], "line-normalized"
+
+    fuzzy_match = _find_fuzzy_line_match(content, search_text)
+    if fuzzy_match is not None:
+        start, end = fuzzy_match
+        return content[:start] + replace_text + content[end:], "fuzzy"
+
+    raise ValueError("SEARCH block did not match the target file.")
+
+
+def _find_line_normalized_match(content: str, search_text: str) -> tuple[int, int] | None:
+    content_lines = content.splitlines(keepends=True)
+    search_lines = search_text.splitlines(keepends=True)
+    if not content_lines or not search_lines or len(search_lines) > len(content_lines):
+        return None
+
+    wanted = [_normalize_match_line(line) for line in search_lines]
+    matches: list[tuple[int, int]] = []
+    for start_idx in range(len(content_lines) - len(search_lines) + 1):
+        window = content_lines[start_idx:start_idx + len(search_lines)]
+        if [_normalize_match_line(line) for line in window] != wanted:
+            continue
+        matches.append((_line_offset(content_lines, start_idx), _line_offset(content_lines, start_idx + len(search_lines))))
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError(
+            "SEARCH block matched multiple locations after line normalization. Add more surrounding context."
+        )
+    return None
+
+
+def _find_fuzzy_line_match(content: str, search_text: str) -> tuple[int, int] | None:
+    content_lines = content.splitlines(keepends=True)
+    search_lines = search_text.splitlines(keepends=True)
+    if not content_lines or not search_lines:
+        return None
+
+    target = _normalize_match_block(search_text)
+    preferred_len = len(search_lines)
+    candidate_lengths = sorted({max(1, preferred_len - 1), preferred_len, preferred_len + 1})
+    scored: list[tuple[float, int, int]] = []
+
+    for window_len in candidate_lengths:
+        if window_len > len(content_lines):
+            continue
+        for start_idx in range(len(content_lines) - window_len + 1):
+            window_text = "".join(content_lines[start_idx:start_idx + window_len])
+            ratio = difflib.SequenceMatcher(None, _normalize_match_block(window_text), target).ratio()
+            scored.append((ratio, start_idx, window_len))
+
+    if not scored:
+        return None
+
+    scored.sort(reverse=True)
+    best_ratio, best_start, best_len = scored[0]
+    if best_ratio < _FUZZY_MATCH_THRESHOLD:
+        return None
+    if len(scored) > 1 and (best_ratio - scored[1][0]) < _FUZZY_AMBIGUITY_DELTA:
+        raise ValueError(
+            "SEARCH block fuzzy-matched multiple locations. Add more surrounding context to make it unique."
+        )
+
+    return (
+        _line_offset(content_lines, best_start),
+        _line_offset(content_lines, best_start + best_len),
+    )
+
+
+def _line_offset(lines: list[str], line_index: int) -> int:
+    return sum(len(line) for line in lines[:line_index])
+
+
+def _normalize_match_line(line: str) -> str:
+    return line.rstrip().replace("\r\n", "\n")
+
+
+def _normalize_match_block(text: str) -> str:
+    return "\n".join(part.rstrip() for part in text.replace("\r\n", "\n").strip("\n").split("\n"))
+
+
+def _validate_edited_content(path: Path, content: str) -> str | None:
+    if path.suffix.lower() != ".py":
+        return None
+
+    try:
+        ast.parse(content, filename=str(path))
+    except SyntaxError as exc:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        return (
+            f"Edit validation failed for {path}.\n"
+            "Python AST validation failed; the file was not written.\n"
+            "Fix the SEARCH/REPLACE block and try again.\n"
+            f"Traceback:\n{tb}"
+        )
+    return None
 
 
 # -- Glob tool ---------------------------------------------------------------
