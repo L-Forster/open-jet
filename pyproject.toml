@@ -1,6 +1,6 @@
 [project]
 name = "open-jet"
-version = "0.1.5"
+version = "0.1.8"
 description = "Offline local-LLM terminal app for Jetson and edge Linux: chat with on-device models, run agent tools, and manage context safely."
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
