@@ -549,20 +549,31 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "def greet():\n    return 'hello'\n")
 
     async def test_run_accepts_image_paths(self) -> None:
-        client = SequencedRuntimeClient([[StreamChunk(text="done")]])
+        client = SequencedRuntimeClient([[StreamChunk(text="A tiny PNG image.")]])
         agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
         session = OpenJetSession(agent)
         with tempfile.TemporaryDirectory() as tmp:
-            image_path = Path(tmp) / "sample.png"
-            image_path.write_bytes(
+            first_image_path = Path(tmp) / "sample.png"
+            first_image_path.write_bytes(
                 base64.b64decode(
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aS2kAAAAASUVORK5CYII="
                 )
             )
-            response = await session.run("inspect", image_paths=[str(image_path)])
+            second_image_path = Path(tmp) / "second.png"
+            second_image_path.write_bytes(first_image_path.read_bytes())
+            response = await session.run(
+                "Describe both images.",
+                image_paths=[str(first_image_path), str(second_image_path)],
+            )
 
-        self.assertEqual(response.text, "done")
-        self.assertIsInstance(client.last_messages[-1]["content"], list)
+        self.assertEqual(response.text, "A tiny PNG image.")
+        content = client.last_messages[-1]["content"]
+        self.assertIsInstance(content, list)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertIn("Describe both images.", content[0]["text"])
+        self.assertIn(f"Attached image: {first_image_path}", content[0]["text"])
+        self.assertIn(f"Attached image: {second_image_path}", content[0]["text"])
+        self.assertEqual([block["type"] for block in content[1:]], ["image_url", "image_url"])
 
 
 class PersistentMemoryTests(unittest.IsolatedAsyncioTestCase):
