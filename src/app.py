@@ -8,7 +8,6 @@ import os
 import re
 import shlex
 import shutil
-import sys
 import time
 from pathlib import Path
 
@@ -53,6 +52,7 @@ from .harness import (
     update_state_after_turn,
     update_state_for_user_message,
 )
+from .harness_debug import write_debug_context_snapshot, write_debug_runtime_messages
 from .config import load_config, save_config
 from .hardware import (
     detect_hardware_info,
@@ -154,6 +154,11 @@ BANNER = r"""[bold green]
 
 
 class PromptInput(Input):
+    def __init__(self, *args, **kwargs) -> None:
+        kwargs.setdefault("select_on_focus", False)
+        super().__init__(*args, **kwargs)
+        self.cursor_blink = False
+
     def _on_paste(self, event: events.Paste) -> None:
         app = self.app
         if isinstance(app, OpenJetApp) and app.handle_prompt_paste(event.text):
@@ -189,6 +194,9 @@ class HistoryLog(RichLog):
         )
         if scroll_end is True or (scroll_end is None and pinned_to_bottom):
             self.scroll_end(animate=False)
+        app = self.app
+        if isinstance(app, OpenJetApp):
+            app._queue_sync_chat_log_height()
         return self
 
 
@@ -264,6 +272,7 @@ class OpenJetApp(App):
         self._ignore_prompt_change_events = 0
         self._utilization_timer = None
         self._utilization_visible = True
+        self._chat_log_sync_pending = False
         self.metrics = SystemMetricsReader()
         self._power_min_watts: float | None = None
         self._power_max_watts: float | None = None
@@ -523,21 +532,21 @@ class OpenJetApp(App):
         await self.run_setup_command(log)
 
     def compose(self) -> ComposeResult:
-        with Container(id="app-shell"):
-            yield HistoryLog(id="chat-log", wrap=True, markup=True, auto_scroll=False)
-            with Container(id="bottom-stack"):
-                yield Static("", id="assistant-status", classes="hidden")
-                yield Static("", id="approval-bar", classes="hidden")
-                yield Static("", id="command-suggestions", classes="hidden")
-                yield Static("", id="token-counter")
-                yield Static("", id="utilization-bar")
-                yield PromptInput(placeholder="> ", id="prompt")
+        yield HistoryLog(id="chat-log", wrap=True, markup=True, auto_scroll=False)
+        with Container(id="bottom-stack"):
+            yield Static("", id="assistant-status", classes="hidden")
+            yield Static("", id="approval-bar", classes="hidden")
+            yield Static("", id="command-suggestions", classes="hidden")
+            yield Static("", id="token-counter")
+            yield Static("", id="utilization-bar")
+            yield PromptInput(placeholder="> ", id="prompt")
 
     def on_mount(self) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write(BANNER)
         self._start_utilization_updates()
         self._render_utilization_bar()
+        self._queue_sync_chat_log_height()
         self._startup_sequence()
 
     @work(exclusive=True)
@@ -630,10 +639,27 @@ class OpenJetApp(App):
             await self.client.close()
         if self.session_logger:
             await self.session_logger.stop()
-        if self.is_inline:
-            sys.stdout.write("\x1b[2J\x1b[H")
-            sys.stdout.flush()
         self.exit()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._queue_sync_chat_log_height()
+
+    def _queue_sync_chat_log_height(self) -> None:
+        if self._chat_log_sync_pending:
+            return
+        self._chat_log_sync_pending = True
+        self.call_after_refresh(self._sync_chat_log_height)
+
+    def _sync_chat_log_height(self) -> None:
+        self._chat_log_sync_pending = False
+        if not self.is_mounted:
+            return
+        log = self.query_one("#chat-log", RichLog)
+        footer = self.query_one("#bottom-stack", Container)
+        available_rows = max(3, self.size.height - footer.outer_size.height)
+        content_rows = max(1, log.virtual_size.height)
+        target_rows = min(content_rows, available_rows)
+        log.styles.height = target_rows
 
     def action_history_page_up(self) -> None:
         self.query_one("#chat-log", RichLog).scroll_page_up(animate=False)
@@ -976,7 +1002,7 @@ class OpenJetApp(App):
     def _start_utilization_updates(self) -> None:
         if self._utilization_timer:
             self._utilization_timer.stop()
-        self._utilization_timer = self.set_interval(2.0, self._render_utilization_bar)
+        self._utilization_timer = None
 
     def _render_utilization_bar(self) -> None:
         bar = self.query_one("#utilization-bar", Static)
@@ -1401,10 +1427,40 @@ class OpenJetApp(App):
             current_context_tokens=self.agent.persistent_context_tokens(),
             effective_window=window,
             memory_snapshot=read_memory_snapshot(),
+            layered_config=self.cfg.get("layered_context", {}),
         )
         self.agent.set_turn_context(context.messages)
         self._turn_context_docs = context.docs_loaded
         self._turn_context_tokens = context.docs_tokens
+        if self.harness_state.mode == "debug":
+            runtime_messages = self.agent._messages_for_runtime()
+            if runtime_messages:
+                write_debug_runtime_messages(
+                    root=Path.cwd(),
+                    turn_id=self._active_turn_id or "pending-turn",
+                    messages=runtime_messages,
+                )
+                write_debug_context_snapshot(
+                    root=Path.cwd(),
+                    turn_id=self._active_turn_id or "pending-turn",
+                    snapshot={
+                        "docs_loaded": context.docs_loaded,
+                        "docs_tokens": context.docs_tokens,
+                        "layer_tokens": context.layer_tokens,
+                        "layer_docs": context.layer_docs,
+                        "budget_alerts": context.budget_alerts,
+                        "budget": {
+                            "effective_window": context.budget.effective_window,
+                            "usable_prompt_budget": context.budget.usable_prompt_budget,
+                            "remaining_budget": context.budget.remaining_budget,
+                            "docs_budget": context.budget.docs_budget,
+                            "layer1_budget": context.budget.layer1_budget,
+                            "layer2_budget": context.budget.layer2_budget,
+                            "layer3_budget": context.budget.layer3_budget,
+                            "layer_alert_tokens": context.budget.layer_alert_tokens,
+                        },
+                    },
+                )
         if self.session_logger:
             self.session_logger.log_event(
                 "turn_context_prepared",
@@ -1636,6 +1692,22 @@ class OpenJetApp(App):
             self._stop_tool_status(tool_status_token)
         result = execution.output
         meta = execution.meta
+        if bool(meta.get("internal_retry")):
+            result_for_context, _ = self._fit_tool_result_to_budget(result)
+            if self.session_logger:
+                self.session_logger.log_tool_result(
+                    tc.name,
+                    result,
+                    turn_id=self._active_turn_id,
+                    proposal_id=tc.id,
+                    duration_ms=round((time.monotonic() - t0) * 1000.0, 2),
+                    arguments=tc.arguments,
+                    context_result_clipped=False,
+                    **meta,
+                )
+            self.agent.complete_tool_call(tc, result_for_context)
+            self.persist_session_state(reason=f"tool_retry:{tc.name}")
+            return None
         result_for_context, clipped_tool_result = self._fit_tool_result_to_budget(result)
         duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
         if execution.ok:
@@ -1751,20 +1823,16 @@ class OpenJetApp(App):
 
     def _start_thinking(self) -> int:
         self._thinking_token += 1
-        self._thinking_idx = 0
         self._assistant_status_kind = "generating"
         self._assistant_status_command = None
         self._generation_started_at = time.monotonic()
         self._generation_tokens_streamed = 0
         self._render_assistant_status()
-        if self._thinking_timer:
-            self._thinking_timer.stop()
-        self._thinking_timer = self.set_interval(0.4, self._tick_thinking)
+        self._thinking_timer = True
         return self._thinking_token
 
     def _tick_thinking(self) -> None:
-        self._render_assistant_status()
-        self._thinking_idx += 1
+        return
 
     def _stop_thinking(self, token: int | None = None) -> None:
         if token is not None and token != self._thinking_token:
@@ -1775,7 +1843,6 @@ class OpenJetApp(App):
                 self._last_generation_tps = self._generation_tokens_streamed / elapsed
         self._generation_started_at = None
         if self._thinking_timer:
-            self._thinking_timer.stop()
             self._thinking_timer = None
         self._assistant_status_kind = None
         self._assistant_status_command = None
@@ -1788,20 +1855,16 @@ class OpenJetApp(App):
         if not command:
             return None
         self._thinking_token += 1
-        self._thinking_idx = 0
         self._assistant_status_kind = "command"
         self._assistant_status_command = command
         self._render_assistant_status()
-        if self._thinking_timer:
-            self._thinking_timer.stop()
-        self._thinking_timer = self.set_interval(0.4, self._tick_thinking)
+        self._thinking_timer = True
         return self._thinking_token
 
     def _stop_tool_status(self, token: int | None = None) -> None:
         if token is None or token != self._thinking_token:
             return
         if self._thinking_timer:
-            self._thinking_timer.stop()
             self._thinking_timer = None
         self._assistant_status_kind = None
         self._assistant_status_command = None
@@ -1809,15 +1872,14 @@ class OpenJetApp(App):
 
     def _render_assistant_status(self) -> None:
         status = self.query_one("#assistant-status", Static)
-        dots = [".", "..", "..."][self._thinking_idx % 3]
         if self._assistant_status_kind == "command" and self._assistant_status_command:
             label = self._format_command_status_label(self._assistant_status_command)
             status.remove_class("hidden")
-            status.update(f"[bold yellow]Running {escape(label)} {dots}[/]")
+            status.update(f"[bold yellow]Running {escape(label)}[/]")
             return
         if self._assistant_status_kind == "generating":
             status.remove_class("hidden")
-            status.update(f"[bold green]Generating {dots}[/]")
+            status.update("[bold green]Generating[/]")
             return
         self._clear_assistant_status()
 
@@ -1986,7 +2048,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     app = OpenJetApp(force_setup=args.setup)
-    app.run(mouse=False, inline=True, inline_no_clear=True)
+    app.run(mouse=False, inline=True, inline_no_clear=False)
 
 
 if __name__ == "__main__":

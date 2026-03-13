@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import tempfile
 import unittest
 from pathlib import Path
 
 from src.agent import ActionKind, Agent
+from src.executor import edit_file
 from src.harness import (
     HarnessState,
     active_step,
@@ -71,6 +73,71 @@ class SequencedRuntimeClient:
 
 
 class HarnessContextTests(unittest.TestCase):
+    def test_build_turn_context_uses_project_docs_for_file_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".openjet" / "agents").mkdir(parents=True)
+            (root / ".openjet" / "projects").mkdir(parents=True)
+            (root / "AGENTS.md").write_text(
+                "## What This Project Is\n"
+                "- offline-first local agent\n\n"
+                "## Core Architecture\n"
+                "- `src/example.py`: owns example behavior\n",
+                encoding="utf-8",
+            )
+            (root / ".openjet" / "agents" / "base.md").write_text("base guidance", encoding="utf-8")
+            (root / ".openjet" / "agents" / "coder.md").write_text("coder guidance", encoding="utf-8")
+
+            state = update_state_for_user_message(
+                HarnessState(),
+                "Implement a change",
+                files=["src/example.py"],
+            )
+            context = build_turn_context(
+                root=root,
+                state=state,
+                current_context_tokens=0,
+                effective_window=4096,
+                memory_snapshot=MemorySnapshot(total_mb=8192, available_mb=4096, used_percent=50.0),
+            )
+
+        joined = "\n".join(message["content"] for message in context.messages)
+        self.assertIn("PROJECT CONTEXT SUMMARY", joined)
+        self.assertIn("FILE CONTEXT: src/example.py", joined)
+        self.assertIn("owns example behavior", joined)
+        self.assertIn("file-context:src/example.py", context.docs_loaded)
+        self.assertIn("layer2", context.layer_docs)
+        self.assertGreaterEqual(context.layer_tokens["layer2"], 1)
+
+    def test_build_turn_context_respects_layered_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".openjet" / "agents").mkdir(parents=True)
+            (root / "AGENTS.md").write_text(
+                "## What This Project Is\n"
+                "- offline-first local agent\n\n"
+                "## Core Architecture\n"
+                "- `src/example.py`: owns example behavior\n",
+                encoding="utf-8",
+            )
+            (root / ".openjet" / "agents" / "base.md").write_text("base guidance", encoding="utf-8")
+            (root / ".openjet" / "agents" / "coder.md").write_text("coder guidance", encoding="utf-8")
+            state = update_state_for_user_message(HarnessState(), "Implement a change", files=["src/example.py"])
+
+            context = build_turn_context(
+                root=root,
+                state=state,
+                current_context_tokens=0,
+                effective_window=4096,
+                memory_snapshot=MemorySnapshot(total_mb=8192, available_mb=4096, used_percent=50.0),
+                layered_config={"layer2_enabled": False},
+            )
+
+        joined = "\n".join(message["content"] for message in context.messages)
+        self.assertIn("PROJECT CONTEXT SUMMARY", joined)
+        self.assertNotIn("FILE CONTEXT: src/example.py", joined)
+        self.assertEqual(context.layer_tokens["layer2"], 0)
+
     def test_build_turn_context_loads_preferred_skill_within_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -112,6 +179,48 @@ class HarnessContextTests(unittest.TestCase):
         state = HarnessState(preferred_skills=["python-refactor", "write-tests"])
         cleared = clear_preferred_skills(state)
         self.assertEqual(cleared.preferred_skills, [])
+
+    def test_edit_file_applies_search_replace_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            path.write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+            patch = (
+                "<<<<<<< SEARCH\n"
+                "def greet():\n"
+                "    return 'hi'\n"
+                "=======\n"
+                "def greet():\n"
+                "    return 'hello'\n"
+                ">>>>>>> REPLACE\n"
+            )
+
+            result = asyncio.run(edit_file(str(path), patch=patch, return_result=True))
+
+            self.assertTrue(result.ok)
+            self.assertIn("replacement(s) made", result.output)
+            self.assertIn("hello", path.read_text(encoding="utf-8"))
+
+    def test_edit_file_rejects_invalid_python_patch_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            original = "def greet():\n    return 'hi'\n"
+            path.write_text(original, encoding="utf-8")
+            patch = (
+                "<<<<<<< SEARCH\n"
+                "def greet():\n"
+                "    return 'hi'\n"
+                "=======\n"
+                "def greet(:\n"
+                "    return 'broken'\n"
+                ">>>>>>> REPLACE\n"
+            )
+
+            result = asyncio.run(edit_file(str(path), patch=patch, return_result=True))
+
+            self.assertFalse(result.ok)
+            self.assertTrue(result.internal_retry)
+            self.assertIn("Python AST validation failed", result.output)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
 
 
 class HarnessStateTests(unittest.TestCase):
@@ -270,6 +379,45 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
         tool_result = next(event.tool_result for event in events if event.kind == SDKEventKind.TOOL_RESULT)
         self.assertTrue(tool_result.approved)
         self.assertTrue(tool_result.ok)
+
+    async def test_stream_hides_invalid_edit_retry_and_exposes_successful_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            path.write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+            bad_patch = (
+                "<<<<<<< SEARCH\n"
+                "def greet():\n"
+                "    return 'hi'\n"
+                "=======\n"
+                "def greet(:\n"
+                "    return 'broken'\n"
+                ">>>>>>> REPLACE\n"
+            )
+            good_patch = (
+                "<<<<<<< SEARCH\n"
+                "def greet():\n"
+                "    return 'hi'\n"
+                "=======\n"
+                "def greet():\n"
+                "    return 'hello'\n"
+                ">>>>>>> REPLACE\n"
+            )
+            client = SequencedRuntimeClient(
+                [
+                    [StreamChunk(tool_calls=[ToolCall(name="edit_file", arguments={"path": str(path), "patch": bad_patch})])],
+                    [StreamChunk(tool_calls=[ToolCall(name="edit_file", arguments={"path": str(path), "patch": good_patch})])],
+                    [StreamChunk(text="done")],
+                ]
+            )
+            agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+            session = OpenJetSession(agent, approval_handler=lambda tc: tc.name == "edit_file")
+
+            events = [event async for event in session.stream("fix the file")]
+            tool_results = [event.tool_result for event in events if event.kind == SDKEventKind.TOOL_RESULT]
+            self.assertEqual(len(tool_results), 1)
+            self.assertTrue(tool_results[0].ok)
+            self.assertIn("replacement(s) made", tool_results[0].output)
+            self.assertEqual(path.read_text(encoding="utf-8"), "def greet():\n    return 'hello'\n")
 
     async def test_run_accepts_image_paths(self) -> None:
         client = SequencedRuntimeClient([[StreamChunk(text="done")]])

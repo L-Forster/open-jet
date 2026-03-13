@@ -149,6 +149,8 @@ class OpenJetSession:
 
             for tool_call in pending_tool_calls:
                 tool_result = await self._handle_tool_call(tool_call)
+                if tool_result is None:
+                    continue
                 yield SDKEvent(
                     kind=SDKEventKind.TOOL_RESULT,
                     tool_call=tool_call,
@@ -176,7 +178,7 @@ class OpenJetSession:
             condense_messages=condense_messages,
         )
 
-    async def _handle_tool_call(self, tool_call: ToolCall) -> ToolResult:
+    async def _handle_tool_call(self, tool_call: ToolCall) -> ToolResult | None:
         if self._allowed_tools is not None and tool_call.name not in self._allowed_tools:
             output = f"Tool {tool_call.name} is not allowed in this session."
             self.agent.complete_tool_call(tool_call, output)
@@ -205,6 +207,8 @@ class OpenJetSession:
         result = await execute_tool(tool_call)
         context_output = self._fit_tool_result_to_budget(result.output)
         self.agent.complete_tool_call(tool_call, context_output)
+        if bool(result.meta.get("internal_retry")):
+            return None
         return ToolResult(tool_call=tool_call, output=result.output, meta=result.meta, approved=True)
 
     async def _approve(self, tool_call: ToolCall) -> bool:

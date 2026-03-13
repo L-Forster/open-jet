@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from .context_index import load_repo_context_index, lookup_file_summary
 from .runtime_limits import MemorySnapshot, estimate_tokens
 
 
@@ -126,6 +127,22 @@ class TurnBudget:
     current_context_tokens: int
     remaining_budget: int
     docs_budget: int
+    layer1_budget: int
+    layer2_budget: int
+    layer3_budget: int
+    layer_alert_tokens: int
+
+
+@dataclass(frozen=True)
+class LayeredContextConfig:
+    enabled: bool
+    layer1_enabled: bool
+    layer2_enabled: bool
+    layer3_enabled: bool
+    layer1_ratio: float
+    layer2_ratio: float
+    layer3_ratio: float
+    alert_ratio: float
 
 
 @dataclass(frozen=True)
@@ -134,6 +151,9 @@ class HarnessContext:
     docs_loaded: list[str]
     docs_tokens: int
     budget: TurnBudget
+    layer_tokens: dict[str, int]
+    layer_docs: dict[str, list[str]]
+    budget_alerts: list[str]
 
 
 class HarnessSessionStore:
@@ -220,7 +240,9 @@ def compute_turn_budget(
     effective_window: int,
     current_context_tokens: int,
     memory_snapshot: MemorySnapshot | None,
+    layered_config: LayeredContextConfig | None = None,
 ) -> TurnBudget:
+    config = layered_config or layered_context_config(None)
     generation_reserve = max(512, int(effective_window * 0.18))
     tool_reserve = max(128, int(effective_window * 0.04))
     system_reserve = 300 if effective_window <= 8192 else 500
@@ -241,6 +263,10 @@ def compute_turn_budget(
     usable_prompt_budget = max(512, int(base_prompt_budget * ram_factor))
     remaining_budget = usable_prompt_budget - max(0, current_context_tokens)
     docs_budget = max(192, min(int(usable_prompt_budget * 0.28), max(192, remaining_budget // 2 if remaining_budget > 0 else 192)))
+    layer1_budget = max(0, min(docs_budget, int(effective_window * config.layer1_ratio))) if config.layer1_enabled else 0
+    layer2_budget = max(0, min(docs_budget, int(effective_window * config.layer2_ratio))) if config.layer2_enabled else 0
+    layer3_budget = max(0, min(docs_budget, int(effective_window * config.layer3_ratio))) if config.layer3_enabled else 0
+    layer_alert_tokens = max(96, int(effective_window * config.alert_ratio))
     return TurnBudget(
         effective_window=effective_window,
         generation_reserve=generation_reserve,
@@ -252,6 +278,10 @@ def compute_turn_budget(
         current_context_tokens=current_context_tokens,
         remaining_budget=remaining_budget,
         docs_budget=docs_budget,
+        layer1_budget=layer1_budget,
+        layer2_budget=layer2_budget,
+        layer3_budget=layer3_budget,
+        layer_alert_tokens=layer_alert_tokens,
     )
 
 
@@ -262,36 +292,77 @@ def build_turn_context(
     current_context_tokens: int,
     effective_window: int,
     memory_snapshot: MemorySnapshot | None,
+    layered_config: dict[str, Any] | None = None,
 ) -> HarnessContext:
+    config = layered_context_config(layered_config)
     budget = compute_turn_budget(
         effective_window=effective_window,
         current_context_tokens=current_context_tokens,
         memory_snapshot=memory_snapshot,
+        layered_config=config,
     )
     messages: list[dict[str, str]] = []
     docs_loaded: list[str] = []
     docs_tokens = 0
+    layer_tokens = {"layer1": 0, "layer2": 0, "layer3": 0}
+    layer_docs = {"layer1": [], "layer2": [], "layer3": []}
+    budget_alerts: list[str] = []
 
     state_summary = build_state_summary(state, budget)
     messages.append({"role": "system", "content": state_summary})
 
     remaining = max(0, budget.docs_budget - estimate_tokens(state_summary))
     if remaining <= 0:
-        return HarnessContext(messages=messages, docs_loaded=docs_loaded, docs_tokens=estimate_tokens(state_summary), budget=budget)
+        return HarnessContext(
+            messages=messages,
+            docs_loaded=docs_loaded,
+            docs_tokens=estimate_tokens(state_summary),
+            budget=budget,
+            layer_tokens=layer_tokens,
+            layer_docs=layer_docs,
+            budget_alerts=budget_alerts,
+        )
 
-    for label, body in _candidate_docs(root, state, effective_window):
+    per_layer_remaining = {
+        "layer1": min(remaining, budget.layer1_budget),
+        "layer2": min(remaining, budget.layer2_budget),
+        "layer3": min(remaining, budget.layer3_budget),
+    }
+
+    for layer_name, label, body in _candidate_docs(root, state, effective_window):
+        if not _layer_enabled(config, layer_name):
+            continue
         doc_tokens = estimate_tokens(body)
         if doc_tokens > remaining:
+            continue
+        if doc_tokens > per_layer_remaining.get(layer_name, remaining):
             continue
         messages.append({"role": "system", "content": body})
         docs_loaded.append(label)
         docs_tokens += doc_tokens
+        layer_tokens[layer_name] = layer_tokens.get(layer_name, 0) + doc_tokens
+        layer_docs.setdefault(layer_name, []).append(label)
         remaining -= doc_tokens
+        per_layer_remaining[layer_name] = max(0, per_layer_remaining.get(layer_name, 0) - doc_tokens)
         if remaining < 128:
             break
 
+    for layer_name, used in layer_tokens.items():
+        if used > budget.layer_alert_tokens:
+            budget_alerts.append(
+                f"{layer_name} exceeded 40% of the context window: used={used} threshold={budget.layer_alert_tokens}"
+            )
+
     docs_tokens += estimate_tokens(state_summary)
-    return HarnessContext(messages=messages, docs_loaded=docs_loaded, docs_tokens=docs_tokens, budget=budget)
+    return HarnessContext(
+        messages=messages,
+        docs_loaded=docs_loaded,
+        docs_tokens=docs_tokens,
+        budget=budget,
+        layer_tokens=layer_tokens,
+        layer_docs=layer_docs,
+        budget_alerts=budget_alerts,
+    )
 
 
 def build_state_summary(state: HarnessState, budget: TurnBudget | None = None) -> str:
@@ -310,7 +381,15 @@ def build_state_summary(state: HarnessState, budget: TurnBudget | None = None) -
         f"OPEN_QUESTIONS: {', '.join(state.open_questions) if state.open_questions else 'none'}",
     ]
     if budget is not None:
-        lines.append(f"PROMPT_BUDGET: usable={budget.usable_prompt_budget} remaining={max(0, budget.remaining_budget)} docs={budget.docs_budget}")
+        lines.append(
+            "PROMPT_BUDGET: "
+            f"usable={budget.usable_prompt_budget} "
+            f"remaining={max(0, budget.remaining_budget)} "
+            f"docs={budget.docs_budget} "
+            f"layer1={budget.layer1_budget} "
+            f"layer2={budget.layer2_budget} "
+            f"layer3={budget.layer3_budget}"
+        )
     lines.append("Work on the active step only. If the step is too broad, split it instead of carrying excess context.")
     return "\n".join(lines)
 
@@ -482,24 +561,31 @@ def _complete_and_advance(state: HarnessState, step_id: str) -> None:
     state.active_step_id = None
 
 
-def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str]]:
+def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str, str]]:
     role_name = ROLE_BY_MODE.get(state.mode, "coder")
-    candidates: list[tuple[str, str]] = []
+    candidates: list[tuple[str, str, str]] = []
+    repo_index = load_repo_context_index(root)
+    if repo_index.project_summary:
+        candidates.append(("layer1", "project-context", repo_index.project_summary))
     base_doc = _load_doc(root / ".openjet" / "agents" / "base.md")
-    candidates.append(("agents/base.md", base_doc or DEFAULT_BASE_PROMPT))
+    candidates.append(("layer1", "agents/base.md", base_doc or DEFAULT_BASE_PROMPT))
     role_doc = _load_doc(root / ".openjet" / "agents" / f"{role_name}.md")
-    candidates.append((f"agents/{role_name}.md", role_doc or DEFAULT_ROLE_PROMPTS.get(role_name, "")))
+    candidates.append(("layer2", f"agents/{role_name}.md", role_doc or DEFAULT_ROLE_PROMPTS.get(role_name, "")))
     project_doc = _load_doc(root / ".openjet" / "projects" / "default.md")
     if project_doc:
-        candidates.append(("projects/default.md", project_doc))
+        candidates.append(("layer1", "projects/default.md", project_doc))
+
+    for file_summary in _file_context_docs(repo_index, state):
+        candidates.append(("layer2", file_summary[0], file_summary[1]))
 
     selected_skills = _select_skills(root, state, window_tokens)
     candidates.extend(selected_skills)
+    candidates.extend(_recent_context_docs(state))
 
-    return [(label, _format_doc(label, body)) for label, body in candidates if body.strip()]
+    return [(layer_name, label, _format_doc(label, body)) for layer_name, label, body in candidates if body.strip()]
 
 
-def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str]]:
+def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str, str]]:
     skills_dir = root / ".openjet" / "skills"
     if not skills_dir.exists():
         return []
@@ -537,7 +623,76 @@ def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[
     active = active_step(state)
     if active and active.skill:
         limit = max(limit, 1)
-    return [(f"skills/{name}", body) for _, name, body in scored[:limit]]
+    return [("layer2", f"skills/{name}", body) for _, name, body in scored[:limit]]
+
+
+def _file_context_docs(index: Any, state: HarnessState) -> list[tuple[str, str]]:
+    docs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_path in state.files_in_play:
+        normalized = str(raw_path).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        summary = lookup_file_summary(index, normalized)
+        if summary is None:
+            continue
+        lines = [
+            f"FILE CONTEXT: {summary.path}",
+            f"Purpose: {summary.purpose}",
+        ]
+        if summary.related_tests:
+            lines.append(f"Related tests: {', '.join(summary.related_tests)}")
+        docs.append((f"file-context:{summary.path}", "\n".join(lines)))
+    return docs
+
+
+def _recent_context_docs(state: HarnessState) -> list[tuple[str, str, str]]:
+    lines = ["RECENT TASK CONTEXT"]
+    if state.last_action:
+        lines.append(f"Last action: {_compact_json(state.last_action)}")
+    if state.last_verification:
+        lines.append(f"Last verification: {_compact_json(state.last_verification)}")
+    if state.files_in_play:
+        lines.append(f"Files in play: {', '.join(state.files_in_play[:4])}")
+    if len(lines) == 1:
+        return []
+    return [("layer3", "recent-context", "\n".join(lines))]
+
+
+def layered_context_config(raw: dict[str, Any] | None) -> LayeredContextConfig:
+    payload = dict(raw or {})
+    enabled = bool(payload.get("enabled", True))
+    return LayeredContextConfig(
+        enabled=enabled,
+        layer1_enabled=enabled and bool(payload.get("layer1_enabled", True)),
+        layer2_enabled=enabled and bool(payload.get("layer2_enabled", True)),
+        layer3_enabled=enabled and bool(payload.get("layer3_enabled", True)),
+        layer1_ratio=_clamp_ratio(payload.get("layer1_ratio"), default=0.15),
+        layer2_ratio=_clamp_ratio(payload.get("layer2_ratio"), default=0.20),
+        layer3_ratio=_clamp_ratio(payload.get("layer3_ratio"), default=0.10),
+        alert_ratio=_clamp_ratio(payload.get("alert_ratio"), default=0.40),
+    )
+
+
+def _layer_enabled(config: LayeredContextConfig, layer_name: str) -> bool:
+    if not config.enabled:
+        return False
+    if layer_name == "layer1":
+        return config.layer1_enabled
+    if layer_name == "layer2":
+        return config.layer2_enabled
+    if layer_name == "layer3":
+        return config.layer3_enabled
+    return True
+
+
+def _clamp_ratio(value: Any, *, default: float) -> float:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(ratio, 1.0))
 
 
 def _load_doc(path: Path) -> str:

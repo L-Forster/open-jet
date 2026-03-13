@@ -466,6 +466,7 @@ async def run_benchmark_case(
                     current_context_tokens=agent.persistent_context_tokens(),
                     effective_window=getattr(runtime, "context_window_tokens", int(cfg.get("context_window_tokens", 2048))),
                     memory_snapshot=read_memory_snapshot(),
+                    layered_config=cfg.get("layered_context", {}),
                 )
                 agent.set_turn_context(context.messages)
                 turn = TurnRecord(

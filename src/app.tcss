@@ -14,13 +14,6 @@ Screen {
 Vertical {
     background: transparent;
 }
-#app-shell {
-    width: 100%;
-    height: auto;
-    layout: vertical;
-    overflow: hidden;
-    background: transparent;
-}
 RichLog {
     background: transparent;
 }
@@ -32,8 +25,7 @@ Static {
 }
 #chat-log {
     width: 100%;
-    height: auto;
-    max-height: 1fr;
+    height: 1fr;
     min-height: 0;
     overflow-y: auto;
     scrollbar-size: 0 0;
@@ -41,7 +33,7 @@ Static {
     color: #ffffff;
 }
 #bottom-stack {
-    width: 100%;
+    dock: bottom;
     height: auto;
     min-height: 4;
     max-height: 10;

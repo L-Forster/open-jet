@@ -9,6 +9,15 @@ logging:
   enabled: true
   label: open-jet
   metrics_interval_seconds: 5
+layered_context:
+  enabled: true
+  layer1_enabled: true
+  layer2_enabled: true
+  layer3_enabled: true
+  layer1_ratio: 0.15
+  layer2_ratio: 0.2
+  layer3_ratio: 0.1
+  alert_ratio: 0.4
 memory_guard:
   check_interval_chunks: 16
   condense_target_tokens: 900

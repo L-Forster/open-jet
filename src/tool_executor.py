@@ -144,26 +144,50 @@ async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
 
     if tool_call.name == "edit_file":
         path = tool_call.arguments.get("path", "")
+        patch = tool_call.arguments.get("patch")
         old_string = tool_call.arguments.get("old_string", "")
         new_string = tool_call.arguments.get("new_string", "")
         replace_all_flag = tool_call.arguments.get("replace_all", False)
         if not isinstance(path, str) or not path.strip():
             return ToolExecutionResult(
-                output="Error: invalid arguments for edit_file (required: path, old_string, new_string)",
+                output="Error: invalid arguments for edit_file (required: path)",
                 meta={"ok": False},
             )
-        if not isinstance(old_string, str) or not old_string:
-            return ToolExecutionResult(
-                output="Error: invalid arguments for edit_file (required: old_string)",
-                meta={"ok": False},
+        if patch is not None:
+            if not isinstance(patch, str) or not patch.strip():
+                return ToolExecutionResult(
+                    output="Error: invalid arguments for edit_file (patch must be a non-empty string)",
+                    meta={"ok": False},
+                )
+            result = await edit_file(path, patch=patch, return_result=True)
+        else:
+            if not isinstance(old_string, str) or not old_string:
+                return ToolExecutionResult(
+                    output="Error: invalid arguments for edit_file (required: patch or old_string)",
+                    meta={"ok": False},
+                )
+            if not isinstance(new_string, str):
+                return ToolExecutionResult(
+                    output="Error: invalid arguments for edit_file (required: new_string)",
+                    meta={"ok": False},
+                )
+            result = await edit_file(
+                path,
+                old_string=old_string,
+                new_string=new_string,
+                replace_all=bool(replace_all_flag),
+                return_result=True,
             )
-        if not isinstance(new_string, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for edit_file (required: new_string)",
-                meta={"ok": False},
-            )
-        text = await edit_file(path, old_string, new_string, replace_all=bool(replace_all_flag))
-        return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error")})
+        return ToolExecutionResult(
+            output=result.output,
+            meta={
+                "ok": result.ok,
+                "internal_retry": result.internal_retry,
+                "replacements": result.replacements,
+                "match_strategy": result.match_strategy,
+                "validation_error": result.validation_error,
+            },
+        )
 
     if tool_call.name == "glob":
         pattern = tool_call.arguments.get("pattern", "")
