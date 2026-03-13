@@ -8,10 +8,9 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from rich.markup import escape
-from textual.widgets import RichLog
 
 from .hardware import running_on_jetson
 
@@ -252,7 +251,7 @@ def render_progress_bar(percent: int, width: int = 24) -> str:
 
 async def materialize_setup_model(
     setup_result: dict,
-    log: RichLog,
+    log: Any,
     *,
     set_status: Callable[[str], None],
     clear_status: Callable[[], None],

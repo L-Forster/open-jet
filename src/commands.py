@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
-from textual.widgets import RichLog
+from typing import TYPE_CHECKING, Any
 
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
 
@@ -126,7 +125,7 @@ class SlashCommandHandler:
         self._render_unknown(log, text)
         return True
 
-    def _render_help(self, log: RichLog) -> None:
+    def _render_help(self, log: Any) -> None:
         lines = ["[bold]Slash commands[/]"]
         for spec in self.COMMANDS:
             aliases = f" (aliases: {', '.join(f'/{a}' for a in spec.aliases)})" if spec.aliases else ""
@@ -135,7 +134,7 @@ class SlashCommandHandler:
             log.write(line)
         log.write("")
 
-    async def _clear(self, log: RichLog, *, reset_kv_cache: bool) -> None:
+    async def _clear(self, log: Any, *, reset_kv_cache: bool) -> None:
         if self.app._awaiting_approval:
             log.write("[yellow]Cannot clear while a tool approval prompt is active.[/]")
             log.write("")
@@ -189,7 +188,7 @@ class SlashCommandHandler:
         self.app.persist_harness_state()
         self.app.persist_session_state(reason="clear_command")
 
-    def _status(self, log: RichLog) -> None:
+    def _status(self, log: Any) -> None:
         snapshot = self.app.runtime_status_snapshot()
         if not snapshot.get("ready"):
             log.write("[bold bright_white]Agent not initialized.[/]")
@@ -248,7 +247,7 @@ class SlashCommandHandler:
                 )
         log.write("")
 
-    async def _condense(self, log: RichLog) -> None:
+    async def _condense(self, log: Any) -> None:
         if self.app._thinking_timer:
             log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
             log.write("")
@@ -266,12 +265,12 @@ class SlashCommandHandler:
         if self.app.session_logger:
             self.app.session_logger.log_event("manual_condense", summary=summary)
 
-    def _render_unknown(self, log: RichLog, text: str) -> None:
+    def _render_unknown(self, log: Any, text: str) -> None:
         log.write(f"[yellow]Unknown command:[/] {text}")
         log.write("[bold bright_white]Run /help to list available commands.[/]")
         log.write("")
 
-    async def _load(self, log: RichLog, raw_arg: str) -> None:
+    async def _load(self, log: Any, raw_arg: str) -> None:
         path = raw_arg.strip()
         if not path:
             log.write("[yellow]Usage:[/] /load <path>")
@@ -288,7 +287,7 @@ class SlashCommandHandler:
             log.write("[bold bright_white]Use /status to inspect current budget and memory.[/]")
             log.write("")
 
-    async def _setup(self, log: RichLog) -> None:
+    async def _setup(self, log: Any) -> None:
         if self.app._awaiting_approval:
             log.write("[yellow]Cannot open setup while a tool approval prompt is active.[/]")
             log.write("")
@@ -299,7 +298,7 @@ class SlashCommandHandler:
             return
         self.app.run_setup_command_worker()
 
-    async def _memory(self, log: RichLog, raw_arg: str) -> None:
+    async def _memory(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip()
         if not arg or arg == "show":
             snapshot = await load_persistent_memory(Path.cwd())
@@ -329,7 +328,7 @@ class SlashCommandHandler:
         log.write(f"[bold bright_white]{result}[/]")
         log.write("")
 
-    async def _resume(self, log: RichLog) -> None:
+    async def _resume(self, log: Any) -> None:
         if self.app._awaiting_approval:
             log.write("[yellow]Cannot resume while a tool approval prompt is active.[/]")
             log.write("")
@@ -353,7 +352,7 @@ class SlashCommandHandler:
         log.write("")
         self.app.refresh_token_counter()
 
-    def _reasoning(self, log: RichLog, raw_arg: str) -> None:
+    def _reasoning(self, log: Any, raw_arg: str) -> None:
         client = self.app.client
         setter = getattr(client, "set_reasoning_mode", None) if client else None
         getter = getattr(client, "reasoning_status", None) if client else None
@@ -375,7 +374,7 @@ class SlashCommandHandler:
         log.write(f"[bold bright_white]Reasoning mode set to {arg}. Applies to future turns with the current model.[/]")
         log.write("")
 
-    def _mode(self, log: RichLog, raw_arg: str) -> None:
+    def _mode(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip().lower()
         if not arg or arg == "status":
             log.write(f"[bold bright_white]Harness mode: {self.app.harness_state.mode}[/]")
@@ -389,7 +388,7 @@ class SlashCommandHandler:
         log.write(f"[bold bright_white]Harness mode set to {arg}.[/]")
         log.write("")
 
-    def _skills(self, log: RichLog, raw_arg: str) -> None:
+    def _skills(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip().lower()
         if not arg or arg == "status":
             selected = self.app.harness_state.preferred_skills
@@ -415,7 +414,7 @@ class SlashCommandHandler:
         log.write("[yellow]Usage:[/] /skills [status|list|clear]")
         log.write("")
 
-    def _skill(self, log: RichLog, raw_arg: str) -> None:
+    def _skill(self, log: Any, raw_arg: str) -> None:
         names = [part.strip() for part in raw_arg.split(",") if part.strip()]
         if not names:
             log.write("[yellow]Usage:[/] /skill <name[,name...]>")
@@ -428,7 +427,7 @@ class SlashCommandHandler:
             log.write(f"[yellow]Unknown skills:[/] {', '.join(missing)}")
         log.write("")
 
-    def _step(self, log: RichLog, raw_arg: str) -> None:
+    def _step(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip().lower()
         if not arg or arg == "status":
             active = self.app.harness_active_step()
@@ -449,7 +448,7 @@ class SlashCommandHandler:
         log.write("[yellow]Usage:[/] /step [status|next|split]")
         log.write("")
 
-    def _util(self, log: RichLog, raw_arg: str) -> None:
+    def _util(self, log: Any, raw_arg: str) -> None:
         action = raw_arg.strip().lower()
         if not action or action == "toggle":
             visible = self.app.toggle_utilization_visible()

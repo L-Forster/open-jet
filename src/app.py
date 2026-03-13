@@ -11,14 +11,16 @@ import shutil
 import time
 from pathlib import Path
 
+from rich.console import Group
 from rich.markup import escape
+from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
 from textual.screen import Screen
 from textual.worker import Worker, get_current_worker
-from textual.widgets import Input, RichLog, Static
+from textual.widgets import Input, Static
 from textual.widgets.input import Selection
 
 from .agent import ActionKind, Agent, ToolCall
@@ -173,7 +175,12 @@ class PromptInput(Input):
         super().action_paste()
 
 
-class HistoryLog(RichLog):
+class HistoryLog(Static):
+    def __init__(self, *args, markup: bool = False, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._markup = markup
+        self._entries: list[object] = []
+
     def write(
         self,
         content,
@@ -183,21 +190,30 @@ class HistoryLog(RichLog):
         scroll_end: bool | None = None,
         animate: bool = False,
     ):
-        pinned_to_bottom = self.is_vertical_scroll_end or self.max_scroll_y <= 0
-        super().write(
-            content,
-            width=width,
-            expand=expand,
-            shrink=shrink,
-            scroll_end=False,
-            animate=animate,
-        )
-        if scroll_end is True or (scroll_end is None and pinned_to_bottom):
-            self.scroll_end(animate=False)
-        app = self.app
-        if isinstance(app, OpenJetApp):
-            app._queue_sync_chat_log_height()
+        del width, expand, shrink, scroll_end, animate
+        if isinstance(content, str):
+            renderable = Text.from_markup(content) if self._markup else Text(content)
+        else:
+            renderable = content
+        self._entries.append(renderable)
+        self.update(Group(*self._entries))
         return self
+
+    def scroll_page_up(self, animate: bool = False) -> None:
+        del animate
+        return
+
+    def scroll_page_down(self, animate: bool = False) -> None:
+        del animate
+        return
+
+    def scroll_home(self, animate: bool = False) -> None:
+        del animate
+        return
+
+    def scroll_end(self, animate: bool = False) -> None:
+        del animate
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +309,18 @@ class OpenJetApp(App):
             "gpu_layers": self.cfg.get("gpu_layers", 0),
             "host_arch": os.uname().machine if hasattr(os, "uname") else None,
         }
+
+    def _log_trace_event(self, event_type: str, **data: object) -> None:
+        if not self.session_logger:
+            return
+        self.session_logger.log_event(
+            event_type,
+            turn_id=self._active_turn_id,
+            **data,
+        )
+
+    def _agent_trace(self, event: str, data: dict[str, object]) -> None:
+        self._log_trace_event(f"agent_trace_{event}", **data)
 
     def _begin_turn_trace(self, prompt: str) -> None:
         self._turn_counter += 1
@@ -390,6 +418,7 @@ class OpenJetApp(App):
             memory_check_interval_chunks=int(mem_cfg.get("check_interval_chunks", 16)),
             condense_target_tokens=int(mem_cfg.get("condense_target_tokens", 900)),
             keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
+            trace_hook=self._agent_trace,
         )
 
     def _build_setup_screen(self, *, exit_on_cancel: bool) -> SetupScreen:
@@ -401,7 +430,7 @@ class OpenJetApp(App):
             exit_on_cancel=exit_on_cancel,
         )
 
-    async def _materialize_setup_model(self, setup_result: dict, log: RichLog) -> dict:
+    async def _materialize_setup_model(self, setup_result: dict, log: HistoryLog) -> dict:
         status = self.query_one("#assistant-status", Static)
 
         def _set_status(text: str) -> None:
@@ -431,7 +460,7 @@ class OpenJetApp(App):
         self.push_screen(screen, callback=_on_dismiss)
         return await result_future
 
-    async def run_setup_command(self, log: RichLog) -> bool:
+    async def run_setup_command(self, log: HistoryLog) -> bool:
         previous_cfg = dict(self.cfg)
         had_runtime = bool(self.client or self.agent)
         if self.agent:
@@ -528,11 +557,11 @@ class OpenJetApp(App):
 
     @work(exclusive=True)
     async def run_setup_command_worker(self) -> None:
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", HistoryLog)
         await self.run_setup_command(log)
 
     def compose(self) -> ComposeResult:
-        yield HistoryLog(id="chat-log", wrap=True, markup=True, auto_scroll=False)
+        yield HistoryLog(id="chat-log", markup=True)
         with Container(id="bottom-stack"):
             yield Static("", id="assistant-status", classes="hidden")
             yield Static("", id="approval-bar", classes="hidden")
@@ -542,16 +571,15 @@ class OpenJetApp(App):
             yield PromptInput(placeholder="> ", id="prompt")
 
     def on_mount(self) -> None:
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", HistoryLog)
         log.write(BANNER)
         self._start_utilization_updates()
         self._render_utilization_bar()
-        self._queue_sync_chat_log_height()
         self._startup_sequence()
 
     @work(exclusive=True)
     async def _startup_sequence(self) -> None:
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", HistoryLog)
         prompt = self.query_one("#prompt", Input)
         log_cfg = self.cfg.get("logging", {})
         if log_cfg.get("enabled", True):
@@ -642,36 +670,19 @@ class OpenJetApp(App):
         self.exit()
 
     def on_resize(self, event: events.Resize) -> None:
-        self._queue_sync_chat_log_height()
-
-    def _queue_sync_chat_log_height(self) -> None:
-        if self._chat_log_sync_pending:
-            return
-        self._chat_log_sync_pending = True
-        self.call_after_refresh(self._sync_chat_log_height)
-
-    def _sync_chat_log_height(self) -> None:
-        self._chat_log_sync_pending = False
-        if not self.is_mounted:
-            return
-        log = self.query_one("#chat-log", RichLog)
-        footer = self.query_one("#bottom-stack", Container)
-        available_rows = max(3, self.size.height - footer.outer_size.height)
-        content_rows = max(1, log.virtual_size.height)
-        target_rows = min(content_rows, available_rows)
-        log.styles.height = target_rows
+        return
 
     def action_history_page_up(self) -> None:
-        self.query_one("#chat-log", RichLog).scroll_page_up(animate=False)
+        self.query_one("#chat-log", HistoryLog).scroll_page_up(animate=False)
 
     def action_history_page_down(self) -> None:
-        self.query_one("#chat-log", RichLog).scroll_page_down(animate=False)
+        self.query_one("#chat-log", HistoryLog).scroll_page_down(animate=False)
 
     def action_history_home(self) -> None:
-        self.query_one("#chat-log", RichLog).scroll_home(animate=False)
+        self.query_one("#chat-log", HistoryLog).scroll_home(animate=False)
 
     def action_history_end(self) -> None:
-        self.query_one("#chat-log", RichLog).scroll_end(animate=False)
+        self.query_one("#chat-log", HistoryLog).scroll_end(animate=False)
 
     def on_key(self, event: events.Key) -> None:
         if self._awaiting_approval:
@@ -823,7 +834,7 @@ class OpenJetApp(App):
             self._render_token_counter()
             return
 
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", HistoryLog)
         if not self.agent:
             log.write("[yellow]LLM is not ready yet. Wait for Ready, or run /setup.[/]")
             log.write("")
@@ -867,7 +878,7 @@ class OpenJetApp(App):
         self._render_token_counter()
         self._start_agent_turn()
 
-    async def _load_mentioned_files_into_context(self, text: str, log: RichLog) -> None:
+    async def _load_mentioned_files_into_context(self, text: str, log: HistoryLog) -> None:
         if not self.agent:
             return
 
@@ -881,7 +892,7 @@ class OpenJetApp(App):
             await self.load_context_file(mention_path, log)
         self._render_token_counter()
 
-    async def load_context_file(self, path: str, log: RichLog) -> bool:
+    async def load_context_file(self, path: str, log: HistoryLog) -> bool:
         if not self.agent:
             return False
         mention_path = path.strip()
@@ -1158,7 +1169,7 @@ class OpenJetApp(App):
     def refresh_token_counter(self) -> None:
         self._render_token_counter()
 
-    def _restore_session_state(self, log: RichLog) -> bool:
+    def _restore_session_state(self, log: HistoryLog) -> bool:
         if not self.agent:
             return False
         state = self.state_store.load()
@@ -1226,7 +1237,7 @@ class OpenJetApp(App):
         except Exception:
             self.harness_state = HarnessState()
 
-    def _replay_restored_history(self, log: RichLog, messages: list[dict]) -> None:
+    def _replay_restored_history(self, log: HistoryLog, messages: list[dict]) -> None:
         for msg in messages:
             role = msg.get("role")
             if role == "user":
@@ -1324,7 +1335,7 @@ class OpenJetApp(App):
         finally:
             self._history_navigation_active = False
 
-    def _write_text_block(self, log: RichLog, text: str) -> None:
+    def _write_text_block(self, log: HistoryLog, text: str) -> None:
         buf = text
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
@@ -1332,7 +1343,7 @@ class OpenJetApp(App):
         if buf:
             log.write(buf)
 
-    def _write_tool_result(self, log: RichLog, result: str) -> None:
+    def _write_tool_result(self, log: HistoryLog, result: str) -> None:
         lines = result.splitlines()
         for line in lines[:20]:
             log.write(f"  [bold bright_white]{line}[/]")
@@ -1414,6 +1425,11 @@ class OpenJetApp(App):
     # -- Agent turn ----------------------------------------------------------
 
     def _start_agent_turn(self, recovery_attempted: bool = False) -> None:
+        if self._generation_worker and not self._generation_worker.is_finished:
+            self._log_trace_event(
+                "turn_replaced",
+                replaced_by_new_turn=True,
+            )
         self._prepare_turn_context()
         self._generation_worker = self.run_agent_turn(recovery_attempted=recovery_attempted)
 
@@ -1479,7 +1495,7 @@ class OpenJetApp(App):
         if not self._generation_worker or self._generation_worker.is_finished:
             return
         self._generation_worker.cancel()
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", HistoryLog)
         log.write("[yellow]Generation stopped.[/]")
         log.write("")
         if self.session_logger:
@@ -1495,7 +1511,7 @@ class OpenJetApp(App):
 
     @work(exclusive=True)
     async def run_agent_turn(self, recovery_attempted: bool = False) -> None:
-        log = self.query_one("#chat-log", RichLog)
+        log = self.query_one("#chat-log", HistoryLog)
         pending_tool_calls: list[ToolCall] = []
         tool_events: list[dict] = []
         condense_requested = False
@@ -1503,10 +1519,19 @@ class OpenJetApp(App):
         assistant_turn_text = ""
         thinking_token = self._start_thinking()
         current_worker = get_current_worker()
+        self._log_trace_event(
+            "run_agent_turn_started",
+            recovery_attempted=recovery_attempted,
+        )
 
         try:
             async for event in self.agent.run_turn():
                 if event.kind == ActionKind.TEXT:
+                    if not assistant_turn_text:
+                        self._log_trace_event(
+                            "assistant_stream_started",
+                            first_chunk_len=len(event.text),
+                        )
                     text_buf += event.text
                     assistant_turn_text += event.text
                     self._generation_tokens_streamed += estimate_tokens(event.text)
@@ -1557,11 +1582,20 @@ class OpenJetApp(App):
                         log.write(text_buf)
                         text_buf = ""
                     log.write("")
+                    self._log_trace_event(
+                        "assistant_stream_done",
+                        assistant_text_len=len(assistant_turn_text),
+                    )
 
             # Flush any remaining text
             if text_buf:
                 log.write(text_buf)
         except asyncio.CancelledError:
+            self._log_trace_event(
+                "run_agent_turn_cancelled",
+                assistant_text_len=len(assistant_turn_text),
+                buffered_text_len=len(text_buf),
+            )
             return
         finally:
             self._stop_thinking(thinking_token)
@@ -1623,7 +1657,7 @@ class OpenJetApp(App):
             self._finish_turn_trace(success=True, status="completed")
             self._render_token_counter()
 
-    async def _handle_tool_call(self, tc: ToolCall, log: RichLog) -> dict | None:
+    async def _handle_tool_call(self, tc: ToolCall, log: HistoryLog) -> dict | None:
         if tc.name not in allowed_tools_for_mode(self.harness_state.mode):
             denied = (
                 f"Tool {tc.name} is not available for this request. "
@@ -1801,7 +1835,7 @@ class OpenJetApp(App):
         )
         return any(needle in lowered for needle in needles)
 
-    async def _recover_runtime(self, log: RichLog, error_text: str) -> bool:
+    async def _recover_runtime(self, log: HistoryLog, error_text: str) -> bool:
         if not self.client:
             return False
         log.write("[yellow]LLM runtime interrupted. Restarting runtime once and retrying...[/]")
@@ -2048,7 +2082,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     app = OpenJetApp(force_setup=args.setup)
-    app.run(mouse=False, inline=True, inline_no_clear=False)
+    app.run(mouse=False, inline=True, inline_no_clear=True)
 
 
 if __name__ == "__main__":

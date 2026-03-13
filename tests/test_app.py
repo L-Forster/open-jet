@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from src.agent import Agent
 from src.app import OpenJetApp
+from src.llama_server import LlamaServerClient
+from src.runtime_protocol import StreamChunk
 
 
 class FakeAgent:
@@ -31,6 +33,33 @@ class FakeReasoningClient:
 
 class FakeRuntimeClient:
     context_window_tokens = 4096
+
+    async def chat_stream(self, messages, *, use_tools=True):
+        yield StreamChunk(text="hello")
+        yield StreamChunk(done=True)
+
+
+class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_trace_hook_records_stream_lifecycle(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+        agent = Agent(
+            client=FakeRuntimeClient(),
+            system_prompt="system",
+            context_window_tokens=4096,
+            trace_hook=lambda event, data: events.append((event, data)),
+        )
+        agent.add_user_message("hi")
+
+        result_kinds = []
+        async for event in agent.run_turn():
+            result_kinds.append(event.kind.name)
+
+        names = [name for name, _ in events]
+        self.assertIn("run_turn_start", names)
+        self.assertIn("stream_first_chunk", names)
+        self.assertIn("run_turn_complete", names)
+        self.assertIn("run_turn_done", names)
+        self.assertIn("DONE", result_kinds)
 
 
 class AppStatusTests(unittest.TestCase):
@@ -64,6 +93,23 @@ class AppStatusTests(unittest.TestCase):
             snapshot = app.runtime_status_snapshot()
 
         self.assertEqual(snapshot["reasoning_mode"], "on")
+
+
+class LlamaServerStartupTests(unittest.TestCase):
+    def test_largest_free_block_parser_uses_highest_available_order(self) -> None:
+        buddyinfo = (
+            "Node 0, zone      DMA      1      0      0      0      0      0      0      0      0      0      0\n"
+            "Node 0, zone   Normal   1406    708    420    250    120     65     24      8      2      0     46\n"
+        )
+
+        lfb_mb = LlamaServerClient._largest_free_block_mb_from_text(buddyinfo, page_size_kb=4)
+
+        self.assertEqual(lfb_mb, 4.0)
+
+    def test_startup_profile_uses_fit_off_and_no_warmup_when_fragmented(self) -> None:
+        profile = LlamaServerClient._startup_profile_for_lfb(4.0)
+
+        self.assertEqual(profile, (128, 32, True, True))
 
 
 class DebugPromptLoggingTests(unittest.TestCase):

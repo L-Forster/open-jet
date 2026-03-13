@@ -20,7 +20,7 @@ from src.harness import (
     update_state_for_user_message,
 )
 from src.persistent_memory import build_system_prompt, update_persistent_memory
-from src.runtime_limits import MemorySnapshot
+from src.runtime_limits import MemorySnapshot, estimate_tokens
 from src.runtime_protocol import StreamChunk, ToolCall
 from src.sdk import OpenJetSession, SDKEventKind
 
@@ -73,20 +73,59 @@ class SequencedRuntimeClient:
 
 
 class HarnessContextTests(unittest.TestCase):
+    def test_build_turn_context_shifts_file_context_between_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_repo_context_docs(
+                root,
+                architecture_lines=[
+                    "- `src/file_a.py`: owns file A behavior",
+                    "- `src/file_b.py`: owns file B behavior",
+                ],
+            )
+
+            first_state = update_state_for_user_message(
+                HarnessState(),
+                "Work on file A",
+                files=["src/file_a.py"],
+            )
+            second_state = update_state_for_user_message(
+                first_state,
+                "Now switch to file B",
+                files=["src/file_b.py"],
+            )
+
+            first_context = build_turn_context(
+                root=root,
+                state=first_state,
+                current_context_tokens=0,
+                effective_window=4096,
+                memory_snapshot=MemorySnapshot(total_mb=8192, available_mb=4096, used_percent=50.0),
+            )
+            second_context = build_turn_context(
+                root=root,
+                state=second_state,
+                current_context_tokens=0,
+                effective_window=4096,
+                memory_snapshot=MemorySnapshot(total_mb=8192, available_mb=4096, used_percent=50.0),
+            )
+
+        first_joined = "\n".join(message["content"] for message in first_context.messages)
+        second_joined = "\n".join(message["content"] for message in second_context.messages)
+        self.assertIn("FILE CONTEXT: src/file_a.py", first_joined)
+        self.assertNotIn("FILE CONTEXT: src/file_b.py", first_joined)
+        self.assertIn("FILE CONTEXT: src/file_b.py", second_joined)
+        self.assertNotIn("FILE CONTEXT: src/file_a.py", second_joined)
+        self.assertIn("file-context:src/file_a.py", first_context.docs_loaded)
+        self.assertIn("file-context:src/file_b.py", second_context.docs_loaded)
+
     def test_build_turn_context_uses_project_docs_for_file_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / ".openjet" / "agents").mkdir(parents=True)
-            (root / ".openjet" / "projects").mkdir(parents=True)
-            (root / "AGENTS.md").write_text(
-                "## What This Project Is\n"
-                "- offline-first local agent\n\n"
-                "## Core Architecture\n"
-                "- `src/example.py`: owns example behavior\n",
-                encoding="utf-8",
+            self._write_repo_context_docs(
+                root,
+                architecture_lines=["- `src/example.py`: owns example behavior"],
             )
-            (root / ".openjet" / "agents" / "base.md").write_text("base guidance", encoding="utf-8")
-            (root / ".openjet" / "agents" / "coder.md").write_text("coder guidance", encoding="utf-8")
 
             state = update_state_for_user_message(
                 HarnessState(),
@@ -112,16 +151,10 @@ class HarnessContextTests(unittest.TestCase):
     def test_build_turn_context_respects_layered_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / ".openjet" / "agents").mkdir(parents=True)
-            (root / "AGENTS.md").write_text(
-                "## What This Project Is\n"
-                "- offline-first local agent\n\n"
-                "## Core Architecture\n"
-                "- `src/example.py`: owns example behavior\n",
-                encoding="utf-8",
+            self._write_repo_context_docs(
+                root,
+                architecture_lines=["- `src/example.py`: owns example behavior"],
             )
-            (root / ".openjet" / "agents" / "base.md").write_text("base guidance", encoding="utf-8")
-            (root / ".openjet" / "agents" / "coder.md").write_text("coder guidance", encoding="utf-8")
             state = update_state_for_user_message(HarnessState(), "Implement a change", files=["src/example.py"])
 
             context = build_turn_context(
@@ -137,6 +170,88 @@ class HarnessContextTests(unittest.TestCase):
         self.assertIn("PROJECT CONTEXT SUMMARY", joined)
         self.assertNotIn("FILE CONTEXT: src/example.py", joined)
         self.assertEqual(context.layer_tokens["layer2"], 0)
+
+    def test_build_turn_context_injects_recent_context_in_layer3(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_repo_context_docs(
+                root,
+                architecture_lines=["- `src/example.py`: owns example behavior"],
+            )
+            state = update_state_for_user_message(HarnessState(), "Implement a change", files=["src/example.py"])
+            state = update_state_after_turn(
+                state,
+                tool_events=[
+                    {
+                        "tool": "shell",
+                        "ok": False,
+                        "summary": "pytest failed",
+                        "target": "pytest tests/test_example.py",
+                        "verification": True,
+                        "command": "pytest tests/test_example.py",
+                    }
+                ],
+                assistant_text="verification failed",
+            )
+
+            context = build_turn_context(
+                root=root,
+                state=state,
+                current_context_tokens=0,
+                effective_window=4096,
+                memory_snapshot=MemorySnapshot(total_mb=8192, available_mb=4096, used_percent=50.0),
+            )
+
+        joined = "\n".join(message["content"] for message in context.messages)
+        self.assertIn("RECENT TASK CONTEXT", joined)
+        self.assertIn("pytest failed", joined)
+        self.assertIn("tests/test_example.py", joined)
+        self.assertIn("recent-context", context.docs_loaded)
+        self.assertGreater(context.layer_tokens["layer3"], 0)
+
+    def test_build_turn_context_enforces_overall_and_layer_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_repo_context_docs(
+                root,
+                architecture_lines=["- `src/example.py`: owns example behavior"],
+            )
+            long_skill = (
+                "---\n"
+                "tags:\n"
+                "  - python\n"
+                "mode: code\n"
+                "---\n"
+                + ("skill detail " * 400)
+            )
+            (root / ".openjet" / "skills").mkdir(parents=True, exist_ok=True)
+            (root / ".openjet" / "skills" / "python-heavy.md").write_text(long_skill, encoding="utf-8")
+            state = update_state_for_user_message(
+                HarnessState(preferred_skills=["python-heavy"]),
+                "Implement a Python change",
+                files=["src/example.py"],
+            )
+            state.last_action = {"type": "read_file", "target": "src/example.py", "summary": "read"}
+            state.last_verification = {
+                "status": "fail",
+                "summary": "pytest failed",
+                "command": "pytest tests/test_example.py",
+            }
+
+            context = build_turn_context(
+                root=root,
+                state=state,
+                current_context_tokens=2200,
+                effective_window=4096,
+                memory_snapshot=MemorySnapshot(total_mb=4096, available_mb=900, used_percent=78.0),
+            )
+
+        self.assertLessEqual(context.docs_tokens, context.budget.docs_budget + estimate_tokens(context.messages[0]["content"]))
+        self.assertLessEqual(context.layer_tokens["layer1"], context.budget.layer1_budget)
+        self.assertLessEqual(context.layer_tokens["layer2"], context.budget.layer2_budget)
+        self.assertLessEqual(context.layer_tokens["layer3"], context.budget.layer3_budget)
+        self.assertNotIn("skill detail skill detail skill detail", "\n".join(message["content"] for message in context.messages))
+        self.assertLessEqual(sum(context.layer_tokens.values()), context.budget.docs_budget)
 
     def test_build_turn_context_loads_preferred_skill_within_budget(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,6 +336,20 @@ class HarnessContextTests(unittest.TestCase):
             self.assertTrue(result.internal_retry)
             self.assertIn("Python AST validation failed", result.output)
             self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def _write_repo_context_docs(self, root: Path, *, architecture_lines: list[str]) -> None:
+        (root / ".openjet" / "agents").mkdir(parents=True)
+        (root / ".openjet" / "projects").mkdir(parents=True)
+        (root / "AGENTS.md").write_text(
+            "## What This Project Is\n"
+            "- offline-first local agent\n\n"
+            "## Core Architecture\n"
+            + "\n".join(architecture_lines)
+            + "\n",
+            encoding="utf-8",
+        )
+        (root / ".openjet" / "agents" / "base.md").write_text("base guidance", encoding="utf-8")
+        (root / ".openjet" / "agents" / "coder.md").write_text("coder guidance", encoding="utf-8")
 
 
 class HarnessStateTests(unittest.TestCase):

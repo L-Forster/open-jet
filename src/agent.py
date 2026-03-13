@@ -6,7 +6,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from .multimodal import content_to_plain_text, estimate_message_content_tokens, runtime_content
 from .runtime_protocol import ToolCall
@@ -50,6 +50,7 @@ class Agent:
         memory_check_interval_chunks: int = 16,
         condense_target_tokens: int = 900,
         keep_last_messages: int = 6,
+        trace_hook: Callable[[str, dict[str, object]], None] | None = None,
     ) -> None:
         self.client = client
         self.system_prompt = system_prompt
@@ -63,6 +64,7 @@ class Agent:
         self.condense_target_tokens = condense_target_tokens
         self.keep_last_messages = keep_last_messages
         self.turn_context_messages: list[dict] = []
+        self.trace_hook = trace_hook
 
     def add_user_message(self, text: str, *, image_paths: list[str] | None = None) -> None:
         from .multimodal import build_user_content
@@ -99,8 +101,15 @@ class Agent:
         (if needed), call complete_tool_call() with the result, and then call
         run_turn() again so the model can continue.
         """
+        self._trace(
+            "run_turn_start",
+            message_count=len(self.messages),
+            turn_context_count=len(self.turn_context_messages),
+            estimated_tokens=self._estimated_context_tokens(include_turn_context=True),
+        )
         pressure_reason = self._resource_pressure_reason()
         if pressure_reason:
+            self._trace("run_turn_condense_before_stream", reason=pressure_reason)
             yield AgentEvent(
                 kind=ActionKind.TEXT,
                 text=f"(resource pressure, condensing chat: {pressure_reason})",
@@ -115,6 +124,13 @@ class Agent:
         try:
             async for chunk in self.client.chat_stream(self._messages_for_runtime()):
                 chunk_count += 1
+                if chunk_count == 1:
+                    self._trace(
+                        "stream_first_chunk",
+                        text_len=len(chunk.text),
+                        tool_call_count=len(chunk.tool_calls),
+                        done=chunk.done,
+                    )
                 if chunk.text:
                     collected_text += chunk.text
                     yield AgentEvent(kind=ActionKind.TEXT, text=chunk.text)
@@ -127,6 +143,12 @@ class Agent:
                     if pressure_reason:
                         if collected_text:
                             self.messages.append({"role": "assistant", "content": collected_text})
+                        self._trace(
+                            "run_turn_condense_mid_stream",
+                            reason=pressure_reason,
+                            chunk_count=chunk_count,
+                            collected_text_len=len(collected_text),
+                        )
                         yield AgentEvent(
                             kind=ActionKind.TEXT,
                             text=(
@@ -138,6 +160,12 @@ class Agent:
                         return
 
         except Exception as e:
+            self._trace(
+                "run_turn_error",
+                error=str(e),
+                chunk_count=chunk_count,
+                collected_text_len=len(collected_text),
+            )
             yield AgentEvent(kind=ActionKind.ERROR, text=str(e))
             return
 
@@ -159,13 +187,28 @@ class Agent:
                 for tc in pending_tool_calls
             ]
         self.messages.append(assistant_msg)
+        self._trace(
+            "run_turn_complete",
+            chunk_count=chunk_count,
+            collected_text_len=len(collected_text),
+            pending_tool_call_count=len(pending_tool_calls),
+        )
 
         # Yield tool requests for the TUI to handle
         for tc in pending_tool_calls:
             yield AgentEvent(kind=ActionKind.TOOL_REQUEST, tool_call=tc)
 
         if not pending_tool_calls:
+            self._trace("run_turn_done", assistant_text_len=len(collected_text))
             yield AgentEvent(kind=ActionKind.DONE)
+
+    def _trace(self, event: str, **data: object) -> None:
+        if not self.trace_hook:
+            return
+        try:
+            self.trace_hook(event, dict(data))
+        except Exception:
+            return
 
     def complete_tool_call(self, tool_call: ToolCall, result: str) -> None:
         """Record a tool result in conversation history so the model sees it."""
