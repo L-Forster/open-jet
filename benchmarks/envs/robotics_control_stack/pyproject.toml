@@ -1,4 +1,0 @@
-[project]
-name = "robotics-control-stack"
-version = "0.3.0"
-requires-python = ">=3.10"

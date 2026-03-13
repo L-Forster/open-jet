@@ -214,6 +214,36 @@ class SystemMetricsReader:
 
         return None
 
+    def read_thermal_metrics(self) -> dict[str, float | str | None] | None:
+        root = Path("/sys/class/thermal")
+        if not root.exists() or not root.is_dir():
+            return None
+
+        hottest_temp_c: float | None = None
+        hottest_zone: str | None = None
+        sample_count = 0
+
+        for zone in root.glob("thermal_zone*"):
+            if not zone.is_dir():
+                continue
+            temp_c = self.read_temperature_c(zone / "temp")
+            if temp_c is None:
+                continue
+            sample_count += 1
+            zone_name = self.read_text_file(zone / "type") or zone.name
+            if hottest_temp_c is None or temp_c > hottest_temp_c:
+                hottest_temp_c = temp_c
+                hottest_zone = zone_name
+
+        if hottest_temp_c is None:
+            return None
+
+        return {
+            "hottest_temp_c": round(hottest_temp_c, 1),
+            "hottest_zone": hottest_zone,
+            "sample_count": sample_count,
+        }
+
     def estimate_battery_remaining_hours(self, dev: Path, status: str | None) -> float | None:
         status_raw = (status or "").strip().lower()
 
@@ -273,7 +303,7 @@ class SystemMetricsReader:
     def read_number_file(self, path: Path) -> float | None:
         try:
             raw = path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, TypeError, UnicodeDecodeError):
             return None
         try:
             return float(raw)
@@ -283,8 +313,18 @@ class SystemMetricsReader:
     def read_text_file(self, path: Path) -> str | None:
         try:
             return path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, TypeError, UnicodeDecodeError):
             return None
+
+    def read_temperature_c(self, path: Path) -> float | None:
+        value = self.read_number_file(path)
+        if value is None:
+            return None
+        if value > 1000.0:
+            value /= 1000.0
+        if value < -100.0 or value > 300.0:
+            return None
+        return value
 
 
 def format_hours(hours: float) -> str:

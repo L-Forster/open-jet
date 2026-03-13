@@ -39,7 +39,6 @@ Issues = "https://github.com/louis/open-jet/issues"
 
 [project.scripts]
 open-jet = "src.app:main"
-open-jet-bench = "src.benchmark:main"
 
 [build-system]
 requires = ["setuptools>=68,<80", "wheel", "Cython>=3.0"]

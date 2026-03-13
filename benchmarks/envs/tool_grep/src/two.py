@@ -1,1 +1,0 @@
-print(TARGET_FLAG)

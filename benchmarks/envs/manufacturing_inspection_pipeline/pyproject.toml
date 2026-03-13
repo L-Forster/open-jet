@@ -1,4 +1,0 @@
-[project]
-name = "inspection-pipeline"
-version = "0.2.0"
-requires-python = ">=3.10"

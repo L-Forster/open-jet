@@ -243,6 +243,7 @@ async def stream_openai_chat(
     model: str,
     messages: list[dict],
     use_tools: bool = True,
+    headers: dict[str, str] | None = None,
     extra_body: dict | None = None,
 ) -> AsyncIterator[StreamChunk]:
     payload: dict = {
@@ -259,7 +260,12 @@ async def stream_openai_chat(
     tool_name_by_index: dict[int, str] = {}
     tool_args_by_index: dict[int, str] = {}
 
-    async with http.stream("POST", f"{base_url}/v1/chat/completions", json=payload) as resp:
+    async with http.stream(
+        "POST",
+        f"{base_url}/v1/chat/completions",
+        json=payload,
+        headers=headers,
+    ) as resp:
         resp.raise_for_status()
         async for line in resp.aiter_lines():
             line = line.strip()
