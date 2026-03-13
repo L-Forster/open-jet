@@ -22,9 +22,10 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "textual>=3.0",
     "httpx>=0.27",
+    "prompt_toolkit>=3.0",
     "pyyaml>=6.0",
+    "rich>=13.0",
     "tiktoken>=0.7",
     "sglang[all]",
     "tensorrt_llm",
