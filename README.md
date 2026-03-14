@@ -1,4 +1,5 @@
-# open-jet
+# OpenJet
+<img width="286" height="114" alt="Screenshot_20260227_144411" src="https://github.com/user-attachments/assets/70d90ca5-5841-44d8-a1d0-ef3e08acd95b" />
 
 `open-jet` is an offline-first agent runtime for Jetson-class and other edge Linux systems with tight memory budgets.
 
