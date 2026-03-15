@@ -143,6 +143,19 @@ class AppStatusTests(unittest.TestCase):
 
         self.assertEqual(snapshot["reasoning_mode"], "on")
 
+    def test_current_tps_uses_decode_window_not_prefill(self) -> None:
+        app = OpenJetApp()
+        app._thinking_timer = True
+        app._generation_started_at = 100.0
+        app._generation_decode_started_at = 102.0
+        app._generation_tokens_streamed = 61
+        app._generation_decode_tokens_streamed = 60
+
+        with patch("src.app.time.monotonic", return_value=104.0):
+            tps = app._current_tps()
+
+        self.assertEqual(tps, 30.0)
+
 
 class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_setup_wizard_persists_manual_llama_model_path_in_history(self) -> None:

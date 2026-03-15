@@ -402,7 +402,9 @@ class OpenJetApp:
         self._power_min_watts: float | None = None
         self._power_max_watts: float | None = None
         self._generation_started_at: float | None = None
+        self._generation_decode_started_at: float | None = None
         self._generation_tokens_streamed = 0
+        self._generation_decode_tokens_streamed = 0
         self._last_generation_tps: float | None = None
         self._pending_image_paths: list[str] = []
         self._widgets = {
@@ -1146,10 +1148,10 @@ class OpenJetApp:
         return "tps n/a" if tps is None else f"tps {tps:.1f}"
 
     def _current_tps(self) -> float | None:
-        if self._thinking_timer is not None and self._generation_started_at is not None:
-            elapsed = time.monotonic() - self._generation_started_at
+        if self._thinking_timer is not None and self._generation_decode_started_at is not None:
+            elapsed = time.monotonic() - self._generation_decode_started_at
             if elapsed > 0:
-                return self._generation_tokens_streamed / elapsed
+                return self._generation_decode_tokens_streamed / elapsed
         return self._last_generation_tps
 
     def _update_power_minmax(self, watts: float | None) -> None:
@@ -1495,6 +1497,10 @@ class OpenJetApp:
                     assistant_turn_text += event.text
                     tokens = estimate_tokens(event.text)
                     self._generation_tokens_streamed += tokens
+                    if tokens > 0:
+                        if self._generation_decode_started_at is None:
+                            self._generation_decode_started_at = time.monotonic()
+                        self._generation_decode_tokens_streamed += tokens
                     self._active_turn_generation_tokens += tokens
                     while "\n" in text_buf:
                         line, text_buf = text_buf.split("\n", 1)
@@ -1785,7 +1791,9 @@ class OpenJetApp:
         self._assistant_status_kind = "generating"
         self._assistant_status_command = None
         self._generation_started_at = time.monotonic()
+        self._generation_decode_started_at = None
         self._generation_tokens_streamed = 0
+        self._generation_decode_tokens_streamed = 0
         self._thinking_timer = True
         self._render_assistant_status()
         return self._thinking_token
@@ -1793,11 +1801,12 @@ class OpenJetApp:
     def _stop_thinking(self, token: int | None = None) -> None:
         if token is not None and token != self._thinking_token:
             return
-        if self._generation_started_at is not None:
-            elapsed = time.monotonic() - self._generation_started_at
-            if elapsed > 0 and self._generation_tokens_streamed > 0:
-                self._last_generation_tps = self._generation_tokens_streamed / elapsed
+        if self._generation_decode_started_at is not None:
+            elapsed = time.monotonic() - self._generation_decode_started_at
+            if elapsed > 0 and self._generation_decode_tokens_streamed > 0:
+                self._last_generation_tps = self._generation_decode_tokens_streamed / elapsed
         self._generation_started_at = None
+        self._generation_decode_started_at = None
         self._thinking_timer = None
         self._assistant_status_kind = None
         self._assistant_status_command = None
