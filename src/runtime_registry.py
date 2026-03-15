@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
+from .airgap import AirgapViolationError, airgapped_from_cfg, assert_endpoint_allowed
 from .llama_server import LlamaServerClient
-from .openai_compatible import OpenAICompatibleClient
+from .openai_compatible import OpenAICompatibleClient, _normalize_base_url
 from .runtime_client import RuntimeClient
 from .sglang_server import SglangServerClient
 from .trtllm_server import TrtllmServerClient
@@ -83,7 +84,10 @@ def active_model_ref(cfg: dict) -> str:
 def create_runtime_client(cfg: dict) -> RuntimeClient:
     runtime = normalize_runtime(str(cfg.get("runtime", DEFAULT_RUNTIME)))
     context_window_tokens = int(cfg.get("context_window_tokens", 2048))
+    airgapped = airgapped_from_cfg(cfg)
     if runtime == "openrouter":
+        if airgapped:
+            raise AirgapViolationError("Air-gapped mode does not allow the OpenRouter runtime.")
         model = str(cfg.get("openrouter_model") or cfg.get("model") or "").strip()
         extra_headers = _openrouter_headers(cfg)
         extra_body = _mapping(cfg.get("openrouter_extra_body"))
@@ -96,20 +100,28 @@ def create_runtime_client(cfg: dict) -> RuntimeClient:
             extra_headers=extra_headers or None,
             extra_body=extra_body or None,
             verify_connection=bool(cfg.get("openrouter_verify_connection", False)),
+            airgapped=airgapped,
         )
     if runtime == "openai_compatible":
         model = str(cfg.get("openai_compatible_model") or cfg.get("model") or "").strip()
+        base_url = str(cfg.get("openai_compatible_base_url") or "").strip() or None
+        if airgapped:
+            assert_endpoint_allowed(
+                _normalize_base_url(base_url),
+                label="the OpenAI-compatible runtime",
+            )
         extra_headers = _string_dict(cfg.get("openai_compatible_headers"))
         extra_body = _mapping(cfg.get("openai_compatible_extra_body"))
         return OpenAICompatibleClient(
             model=model,
-            base_url=str(cfg.get("openai_compatible_base_url") or "").strip() or None,
+            base_url=base_url,
             api_key=str(cfg.get("openai_compatible_api_key") or "").strip() or None,
             api_key_env=str(cfg.get("openai_compatible_api_key_env", "OPENAI_API_KEY")),
             context_window_tokens=context_window_tokens,
             extra_headers=extra_headers or None,
             extra_body=extra_body or None,
             verify_connection=bool(cfg.get("openai_compatible_verify_connection", False)),
+            airgapped=airgapped,
         )
     if runtime == "trtllm_pytorch":
         model = str(cfg.get("trtllm_model") or cfg.get("model") or "").strip()
@@ -121,16 +133,25 @@ def create_runtime_client(cfg: dict) -> RuntimeClient:
             backend=str(cfg.get("trtllm_backend", "pytorch")),
             config_path=str(cfg.get("trtllm_config_path", "")).strip() or None,
             trust_remote_code=bool(cfg.get("trtllm_trust_remote_code", True)),
+            airgapped=airgapped,
         )
     if runtime == "sglang":
         model = str(cfg.get("sglang_model") or cfg.get("model") or "").strip()
         if not model:
             raise ValueError("Missing model for sglang runtime (`sglang_model` or `model`).")
+        sglang_base_url = str(cfg.get("sglang_base_url", "")).strip() or None
+        sglang_host = str(cfg.get("sglang_host", "127.0.0.1"))
+        sglang_port = int(cfg.get("sglang_port", 8080))
+        if airgapped:
+            assert_endpoint_allowed(
+                sglang_base_url or f"http://{sglang_host}:{sglang_port}",
+                label="the SGLang runtime",
+            )
         return SglangServerClient(
             model=model,
-            host=str(cfg.get("sglang_host", "127.0.0.1")),
-            port=int(cfg.get("sglang_port", 8080)),
-            base_url=str(cfg.get("sglang_base_url", "")).strip() or None,
+            host=sglang_host,
+            port=sglang_port,
+            base_url=sglang_base_url,
             context_window_tokens=context_window_tokens,
             device=str(cfg.get("device", "cuda")),
             mem_fraction_static=float(cfg.get("sglang_mem_fraction_static", 0.8)),
@@ -153,6 +174,7 @@ def create_runtime_client(cfg: dict) -> RuntimeClient:
             docker_use_host_network=bool(cfg.get("sglang_docker_use_host_network", True)),
             docker_runtime=str(cfg.get("sglang_docker_runtime", "nvidia")).strip() or None,
             docker_extra_args=_string_list(cfg.get("sglang_docker_extra_args")),
+            airgapped=airgapped,
         )
     model = str(cfg.get("llama_model") or cfg.get("model") or "").strip()
     if not model:
@@ -162,6 +184,7 @@ def create_runtime_client(cfg: dict) -> RuntimeClient:
         context_window_tokens=context_window_tokens,
         device=str(cfg.get("device", "auto")),
         gpu_layers=int(cfg.get("gpu_layers", 99)),
+        airgapped=airgapped,
     )
 
 

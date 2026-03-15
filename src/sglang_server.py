@@ -15,6 +15,7 @@ from typing import AsyncIterator
 
 import httpx
 
+from .airgap import apply_airgap_env, assert_endpoint_allowed
 from .runtime_protocol import StreamChunk, stream_openai_chat
 
 
@@ -57,6 +58,7 @@ class SglangServerClient:
         docker_use_host_network: bool = True,
         docker_runtime: str = "nvidia",
         docker_extra_args: list[str] | None = None,
+        airgapped: bool = False,
     ) -> None:
         self.model = model
         self.host = host
@@ -90,6 +92,7 @@ class SglangServerClient:
         self.docker_use_host_network = bool(docker_use_host_network)
         self.docker_runtime = (docker_runtime or "").strip() or None
         self.docker_extra_args = [str(arg) for arg in (docker_extra_args or []) if str(arg).strip()]
+        self.airgapped = bool(airgapped)
         self.gpu_layers = 0
         self.base_url = _normalize_base_url(base_url, host=self.host, port=self.port)
         parsed = urlsplit(self.base_url)
@@ -101,6 +104,7 @@ class SglangServerClient:
         self._proc: asyncio.subprocess.Process | None = None
 
     async def start(self) -> None:
+        assert_endpoint_allowed(self.base_url, label="the SGLang runtime")
         await self._stop_server()
         if self.launch_mode == "external":
             await self._wait_until_ready(deadline_seconds=30.0)
@@ -122,6 +126,7 @@ class SglangServerClient:
         cmd = [sys.executable, "-m", "sglang.launch_server", *self._server_args(self.model)]
 
         env = os.environ.copy()
+        apply_airgap_env(env, enabled=self.airgapped)
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
@@ -186,6 +191,7 @@ class SglangServerClient:
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
+        assert_endpoint_allowed(self.base_url, label="the SGLang runtime")
         async for chunk in stream_openai_chat(
             self._http,
             base_url=self.base_url,
@@ -215,6 +221,7 @@ class SglangServerClient:
         cmd.extend(["python", "-m", "sglang.launch_server", *self._server_args(model_path_in_container)])
 
         env = os.environ.copy()
+        apply_airgap_env(env, enabled=self.airgapped)
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
@@ -253,6 +260,7 @@ class SglangServerClient:
         ]
         cmd = " ".join(arg for arg in run_args if arg)
         env = os.environ.copy()
+        apply_airgap_env(env, enabled=self.airgapped)
         self._proc = await asyncio.create_subprocess_shell(
             cmd,
             env=env,
@@ -265,6 +273,7 @@ class SglangServerClient:
             _ensure_sglang_module()
             cmd = [sys.executable, "-m", "sglang.launch_server", *self._server_args(self.model)]
             env = os.environ.copy()
+            apply_airgap_env(env, enabled=self.airgapped)
             self._proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 env=env,

@@ -6,6 +6,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from .airgap import airgapped_from_cfg, set_airgapped
 from .agent import ActionKind, Agent
 from .config import load_config
 from .persistent_memory import build_system_prompt
@@ -61,10 +62,13 @@ class OpenJetSession:
         *,
         approval_handler: ApprovalHandler | None = None,
         allowed_tools: set[str] | None = None,
+        airgapped: bool = False,
     ) -> None:
         self.agent = agent
         self._approval_handler = approval_handler
         self._allowed_tools = allowed_tools
+        self.airgapped = bool(airgapped)
+        set_airgapped(self.airgapped)
 
     @classmethod
     async def create(
@@ -74,8 +78,11 @@ class OpenJetSession:
         system_prompt: str | None = None,
         approval_handler: ApprovalHandler | None = None,
         allowed_tools: set[str] | None = None,
+        airgapped: bool | None = None,
     ) -> OpenJetSession:
         resolved_cfg = dict(cfg or load_config())
+        resolved_cfg["airgapped"] = airgapped_from_cfg(resolved_cfg, override=airgapped)
+        set_airgapped(bool(resolved_cfg["airgapped"]))
         client = create_runtime_client(resolved_cfg)
         mem_cfg = resolved_cfg.get("memory_guard", {})
         await client.start()
@@ -106,10 +113,19 @@ class OpenJetSession:
             condense_target_tokens=int(mem_cfg.get("condense_target_tokens", 900)),
             keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
         )
-        return cls(agent, approval_handler=approval_handler, allowed_tools=allowed_tools)
+        return cls(
+            agent,
+            approval_handler=approval_handler,
+            allowed_tools=allowed_tools,
+            airgapped=bool(resolved_cfg["airgapped"]),
+        )
 
     async def close(self) -> None:
         await self.agent.client.close()
+
+    def set_airgapped(self, enabled: bool) -> None:
+        self.airgapped = bool(enabled)
+        set_airgapped(self.airgapped)
 
     def add_turn_context(self, messages: list[dict]) -> None:
         self.agent.set_turn_context(messages)
@@ -255,3 +271,20 @@ class OpenJetSession:
             candidate = prefix + clipped
 
         return candidate
+
+
+async def create_agent(
+    *,
+    cfg: dict | None = None,
+    system_prompt: str | None = None,
+    approval_handler: ApprovalHandler | None = None,
+    allowed_tools: set[str] | None = None,
+    airgapped: bool | None = None,
+) -> OpenJetSession:
+    return await OpenJetSession.create(
+        cfg=cfg,
+        system_prompt=system_prompt,
+        approval_handler=approval_handler,
+        allowed_tools=allowed_tools,
+        airgapped=airgapped,
+    )

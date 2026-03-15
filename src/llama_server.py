@@ -11,6 +11,7 @@ from typing import AsyncIterator
 
 import httpx
 
+from .airgap import apply_airgap_env, assert_endpoint_allowed
 from .runtime_protocol import StreamChunk, stream_openai_chat
 
 
@@ -41,6 +42,7 @@ class LlamaServerClient:
         context_window_tokens: int = 2048,
         device: str = "auto",
         gpu_layers: int = 99,
+        airgapped: bool = False,
     ) -> None:
         self.model = model
         self.host = host
@@ -48,6 +50,7 @@ class LlamaServerClient:
         self.context_window_tokens = max(512, int(context_window_tokens))
         self.device = device.strip().lower() if device else "auto"
         self.gpu_layers = max(0, int(gpu_layers))
+        self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
@@ -179,12 +182,14 @@ class LlamaServerClient:
         return lfb_mb
 
     async def start(self) -> None:
+        assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
         await self._stop_server()
         await self._cleanup_stale_inference_processes()
         self._ensure_jetson_clocks_sudoers()
         self._maximize_gpu_clocks()
         binary = _find_llama_server()
         env = os.environ.copy()
+        apply_airgap_env(env, enabled=self.airgapped)
         bin_dir = os.path.dirname(binary)
         env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
         # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
@@ -404,6 +409,7 @@ class LlamaServerClient:
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
+        assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
         extra_body: dict[str, object] | None = None
         if self.reasoning_mode == "on":
             extra_body = {

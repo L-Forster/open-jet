@@ -116,7 +116,7 @@ open-jet
 - bounded-context local chat with your on-device model
 - automatic context condensing under pressure
 - session resume and harness state recovery
-- replayable JSONL event traces
+- OpenTelemetry instrumentation with collector export
 - hardware-aware runtime setup for Jetson and edge Linux
 - controlled tool use and slash commands
 - Python SDK access to the same backend
@@ -144,6 +144,7 @@ OpenJet is built around:
 - [Usage: Slash commands](docs/usage/slash-commands.md)
 - [Usage: Workflow harness](docs/usage/workflow-harness.md)
 - [Usage: Session state and logging](docs/usage/session-state-and-logging.md)
+- [Telemetry](docs/telemetry.md)
 - [Python SDK](docs/sdk/python-sdk.md)
 - [Deployment: Jetson](docs/deployment/jetson.md)
 - [Deployment: Linux x86 + NVIDIA](docs/deployment/linux-x86-nvidia.md)

@@ -38,6 +38,7 @@ class SlashCommandHandler:
         CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
         CommandSpec(name="memory", description="Inspect or update persistent memory: /memory [show|clear <user|agent>]"),
         CommandSpec(name="reasoning", description="Show or set llama.cpp reasoning mode: /reasoning [status|on|off|default]"),
+        CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
         CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
@@ -63,7 +64,7 @@ class SlashCommandHandler:
         log.write(f"[bold green]> [/]{text}")
         log.write("")
         if self.app.session_logger:
-            self.app.session_logger.log_event("slash_command", text=text)
+            self.app.session_logger.record_slash_command(text)
 
         raw = text[1:].strip()
         if not raw:
@@ -99,6 +100,9 @@ class SlashCommandHandler:
             return True
         if cmd == "reasoning":
             self._reasoning(log, arg)
+            return True
+        if cmd == "air-gapped":
+            self._air_gapped(log, arg)
             return True
         if cmd == "resume":
             await self._resume(log)
@@ -192,6 +196,11 @@ class SlashCommandHandler:
         snapshot = self.app.runtime_status_snapshot()
         if not snapshot.get("ready"):
             log.write("[bold bright_white]Agent not initialized.[/]")
+            log.write(
+                "[bold bright_white]"
+                f"Air-gapped mode: {'true' if snapshot.get('airgapped') else 'false'}"
+                "[/]"
+            )
             log.write("")
             return
 
@@ -213,6 +222,11 @@ class SlashCommandHandler:
                 f"Reasoning mode: {snapshot.get('reasoning_mode')}"
                 "[/]"
             )
+        log.write(
+            "[bold bright_white]"
+            f"Air-gapped mode: {'true' if snapshot.get('airgapped') else 'false'}"
+            "[/]"
+        )
         log.write(
             "[bold bright_white]"
             f"Context tokens: {snapshot['context_tokens']}/{snapshot['context_window_tokens']} | "
@@ -263,7 +277,7 @@ class SlashCommandHandler:
         self.app.refresh_token_counter()
         self.app.persist_session_state(reason="manual_condense")
         if self.app.session_logger:
-            self.app.session_logger.log_event("manual_condense", summary=summary)
+            self.app.session_logger.record_manual_condense(summary)
 
     def _render_unknown(self, log: Any, text: str) -> None:
         log.write(f"[yellow]Unknown command:[/] {text}")
@@ -372,6 +386,41 @@ class SlashCommandHandler:
             return
         setter(arg)
         log.write(f"[bold bright_white]Reasoning mode set to {arg}. Applies to future turns with the current model.[/]")
+        log.write("")
+
+    def _air_gapped(self, log: Any, raw_arg: str) -> None:
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot change air-gapped mode while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+
+        arg = raw_arg.strip().lower() or "status"
+        if arg == "status":
+            log.write(
+                f"[bold bright_white]Air-gapped mode: {'true' if self.app.is_airgapped() else 'false'}[/]"
+            )
+            log.write("")
+            return
+
+        if arg not in {"true", "false"}:
+            log.write("[yellow]Usage:[/] /air-gapped [status|true|false]")
+            log.write("")
+            return
+
+        enabled = arg == "true"
+        self.app.set_airgapped(enabled)
+        if enabled:
+            log.write(
+                "[bold bright_white]Air-gapped mode set to true. External network access is now blocked.[/]"
+            )
+        else:
+            log.write(
+                "[bold bright_white]Air-gapped mode set to false. External network access is allowed again.[/]"
+            )
         log.write("")
 
     def _mode(self, log: Any, raw_arg: str) -> None:

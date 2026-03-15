@@ -11,6 +11,7 @@ from typing import AsyncIterator
 
 import httpx
 
+from .airgap import apply_airgap_env, assert_endpoint_allowed
 from .runtime_protocol import StreamChunk, stream_openai_chat
 
 
@@ -37,6 +38,7 @@ class TrtllmServerClient:
         backend: str = "pytorch",
         config_path: str | None = None,
         trust_remote_code: bool = True,
+        airgapped: bool = False,
     ) -> None:
         self.model = model
         self.host = host
@@ -47,14 +49,17 @@ class TrtllmServerClient:
         self.backend = (backend or "pytorch").strip()
         self.config_path = (config_path or "").strip() or None
         self.trust_remote_code = bool(trust_remote_code)
+        self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
 
     async def start(self) -> None:
+        assert_endpoint_allowed(self.base_url, label="the TensorRT-LLM runtime")
         await self._stop_server()
         binary = _find_trtllm_serve()
         env = os.environ.copy()
+        apply_airgap_env(env, enabled=self.airgapped)
 
         cmd = [
             binary,
@@ -132,6 +137,7 @@ class TrtllmServerClient:
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
+        assert_endpoint_allowed(self.base_url, label="the TensorRT-LLM runtime")
         async for chunk in stream_openai_chat(
             self._http,
             base_url=self.base_url,

@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator
 
 import httpx
 
+from .airgap import assert_endpoint_allowed
 from .runtime_protocol import StreamChunk, stream_openai_chat
 
 
@@ -31,6 +32,7 @@ class OpenAICompatibleClient:
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
         verify_connection: bool = False,
+        airgapped: bool = False,
     ) -> None:
         resolved_model = (model or "").strip()
         if not resolved_model:
@@ -41,6 +43,7 @@ class OpenAICompatibleClient:
         self.gpu_layers = 0
         self.verify_connection = bool(verify_connection)
         self.extra_body = dict(extra_body or {})
+        self.airgapped = bool(airgapped)
         self._http = httpx.AsyncClient(timeout=120.0)
 
         resolved_key = (api_key or "").strip()
@@ -59,6 +62,7 @@ class OpenAICompatibleClient:
         self._headers = headers
 
     async def start(self) -> None:
+        assert_endpoint_allowed(self.base_url, label="the OpenAI-compatible runtime")
         if not self.verify_connection:
             return
         resp = await self._http.get(f"{self.base_url}/v1/models", headers=self._headers or None)
@@ -73,6 +77,7 @@ class OpenAICompatibleClient:
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
+        assert_endpoint_allowed(self.base_url, label="the OpenAI-compatible runtime")
         async for chunk in stream_openai_chat(
             self._http,
             base_url=self.base_url,

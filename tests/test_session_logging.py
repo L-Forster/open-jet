@@ -1,29 +1,93 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from src.app import _classify_shell_command
-from src.session_logging import SessionLogger
+from src.session_logging import BroadcastConfig, SessionLogger
 
 
 class SessionLoggerTests(unittest.TestCase):
-    def test_log_event_includes_schema_version_and_event_index(self) -> None:
+    def test_start_creates_session_manifest_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             logger = SessionLogger(base_dir=Path(tmp), label="trace-test")
-            logger.log_event("tool_request", tool="shell", turn_id="turn-1")
-            logger.log_event("tool_result", tool="shell", turn_id="turn-1", ok=True)
 
-            lines = logger.events_path.read_text(encoding="utf-8").splitlines()
-            first = json.loads(lines[0])
-            second = json.loads(lines[1])
+            asyncio.run(logger.start())
+            logger.log_event("runtime_recovery_succeeded")
+            asyncio.run(logger.stop())
 
-            self.assertEqual(first["schema_version"], 2)
-            self.assertEqual(first["event_index"], 1)
-            self.assertEqual(second["event_index"], 2)
-            self.assertEqual(second["data"]["ok"], True)
+            manifest = json.loads(logger.manifest_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(logger.manifest_path.exists())
+            self.assertEqual(manifest["session_id"], logger.session_id)
+            self.assertEqual(Path(manifest["session_dir"]), logger.session_dir)
+            self.assertEqual(manifest["telemetry"]["enabled"], False)
+            self.assertFalse((logger.session_dir / "logs").exists())
+            self.assertFalse((logger.session_dir / "traces").exists())
+            self.assertFalse((logger.session_dir / "metrics").exists())
+
+    def test_manifest_records_collector_endpoint_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = SessionLogger(
+                base_dir=Path(tmp),
+                label="trace-test",
+                broadcast=BroadcastConfig(enabled=True, endpoint="http://127.0.0.1:4318"),
+            )
+
+            asyncio.run(logger.start())
+            asyncio.run(logger.stop())
+
+            manifest = json.loads(logger.manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["telemetry"]["collector_endpoint"], "http://127.0.0.1:4318")
+            self.assertEqual(manifest["telemetry"]["enabled"], True)
+
+    def test_user_message_telemetry_does_not_store_prompt_text_in_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = SessionLogger(base_dir=Path(tmp), label="trace-test")
+            prompt = "super secret prompt with /home/louis/private.txt"
+
+            asyncio.run(logger.start())
+            logger.record_user_message(
+                turn_id="turn-1",
+                text=prompt,
+                mentioned_files=["/home/louis/private.txt"],
+                attached_images=[],
+                mode="chat",
+            )
+            asyncio.run(logger.stop())
+
+            manifest = json.loads(logger.manifest_path.read_text(encoding="utf-8"))
+            encoded = json.dumps(manifest)
+
+            self.assertNotIn(prompt, encoded)
+            self.assertNotIn("/home/louis/private.txt", encoded)
+            self.assertEqual(manifest["runtime_context"], {})
+
+    def test_sanitizes_generic_event_without_raw_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = SessionLogger(base_dir=Path(tmp), label="trace-test")
+
+            payload = logger._sanitize_generic_event(
+                "tool_result",
+                {
+                    "turn_id": "turn-1",
+                    "text": "sensitive prompt",
+                    "command": "cat /home/louis/private.txt",
+                    "cwd": "/home/louis/repo",
+                },
+            )
+
+            encoded = json.dumps(payload)
+
+            self.assertNotIn("sensitive prompt", encoded)
+            self.assertNotIn("/home/louis/private.txt", encoded)
+            self.assertEqual(payload["openjet.text_char_count"], len("sensitive prompt"))
+            self.assertEqual(payload["openjet.command_char_count"], len("cat /home/louis/private.txt"))
+            self.assertEqual(payload["openjet.cwd_name"], "repo")
 
 
 class ShellCommandClassificationTests(unittest.TestCase):

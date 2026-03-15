@@ -17,7 +17,9 @@ logging:
   directory: session_logs
   enabled: true
   label: open-jet
+  max_sessions: 100
   metrics_interval_seconds: 5
+  retention_days: 30
 memory_guard:
   check_interval_chunks: 16
   condense_target_tokens: 900
@@ -37,6 +39,16 @@ state:
   auto_resume: false
   enabled: true
   path: session_state.json
+telemetry:
+  broadcast:
+    enabled: false
+    endpoint: ''
+    export_logs: true
+    export_metrics: true
+    export_traces: true
+    headers: {}
+    timeout_seconds: 3.0
+  install_id_path: .openjet/state/telemetry_identity.json
 system_prompt: 'AI assistant on a Jetson edge device with filesystem access.
 
   Tools: shell, read_file, write_file, edit_file, glob, grep, list_directory, load_file.

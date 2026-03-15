@@ -1,19 +1,26 @@
 # Session State and Logging
 
-When enabled:
+When local logging is enabled, each session gets its own directory under `session_logs/YYYY/MM/DD/`.
 
-- session events are written to `session_logs/*.events.jsonl`
-- system metrics are written to `session_logs/*.metrics.jsonl`
-- conversation state is saved to `session_state.json`
+The session folder contains:
 
-The event log captures replayable traces for:
+- `session.json`: manifest with session id, install id, runtime context, and collector configuration
+- `session_state.json`: chat/session state if state persistence is enabled
 
-- tool call success rate
-- approval and denial decisions
-- interrupted generation and resumed sessions
-- time-to-resolution
-- token usage for successful tasks
-- hallucinated or low-value command proposals
-- hardware/runtime-specific failure analysis
+Telemetry is no longer persisted by the app itself. `open-jet` emits OTLP to a collector, and the collector decides where logs, traces, and metrics are stored.
 
-Use this data to evaluate reliability from real traces, not only subjective testing.
+The emitted payload is intentionally metadata-only:
+
+- prompt text is not emitted
+- tool output, stdout, stderr, file paths, and model paths are not exported
+- model identifiers are reduced to safe names
+- errors are exported as redacted summaries plus hashes
+
+This keeps telemetry useful for reliability analysis without turning it into a second conversation transcript.
+
+To keep local session metadata bounded:
+
+- `logging.retention_days` prunes old session folders
+- `logging.max_sessions` keeps only the newest session directories
+
+For remote telemetry broadcasting, see [Telemetry](../telemetry.md).

@@ -27,6 +27,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.rule import Rule
 
+from .airgap import airgapped_from_cfg, set_airgapped
 from .agent import ActionKind, Agent, ToolCall
 from .commands import SlashCommandHandler
 from .completion import CompletionEngine, FileMentionCompletionProvider, SlashCompletionProvider
@@ -69,7 +70,7 @@ from .persistent_memory import build_system_prompt
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
 from .runtime_registry import active_model_ref, create_runtime_client
-from .session_logging import SessionLogger
+from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import SessionStateStore
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
@@ -134,6 +135,31 @@ def _classify_shell_command(command: str) -> dict[str, object]:
         "false_positive_proposal": false_positive,
         "classification_reason": ", ".join(reasons) if reasons else None,
     }
+
+
+def _shell_command_category(primary_command: str) -> str:
+    primary = primary_command.strip().lower()
+    if not primary:
+        return "empty"
+    if primary in _SHELL_BUILTINS:
+        return "builtin"
+    if primary in {"git", "gh"}:
+        return "git"
+    if primary in {"pytest", "unittest", "nose"}:
+        return "test"
+    if primary in {"python", "python3", "uv", "pip", "pip3"}:
+        return "python"
+    if primary in {"cargo", "rustc"}:
+        return "rust"
+    if primary in {"npm", "pnpm", "yarn", "node"}:
+        return "node"
+    if primary in {"make", "cmake", "ninja"}:
+        return "build"
+    if primary in {"bash", "sh", "zsh"}:
+        return "shell"
+    if primary in {"ls", "cat", "find", "grep", "rg"}:
+        return "filesystem"
+    return "other"
 
 
 BANNER = r"""[bold green]
@@ -237,6 +263,8 @@ class OpenJetApp:
     def __init__(self, *, force_setup: bool = False) -> None:
         self.force_setup = force_setup
         self.cfg = load_config()
+        self.cfg["airgapped"] = airgapped_from_cfg(self.cfg)
+        set_airgapped(bool(self.cfg["airgapped"]))
         self.client: RuntimeClient | None = None
         self.agent: Agent | None = None
         self.session_logger: SessionLogger | None = None
@@ -245,6 +273,8 @@ class OpenJetApp:
             {
                 "prompt": "bg:#14213d #e5e7eb bold",
                 "brand": "bg:#88D83F #111111 bold",
+                "prompt-airgapped": "bg:#7c2d12 #ffedd5 bold",
+                "brand-airgapped": "bg:#c2410c #fff7ed bold",
                 "bottom-toolbar": "bg:#0f172a #cbd5e1",
                 "completion-menu.completion": "bg:#111827 #cbd5e1",
                 "completion-menu.completion.current": "bg:#88D83F #111111 bold",
@@ -373,10 +403,43 @@ class OpenJetApp:
     def _active_model_ref(self) -> str:
         return active_model_ref(self.cfg)
 
+    def is_airgapped(self) -> bool:
+        return bool(self.cfg.get("airgapped", False))
+
+    def set_airgapped(self, enabled: bool, *, persist: bool = True) -> bool:
+        normalized = bool(enabled)
+        changed = normalized != self.is_airgapped()
+        self.cfg["airgapped"] = normalized
+        set_airgapped(normalized)
+        if persist:
+            save_config(self.cfg)
+            self.persist_session_state(reason=f"airgapped:{str(normalized).lower()}")
+        if self.session_logger:
+            self.session_logger.broadcast = self._effective_broadcast_config()
+        if self._session and self._session.app:
+            self._session.app.invalidate()
+        self._render_token_counter()
+        return changed
+
+    def _effective_broadcast_config(self) -> BroadcastConfig:
+        telemetry_cfg = self.cfg.get("telemetry", {})
+        broadcast_cfg = telemetry_cfg.get("broadcast", {})
+        enabled = bool(broadcast_cfg.get("enabled", False)) and not self.is_airgapped()
+        return BroadcastConfig(
+            enabled=enabled,
+            endpoint=str(broadcast_cfg.get("endpoint", "")).strip() or None,
+            headers=broadcast_cfg.get("headers") if isinstance(broadcast_cfg.get("headers"), dict) else None,
+            timeout_seconds=float(broadcast_cfg.get("timeout_seconds", 3.0)),
+            export_logs=bool(broadcast_cfg.get("export_logs", True)),
+            export_metrics=bool(broadcast_cfg.get("export_metrics", True)),
+            export_traces=bool(broadcast_cfg.get("export_traces", True)),
+        )
+
     def _trace_runtime_context(self) -> dict[str, object]:
         return {
             "runtime": self.cfg.get("runtime", "llama_cpp"),
             "model": self._active_model_ref(),
+            "airgapped": self.is_airgapped(),
             "device_profile": self.cfg.get("device", "auto"),
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
             "gpu_layers": self.cfg.get("gpu_layers", 0),
@@ -388,7 +451,8 @@ class OpenJetApp:
             self.session_logger.log_event(event_type, turn_id=self._active_turn_id, **data)
 
     def _agent_trace(self, event: str, data: dict[str, object]) -> None:
-        self._log_trace_event(f"agent_trace_{event}", **data)
+        if self.session_logger:
+            self.session_logger.record_agent_trace(event, data, turn_id=self._active_turn_id)
 
     def _begin_turn_trace(self, prompt: str) -> None:
         self._turn_counter += 1
@@ -404,32 +468,94 @@ class OpenJetApp:
         self._active_turn_hallucinated_commands = 0
         self._active_turn_recovered_after_resume = False
         if self.session_logger:
-            self.session_logger.log_event(
-                "turn_start",
+            self.session_logger.start_turn(
                 turn_id=self._active_turn_id,
-                goal=prompt,
+                prompt=prompt,
                 mode=self.harness_state.mode,
                 resumed_session=self._session_was_resumed,
                 active_step=active.title if (active := active_step(self.harness_state)) else None,
                 files_in_play=self.harness_state.files_in_play,
-                **self._trace_runtime_context(),
+                runtime_context=self._trace_runtime_context(),
             )
+
+    def _tool_telemetry_attributes(self, tc: ToolCall) -> dict[str, object]:
+        attrs: dict[str, object] = {}
+        if isinstance(tc.arguments, dict):
+            attrs["openjet.tool.arg_keys"] = sorted(str(key) for key in tc.arguments.keys())
+        if tc.name == "shell" and isinstance(tc.arguments, dict):
+            command = str(tc.arguments.get("command", "")).strip()
+            classified = _classify_shell_command(command)
+            attrs.update(
+                {
+                    "openjet.tool.shell.command_category": _shell_command_category(
+                        str(classified.get("primary_command", ""))
+                    ),
+                    "openjet.tool.shell.classified_verification": bool(
+                        classified.get("classified_verification")
+                    ),
+                    "openjet.tool.shell.hallucinated_command": bool(
+                        classified.get("hallucinated_command")
+                    ),
+                    "openjet.tool.shell.false_positive_proposal": bool(
+                        classified.get("false_positive_proposal")
+                    ),
+                }
+            )
+        elif tc.name in {"read_file", "write_file", "load_file", "edit_file"} and isinstance(tc.arguments, dict):
+            path = Path(str(tc.arguments.get("path", "")).strip())
+            attrs.update(
+                {
+                    "openjet.tool.target_extension": path.suffix.lower() or "<none>",
+                    "openjet.tool.target_is_absolute": path.is_absolute(),
+                }
+            )
+        elif tc.name in {"glob", "grep"} and isinstance(tc.arguments, dict):
+            attrs["openjet.tool.pattern_length"] = len(str(tc.arguments.get("pattern", "")))
+        elif tc.name == "memory" and isinstance(tc.arguments, dict):
+            attrs["openjet.tool.memory.scope"] = str(tc.arguments.get("scope", "")).strip() or "<empty>"
+            attrs["openjet.tool.memory.action"] = str(tc.arguments.get("action", "")).strip() or "<empty>"
+        return attrs
+
+    def _tool_result_telemetry_attributes(
+        self,
+        tc: ToolCall,
+        meta: dict[str, object],
+        *,
+        duration_ms: float,
+        output_truncated: bool,
+    ) -> dict[str, object]:
+        attrs: dict[str, object] = {
+            "openjet.tool.duration_ms": duration_ms,
+            "openjet.tool.output_truncated": output_truncated,
+        }
+        if tc.name == "shell":
+            attrs["openjet.tool.shell.timed_out"] = bool(meta.get("timed_out"))
+            exit_code = meta.get("exit_code")
+            if isinstance(exit_code, int):
+                attrs["openjet.tool.shell.exit_code"] = exit_code
+            timeout_seconds = meta.get("timeout_seconds")
+            if isinstance(timeout_seconds, int):
+                attrs["openjet.tool.shell.timeout_seconds"] = timeout_seconds
+        elif tc.name == "load_file":
+            for key in ("truncated", "estimated_tokens", "returned_tokens", "token_budget", "mem_available_mb"):
+                if key in meta:
+                    attrs[f"openjet.tool.load_file.{key}"] = meta[key]
+        elif tc.name == "edit_file":
+            for key in ("internal_retry", "replacements", "match_strategy"):
+                if key in meta:
+                    attrs[f"openjet.tool.edit_file.{key}"] = meta[key]
+            attrs["openjet.tool.edit_file.validation_error_present"] = bool(meta.get("validation_error"))
+        return attrs
 
     def _finish_turn_trace(self, *, success: bool, status: str, error: str | None = None) -> None:
         if not self._active_turn_id:
             return
-        resolution_ms = None
-        if self._active_turn_started_at is not None:
-            resolution_ms = round((time.monotonic() - self._active_turn_started_at) * 1000.0, 2)
         if self.session_logger:
-            self.session_logger.log_event(
-                "task_outcome",
-                turn_id=self._active_turn_id,
-                goal=self._active_turn_prompt,
+            self.session_logger.finish_turn(
+                self._active_turn_id,
                 success=success,
                 status=status,
                 error=error,
-                resolution_ms=resolution_ms,
                 generation_tokens=self._active_turn_generation_tokens,
                 tool_attempts=self._active_turn_tool_attempts,
                 tool_successes=self._active_turn_tool_successes,
@@ -438,7 +564,7 @@ class OpenJetApp:
                 false_positive_command_proposals=self._active_turn_false_positive_commands,
                 hallucinated_command_proposals=self._active_turn_hallucinated_commands,
                 recovered_after_resumed_session=self._active_turn_recovered_after_resume,
-                **self._trace_runtime_context(),
+                runtime_context=self._trace_runtime_context(),
             )
         self._active_turn_id = None
         self._active_turn_started_at = None
@@ -521,6 +647,8 @@ class OpenJetApp:
                     await self._init_client()
                     log.write("[bold bright_white]Setup cancelled. Previous runtime restored.[/]")
                 except Exception as exc:
+                    if self.session_logger:
+                        self.session_logger.record_exception("setup_restore_failed", exc, component="setup")
                     log.write(f"[bold red]Setup cancelled; runtime restore failed:[/] {_format_error(exc)}")
             else:
                 log.write("[bold bright_white]Setup cancelled.[/]")
@@ -531,6 +659,8 @@ class OpenJetApp:
         try:
             resolved_result = await self._materialize_setup_model(result, log)
         except Exception as exc:
+            if self.session_logger:
+                self.session_logger.record_exception("setup_apply_failed", exc, component="setup")
             log.write(f"[bold red]Setup failed:[/] {_format_error(exc)}")
             log.write("")
             return False
@@ -553,6 +683,8 @@ class OpenJetApp:
                 await self._init_client()
             except Exception:
                 pass
+            if self.session_logger:
+                self.session_logger.record_exception("setup_reload_failed", exc, component="setup")
             log.write(f"[bold red]Setup failed:[/] {_format_error(exc)}")
             log.write("")
             return False
@@ -580,6 +712,12 @@ class OpenJetApp:
                 base_dir=Path(log_cfg.get("directory", "session_logs")),
                 label=str(log_cfg.get("label", "open-jet")),
                 metrics_interval_seconds=float(log_cfg.get("metrics_interval_seconds", 5)),
+                install_id_path=Path(
+                    self.cfg.get("telemetry", {}).get("install_id_path", ".openjet/state/telemetry_identity.json")
+                ),
+                retention_days=int(log_cfg.get("retention_days", 30)) if log_cfg.get("retention_days") is not None else None,
+                max_sessions=int(log_cfg.get("max_sessions", 100)) if log_cfg.get("max_sessions") is not None else None,
+                broadcast=self._effective_broadcast_config(),
             )
             await self.session_logger.start()
             self.session_logger.log_event("app_mount", cwd=str(Path.cwd()))
@@ -592,6 +730,8 @@ class OpenJetApp:
                 try:
                     setup_result = await self._materialize_setup_model(setup_result, log)
                 except Exception as exc:
+                    if self.session_logger:
+                        self.session_logger.record_exception("setup_failed", exc, component="setup")
                     log.write(f"[bold red]Setup failed:[/] {_format_error(exc)}")
                     log.write("")
                     self._quit_requested = True
@@ -614,6 +754,8 @@ class OpenJetApp:
             try:
                 resolved = await self._materialize_setup_model(dict(self.cfg), log)
             except Exception as exc:
+                if self.session_logger:
+                    self.session_logger.record_exception("setup_resolve_model_failed", exc, component="setup")
                 log.write(f"[bold red]Failed to resolve Ollama model:[/] {_format_error(exc)}")
                 log.write("")
                 self._quit_requested = True
@@ -626,13 +768,16 @@ class OpenJetApp:
         try:
             await self._init_client()
         except Exception as exc:
+            if self.session_logger:
+                self.session_logger.record_exception("runtime_start_failed", exc, component="runtime")
             log.write(f"\n[bold red]Failed to start LLM:[/] {_format_error(exc)}")
             self._quit_requested = True
             return
         if self.session_logger:
-            self.session_logger.log_event("llm_ready", model=active_model)
-            self.session_logger.log_event("llm_runtime_config", **self._trace_runtime_context())
+            self.session_logger.record_runtime_ready(**self._trace_runtime_context())
         log.write("  [bold bright_white]Ready.[/]")
+        if self.is_airgapped():
+            log.write("  [bold #c2410c]Air-gapped mode is enabled. External network access is blocked.[/]")
         if self.auto_resume:
             self._restore_session_state(log)
         self._restore_harness_state()
@@ -711,13 +856,12 @@ class OpenJetApp:
         self._begin_turn_trace(history_text)
         self.persist_harness_state()
         if self.session_logger:
-            self.session_logger.log_event(
-                "user_message",
+            self.session_logger.record_user_message(
                 turn_id=self._active_turn_id,
                 text=history_text,
                 mentioned_files=mentioned_files,
-                mode=self.harness_state.mode,
                 attached_images=attached_images,
+                mode=self.harness_state.mode,
             )
         await self._load_mentioned_files_into_context(stripped, log)
         self.agent.add_user_message(stripped, image_paths=attached_images)
@@ -775,8 +919,7 @@ class OpenJetApp:
             self.persist_harness_state()
         log.write(f"[bold bright_white]Loaded @{mention_path} into context ({result.summary}).[/]")
         if self.session_logger:
-            self.session_logger.log_event(
-                "context_file_loaded",
+            self.session_logger.record_context_file_loaded(
                 mention_path=mention_path,
                 resolved_path=result.path,
                 context_tokens_before=current_tokens,
@@ -868,6 +1011,7 @@ class OpenJetApp:
 
     def _toolbar_text(self) -> str:
         rows: list[str] = []
+        rows.append("mode: AIR-GAPPED" if self.is_airgapped() else "mode: internet")
         if not self.query_one("#assistant-status").hidden and self.query_one("#assistant-status").text:
             rows.append(_plain_markup(self.query_one("#assistant-status").text))
         if not self.query_one("#approval-bar").hidden and self.query_one("#approval-bar").text:
@@ -887,6 +1031,8 @@ class OpenJetApp:
         return "\n".join(row for row in rows if row)
 
     def _prompt_message(self) -> HTML:
+        if self.is_airgapped():
+            return HTML("<brand-airgapped> open-jet air-gap </brand-airgapped><prompt-airgapped>  > </prompt-airgapped>")
         return HTML("<brand> open-jet </brand><prompt>  > </prompt>")
 
     def set_utilization_visible(self, visible: bool) -> None:
@@ -901,7 +1047,7 @@ class OpenJetApp:
 
     def runtime_status_snapshot(self) -> dict:
         if not self.agent:
-            return {"ready": False}
+            return {"ready": False, "airgapped": self.is_airgapped()}
         window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
         budget = self.agent.context_budget() or derive_context_budget(window)
         current = self.agent.estimated_context_tokens()
@@ -917,6 +1063,7 @@ class OpenJetApp:
         return {
             "ready": True,
             "messages": self.agent.conversation_message_count(),
+            "airgapped": self.is_airgapped(),
             "generating": self._thinking_timer is not None,
             "command_in_progress": self._assistant_status_kind == "command",
             "active_command": self._assistant_status_command,
@@ -944,6 +1091,9 @@ class OpenJetApp:
         state = self.state_store.load()
         if not state:
             return False
+        airgapped = state.get("airgapped")
+        if isinstance(airgapped, bool):
+            self.set_airgapped(airgapped, persist=False)
         messages = state.get("messages")
         if not isinstance(messages, list) or not messages:
             return False
@@ -1052,6 +1202,7 @@ class OpenJetApp:
             "saved_at": time.time(),
             "reason": reason,
             "session_id": self.session_logger.session_id if self.session_logger else None,
+            "airgapped": self.is_airgapped(),
             "model": self.cfg.get("model"),
             "device": self.cfg.get("device", "auto"),
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
@@ -1237,6 +1388,15 @@ class OpenJetApp:
                 if event:
                     tool_events.append(event)
             except Exception as exc:
+                if self.session_logger:
+                    self.session_logger.record_exception(
+                        "tool_call_failed",
+                        exc,
+                        component="tool",
+                        turn_id=self._active_turn_id,
+                        tool_key=tc.id,
+                        extra_attributes={"openjet.tool.name": tc.name},
+                    )
                 log.write(f"[bold red]tool error ({tc.name}):[/] {exc}")
                 log.write("")
                 if self.agent:
@@ -1253,14 +1413,46 @@ class OpenJetApp:
             self._render_token_counter()
 
     async def _handle_tool_call(self, tc: ToolCall, log: LogView) -> dict | None:
+        tool_key = tc.id or f"{tc.name}-{int(time.time() * 1000)}"
+        tc.id = tool_key
+        tool_attrs = self._tool_telemetry_attributes(tc)
+        if tc.name == "shell":
+            if bool(tool_attrs.get("openjet.tool.shell.false_positive_proposal")):
+                self._active_turn_false_positive_commands += 1
+            if bool(tool_attrs.get("openjet.tool.shell.hallucinated_command")):
+                self._active_turn_hallucinated_commands += 1
         if tc.name not in allowed_tools_for_mode(self.harness_state.mode):
             denied = f"Tool {tc.name} is not available for this request. Use an approved tool or ask for a different approach."
             log.write(f"[yellow]{denied}[/]")
             log.write("")
+            if self.session_logger and self._active_turn_id:
+                self.session_logger.start_tool_call(
+                    turn_id=self._active_turn_id,
+                    tool_key=tool_key,
+                    tool_name=tc.name,
+                    attributes=tool_attrs,
+                    needs_confirmation=False,
+                )
+                self.session_logger.finish_tool_call(
+                    tool_key,
+                    ok=False,
+                    approved=False,
+                    duration_ms=None,
+                    status="disallowed",
+                    attributes={"openjet.tool.denial_reason": "mode_restricted"},
+                )
             if self.agent:
                 self.agent.complete_tool_call(tc, denied)
             return {"tool": tc.name, "ok": False, "summary": denied, "target": format_tool_args(tc)}
         needs_confirm = self.agent.needs_confirmation(tc) if self.agent else False
+        if self.session_logger and self._active_turn_id:
+            self.session_logger.start_tool_call(
+                turn_id=self._active_turn_id,
+                tool_key=tool_key,
+                tool_name=tc.name,
+                attributes=tool_attrs,
+                needs_confirmation=needs_confirm,
+            )
         if needs_confirm:
             self._active_turn_approval_requests += 1
             log.write(Rule(f"[bold yellow]Tool Request: {tc.name}", style="yellow"))
@@ -1268,13 +1460,30 @@ class OpenJetApp:
             for preview_line in self._tool_preview_lines(tc):
                 log.write(f"  [bold bright_white]{preview_line}[/]")
             approved = await self._wait_for_tool_approval(tc)
+            decision_ms = None
+            if self._approval_started_at is not None:
+                decision_ms = round((time.monotonic() - self._approval_started_at) * 1000.0, 2)
             self._approval_started_at = None
+            if self.session_logger:
+                self.session_logger.record_tool_approval(
+                    tool_key=tool_key,
+                    approved=approved,
+                    decision_ms=decision_ms,
+                )
             if not approved:
                 log.write("[red]  denied[/]")
                 log.write("")
                 assert self.agent is not None
                 self.agent.complete_tool_call(tc, "User denied this action.")
                 self.persist_session_state(reason=f"tool_denied:{tc.name}")
+                if self.session_logger:
+                    self.session_logger.finish_tool_call(
+                        tool_key,
+                        ok=False,
+                        approved=False,
+                        duration_ms=decision_ms,
+                        status="denied",
+                    )
                 return {"tool": tc.name, "ok": False, "summary": "User denied this action.", "target": format_tool_args(tc)}
             log.write("[green]  approved[/]")
             self._active_turn_approval_grants += 1
@@ -1286,11 +1495,30 @@ class OpenJetApp:
         tool_status_token = self._start_tool_status(tc)
         try:
             execution = await execute_tool(tc)
+        except Exception as exc:
+            duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
+            if self.session_logger:
+                self.session_logger.record_exception(
+                    "tool_execute_exception",
+                    exc,
+                    component="tool",
+                    turn_id=self._active_turn_id,
+                    tool_key=tool_key,
+                    extra_attributes={"openjet.tool.name": tc.name},
+                )
+                self.session_logger.finish_tool_call(
+                    tool_key,
+                    ok=False,
+                    approved=True,
+                    duration_ms=duration_ms,
+                    status="exception",
+                )
+            raise
         finally:
             self._stop_tool_status(tool_status_token)
         result = execution.output
         meta = execution.meta
-        result_for_context, _ = self._fit_tool_result_to_budget(result)
+        result_for_context, output_truncated = self._fit_tool_result_to_budget(result)
         if execution.ok:
             self._active_turn_tool_successes += 1
         for line in result_for_context.splitlines()[:20]:
@@ -1301,6 +1529,21 @@ class OpenJetApp:
         assert self.agent is not None
         self.agent.complete_tool_call(tc, result_for_context)
         self.persist_session_state(reason=f"tool_result:{tc.name}")
+        duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
+        if self.session_logger:
+            self.session_logger.finish_tool_call(
+                tool_key,
+                ok=execution.ok,
+                approved=True,
+                duration_ms=duration_ms,
+                status="completed" if execution.ok else "failed",
+                attributes=self._tool_result_telemetry_attributes(
+                    tc,
+                    meta,
+                    duration_ms=duration_ms,
+                    output_truncated=output_truncated,
+                ),
+            )
         return {
             "tool": tc.name,
             "ok": bool(meta.get("ok", True)),
@@ -1308,7 +1551,7 @@ class OpenJetApp:
             "target": format_tool_args(tc),
             "verification": tc.name == "shell" and shell_command_is_verification(str(tc.arguments.get("command", ""))),
             "command": tc.arguments.get("command") if isinstance(tc.arguments, dict) else None,
-            "duration_ms": round((time.monotonic() - t0) * 1000.0, 2),
+            "duration_ms": duration_ms,
         }
 
     def _clamp_load_file_tool_budget(self, tc: ToolCall) -> None:
@@ -1351,12 +1594,22 @@ class OpenJetApp:
         if not self.client:
             return False
         log.write("[yellow]LLM runtime interrupted. Restarting runtime once and retrying...[/]")
+        self._log_trace_event("runtime_recovery_attempt", recoverable_error=error_text)
         try:
             await self.client.reset_kv_cache()
         except Exception as exc:
+            if self.session_logger:
+                self.session_logger.record_exception(
+                    "runtime_recovery_failed",
+                    exc,
+                    component="runtime",
+                    turn_id=self._active_turn_id,
+                )
             log.write(f"[bold red]Runtime recovery failed:[/] {exc}")
             log.write("")
             return False
+        if self.session_logger:
+            self.session_logger.log_event("runtime_recovery_succeeded")
         log.write("[bold bright_white]Runtime recovered. Retrying turn.[/]")
         log.write("")
         return True
