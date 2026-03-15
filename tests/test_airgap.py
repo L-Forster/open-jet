@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from src import create_agent
 from src.airgap import AirgapViolationError, assert_endpoint_allowed, set_airgapped
 from src.app import OpenJetApp
+from src import runtime_limits
 from src.runtime_registry import create_runtime_client
 
 
@@ -72,6 +73,23 @@ class RuntimeRegistryAirgapTests(AirgapBaseTestCase):
 
 
 class AppAirgapTests(AirgapBaseTestCase):
+    def test_estimate_tokens_uses_local_airgapped_counter(self) -> None:
+        runtime_limits._get_encoder.cache_clear()
+        runtime_limits._get_airgapped_token_counter.cache_clear()
+        with patch("src.runtime_limits.is_airgapped", return_value=True), patch(
+            "src.runtime_limits._get_airgapped_token_counter",
+            return_value=lambda text: 17,
+        ), patch(
+            "src.runtime_limits.tiktoken.get_encoding",
+            side_effect=AssertionError("tiktoken should not be used in air-gapped mode"),
+        ):
+            tokens = runtime_limits.estimate_tokens("hello")
+
+        runtime_limits._get_encoder.cache_clear()
+        runtime_limits._get_airgapped_token_counter.cache_clear()
+
+        self.assertEqual(tokens, 17)
+
     def test_runtime_status_snapshot_reports_airgapped_mode(self) -> None:
         app = OpenJetApp()
         app.agent = Mock()

@@ -1398,7 +1398,7 @@ class OpenJetApp:
         log = self.query_one("#chat-log")
         pending_tool_calls: list[ToolCall] = []
         tool_events: list[dict] = []
-        condense_requested = False
+        condense_reason: str | None = None
         text_buf = ""
         assistant_turn_text = ""
         assistant_header_written = False
@@ -1422,7 +1422,7 @@ class OpenJetApp:
                 elif event.kind == ActionKind.TOOL_REQUEST:
                     pending_tool_calls.append(event.tool_call)
                 elif event.kind == ActionKind.CONDENSE:
-                    condense_requested = True
+                    condense_reason = event.text
                 elif event.kind == ActionKind.ERROR:
                     if not recovery_attempted and self._is_recoverable_runtime_error(event.text):
                         recovered = await self._recover_runtime(log, event.text)
@@ -1444,12 +1444,27 @@ class OpenJetApp:
             if self._generation_worker and self._generation_worker.done():
                 self._generation_worker = None
 
-        if condense_requested:
+        if condense_reason is not None:
             result = await self.agent.condense_context()
             log.write(f"  [bold bright_white]{result}[/]")
             log.write("")
             self.persist_session_state(reason="auto_condense")
             self.persist_harness_state()
+            remaining_pressure = self.agent.resource_pressure_reason()
+            if remaining_pressure:
+                log.write(
+                    "  [yellow]Auto-condense stopped: "
+                    f"{remaining_pressure}. Retry after memory/context pressure clears.[/]"
+                )
+                log.write("")
+                self.persist_session_state(reason="auto_condense_stopped")
+                self._finish_turn_trace(
+                    success=False,
+                    status="resource_pressure",
+                    error=remaining_pressure,
+                )
+                self._render_token_counter()
+                return
             self._start_agent_turn()
             return
 

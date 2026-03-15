@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
+import json
 import os
+from pathlib import Path
 
 import tiktoken
 from typing import Any
+
+from .airgap import is_airgapped
+from .config import load_config
 
 
 MIN_TOKEN_BUDGET = 128
@@ -36,6 +42,10 @@ class ContextBudget:
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
+    if is_airgapped():
+        counter = _get_airgapped_token_counter()
+        if counter is not None:
+            return counter(text)
     return len(_get_encoder().encode_ordinary(text))
 
 
@@ -43,6 +53,67 @@ def estimate_tokens(text: str) -> int:
 def _get_encoder() -> tiktoken.Encoding:
     encoding_name = os.getenv("OPEN_JET_TOKENIZER", "cl100k_base")
     return tiktoken.get_encoding(encoding_name)
+
+
+@lru_cache(maxsize=1)
+def _get_airgapped_token_counter() -> Any | None:
+    model_path = _resolve_airgapped_model_path()
+    if model_path is None:
+        return None
+    if model_path.suffix.lower() != ".gguf" or not model_path.is_file():
+        return None
+
+    try:
+        import gguf
+        from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
+    except ImportError:
+        return None
+
+    reader = gguf.GGUFReader(str(model_path))
+    model_type = reader.get_field("tokenizer.ggml.model")
+    pre_type = reader.get_field("tokenizer.ggml.pre")
+    tokens_field = reader.get_field("tokenizer.ggml.tokens")
+    merges_field = reader.get_field("tokenizer.ggml.merges")
+    if model_type is None or pre_type is None or tokens_field is None or merges_field is None:
+        return None
+    if model_type.contents() != "gpt2" or pre_type.contents() != "qwen2":
+        return None
+
+    tokens = tokens_field.contents()
+    merges = merges_field.contents()
+    cache_dir = _materialize_qwen_tokenizer_files(model_path, tokens=tokens, merges=merges)
+    tokenizer = Qwen2Tokenizer(str(cache_dir / "vocab.json"), str(cache_dir / "merges.txt"))
+    return lambda text: len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def _resolve_airgapped_model_path() -> Path | None:
+    cfg = load_config()
+    model_ref = str(cfg.get("llama_model") or cfg.get("model") or "").strip()
+    if not model_ref:
+        return None
+    return Path(model_ref).expanduser()
+
+
+def _materialize_qwen_tokenizer_files(
+    model_path: Path,
+    *,
+    tokens: list[str],
+    merges: list[str],
+) -> Path:
+    cache_key = hashlib.sha1(str(model_path).encode("utf-8")).hexdigest()[:16]
+    cache_dir = Path(".openjet") / "state" / "tokenizers" / cache_key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    vocab_path = cache_dir / "vocab.json"
+    if not vocab_path.exists():
+        vocab = {token: idx for idx, token in enumerate(tokens)}
+        vocab_path.write_text(json.dumps(vocab, ensure_ascii=False), encoding="utf-8")
+
+    merges_path = cache_dir / "merges.txt"
+    if not merges_path.exists():
+        merges_path.write_text("#version: 0.2\n" + "\n".join(merges) + "\n", encoding="utf-8")
+
+    return cache_dir
 
 
 def read_memory_snapshot() -> MemorySnapshot | None:

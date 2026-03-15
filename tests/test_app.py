@@ -7,11 +7,12 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from rich.console import Console
 
-from src.agent import Agent
+from src.agent import ActionKind, Agent
 from src.app import OpenJetApp
 from src.hardware import HardwareInfo
 from src.llama_server import (
@@ -232,6 +233,44 @@ class AppQuitTests(unittest.TestCase):
         scheduled = create_task.call_args.args[0]
         self.assertTrue(asyncio.iscoroutine(scheduled))
         scheduled.close()
+
+
+class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_agent_turn_stops_when_pressure_remains_after_condense(self) -> None:
+        app = OpenJetApp()
+
+        class CondenseLoopAgent:
+            messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "hi"}]
+
+            async def run_turn(self):
+                yield SimpleNamespace(kind=ActionKind.CONDENSE, text="mem_available=300MB < 512MB")
+
+            async def condense_context(self) -> str:
+                return "Context condensed automatically. messages: 2 -> 2, tokens(est): 600 -> 580."
+
+            def resource_pressure_reason(self) -> str | None:
+                return "mem_available=300MB < 512MB"
+
+        app.agent = CondenseLoopAgent()
+
+        with patch.object(app, "_start_agent_turn") as start_next, patch.object(
+            app, "persist_session_state"
+        ) as persist_session, patch.object(app, "persist_harness_state") as persist_harness, patch.object(
+            app, "_finish_turn_trace"
+        ) as finish_turn, patch.object(app, "_render_token_counter") as render_counter:
+            await app.run_agent_turn()
+
+        start_next.assert_not_called()
+        persist_harness.assert_called_once()
+        self.assertGreaterEqual(persist_session.call_count, 2)
+        finish_turn.assert_called_once()
+        render_counter.assert_called_once()
+        self.assertTrue(
+            any(
+                "Auto-condense stopped" in str(entry)
+                for entry in app.query_one("#chat-log")._entries
+            )
+        )
 
 
 class LlamaServerStartupTests(unittest.TestCase):

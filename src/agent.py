@@ -329,6 +329,9 @@ class Agent:
             return context_pressure
         return self._memory_pressure_reason()
 
+    def resource_pressure_reason(self) -> str | None:
+        return self._resource_pressure_reason()
+
     def _context_pressure_reason(self) -> str | None:
         budget = self.context_budget()
         if not budget:

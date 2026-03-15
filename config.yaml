@@ -13,7 +13,7 @@ layered_context:
   layer2_ratio: 0.2
   layer3_enabled: true
   layer3_ratio: 0.1
-llama_model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
+llama_model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 logging:
   directory: session_logs
   enabled: true
@@ -27,12 +27,15 @@ memory_guard:
   keep_last_messages: 6
   max_used_percent: null
   min_available_mb: null
-model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
+model: /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 model_source: local
 ollama_model: null
 recommended_llm: null
 runtime: llama_cpp
 setup_complete: true
+setup_model_history:
+  llama_cpp:
+  - /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 sglang_launch_mode: jetson_container
 sglang_model: null
 sglang_served_model_name: local
