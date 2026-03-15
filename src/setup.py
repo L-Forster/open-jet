@@ -20,6 +20,7 @@ from .hardware import (
     recommended_llm_models,
     recommended_param_budget_b,
 )
+from .model_profiles import default_profile_name
 from .ollama_setup import discover_installed_ollama_models, find_ollama_cli
 from .runtime_registry import runtime_options, runtime_spec
 
@@ -389,5 +390,10 @@ async def run_setup_wizard(
             "gpu_layers": gpu_value if runtime == "llama_cpp" else 0,
             "setup_complete": True,
         }
+    )
+    payload["model_profile_name"] = await _prompt_text(
+        session,
+        "model name> ",
+        default=default_profile_name(payload),
     )
     return payload

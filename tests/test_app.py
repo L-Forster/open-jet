@@ -149,14 +149,16 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         console = Mock()
         hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
         manual_model = "/models/custom.gguf"
+        profile_name = "Custom Model"
 
         choices = iter(["auto", "llama_cpp", "__local__", "__manual__", 4096, 99])
+        texts = iter([manual_model, profile_name])
 
         async def fake_choice(*_args, **_kwargs):
             return next(choices)
 
         async def fake_text(*_args, **_kwargs):
-            return manual_model
+            return next(texts)
 
         with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
             "src.setup._prompt_text", side_effect=fake_text
@@ -178,6 +180,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload["llama_model"], manual_model)
         self.assertEqual(payload["setup_model_history"], {"llama_cpp": [manual_model]})
+        self.assertEqual(payload["model_profile_name"], profile_name)
 
     async def test_run_setup_wizard_lists_saved_llama_model_path_on_next_run(self) -> None:
         console = Console(file=io.StringIO(), force_terminal=False, color_system=None)
@@ -255,6 +258,91 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events[:3], ["save", "materialize", "save"])
         self.assertEqual(events[3], "init")
+
+    def test_persist_setup_result_keeps_existing_named_profiles(self) -> None:
+        app = OpenJetApp()
+        app.cfg["active_model_profile"] = "Base"
+        app.cfg["model_profiles"] = [
+            {
+                "name": "Base",
+                "runtime": "llama_cpp",
+                "model_source": "local",
+                "model": "/models/base.gguf",
+                "llama_model": "/models/base.gguf",
+                "context_window_tokens": 4096,
+                "gpu_layers": 99,
+            }
+        ]
+
+        with patch("src.app.save_config"):
+            app._persist_setup_result(
+                {
+                    "runtime": "llama_cpp",
+                    "model_source": "local",
+                    "model": "/models/alt.gguf",
+                    "llama_model": "/models/alt.gguf",
+                    "context_window_tokens": 8192,
+                    "gpu_layers": 70,
+                    "model_profile_name": "Alt",
+                }
+            )
+
+        self.assertEqual(app.cfg["active_model_profile"], "Alt")
+        self.assertEqual(
+            [profile["name"] for profile in app.cfg["model_profiles"]],
+            ["Alt", "Base"],
+        )
+
+
+class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_command_switches_to_saved_profile(self) -> None:
+        app = OpenJetApp()
+        app.cfg["model_profiles"] = [
+            {
+                "name": "alt",
+                "runtime": "llama_cpp",
+                "model_source": "local",
+                "model": "/models/alt.gguf",
+                "llama_model": "/models/alt.gguf",
+                "context_window_tokens": 4096,
+                "gpu_layers": 99,
+            }
+        ]
+        app.cfg["active_model_profile"] = "base"
+
+        with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate:
+            handled = await app.commands.maybe_handle("/model alt")
+
+        self.assertTrue(handled)
+        activate.assert_awaited_once_with("alt", app.query_one("#chat-log"))
+
+    async def test_edit_model_updates_saved_profile(self) -> None:
+        app = OpenJetApp()
+        app.cfg["model_profiles"] = [
+            {
+                "name": "alt",
+                "runtime": "llama_cpp",
+                "model_source": "local",
+                "model": "/models/alt.gguf",
+                "llama_model": "/models/alt.gguf",
+                "context_window_tokens": 4096,
+                "gpu_layers": 99,
+            }
+        ]
+        app.cfg["active_model_profile"] = "base"
+
+        prompts = iter(["Alt Edited", "/models/alt-v2.gguf", "8192", "70"])
+        with patch("src.commands._prompt_text", side_effect=lambda *_args, **_kwargs: next(prompts)), patch(
+            "src.commands.save_config"
+        ) as save_cfg:
+            handled = await app.commands.maybe_handle("/edit-model alt")
+
+        self.assertTrue(handled)
+        self.assertEqual(app.cfg["model_profiles"][0]["name"], "Alt Edited")
+        self.assertEqual(app.cfg["model_profiles"][0]["llama_model"], "/models/alt-v2.gguf")
+        self.assertEqual(app.cfg["model_profiles"][0]["context_window_tokens"], 8192)
+        self.assertEqual(app.cfg["model_profiles"][0]["gpu_layers"], 70)
+        save_cfg.assert_called_once()
 
 
 class AppQuitTests(unittest.TestCase):

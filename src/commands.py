@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .config import save_config
+from .model_profiles import get_model_profile, list_model_profiles, replace_model_profile
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
+from .runtime_registry import runtime_spec
+from .setup import _prompt_text
 
 if TYPE_CHECKING:
     from .app import OpenJetApp
@@ -41,6 +45,8 @@ class SlashCommandHandler:
         CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
+        CommandSpec(name="model", description="Show or switch saved model presets: /model [status|list|<name>]"),
+        CommandSpec(name="edit-model", description="Edit a saved model preset: /edit-model [name]"),
         CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
         CommandSpec(name="skills", description="Show or clear selected harness skills: /skills [status|list|clear]"),
         CommandSpec(name="skill", description="Pin one or more harness skills: /skill <name[,name...]>"),
@@ -109,6 +115,12 @@ class SlashCommandHandler:
             return True
         if cmd == "setup":
             await self._setup(log)
+            return True
+        if cmd == "model":
+            await self._model(log, arg)
+            return True
+        if cmd == "edit-model":
+            await self._edit_model(log, arg)
             return True
         if cmd == "mode":
             self._mode(log, arg)
@@ -340,6 +352,120 @@ class SlashCommandHandler:
             log.write("")
             return
         log.write(f"[bold bright_white]{result}[/]")
+        log.write("")
+
+    async def _model(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip()
+        profiles = self.app.model_profiles()
+        active = str(self.app.cfg.get("active_model_profile") or "").strip()
+
+        if not arg or arg.lower() in {"status", "list"}:
+            if not profiles:
+                log.write("[yellow]No saved model presets yet. Run /setup to add one.[/]")
+                log.write("")
+                return
+            log.write(f"[bold bright_white]Active model preset: {active or 'none'}[/]")
+            for profile in profiles:
+                marker = " (active)" if profile["name"] == active else ""
+                model_ref = str(profile.get("ollama_model") or profile.get("model") or profile.get("llama_model") or "")
+                log.write(
+                    "[bold bright_white]"
+                    f"- {profile['name']}{marker}: runtime={profile.get('runtime', 'llama_cpp')} "
+                    f"context={profile.get('context_window_tokens', 'n/a')} gpu={profile.get('gpu_layers', 'n/a')} "
+                    f"model={model_ref or 'n/a'}"
+                    "[/]"
+                )
+            log.write("")
+            return
+
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot switch models while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+        if not await self.app.activate_model_profile(arg, log):
+            log.write(f"[yellow]Unknown model preset:[/] {arg}")
+            log.write("")
+
+    async def _edit_model(self, log: Any, raw_arg: str) -> None:
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot edit model presets while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+
+        target_name = raw_arg.strip() or str(self.app.cfg.get("active_model_profile") or "").strip()
+        if not target_name:
+            profiles = list_model_profiles(self.app.cfg)
+            if len(profiles) == 1:
+                target_name = profiles[0]["name"]
+            else:
+                log.write("[yellow]Usage:[/] /edit-model [name]")
+                log.write("")
+                return
+
+        profile = get_model_profile(self.app.cfg, target_name)
+        if not profile:
+            log.write(f"[yellow]Unknown model preset:[/] {target_name}")
+            log.write("")
+            return
+
+        runtime = str(profile.get("runtime", "llama_cpp"))
+        model_source = str(profile.get("model_source", "local"))
+        model_key = "ollama_model" if model_source == "ollama" else runtime_spec(runtime).model_config_key
+        model_prompt = "ollama model> " if model_source == "ollama" else "model ref> "
+
+        name_value = await _prompt_text(self.app._session, "model name> ", default=str(profile["name"]))
+        model_value = await _prompt_text(self.app._session, model_prompt, default=str(profile.get(model_key) or profile.get("model") or ""))
+        context_value = await _prompt_text(
+            self.app._session,
+            "context window> ",
+            default=str(profile.get("context_window_tokens", 4096)),
+        )
+        gpu_value = str(profile.get("gpu_layers", 0))
+        if runtime == "llama_cpp":
+            gpu_value = await _prompt_text(self.app._session, "gpu layers> ", default=gpu_value)
+
+        try:
+            context_tokens = int(context_value.strip())
+            gpu_layers = int(gpu_value.strip())
+        except ValueError:
+            log.write("[yellow]Context window and GPU layers must be integers.[/]")
+            log.write("")
+            return
+
+        updated = dict(profile)
+        updated["name"] = name_value.strip() or profile["name"]
+        updated["context_window_tokens"] = context_tokens
+        updated["gpu_layers"] = gpu_layers if runtime == "llama_cpp" else 0
+        updated[model_key] = model_value.strip()
+        if model_source != "ollama":
+            updated["model"] = model_value.strip()
+        else:
+            updated["recommended_llm"] = model_value.strip()
+            updated["model"] = str(profile.get("model") or "").strip()
+
+        try:
+            stored = replace_model_profile(self.app.cfg, updated, previous_name=profile["name"])
+        except ValueError as exc:
+            log.write(f"[yellow]{exc}[/]")
+            log.write("")
+            return
+
+        active = str(self.app.cfg.get("active_model_profile") or "").strip()
+        if active.lower() == str(profile["name"]).strip().lower():
+            save_config(self.app.cfg)
+            await self.app.activate_model_profile(stored["name"], log)
+            return
+
+        save_config(self.app.cfg)
+        log.write(f"[bold bright_white]Model preset '{stored['name']}' updated.[/]")
         log.write("")
 
     async def _resume(self, log: Any) -> None:

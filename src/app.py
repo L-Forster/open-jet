@@ -66,6 +66,12 @@ from .multimodal import (
     is_image_path,
     is_supported_message_content,
 )
+from .model_profiles import (
+    apply_model_profile,
+    get_model_profile,
+    list_model_profiles,
+    sync_active_model_profile,
+)
 from .ollama_setup import discover_installed_ollama_models, materialize_setup_model
 from .persistent_memory import build_system_prompt
 from .runtime_client import RuntimeClient
@@ -655,6 +661,7 @@ class OpenJetApp:
         if self.client.context_window_tokens != configured_ctx or self.client.gpu_layers != configured_gpu_layers:
             self.cfg["context_window_tokens"] = self.client.context_window_tokens
             self.cfg["gpu_layers"] = self.client.gpu_layers
+            sync_active_model_profile(self.cfg)
             save_config(self.cfg)
         self.agent = Agent(
             client=self.client,
@@ -693,8 +700,76 @@ class OpenJetApp:
         )
 
     def _persist_setup_result(self, setup_result: dict[str, Any]) -> None:
-        self.cfg.update(setup_result)
+        payload = dict(setup_result)
+        profile_name = str(payload.pop("model_profile_name", "")).strip() or None
+        self.cfg.update(payload)
+        sync_active_model_profile(self.cfg, preferred_name=profile_name)
         save_config(self.cfg)
+
+    def model_profiles(self) -> list[dict[str, Any]]:
+        return list_model_profiles(self.cfg)
+
+    async def activate_model_profile(self, profile_name: str, log: LogView) -> bool:
+        selected = get_model_profile(self.cfg, profile_name)
+        if not selected:
+            return False
+
+        previous_cfg = dict(self.cfg)
+        if self.agent:
+            self.persist_session_state(reason="model_switch_start")
+        if self.client:
+            try:
+                await self.client.close()
+            except Exception as exc:
+                log.write(f"[yellow]Runtime stop warning:[/] {exc}")
+        self.client = None
+        self.agent = None
+        self.loaded_files.clear()
+        self._render_token_counter()
+
+        apply_model_profile(self.cfg, selected)
+        save_config(self.cfg)
+        try:
+            resolved = await self._materialize_setup_model(dict(self.cfg), log)
+            self._persist_setup_result({**resolved, "model_profile_name": selected["name"]})
+        except Exception as exc:
+            self.cfg = previous_cfg
+            save_config(self.cfg)
+            try:
+                await self._init_client()
+            except Exception:
+                pass
+            log.write(f"[bold red]Model switch failed:[/] {_format_error(exc)}")
+            log.write("")
+            return False
+
+        model_name = Path(self._active_model_ref()).name or self._active_model_ref() or "model"
+        log.write(f"  [bold bright_white]Loading {escape(model_name)}...[/]")
+        status = self.query_one("#assistant-status")
+        status.update(f"[bold {ACCENT_GREEN}]loading {escape(model_name)}...[/]")
+        status.remove_class("hidden")
+        try:
+            await self._init_client()
+        except Exception as exc:
+            status.update("")
+            status.add_class("hidden")
+            self.cfg = previous_cfg
+            save_config(self.cfg)
+            try:
+                await self._init_client()
+            except Exception:
+                pass
+            log.write(f"[bold red]Model switch failed:[/] {_format_error(exc)}")
+            log.write("")
+            return False
+        status.update("")
+        status.add_class("hidden")
+        self.loaded_files.clear()
+        self.persist_session_state(reason="model_switch")
+        self._render_token_counter()
+        log.write("[bold bright_white]Model switched. Runtime restarted and context reset.[/]")
+        log.write("")
+        return True
 
     async def run_setup_command(self, log: LogView) -> bool:
         previous_cfg = dict(self.cfg)
