@@ -692,6 +692,10 @@ class OpenJetApp:
             current_cfg=self.cfg,
         )
 
+    def _persist_setup_result(self, setup_result: dict[str, Any]) -> None:
+        self.cfg.update(setup_result)
+        save_config(self.cfg)
+
     async def run_setup_command(self, log: LogView) -> bool:
         previous_cfg = dict(self.cfg)
         had_runtime = bool(self.client or self.agent)
@@ -727,6 +731,8 @@ class OpenJetApp:
             self._render_token_counter()
             return False
 
+        self._persist_setup_result(result)
+
         try:
             resolved_result = await self._materialize_setup_model(result, log)
         except Exception as exc:
@@ -736,8 +742,7 @@ class OpenJetApp:
             log.write("")
             return False
 
-        self.cfg.update(resolved_result)
-        save_config(self.cfg)
+        self._persist_setup_result(resolved_result)
         model_name = Path(self._active_model_ref()).name or self._active_model_ref() or "model"
         log.write(f"  [bold bright_white]Applying setup and loading {escape(model_name)}...[/]")
         status = self.query_one("#assistant-status")
@@ -798,6 +803,7 @@ class OpenJetApp:
             except (EOFError, KeyboardInterrupt):
                 setup_result = None
             if isinstance(setup_result, dict):
+                self._persist_setup_result(setup_result)
                 try:
                     setup_result = await self._materialize_setup_model(setup_result, log)
                 except Exception as exc:
@@ -807,8 +813,7 @@ class OpenJetApp:
                     log.write("")
                     self._quit_requested = True
                     return
-                self.cfg.update(setup_result)
-                save_config(self.cfg)
+                self._persist_setup_result(setup_result)
             elif not self._has_any_configured_model():
                 self._quit_requested = True
                 return

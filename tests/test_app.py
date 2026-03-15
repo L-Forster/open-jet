@@ -212,6 +212,51 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn((f"{Path(saved_model).name} (saved)", saved_model), captured_options)
 
 
+class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_setup_command_saves_config_before_materializing_model(self) -> None:
+        app = OpenJetApp()
+        app.cfg["logging"] = {"enabled": False}
+        events: list[str] = []
+
+        with patch.object(app, "_run_setup_wizard", AsyncMock(return_value={"model": "/models/base.gguf"})), patch(
+            "src.app.save_config", side_effect=lambda _cfg: events.append("save")
+        ), patch.object(
+            app,
+            "_materialize_setup_model",
+            AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "model": "/models/resolved.gguf"}),
+        ), patch.object(app, "_init_client", AsyncMock(side_effect=lambda: events.append("init"))), patch.object(
+            app, "_render_token_counter"
+        ), patch.object(
+            app, "persist_session_state"
+        ):
+            applied = await app.run_setup_command(app.query_one("#chat-log"))
+
+        self.assertTrue(applied)
+        self.assertEqual(events[:3], ["save", "materialize", "save"])
+        self.assertEqual(events[3], "init")
+
+    async def test_startup_force_setup_saves_config_before_materializing_model(self) -> None:
+        app = OpenJetApp(force_setup=True)
+        app.cfg["logging"] = {"enabled": False}
+        events: list[str] = []
+
+        with patch.object(app, "_run_setup_wizard", AsyncMock(return_value={"model": "/models/base.gguf"})), patch(
+            "src.app.save_config", side_effect=lambda _cfg: events.append("save")
+        ), patch.object(
+            app,
+            "_materialize_setup_model",
+            AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "model": "/models/resolved.gguf"}),
+        ), patch.object(app, "_init_client", AsyncMock(side_effect=lambda: events.append("init"))), patch.object(
+            app, "_render_token_counter"
+        ), patch.object(
+            app, "_restore_harness_state"
+        ):
+            await app._startup_sequence()
+
+        self.assertEqual(events[:3], ["save", "materialize", "save"])
+        self.assertEqual(events[3], "init")
+
+
 class AppQuitTests(unittest.TestCase):
     def test_request_terminal_exit_exits_active_prompt_app(self) -> None:
         app = OpenJetApp()
