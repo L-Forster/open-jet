@@ -17,6 +17,7 @@ session_state.json
 .openjet/memories/
 AGENTS.md
 claude.md
+config.yaml
 
 # Local tooling/cache artifacts
 .pytest_cache/

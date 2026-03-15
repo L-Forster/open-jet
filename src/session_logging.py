@@ -88,6 +88,19 @@ def _safe_model_name(model: str | None) -> str | None:
     return Path(str(model)).name or str(model)
 
 
+def _normalize_slug(value: str | None, *, default: str = "unknown") -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return default
+    cleaned = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return cleaned or default
+
+
+def _coerce_optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
 def _signal_endpoint(base_endpoint: str, signal: str) -> str:
     return f"{base_endpoint.rstrip('/')}/v1/{signal}"
 
@@ -904,13 +917,27 @@ class SessionLogger:
         return attrs
 
     def _sanitize_runtime_context(self, data: Mapping[str, Any]) -> dict[str, Any]:
+        model_name = _safe_model_name(_coerce_optional_text(data.get("model"))) or "unknown"
+        model_id = _normalize_slug(_coerce_optional_text(data.get("model_id")) or model_name)
+        model_variant = _normalize_slug(_coerce_optional_text(data.get("model_variant")), default="unknown")
+        use_case_tag = _normalize_slug(_coerce_optional_text(data.get("use_case_tag")), default="unknown")
         return {
+            "openjet.app.version": self._service_version,
             "openjet.runtime": data.get("runtime", "unknown"),
-            "openjet.model.name": _safe_model_name(str(data.get("model") or "")) or "unknown",
+            "openjet.backend": data.get("backend", "unknown"),
+            "openjet.model.name": model_name,
+            "openjet.model.id": model_id,
+            "openjet.model.variant": model_variant,
+            "openjet.hardware.class": data.get("hardware_class", "unknown"),
+            "openjet.hardware.family": data.get("hardware_family", "unknown"),
+            "openjet.hardware.accelerator": data.get("accelerator", data.get("device_profile", "auto")),
             "openjet.device_profile": data.get("device_profile", "auto"),
+            "openjet.os.type": data.get("os_type", "unknown"),
             "openjet.context_window_tokens": int(data.get("context_window_tokens", 0) or 0),
             "openjet.gpu_layers": int(data.get("gpu_layers", 0) or 0),
+            "openjet.system.memory.total_mb": round(float(data.get("system_memory_total_mb", 0.0) or 0.0), 2),
             "openjet.host_arch": data.get("host_arch") or "unknown",
+            "openjet.use_case_tag": use_case_tag,
         }
 
     def _sanitize_generic_event(self, event_type: str, data: Mapping[str, Any]) -> dict[str, Any]:

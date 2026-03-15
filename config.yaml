@@ -1,3 +1,4 @@
+airgapped: true
 context_window_tokens: 4096
 device: cuda
 gpu_layers: 99
@@ -12,7 +13,7 @@ layered_context:
   layer2_ratio: 0.2
   layer3_enabled: true
   layer3_ratio: 0.1
-llama_model: null
+llama_model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
 logging:
   directory: session_logs
   enabled: true
@@ -26,7 +27,7 @@ memory_guard:
   keep_last_messages: 6
   max_used_percent: null
   min_available_mb: null
-model: null
+model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
 model_source: local
 ollama_model: null
 recommended_llm: null
@@ -39,16 +40,6 @@ state:
   auto_resume: false
   enabled: true
   path: session_state.json
-telemetry:
-  broadcast:
-    enabled: false
-    endpoint: ''
-    export_logs: true
-    export_metrics: true
-    export_traces: true
-    headers: {}
-    timeout_seconds: 3.0
-  install_id_path: .openjet/state/telemetry_identity.json
 system_prompt: 'AI assistant on a Jetson edge device with filesystem access.
 
   Tools: shell, read_file, write_file, edit_file, glob, grep, list_directory, load_file.
@@ -66,6 +57,17 @@ system_prompt: 'AI assistant on a Jetson edge device with filesystem access.
   Act directly with tools. Be concise. Never chain destructive commands.
 
   '
+telemetry:
+  broadcast:
+    enabled: false
+    endpoint: ''
+    export_logs: true
+    export_metrics: true
+    export_traces: true
+    headers: {}
+    timeout_seconds: 3.0
+  install_id_path: .openjet/state/telemetry_identity.json
+  use_case_tag: ''
 trtllm_backend: pytorch
 trtllm_model: null
 trtllm_trust_remote_code: true

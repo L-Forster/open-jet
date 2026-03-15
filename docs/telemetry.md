@@ -9,11 +9,12 @@ Telemetry is intentionally narrow:
 - anonymous install id
 - session id and turn id
 - timestamps
-- runtime name, device profile, context window, and safe model name
+- runtime name, backend, device class/family, accelerator, memory size, context window, and safe model identifiers
 - TTFT and turn/tool durations
 - tool names, approval decisions, and high-level shell command classification
 - error type, redacted error summary, and error hash
 - CPU, memory, load average, and process RSS metrics
+- optional `use_case_tag` if you set one yourself
 
 It does not send:
 
@@ -36,6 +37,7 @@ logging:
 
 telemetry:
   install_id_path: .openjet/state/telemetry_identity.json
+  use_case_tag: robotics
   broadcast:
     enabled: false
     endpoint: https://your-collector.example.com
@@ -50,6 +52,23 @@ telemetry:
 `telemetry.broadcast.endpoint` is the collector base URL. `open-jet` appends `/v1/logs`, `/v1/metrics`, and `/v1/traces`.
 
 `logging.directory` now stores session manifests only. Telemetry signal storage belongs to the collector and its configured exporters.
+
+Useful emitted attributes now include:
+
+- `openjet.backend`
+- `openjet.runtime`
+- `openjet.model.name`
+- `openjet.model.id`
+- `openjet.model.variant`
+- `openjet.hardware.class`
+- `openjet.hardware.family`
+- `openjet.hardware.accelerator`
+- `openjet.os.type`
+- `openjet.host_arch`
+- `openjet.system.memory.total_mb`
+- `openjet.context_window_tokens`
+- `openjet.gpu_layers`
+- `openjet.use_case_tag`
 
 ## Recommended server path
 

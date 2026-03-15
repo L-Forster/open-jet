@@ -53,6 +53,7 @@ from .harness import (
 from .harness_debug import write_debug_context_snapshot, write_debug_runtime_messages
 from .hardware import (
     detect_hardware_info,
+    effective_hardware_info,
     recommended_context_window_tokens,
     recommended_device,
     recommended_gpu_layers,
@@ -84,6 +85,68 @@ def _format_error(exc: Exception) -> str:
 
 def _plain_markup(text: str) -> str:
     return re.sub(r"\[[^\]]*\]", "", text)
+
+
+def _normalize_telemetry_slug(value: str | None, *, default: str = "unknown") -> str:
+    text = (value or "").strip().lower()
+    if not text:
+        return default
+    cleaned = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return cleaned or default
+
+
+def _telemetry_backend(cfg: dict[str, Any]) -> str:
+    model_source = str(cfg.get("model_source", "") or "").strip().lower()
+    runtime = str(cfg.get("runtime", "llama_cpp") or "").strip().lower()
+    if model_source:
+        return _normalize_telemetry_slug(model_source)
+    if runtime == "openai_compatible":
+        return "openai_compatible"
+    if runtime == "openrouter":
+        return "openrouter"
+    return _normalize_telemetry_slug(runtime)
+
+
+def _telemetry_model_fields(model_ref: str) -> tuple[str, str]:
+    model_name = Path(model_ref).name or model_ref or "unknown"
+    base = re.sub(r"\.(gguf|bin|safetensors)$", "", model_name, flags=re.IGNORECASE)
+    parts = [part for part in re.split(r"[-_]+", base) if part]
+    variant_tokens: list[str] = []
+    id_tokens: list[str] = []
+    variant_started = False
+    for part in parts:
+        lower = part.lower()
+        if variant_started or re.fullmatch(r"(q\d.*|awq|gptq|fp\d+|bf16|int\d+)", lower):
+            variant_started = True
+            variant_tokens.append(lower)
+        else:
+            id_tokens.append(lower)
+    model_id = _normalize_telemetry_slug("-".join(id_tokens) or base)
+    model_variant = _normalize_telemetry_slug("-".join(variant_tokens), default="unknown")
+    return model_id, model_variant
+
+
+def _telemetry_hardware_fields(cfg: dict[str, Any]) -> dict[str, object]:
+    detected = detect_hardware_info()
+    hardware = effective_hardware_info(
+        str(cfg.get("hardware_profile", "auto")),
+        detected,
+        str(cfg.get("hardware_override", "")).strip() or None,
+    )
+    label = hardware.label.strip() or "unknown"
+    lowered = label.lower()
+    if "jetson" in lowered:
+        family = "jetson"
+    elif hardware.has_cuda:
+        family = "cuda"
+    else:
+        family = "cpu"
+    return {
+        "hardware_class": _normalize_telemetry_slug(label),
+        "hardware_family": family,
+        "accelerator": "cuda" if hardware.has_cuda else "cpu",
+        "system_memory_total_mb": round(hardware.total_ram_gb * 1024.0, 2),
+    }
 
 
 _SHELL_BUILTINS = {
@@ -436,14 +499,21 @@ class OpenJetApp:
         )
 
     def _trace_runtime_context(self) -> dict[str, object]:
+        model_ref = self._active_model_ref()
+        model_id, model_variant = _telemetry_model_fields(model_ref)
         return {
             "runtime": self.cfg.get("runtime", "llama_cpp"),
-            "model": self._active_model_ref(),
-            "airgapped": self.is_airgapped(),
+            "backend": _telemetry_backend(self.cfg),
+            "model": model_ref,
+            "model_id": model_id,
+            "model_variant": model_variant,
             "device_profile": self.cfg.get("device", "auto"),
+            "os_type": os.uname().sysname.lower() if hasattr(os, "uname") else os.name,
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
             "gpu_layers": self.cfg.get("gpu_layers", 0),
             "host_arch": os.uname().machine if hasattr(os, "uname") else None,
+            "use_case_tag": self.cfg.get("telemetry", {}).get("use_case_tag"),
+            **_telemetry_hardware_fields(self.cfg),
         }
 
     def _log_trace_event(self, event_type: str, **data: object) -> None:
@@ -619,6 +689,7 @@ class OpenJetApp:
             console=self.console,
             hardware_info=detect_hardware_info(),
             recommended_ctx=recommended_context_window_tokens(),
+            current_cfg=self.cfg,
         )
 
     async def run_setup_command(self, log: LogView) -> bool:

@@ -89,6 +89,41 @@ class SessionLoggerTests(unittest.TestCase):
             self.assertEqual(payload["openjet.command_char_count"], len("cat /home/louis/private.txt"))
             self.assertEqual(payload["openjet.cwd_name"], "repo")
 
+    def test_runtime_context_includes_explicit_device_and_model_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = SessionLogger(base_dir=Path(tmp), label="trace-test")
+
+            attrs = logger._sanitize_runtime_context(
+                {
+                    "runtime": "llama_cpp",
+                    "backend": "ollama",
+                    "model": "/models/Qwen3.5-4B-Q4_K_M.gguf",
+                    "model_id": "qwen3.5-4b",
+                    "model_variant": "q4_k_m",
+                    "hardware_class": "jetson_orin_nano_8gb",
+                    "hardware_family": "jetson",
+                    "accelerator": "cuda",
+                    "device_profile": "cuda",
+                    "os_type": "linux",
+                    "context_window_tokens": 4096,
+                    "gpu_layers": 99,
+                    "system_memory_total_mb": 7620.5,
+                    "host_arch": "aarch64",
+                    "use_case_tag": "robotics",
+                }
+            )
+
+            self.assertEqual(attrs["openjet.backend"], "ollama")
+            self.assertEqual(attrs["openjet.model.name"], "Qwen3.5-4B-Q4_K_M.gguf")
+            self.assertEqual(attrs["openjet.model.id"], "qwen3_5_4b")
+            self.assertEqual(attrs["openjet.model.variant"], "q4_k_m")
+            self.assertEqual(attrs["openjet.hardware.class"], "jetson_orin_nano_8gb")
+            self.assertEqual(attrs["openjet.hardware.family"], "jetson")
+            self.assertEqual(attrs["openjet.hardware.accelerator"], "cuda")
+            self.assertEqual(attrs["openjet.os.type"], "linux")
+            self.assertEqual(attrs["openjet.system.memory.total_mb"], 7620.5)
+            self.assertEqual(attrs["openjet.use_case_tag"], "robotics")
+
 
 class ShellCommandClassificationTests(unittest.TestCase):
     def test_classifies_tool_like_shell_as_false_positive(self) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 from rich.console import Console
 from rich.markup import escape
@@ -21,7 +21,7 @@ from .hardware import (
     recommended_param_budget_b,
 )
 from .ollama_setup import discover_installed_ollama_models, find_ollama_cli
-from .runtime_registry import runtime_options
+from .runtime_registry import runtime_options, runtime_spec
 
 if TYPE_CHECKING:
     from prompt_toolkit import PromptSession
@@ -95,6 +95,53 @@ def gpu_layer_options(device: str, recommended: int) -> list[int]:
     return sorted(set(base))
 
 
+def _dedupe_refs(refs: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for ref in refs:
+        value = str(ref).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _saved_model_refs(current_cfg: Mapping[str, object] | None, runtime: str) -> list[str]:
+    if not isinstance(current_cfg, Mapping):
+        return []
+    refs: list[str] = []
+    history = current_cfg.get("setup_model_history")
+    if isinstance(history, dict):
+        saved = history.get(runtime)
+        if isinstance(saved, list):
+            refs.extend(str(item).strip() for item in saved)
+    model_key = runtime_spec(runtime).model_config_key
+    active_ref = str(current_cfg.get(model_key) or "").strip()
+    if active_ref:
+        refs.insert(0, active_ref)
+    return _dedupe_refs(refs)
+
+
+def _remember_model_ref(
+    payload: dict[str, object],
+    current_cfg: Mapping[str, object] | None,
+    runtime: str,
+    model_ref: str,
+) -> None:
+    ref = str(model_ref).strip()
+    if not ref:
+        return
+    history_payload: dict[str, list[str]] = {}
+    existing = current_cfg.get("setup_model_history") if isinstance(current_cfg, Mapping) else None
+    if isinstance(existing, dict):
+        for key, value in existing.items():
+            if isinstance(value, list):
+                history_payload[str(key)] = _dedupe_refs([str(item) for item in value])
+    history_payload[runtime] = _dedupe_refs([ref, *history_payload.get(runtime, [])])
+    payload["setup_model_history"] = history_payload
+
+
 async def _prompt_text(
     session: PromptSession[object] | None,
     prompt: str,
@@ -142,6 +189,7 @@ async def run_setup_wizard(
     console: Console,
     hardware_info: HardwareInfo,
     recommended_ctx: int,
+    current_cfg: Mapping[str, object] | None = None,
 ) -> dict | None:
     ram_text = f"{hardware_info.total_ram_gb:.1f} GB RAM" if hardware_info.total_ram_gb > 0 else "RAM unknown"
     console.print(f"[bold {ACCENT_GREEN}]open-jet setup[/]")
@@ -189,6 +237,7 @@ async def run_setup_wizard(
 
     if runtime == "llama_cpp":
         model_files = discover_model_files()
+        saved_model_files = _saved_model_refs(current_cfg, runtime)
         ollama_cli = find_ollama_cli()
         installed_ollama = discover_installed_ollama_models() if ollama_cli else []
         max_b = recommended_param_budget_b(str(hardware), hardware_info, hardware_override)
@@ -223,6 +272,11 @@ async def run_setup_wizard(
             )
         if model_plan == "__local__":
             local_rows = [(Path(model).name, model) for model in model_files]
+            local_rows.extend(
+                (f"{Path(model).name} (saved)", model)
+                for model in saved_model_files
+                if model not in model_files
+            )
             local_rows.append(("Manual path", "__manual__"))
             local_choice = await _prompt_choice(
                 session,
@@ -243,6 +297,7 @@ async def run_setup_wizard(
             payload["model_source"] = "local"
             payload["model"] = str(model_file)
             payload["llama_model"] = str(model_file)
+            _remember_model_ref(payload, current_cfg, runtime, str(model_file))
         else:
             if not ollama_cli:
                 raise RuntimeError("Ollama CLI not found.")
@@ -252,7 +307,14 @@ async def run_setup_wizard(
             payload["recommended_llm"] = model_plan
             payload["ollama_model"] = model_plan
     elif runtime == "sglang":
-        rows = [(Path(model).name, model) for model in discover_sglang_model_dirs()]
+        discovered = discover_sglang_model_dirs()
+        saved_refs = _saved_model_refs(current_cfg, runtime)
+        rows = [(Path(model).name, model) for model in discovered]
+        rows.extend(
+            (f"{Path(model).name or model} (saved)", model)
+            for model in saved_refs
+            if model not in discovered
+        )
         rows.append(("Manual path or HF model id", "__manual__"))
         choice = await _prompt_choice(session, console, "SGLang model", rows)
         model_ref = await _prompt_text(session, "sglang model> ") if choice == "__manual__" else str(choice)
@@ -263,8 +325,16 @@ async def run_setup_wizard(
         payload["sglang_model"] = model_ref
         payload["sglang_launch_mode"] = "jetson_container" if jetson_target else "managed"
         payload["sglang_served_model_name"] = "local"
+        _remember_model_ref(payload, current_cfg, runtime, model_ref)
     else:
-        rows = [(Path(model).name, model) for model in discover_trt_model_dirs()]
+        discovered = discover_trt_model_dirs()
+        saved_refs = _saved_model_refs(current_cfg, runtime)
+        rows = [(Path(model).name, model) for model in discovered]
+        rows.extend(
+            (f"{Path(model).name or model} (saved)", model)
+            for model in saved_refs
+            if model not in discovered
+        )
         rows.append(("Manual path or HF model id", "__manual__"))
         choice = await _prompt_choice(session, console, "TensorRT model", rows)
         model_ref = await _prompt_text(session, "trt model> ") if choice == "__manual__" else str(choice)
@@ -273,6 +343,7 @@ async def run_setup_wizard(
         payload["model_source"] = "local"
         payload["model"] = model_ref
         payload["trtllm_model"] = model_ref
+        _remember_model_ref(payload, current_cfg, runtime, model_ref)
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     if hardware == "auto":

@@ -3,19 +3,24 @@ from __future__ import annotations
 import asyncio
 import os
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+from rich.console import Console
+
 from src.agent import Agent
 from src.app import OpenJetApp
+from src.hardware import HardwareInfo
 from src.llama_server import (
     LlamaServerClient,
     _JETSON_VMM_CHUNK_MB,
     _JETSON_VMM_RESERVE_MB,
 )
 from src.runtime_protocol import StreamChunk
+from src.setup import run_setup_wizard
 
 
 class FakeAgent:
@@ -42,6 +47,10 @@ class FakeRuntimeClient:
     async def chat_stream(self, messages, *, use_tools=True):
         yield StreamChunk(text="hello")
         yield StreamChunk(done=True)
+
+
+class StopSetupWizard(Exception):
+    pass
 
 
 class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
@@ -132,6 +141,74 @@ class AppStatusTests(unittest.TestCase):
             snapshot = app.runtime_status_snapshot()
 
         self.assertEqual(snapshot["reasoning_mode"], "on")
+
+
+class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_setup_wizard_persists_manual_llama_model_path_in_history(self) -> None:
+        console = Mock()
+        hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
+        manual_model = "/models/custom.gguf"
+
+        choices = iter(["auto", "llama_cpp", "__local__", "__manual__", 4096, 99])
+
+        async def fake_choice(*_args, **_kwargs):
+            return next(choices)
+
+        async def fake_text(*_args, **_kwargs):
+            return manual_model
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.find_ollama_cli", return_value=None
+        ), patch("src.setup.recommended_context_window_tokens", return_value=4096), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=4096
+        ), patch("src.setup.recommended_gpu_layers", return_value=99), patch(
+            "pathlib.Path.is_file", return_value=True
+        ):
+            payload = await run_setup_wizard(
+                session=None,
+                console=console,
+                hardware_info=hardware,
+                recommended_ctx=4096,
+                current_cfg={},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["llama_model"], manual_model)
+        self.assertEqual(payload["setup_model_history"], {"llama_cpp": [manual_model]})
+
+    async def test_run_setup_wizard_lists_saved_llama_model_path_on_next_run(self) -> None:
+        console = Console(file=io.StringIO(), force_terminal=False, color_system=None)
+        hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
+        saved_model = "/models/custom.gguf"
+        captured_options: list[tuple[str, object]] = []
+
+        async def fake_choice(_session, _console, title, options, **_kwargs):
+            if title == "Hardware profile":
+                return "auto"
+            if title == "Runtime":
+                return "llama_cpp"
+            if title == "Model source":
+                return "__local__"
+            if title == "Local model":
+                captured_options.extend(options)
+                raise StopSetupWizard()
+            raise AssertionError(f"Unexpected setup prompt: {title}")
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup.discover_model_files", return_value=[]
+        ), patch("src.setup.find_ollama_cli", return_value=None):
+            with self.assertRaises(StopSetupWizard):
+                await run_setup_wizard(
+                    session=None,
+                    console=console,
+                    hardware_info=hardware,
+                    recommended_ctx=4096,
+                    current_cfg={"setup_model_history": {"llama_cpp": [saved_model]}},
+                )
+
+        self.assertIn((f"{Path(saved_model).name} (saved)", saved_model), captured_options)
 
 
 class AppQuitTests(unittest.TestCase):
