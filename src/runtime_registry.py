@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from typing import Any, Callable
 
 from .airgap import AirgapViolationError, airgapped_from_cfg, assert_endpoint_allowed
 from .llama_server import LlamaServerClient
@@ -81,7 +82,11 @@ def active_model_ref(cfg: dict) -> str:
     return str(cfg.get(spec.model_config_key) or cfg.get("model") or "").strip()
 
 
-def create_runtime_client(cfg: dict) -> RuntimeClient:
+def create_runtime_client(
+    cfg: dict,
+    *,
+    diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
+) -> RuntimeClient:
     runtime = normalize_runtime(str(cfg.get("runtime", DEFAULT_RUNTIME)))
     context_window_tokens = int(cfg.get("context_window_tokens", 2048))
     airgapped = airgapped_from_cfg(cfg)
@@ -185,6 +190,7 @@ def create_runtime_client(cfg: dict) -> RuntimeClient:
         device=str(cfg.get("device", "auto")),
         gpu_layers=int(cfg.get("gpu_layers", 99)),
         airgapped=airgapped,
+        diagnostics_hook=diagnostics_hook,
     )
 
 

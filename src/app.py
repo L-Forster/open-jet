@@ -656,7 +656,7 @@ class OpenJetApp:
         mem_cfg = self.cfg.get("memory_guard", {})
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
         configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
-        self.client = create_runtime_client(self.cfg)
+        self.client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
         if self.client.gpu_layers == 0:
             configured_gpu_layers = 0
         await self.client.start()
@@ -678,6 +678,10 @@ class OpenJetApp:
             keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
             trace_hook=self._agent_trace,
         )
+
+    def _runtime_diagnostic(self, event_type: str, data: dict[str, object]) -> None:
+        if self.session_logger:
+            self.session_logger.log_event(event_type, **data)
 
     async def _materialize_setup_model(self, setup_result: dict, log: LogView) -> dict:
         status = self.query_one("#assistant-status")

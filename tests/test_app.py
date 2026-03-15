@@ -472,6 +472,90 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepare.await_count, 1)
         self.assertEqual(cleanup.await_count, 1)
 
+    async def test_start_emits_startup_diagnostics(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+        client = LlamaServerClient(
+            model="model.gguf",
+            device="cuda",
+            gpu_layers=99,
+            context_window_tokens=4096,
+            diagnostics_hook=lambda event_type, data: events.append((event_type, data)),
+        )
+        start_once = AsyncMock()
+
+        with patch.object(client, "_stop_server", AsyncMock()), patch.object(
+            client, "_cleanup_stale_inference_processes", AsyncMock()
+        ), patch.object(client, "_prepare_memory_for_launch", AsyncMock(return_value=4.0)), patch.object(
+            client, "_start_once", start_once
+        ), patch.object(
+            client, "_ensure_jetson_clocks_sudoers", return_value=None
+        ), patch.object(
+            client, "_maximize_gpu_clocks", return_value=None
+        ), patch.object(
+            client, "_is_jetson_platform", return_value=True
+        ), patch.object(
+            client, "_memory_snapshot", return_value={"memavailable_mb": 8192.0, "largest_free_block_mb": 32.0}
+        ), patch(
+            "src.llama_server._find_llama_server", return_value="/usr/bin/llama-server"
+        ):
+            await client.start()
+
+        self.assertTrue(any(name == "runtime_llama_starting" for name, _ in events))
+        starting = next(data for name, data in events if name == "runtime_llama_starting")
+        self.assertEqual(starting["requested_ctx"], 4096)
+        self.assertEqual(starting["requested_ngl"], 99)
+        self.assertEqual(starting["memavailable_mb"], 8192.0)
+
+    async def test_start_once_emits_failure_diagnostics_with_stderr_tail(self) -> None:
+        events: list[tuple[str, dict[str, object]]] = []
+        client = LlamaServerClient(
+            model="model.gguf",
+            diagnostics_hook=lambda event_type, data: events.append((event_type, data)),
+        )
+
+        class _FakeStream:
+            def __init__(self, lines: list[bytes]) -> None:
+                self._lines = list(lines)
+
+            async def readline(self) -> bytes:
+                if self._lines:
+                    return self._lines.pop(0)
+                return b""
+
+        proc = SimpleNamespace(
+            returncode=1,
+            pid=4321,
+            stderr=_FakeStream(
+                [
+                    b"load_tensors: offloaded 33/33 layers to GPU\n",
+                    b"NvMapMemAllocInternalTagged: 1075072515 error 12\n",
+                    b"CUDA error: out of memory\n",
+                ]
+            ),
+        )
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)), patch.object(
+            client, "_memory_snapshot", return_value={"memavailable_mb": 7424.0, "largest_free_block_mb": 16.0}
+        ):
+            with self.assertRaises(RuntimeError):
+                await client._start_once(
+                    binary="/usr/bin/llama-server",
+                    env={"GGML_CUDA_ENABLE_UNIFIED_MEMORY": "1"},
+                    ngl=99,
+                    ctx=6144,
+                    batch=128,
+                    ubatch=32,
+                    fit_off=True,
+                    no_warmup=False,
+                )
+
+        self.assertTrue(any(name == "runtime_llama_start_failed" for name, _ in events))
+        failure = next(data for name, data in events if name == "runtime_llama_start_failed")
+        self.assertEqual(failure["ctx"], 6144)
+        self.assertEqual(failure["ngl"], 99)
+        self.assertIn("CUDA error: out of memory", failure["error"])
+        self.assertIn("NvMapMemAllocInternalTagged: 1075072515 error 12", failure["stderr_tail"])
+
 
 class DebugPromptLoggingTests(unittest.TestCase):
     def test_prepare_turn_context_saves_full_runtime_messages_in_debug_mode(self) -> None:

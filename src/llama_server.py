@@ -6,8 +6,9 @@ import asyncio
 import os
 import shutil
 import signal
+from collections import deque
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import httpx
 
@@ -43,6 +44,7 @@ class LlamaServerClient:
         device: str = "auto",
         gpu_layers: int = 99,
         airgapped: bool = False,
+        diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.model = model
         self.host = host
@@ -55,6 +57,7 @@ class LlamaServerClient:
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
         self.reasoning_mode = "default"
+        self._diagnostics_hook = diagnostics_hook
 
     def set_reasoning_mode(self, mode: str) -> None:
         normalized = mode.strip().lower()
@@ -64,6 +67,14 @@ class LlamaServerClient:
 
     def reasoning_status(self) -> str:
         return self.reasoning_mode
+
+    def _emit_diagnostic(self, event_type: str, **data: Any) -> None:
+        if not self._diagnostics_hook:
+            return
+        try:
+            self._diagnostics_hook(event_type, data)
+        except Exception:
+            pass
 
     @staticmethod
     def _ensure_jetson_clocks_sudoers() -> None:
@@ -166,6 +177,43 @@ class LlamaServerClient:
         return cls._largest_free_block_mb_from_text(buddyinfo, page_size_kb=page_size_kb)
 
     @staticmethod
+    def _read_meminfo_fields() -> dict[str, float]:
+        wanted = {
+            "MemTotal:",
+            "MemAvailable:",
+            "MemFree:",
+            "Cached:",
+            "AnonPages:",
+            "Shmem:",
+            "CmaTotal:",
+            "CmaFree:",
+            "SwapTotal:",
+            "SwapFree:",
+        }
+        values: dict[str, float] = {}
+        try:
+            text = Path("/proc/meminfo").read_text(encoding="utf-8")
+        except OSError:
+            return values
+        for raw_line in text.splitlines():
+            parts = raw_line.split()
+            if len(parts) < 2 or parts[0] not in wanted:
+                continue
+            try:
+                values[parts[0].rstrip(":").lower() + "_mb"] = round(int(parts[1]) / 1024.0, 2)
+            except ValueError:
+                continue
+        return values
+
+    @classmethod
+    def _memory_snapshot(cls) -> dict[str, float]:
+        snapshot = cls._read_meminfo_fields()
+        lfb_mb = cls._largest_free_block_mb()
+        if lfb_mb is not None:
+            snapshot["largest_free_block_mb"] = round(lfb_mb, 2)
+        return snapshot
+
+    @staticmethod
     def _startup_profile_for_lfb(lfb_mb: float | None) -> tuple[int, int, bool, bool]:
         if lfb_mb is not None and lfb_mb < _FRAGMENTED_LFB_MB:
             return (128, 32, True, True)
@@ -208,6 +256,21 @@ class LlamaServerClient:
         requested_ngl = self.gpu_layers if resolved_device == "cuda" else 0
         requested_ctx = self.context_window_tokens
         batch, ubatch, fit_off, no_warmup = self._startup_profile_for_lfb(lfb_mb)
+        startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
+        self._emit_diagnostic(
+            "runtime_llama_starting",
+            model=Path(self.model).name,
+            resolved_device=resolved_device,
+            requested_ctx=requested_ctx,
+            requested_ngl=requested_ngl,
+            batch=batch,
+            ubatch=ubatch,
+            fit_off=fit_off,
+            no_warmup=no_warmup,
+            jetson_platform=self._is_jetson_platform(),
+            airgapped=self.airgapped,
+            **startup_snapshot,
+        )
         await self._start_once(
             binary=binary,
             env=env,
@@ -262,17 +325,34 @@ class LlamaServerClient:
             "-c",
             str(ctx),
         ])
+        self._emit_diagnostic(
+            "runtime_llama_launch_command",
+            command=" ".join(cmd),
+            ctx=ctx,
+            ngl=ngl,
+            batch=batch,
+            ubatch=ubatch,
+            fit_off=fit_off,
+            no_warmup=no_warmup,
+            cuda_module_loading=env.get("CUDA_MODULE_LOADING", ""),
+            ggml_cuda_enable_unified_memory=env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY", ""),
+            ggml_cuda_vmm_chunk_mb=env.get("GGML_CUDA_VMM_CHUNK_MB", ""),
+            ggml_cuda_vmm_reserve_mb=env.get("GGML_CUDA_VMM_RESERVE_MB", ""),
+        )
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             env=env,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
+        stderr_lines: deque[str] = deque(maxlen=120)
+        stderr_task = asyncio.create_task(self._capture_startup_stderr(stderr_lines))
 
         deadline = asyncio.get_event_loop().time() + 120.0
         while asyncio.get_event_loop().time() < deadline:
             if self._proc.returncode is not None:
-                err = (await self._proc.stderr.read()).decode(errors="replace").strip()
+                await stderr_task
+                err = "\n".join(stderr_lines).strip()
                 if len(err) > 8000:
                     keep = 4000
                     omitted = len(err) - (keep * 2)
@@ -282,12 +362,38 @@ class LlamaServerClient:
                         f"{err[-keep:]}"
                     )
                 detail = err or "no stderr output"
+                self._emit_diagnostic(
+                    "runtime_llama_start_failed",
+                    error=detail,
+                    ctx=ctx,
+                    ngl=ngl,
+                    batch=batch,
+                    ubatch=ubatch,
+                    fit_off=fit_off,
+                    no_warmup=no_warmup,
+                    returncode=self._proc.returncode,
+                    stderr_line_count=len(stderr_lines),
+                    stderr_tail=list(stderr_lines)[-20:],
+                    **self._memory_snapshot(),
+                )
                 raise RuntimeError(
                     f"llama-server exited with code {self._proc.returncode}: {detail}"
                 )
             try:
                 r = await self._http.get(f"{self.base_url}/health")
                 if r.status_code == 200:
+                    stderr_task.cancel()
+                    try:
+                        await stderr_task
+                    except asyncio.CancelledError:
+                        pass
+                    self._emit_diagnostic(
+                        "runtime_llama_start_ready",
+                        pid=self._proc.pid if self._proc else 0,
+                        ctx=ctx,
+                        ngl=ngl,
+                        stderr_line_count=len(stderr_lines),
+                    )
                     return
             except (
                 httpx.ConnectError,
@@ -299,12 +405,48 @@ class LlamaServerClient:
                 # Treat transient transport errors the same as "not ready yet".
                 pass
             await asyncio.sleep(1.0)
+        stderr_task.cancel()
+        try:
+            await stderr_task
+        except asyncio.CancelledError:
+            pass
+        self._emit_diagnostic(
+            "runtime_llama_start_timeout",
+            ctx=ctx,
+            ngl=ngl,
+            stderr_line_count=len(stderr_lines),
+            stderr_tail=list(stderr_lines)[-20:],
+            **self._memory_snapshot(),
+        )
         raise TimeoutError("llama-server did not become ready")
+
+    async def _capture_startup_stderr(self, sink: deque[str]) -> None:
+        if not self._proc or not self._proc.stderr:
+            return
+        while True:
+            line = await self._proc.stderr.readline()
+            if not line:
+                return
+            text = line.decode(errors="replace").rstrip()
+            if not text:
+                continue
+            sink.append(text)
+            lowered = text.lower()
+            if any(token in lowered for token in ("cuda error", "out of memory", "nvmap", "ggml", "llama_context", "load_tensors")):
+                self._emit_diagnostic(
+                    "runtime_llama_stderr_line",
+                    summary=text[:200],
+                )
 
     async def _cleanup_stale_inference_processes(self) -> None:
         stale_pids = self._find_stale_inference_pids()
         if not stale_pids:
             return
+        self._emit_diagnostic(
+            "runtime_llama_cleanup_stale_processes",
+            stale_pid_count=len(stale_pids),
+            stale_pids=stale_pids[:8],
+        )
 
         for pid in stale_pids:
             try:
