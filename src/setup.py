@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+from html import escape as html_escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping
 
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.markup import escape
 
@@ -155,6 +158,25 @@ async def _prompt_text(
     return input(f"{prompt}{default}").strip()
 
 
+def _choice_prompt_html(
+    title: str,
+    options: list[tuple[str, object]],
+    *,
+    selected_index: int,
+    detail: str | None = None,
+) -> HTML:
+    lines = [f"<style fg='{ACCENT_GREEN}' bold>{html_escape(title)}</style>"]
+    if detail:
+        lines.append(f"<style fg='ansibrightblack'>{html_escape(detail)}</style>")
+    for idx, (label, _value) in enumerate(options):
+        marker = "›" if idx == selected_index else " "
+        style = f" fg='{ACCENT_GREEN}' bold" if idx == selected_index else ""
+        lines.append(
+            f"{marker} <style{style}>{idx + 1}. {html_escape(str(label))}</style>"
+        )
+    return HTML("\n".join(lines) + "\n\nchoice> ")
+
+
 async def _prompt_choice(
     session: PromptSession[object] | None,
     console: Console,
@@ -164,6 +186,68 @@ async def _prompt_choice(
     default_index: int = 0,
     detail: str | None = None,
 ) -> object:
+    default_index = max(0, min(default_index, len(options) - 1))
+    if session is not None:
+        selected_index = default_index
+        bindings = KeyBindings()
+
+        def _set_index(next_index: int) -> None:
+            nonlocal selected_index
+            selected_index = next_index % len(options)
+
+        @bindings.add("up")
+        @bindings.add("c-p")
+        def _prev_choice(event) -> None:
+            _set_index(selected_index - 1)
+            event.current_buffer.reset()
+            event.app.invalidate()
+
+        @bindings.add("down")
+        @bindings.add("c-n")
+        def _next_choice(event) -> None:
+            _set_index(selected_index + 1)
+            event.current_buffer.reset()
+            event.app.invalidate()
+
+        @bindings.add("pageup")
+        def _first_choice(event) -> None:
+            _set_index(0)
+            event.current_buffer.reset()
+            event.app.invalidate()
+
+        @bindings.add("pagedown")
+        def _last_choice(event) -> None:
+            _set_index(len(options) - 1)
+            event.current_buffer.reset()
+            event.app.invalidate()
+
+        @bindings.add("enter")
+        def _submit_choice(event) -> None:
+            event.app.exit(result=options[selected_index][1])
+
+        result = await session.prompt_async(
+            lambda: _choice_prompt_html(
+                title,
+                options,
+                selected_index=selected_index,
+                detail=detail,
+            ),
+            default="",
+            key_bindings=bindings,
+            complete_while_typing=False,
+            enable_suspend=False,
+        )
+        raw = str(result).strip()
+        if not raw:
+            return options[selected_index][1]
+        try:
+            picked = int(raw) - 1
+        except ValueError:
+            return options[selected_index][1]
+        if 0 <= picked < len(options):
+            return options[picked][1]
+        return options[selected_index][1]
+
     console.print(f"[bold {ACCENT_GREEN}]{escape(title)}[/]")
     if detail:
         console.print(f"[dim]{escape(detail)}[/]")

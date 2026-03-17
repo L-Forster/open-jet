@@ -4,12 +4,23 @@
 
 ```bash
 open-jet
+open-jet chat
 ```
 
 Optional setup flow:
 
 ```bash
 open-jet --setup
+open-jet setup
+```
+
+Read-only helpers:
+
+```bash
+open-jet status
+open-jet models
+open-jet commands
+open-jet version
 ```
 
 ## Basic interaction

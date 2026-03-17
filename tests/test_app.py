@@ -13,7 +13,13 @@ from unittest.mock import AsyncMock, Mock, patch
 from rich.console import Console
 
 from src.agent import ActionKind, Agent
-from src.app import OpenJetApp
+from src.app import (
+    OpenJetApp,
+    _format_cli_status,
+    _format_model_profiles_summary,
+    _format_slash_commands_summary,
+    main,
+)
 from src.hardware import HardwareInfo
 from src.llama_server import (
     LlamaServerClient,
@@ -21,7 +27,7 @@ from src.llama_server import (
     _JETSON_VMM_RESERVE_MB,
 )
 from src.runtime_protocol import StreamChunk
-from src.setup import run_setup_wizard
+from src.setup import _prompt_choice, run_setup_wizard
 
 
 class FakeAgent:
@@ -158,6 +164,53 @@ class AppStatusTests(unittest.TestCase):
 
 
 class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_choice_supports_arrow_navigation_with_prompt_session(self) -> None:
+        test_case = self
+
+        class FakeBuffer:
+            def reset(self) -> None:
+                return
+
+        class FakeApp:
+            def __init__(self) -> None:
+                self.result = None
+
+            def invalidate(self) -> None:
+                return
+
+            def exit(self, *, result=None) -> None:
+                self.result = result
+
+        class FakeEvent:
+            def __init__(self, app: FakeApp) -> None:
+                self.app = app
+                self.current_buffer = FakeBuffer()
+
+        class FakeSession:
+            async def prompt_async(self, message, **kwargs):
+                app = FakeApp()
+                event = FakeEvent(app)
+                bindings = kwargs["key_bindings"]
+                handlers = {
+                    tuple(binding.keys): binding.handler
+                    for binding in bindings.bindings
+                }
+                rendered = message()
+                test_case.assertIn("Hardware profile", rendered.value)
+                handlers[("down",)](event)
+                handlers[("enter",)](event)
+                return app.result
+
+        session = FakeSession()
+        choice = await _prompt_choice(
+            session,
+            Mock(),
+            "Hardware profile",
+            [("Auto", "auto"), ("Manual", "manual")],
+        )
+
+        self.assertEqual(choice, "manual")
+
     async def test_run_setup_wizard_persists_manual_llama_model_path_in_history(self) -> None:
         console = Mock()
         hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
@@ -329,6 +382,41 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         activate.assert_awaited_once_with("alt", app.query_one("#chat-log"))
 
+    async def test_model_command_without_args_opens_picker_and_switches(self) -> None:
+        app = OpenJetApp()
+        app.cfg["model_profiles"] = [
+            {
+                "name": "base",
+                "runtime": "llama_cpp",
+                "model_source": "local",
+                "model": "/models/base.gguf",
+                "llama_model": "/models/base.gguf",
+                "context_window_tokens": 4096,
+                "gpu_layers": 99,
+            },
+            {
+                "name": "alt",
+                "runtime": "llama_cpp",
+                "model_source": "local",
+                "model": "/models/alt.gguf",
+                "llama_model": "/models/alt.gguf",
+                "context_window_tokens": 4096,
+                "gpu_layers": 99,
+            }
+        ]
+
+        app.cfg["active_model_profile"] = "base"
+
+        picker = AsyncMock(return_value="alt")
+        dialog = Mock(run_async=picker)
+        with patch("src.commands.radiolist_dialog", return_value=dialog), patch.object(
+            app, "activate_model_profile", AsyncMock(return_value=True)
+        ) as activate:
+            handled = await app.commands.maybe_handle("/model")
+
+        self.assertTrue(handled)
+        activate.assert_awaited_once_with("alt", app.query_one("#chat-log"))
+
     async def test_edit_model_updates_saved_profile(self) -> None:
         app = OpenJetApp()
         app.cfg["model_profiles"] = [
@@ -377,6 +465,86 @@ class AppQuitTests(unittest.TestCase):
 
         create_task.assert_called_once()
         scheduled = create_task.call_args.args[0]
+        self.assertTrue(asyncio.iscoroutine(scheduled))
+        scheduled.close()
+
+
+class CliCommandTests(unittest.TestCase):
+    def test_format_model_profiles_summary_lists_active_profile(self) -> None:
+        text = _format_model_profiles_summary(
+            {
+                "active_model_profile": "base",
+                "model_profiles": [
+                    {
+                        "name": "base",
+                        "runtime": "llama_cpp",
+                        "model_source": "local",
+                        "model": "/models/base.gguf",
+                        "llama_model": "/models/base.gguf",
+                        "context_window_tokens": 4096,
+                        "gpu_layers": 99,
+                    }
+                ],
+            }
+        )
+
+        self.assertIn("Active model preset: base", text)
+        self.assertIn("- base (active): runtime=llama_cpp", text)
+
+    def test_format_cli_status_reports_runtime_and_airgap(self) -> None:
+        text = _format_cli_status(
+            {
+                "runtime": "llama_cpp",
+                "active_model_profile": "base",
+                "llama_model": "/models/base.gguf",
+                "context_window_tokens": 4096,
+                "gpu_layers": 99,
+                "airgapped": True,
+            }
+        )
+
+        self.assertIn("Runtime: llama.cpp (GGUF) (llama_cpp)", text)
+        self.assertIn("Active model preset: base", text)
+        self.assertIn("Air-gapped: true", text)
+
+    def test_format_slash_commands_summary_includes_models_alias(self) -> None:
+        text = _format_slash_commands_summary()
+
+        self.assertIn("/model: Show or switch saved model presets", text)
+        self.assertIn("/models", text)
+
+    def test_main_models_command_prints_saved_presets(self) -> None:
+        cfg = {
+            "active_model_profile": "base",
+            "model_profiles": [
+                {
+                    "name": "base",
+                    "runtime": "llama_cpp",
+                    "model_source": "local",
+                    "model": "/models/base.gguf",
+                    "llama_model": "/models/base.gguf",
+                    "context_window_tokens": 4096,
+                    "gpu_layers": 99,
+                }
+            ],
+        }
+
+        with patch("src.app.load_config", return_value=cfg), patch("builtins.print") as printer:
+            main(["models"])
+
+        printer.assert_called_once()
+        self.assertIn("Active model preset: base", printer.call_args.args[0])
+
+    def test_main_setup_command_launches_app_in_setup_mode(self) -> None:
+        fake_app = Mock()
+        fake_app.run_async = AsyncMock()
+
+        with patch("src.app.OpenJetApp", return_value=fake_app) as app_cls, patch("asyncio.run") as run_async:
+            main(["setup"])
+
+        app_cls.assert_called_once_with(force_setup=True)
+        run_async.assert_called_once()
+        scheduled = run_async.call_args.args[0]
         self.assertTrue(asyncio.iscoroutine(scheduled))
         scheduled.close()
 

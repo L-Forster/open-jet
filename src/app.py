@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import importlib.metadata
 import os
 import re
 import shlex
@@ -76,7 +77,7 @@ from .ollama_setup import discover_installed_ollama_models, materialize_setup_mo
 from .persistent_memory import build_system_prompt
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
-from .runtime_registry import active_model_ref, create_runtime_client
+from .runtime_registry import active_model_ref, create_runtime_client, runtime_spec
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import SessionStateStore
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
@@ -2047,11 +2048,87 @@ def _extract_file_mentions(text: str) -> list[str]:
     return cleaned
 
 
+def _active_profile_name(cfg: dict[str, Any]) -> str:
+    return str(cfg.get("active_model_profile") or "").strip() or "none"
+
+
+def _format_model_profiles_summary(cfg: dict[str, Any]) -> str:
+    profiles = list_model_profiles(cfg)
+    if not profiles:
+        return "No saved model presets yet. Run `open-jet setup` or `/setup` to add one."
+
+    active_name = _active_profile_name(cfg).lower()
+    lines = [f"Active model preset: {_active_profile_name(cfg)}"]
+    for profile in profiles:
+        runtime = str(profile.get("runtime", "llama_cpp"))
+        model_ref = active_model_ref(dict(profile)) or "n/a"
+        marker = " (active)" if str(profile["name"]).strip().lower() == active_name else ""
+        lines.append(
+            f"- {profile['name']}{marker}: runtime={runtime} "
+            f"context={profile.get('context_window_tokens', 'n/a')} "
+            f"gpu={profile.get('gpu_layers', 'n/a')} "
+            f"model={model_ref}"
+        )
+    return "\n".join(lines)
+
+
+def _format_cli_status(cfg: dict[str, Any]) -> str:
+    runtime = str(cfg.get("runtime", "llama_cpp"))
+    spec = runtime_spec(runtime)
+    model_ref = active_model_ref(cfg) or "n/a"
+    lines = [
+        f"Runtime: {spec.label} ({runtime})",
+        f"Active model preset: {_active_profile_name(cfg)}",
+        f"Model ref: {model_ref}",
+        f"Context window: {cfg.get('context_window_tokens', 'n/a')}",
+        f"GPU layers: {cfg.get('gpu_layers', 'n/a')}",
+        f"Air-gapped: {'true' if airgapped_from_cfg(cfg) else 'false'}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_slash_commands_summary() -> str:
+    lines = ["Slash commands:"]
+    for spec in SlashCommandHandler.COMMANDS:
+        aliases = f" (aliases: {', '.join(f'/{alias}' for alias in spec.aliases)})" if spec.aliases else ""
+        lines.append(f"- /{spec.name}: {spec.description}{aliases}")
+    return "\n".join(lines)
+
+
+def _open_jet_version() -> str:
+    try:
+        return importlib.metadata.version("open-jet")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="open-jet offline agentic terminal UI")
     parser.add_argument("--setup", action="store_true", help="start in setup wizard mode before launching the chat UI")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("chat", help="start the interactive chat UI")
+    subparsers.add_parser("setup", help="run setup wizard before launching the chat UI")
+    subparsers.add_parser("models", help="list saved model presets")
+    subparsers.add_parser("commands", help="list available slash commands")
+    subparsers.add_parser("status", help="show runtime and configuration status")
+    subparsers.add_parser("version", help="show version information")
     args = parser.parse_args(argv)
-    asyncio.run(OpenJetApp(force_setup=args.setup).run_async())
+
+    if args.command == "models":
+        print(_format_model_profiles_summary(load_config()))
+        return
+    if args.command == "commands":
+        print(_format_slash_commands_summary())
+        return
+    if args.command == "status":
+        print(_format_cli_status(load_config()))
+        return
+    if args.command == "version":
+        print(f"open-jet {_open_jet_version()}")
+        return
+
+    force_setup = bool(args.setup or args.command == "setup")
+    asyncio.run(OpenJetApp(force_setup=force_setup).run_async())
 
 
 if __name__ == "__main__":

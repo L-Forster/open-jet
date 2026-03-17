@@ -9,3 +9,15 @@
 - `/load <path>` load a file into context
 - `/resume` load previous saved session
 - `/setup` reopen setup wizard
+- `/model` open an arrow-key picker to switch saved model presets
+- `/model [status|list|<name>]` show or switch saved model presets
+- `/models` alias for `/model`
+- `/edit-model [name]` edit a saved model preset
+- `/memory [show|clear <user|agent>]` inspect or clear persistent memory
+- `/reasoning [status|on|off|default]` control llama.cpp reasoning mode
+- `/air-gapped [status|true|false]` control air-gapped mode
+- `/mode [chat|code|review|debug|status]` set harness mode
+- `/skills [status|list|clear]` inspect or clear selected harness skills
+- `/skill <name[,name...]>` pin harness skills
+- `/step [status|next|split]` inspect or control the active workflow step
+- `/util [show|hide|toggle|status]` show or hide the utilization line

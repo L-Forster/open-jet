@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from prompt_toolkit.shortcuts import radiolist_dialog
+
 from .config import save_config
 from .model_profiles import get_model_profile, list_model_profiles, replace_model_profile
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
@@ -45,7 +47,11 @@ class SlashCommandHandler:
         CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
         CommandSpec(name="resume", description="Load previous session state into chat"),
         CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
-        CommandSpec(name="model", description="Show or switch saved model presets: /model [status|list|<name>]"),
+        CommandSpec(
+            name="model",
+            description="Show or switch saved model presets: /model [status|list|<name>]",
+            aliases=("models",),
+        ),
         CommandSpec(name="edit-model", description="Edit a saved model preset: /edit-model [name]"),
         CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
         CommandSpec(name="skills", description="Show or clear selected harness skills: /skills [status|list|clear]"),
@@ -359,7 +365,49 @@ class SlashCommandHandler:
         profiles = self.app.model_profiles()
         active = str(self.app.cfg.get("active_model_profile") or "").strip()
 
-        if not arg or arg.lower() in {"status", "list"}:
+        if not arg:
+            if not profiles:
+                log.write("[yellow]No saved model presets yet. Run /setup to add one.[/]")
+                log.write("")
+                return
+            if self.app._awaiting_approval:
+                log.write("[yellow]Cannot switch models while a tool approval prompt is active.[/]")
+                log.write("")
+                return
+            if self.app._thinking_timer:
+                log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+                log.write("")
+                return
+
+            selected = await radiolist_dialog(
+                title="Switch model preset",
+                text="Use arrow keys to choose a saved model preset.",
+                values=[
+                    (
+                        profile["name"],
+                        f"{profile['name']}"
+                        f"{' (active)' if profile['name'] == active else ''}"
+                        f" | runtime={profile.get('runtime', 'llama_cpp')}"
+                        f" | ctx={profile.get('context_window_tokens', 'n/a')}"
+                        f" | gpu={profile.get('gpu_layers', 'n/a')}",
+                    )
+                    for profile in profiles
+                ],
+            ).run_async()
+            if selected is None:
+                log.write("[bold bright_white]Model switch cancelled.[/]")
+                log.write("")
+                return
+            if str(selected).strip().lower() == active.lower():
+                log.write(f"[bold bright_white]Model preset '{selected}' is already active.[/]")
+                log.write("")
+                return
+            if not await self.app.activate_model_profile(str(selected), log):
+                log.write(f"[yellow]Unknown model preset:[/] {selected}")
+                log.write("")
+            return
+
+        if arg.lower() in {"status", "list"}:
             if not profiles:
                 log.write("[yellow]No saved model presets yet. Run /setup to add one.[/]")
                 log.write("")
