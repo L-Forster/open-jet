@@ -1,6 +1,6 @@
 [project]
 name = "open-jet"
-version = "0.1.12"
+version = "0.1.13"
 description = "Offline local-LLM terminal app for Jetson and edge Linux: chat with on-device models, run agent tools, and manage context safely."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
@@ -41,6 +41,7 @@ Issues = "https://github.com/l-forster/open-jet/issues"
 
 [project.scripts]
 open-jet = "src.app:main"
+openjet = "src.app:main"
 
 [build-system]
 requires = ["setuptools>=68,<80", "wheel", "Cython>=3.0"]
