@@ -128,6 +128,7 @@ class AppStatusTests(unittest.TestCase):
         prompt = app._prompt_message()
 
         self.assertIn("Generating...", prompt.value)
+        self.assertIn("prompt-splash-block-", prompt.value)
         self.assertIn("open-jet", prompt.value)
 
     def test_tool_output_line_highlights_shell_commands(self) -> None:

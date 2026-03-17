@@ -231,14 +231,12 @@ def _shell_command_category(primary_command: str) -> str:
     return "other"
 
 
-BANNER = r"""[brand]
-   ___                    _        _
-  / _ \ _ __   ___ _ __  (_) ___  | |_
- | | | | '_ \ / _ \ '_ \ | |/ _ \ | __|
- | |_| | |_) |  __/ | | || |  __/ | |_
-  \___/| .__/ \___|_| |_|/ |\___|  \__|
-       |_|              |__/
-[/]"""
+BANNER = """[#14532d] ██████╗ ██████╗ ███████╗███╗   ██╗      ██╗███████╗████████╗[/]
+[#15803d]██╔═══██╗██╔══██╗██╔════╝████╗  ██║      ██║██╔════╝╚══██╔══╝[/]
+[#16a34a]██║   ██║██████╔╝█████╗  ██╔██╗ ██║      ██║█████╗     ██║   [/] 
+[#4ade80]██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║ ██   ██║██╔══╝     ██║   [/]
+[#86efac]╚██████╔╝██║     ███████╗██║ ╚████║ ╚█████╔╝███████╗   ██║   [/]
+[#dcfce7] ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝  ╚════╝ ╚══════╝   ╚═╝   [/]"""
 
 
 @dataclass
@@ -328,6 +326,7 @@ class OpenJetCompleter(Completer):
 
 class OpenJetApp:
     TITLE = "open-jet"
+    _SPLASH_BLOCKS = ("▉", "▉", "▉", "▉")
 
     def __init__(self, *, force_setup: bool = False) -> None:
         self.force_setup = force_setup
@@ -852,6 +851,7 @@ class OpenJetApp:
 
     async def _startup_sequence(self) -> None:
         log = self.query_one("#chat-log")
+        log.write("")
         log.write(BANNER)
         log_cfg = self.cfg.get("logging", {})
         if log_cfg.get("enabled", True):
@@ -924,7 +924,7 @@ class OpenJetApp:
             self.session_logger.record_runtime_ready(**self._trace_runtime_context())
         log.write("  [bold bright_white]Ready.[/]")
         if self.is_airgapped():
-            log.write("  [bold #c2410c]Air-gapped mode is enabled. External network access is blocked.[/]")
+            log.write("  [bold bright_white]Air-gapped mode is enabled. External network access is blocked.[/]")
         if self.auto_resume:
             self._restore_session_state(log)
         self._restore_harness_state()
@@ -1189,12 +1189,36 @@ class OpenJetApp:
             )
         return HTML("\n".join(row for row in rows if row))
 
+    def _loading_blocks_html(self) -> str:
+        phase = int(time.monotonic() * 8) % len(self._SPLASH_BLOCKS)
+        styles = (
+            "prompt-splash-block-1",
+            "prompt-splash-block-2",
+            "prompt-splash-block-3",
+            "prompt-splash-block-4",
+        )
+        blocks: list[str] = []
+        for idx, block in enumerate(self._SPLASH_BLOCKS):
+            style = styles[(idx - phase) % len(styles)]
+            blocks.append(f"<{style}>{block}</{style}>")
+        return "".join(blocks)
+
+    def _render_prompt_status_html(self, text: str) -> str:
+        escaped = html.escape(text)
+        if self._assistant_status_kind == "command":
+            return f"<prompt-command>{escaped}</prompt-command>"
+        if self._assistant_status_kind == "generating":
+            return (
+                f"{self._loading_blocks_html()} "
+                f"<prompt-splash-text>{escaped}</prompt-splash-text>"
+            )
+        return f"<prompt-status>{escaped}</prompt-status>"
+
     def _prompt_message(self) -> HTML:
         status = self.query_one("#assistant-status")
         status_html = ""
         if not status.hidden and status.text:
-            style = "prompt-command" if self._assistant_status_kind == "command" else "prompt-status"
-            status_html = f"<{style}>{html.escape(status.text)}</{style}>\n"
+            status_html = f"{self._render_prompt_status_html(status.text)}\n"
         if self.is_airgapped():
             return HTML(
                 f"{status_html}<brand-airgapped> open-jet air-gap </brand-airgapped>"
@@ -2043,7 +2067,8 @@ class OpenJetApp:
 
     async def _toolbar_updater(self) -> None:
         while not self._quit_requested:
-            await asyncio.sleep(1.0)
+            interval = 0.12 if self._assistant_status_kind == "generating" else 1.0
+            await asyncio.sleep(interval)
             if self._session and self._session.app:
                 self._session.app.invalidate()
 
