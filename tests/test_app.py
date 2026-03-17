@@ -4,6 +4,7 @@ import asyncio
 import os
 import json
 import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,7 @@ from src.app import (
     _format_slash_commands_summary,
     main,
 )
+from src.cli import main as cli_main
 from src.hardware import HardwareInfo
 from src.llama_server import (
     LlamaServerClient,
@@ -118,6 +120,39 @@ class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AppStatusTests(unittest.TestCase):
+    def test_prompt_message_includes_generating_status_above_prompt(self) -> None:
+        app = OpenJetApp()
+        app._assistant_status_kind = "generating"
+        app._render_assistant_status()
+
+        prompt = app._prompt_message()
+
+        self.assertIn("Generating...", prompt.value)
+        self.assertIn("open-jet", prompt.value)
+
+    def test_tool_output_line_highlights_shell_commands(self) -> None:
+        app = OpenJetApp()
+
+        rendered = app._format_tool_output_line("git status --short")
+
+        self.assertIn("[command]", rendered)
+
+    def test_status_cli_does_not_import_tui_surface(self) -> None:
+        sys.modules.pop("src.app", None)
+        stdout = io.StringIO()
+
+        with patch("src.cli.load_config", return_value={"runtime": "llama_cpp"}), patch(
+            "src.cli.runtime_spec",
+            return_value=SimpleNamespace(label="llama.cpp (GGUF)"),
+        ), patch("src.cli.active_model_ref", return_value="model.gguf"), patch(
+            "src.cli.airgapped_from_cfg",
+            return_value=False,
+        ), patch("sys.stdout", stdout):
+            cli_main(["status"])
+
+        self.assertIn("Runtime: llama.cpp (GGUF) (llama_cpp)", stdout.getvalue())
+        self.assertNotIn("src.app", sys.modules)
+
     def test_format_command_status_label_compacts_and_truncates(self) -> None:
         label = OpenJetApp._format_command_status_label(
             "pytest\n\n   tests/test_app.py   -k   status_indicator",

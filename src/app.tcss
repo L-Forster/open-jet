@@ -1,12 +1,12 @@
 App {
-    background: #2a2a2a;
+    background: #0b1220;
 }
 SetupScreen {
-    background: #2a2a2a;
+    background: #0b1220;
     tint: transparent;
 }
 Screen {
-    background: #2a2a2a;
+    background: #0b1220;
     layout: vertical;
 }
 Vertical {
@@ -28,49 +28,49 @@ Static {
     overflow-y: hidden;
     scrollbar-size: 0 0;
     padding: 0 2 1 2;
-    color: #ffffff;
+    color: #e5e7eb;
 }
 #bottom-stack {
     height: auto;
     min-height: 4;
     layout: vertical;
-    border-top: solid #4a4a4a;
+    border-top: solid #243244;
     padding: 1 0 0 0;
     background: transparent;
 }
 #prompt {
     height: 3;
     margin: 0 2;
-    color: #ffffff;
+    color: #f8fafc;
 }
 #command-suggestions {
     height: auto;
     max-height: 3;
     overflow-y: auto;
     margin: 0 2;
-    color: #ffffff;
+    color: #cbd5e1;
 }
 #token-counter {
     height: 1;
     margin: 0 2;
-    color: #ffffff;
+    color: #cbd5e1;
 }
 #utilization-bar {
     height: 1;
     margin: 0 2;
-    color: #ffffff;
+    color: #cbd5e1;
 }
 #assistant-status {
     height: 1;
     margin: 0 2;
-    color: #ffffff;
+    color: #93c5fd;
 }
 #approval-bar {
     height: auto;
     min-height: 3;
     margin: 0 2;
     padding: 0 1;
-    border: round $warning;
+    border: round #f59e0b;
     background: transparent;
 }
 .hidden {

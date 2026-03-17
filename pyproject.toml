@@ -40,8 +40,8 @@ Repository = "https://github.com/l-forster/open-jet"
 Issues = "https://github.com/l-forster/open-jet/issues"
 
 [project.scripts]
-open-jet = "src.app:main"
-openjet = "src.app:main"
+open-jet = "src.cli:main"
+openjet = "src.cli:main"
 
 [build-system]
 requires = ["setuptools>=68,<80", "wheel", "Cython>=3.0"]
@@ -52,7 +52,7 @@ include-package-data = false
 license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
-include = ["src"]
+include = ["src", "src.*"]
 
 [tool.setuptools.package-data]
 src = ["app.tcss"]

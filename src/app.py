@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import html
-import importlib.metadata
 import os
 import re
 import shlex
@@ -77,11 +75,12 @@ from .ollama_setup import discover_installed_ollama_models, materialize_setup_mo
 from .persistent_memory import build_system_prompt
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
-from .runtime_registry import active_model_ref, create_runtime_client, runtime_spec
+from .runtime_registry import active_model_ref, create_runtime_client
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import SessionStateStore
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
+from .theme import PROMPT_STYLE, RICH_THEME, rich_text
 from .tool_executor import execute_tool, format_tool_args
 
 
@@ -232,7 +231,7 @@ def _shell_command_category(primary_command: str) -> str:
     return "other"
 
 
-BANNER = r"""[bold green]
+BANNER = r"""[brand]
    ___                    _        _
   / _ \ _ __   ___ _ __  (_) ___  | |_
  | | | | '_ \ / _ \ '_ \ | |/ _ \ | __|
@@ -338,18 +337,8 @@ class OpenJetApp:
         self.client: RuntimeClient | None = None
         self.agent: Agent | None = None
         self.session_logger: SessionLogger | None = None
-        self.console = Console()
-        self._style = Style.from_dict(
-            {
-                "prompt": "bg:#14213d #e5e7eb bold",
-                "brand": "bg:#88D83F #111111 bold",
-                "prompt-airgapped": "bg:#7c2d12 #ffedd5 bold",
-                "brand-airgapped": "bg:#c2410c #fff7ed bold",
-                "bottom-toolbar": "bg:#0f172a #cbd5e1",
-                "completion-menu.completion": "bg:#111827 #cbd5e1",
-                "completion-menu.completion.current": "bg:#88D83F #111111 bold",
-            }
-        )
+        self.console = Console(theme=RICH_THEME)
+        self._style = Style.from_dict(PROMPT_STYLE)
         self._session: PromptSession[str] | None = None
         self._toolbar_task: asyncio.Task[None] | None = None
         self._generation_worker: asyncio.Task[None] | None = None
@@ -965,7 +954,7 @@ class OpenJetApp:
         prompt = self.query_one("#prompt")
         prompt.value = text
         if self._awaiting_approval or (self._generation_worker and not self._generation_worker.done()):
-            self.query_one("#chat-log").write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            self.query_one("#chat-log").write("[warning]Wait for the current generation to finish, then retry.[/]")
             self.query_one("#chat-log").write("")
             prompt.value = ""
             return
@@ -989,16 +978,18 @@ class OpenJetApp:
 
         log = self.query_one("#chat-log")
         if not self.agent:
-            log.write("[yellow]LLM is not ready yet. Wait for Ready, or run /setup.[/]")
+            log.write("[warning]LLM is not ready yet. Wait for Ready, or run /setup.[/]")
             log.write("")
             self._render_token_counter()
             return
 
         display_text = stripped if stripped else "[image attachment]"
-        log.write(Rule("[bold green]User", style="green"))
-        log.write(f"[bold green]> [/]{display_text}")
+        user_header = "Slash Command" if display_text.startswith("/") else "User"
+        user_text_style = "command" if display_text.startswith("/") else "muted"
+        log.write(Rule(rich_text(user_header, "user"), style="user"))
+        log.write(f"{rich_text('> ', 'user')}{rich_text(display_text, user_text_style)}")
         for image_path in attached_images:
-            log.write(f"  [bold bright_white]attached image:[/] {escape(image_path)}")
+            log.write(f"  {rich_text('attached image:', 'dim')} {rich_text(image_path, 'muted')}")
         log.write("")
 
         mentioned_files = _extract_file_mentions(stripped)
@@ -1167,15 +1158,22 @@ class OpenJetApp:
         if self._power_max_watts is None or watts > self._power_max_watts:
             self._power_max_watts = watts
 
-    def _toolbar_text(self) -> str:
+    def _toolbar_text(self) -> HTML:
         rows: list[str] = []
-        rows.append("mode: AIR-GAPPED" if self.is_airgapped() else "mode: internet")
-        if not self.query_one("#assistant-status").hidden and self.query_one("#assistant-status").text:
-            rows.append(_plain_markup(self.query_one("#assistant-status").text))
+        if self.is_airgapped():
+            rows.append("<toolbar-label>mode</toolbar-label>: <toolbar-warning>AIR-GAPPED</toolbar-warning>")
+        else:
+            rows.append("<toolbar-label>mode</toolbar-label>: <toolbar-accent>local</toolbar-accent>")
         if not self.query_one("#approval-bar").hidden and self.query_one("#approval-bar").text:
-            rows.append(_plain_markup(self.query_one("#approval-bar").text))
+            rows.append(
+                "<toolbar-label>approval</toolbar-label>: "
+                f"<toolbar-warning>{html.escape(_plain_markup(self.query_one('#approval-bar').text))}</toolbar-warning>"
+            )
         if not self.query_one("#token-counter").hidden and self.query_one("#token-counter").text:
-            rows.append(self.query_one("#token-counter").text)
+            rows.append(
+                "<toolbar-label>context</toolbar-label>: "
+                f"<toolbar-value>{html.escape(self.query_one('#token-counter').text)}</toolbar-value>"
+            )
         if self._utilization_visible:
             cpu_pct = self.metrics.read_cpu_percent()
             mem = read_memory_snapshot()
@@ -1185,13 +1183,24 @@ class OpenJetApp:
             mem_text = self._format_percent("mem", mem.used_percent if mem else None)
             cpu_text = self._format_percent("cpu", cpu_pct)
             power_text = self._format_power_text(power_watts, power_pct, battery)
-            rows.append(f"util: {cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}")
-        return "\n".join(row for row in rows if row)
+            rows.append(
+                "<toolbar-label>util</toolbar-label>: "
+                f"<toolbar-value>{html.escape(f'{cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}')}</toolbar-value>"
+            )
+        return HTML("\n".join(row for row in rows if row))
 
     def _prompt_message(self) -> HTML:
+        status = self.query_one("#assistant-status")
+        status_html = ""
+        if not status.hidden and status.text:
+            style = "prompt-command" if self._assistant_status_kind == "command" else "prompt-status"
+            status_html = f"<{style}>{html.escape(status.text)}</{style}>\n"
         if self.is_airgapped():
-            return HTML("<brand-airgapped> open-jet air-gap </brand-airgapped><prompt-airgapped>  > </prompt-airgapped>")
-        return HTML("<brand> open-jet </brand><prompt>  > </prompt>")
+            return HTML(
+                f"{status_html}<brand-airgapped> open-jet air-gap </brand-airgapped>"
+                "<prompt-airgapped>  > </prompt-airgapped>"
+            )
+        return HTML(f"{status_html}<brand> open-jet </brand><prompt>  > </prompt>")
 
     def set_utilization_visible(self, visible: bool) -> None:
         self._utilization_visible = bool(visible)
@@ -1338,18 +1347,21 @@ class OpenJetApp:
 
     def _write_text_block(self, log: LogView, text: str) -> None:
         buf = text
+        in_code_block = False
         while "\n" in buf:
             line, buf = buf.split("\n", 1)
-            log.write(line)
+            rendered, in_code_block = self._format_assistant_output_line(line, in_code_block=in_code_block)
+            log.write(rendered)
         if buf:
-            log.write(buf)
+            rendered, _ = self._format_assistant_output_line(buf, in_code_block=in_code_block)
+            log.write(rendered)
 
     def _write_tool_result(self, log: LogView, result: str) -> None:
         lines = result.splitlines()
         for line in lines[:20]:
-            log.write(f"  [bold bright_white]{line}[/]")
+            log.write(f"  {self._format_tool_output_line(line)}")
         if len(lines) > 20:
-            log.write(f"  [bold bright_white]... ({len(lines) - 20} more lines)[/]")
+            log.write(f"  {rich_text(f'... ({len(lines) - 20} more lines)', 'dim')}")
         log.write("")
 
     def persist_session_state(self, *, reason: str) -> None:
@@ -1489,6 +1501,7 @@ class OpenJetApp:
         text_buf = ""
         assistant_turn_text = ""
         assistant_header_written = False
+        assistant_in_code_block = False
         thinking_token = self._start_thinking()
         self._log_trace_event("run_agent_turn_started", recovery_attempted=recovery_attempted)
         try:
@@ -1496,7 +1509,7 @@ class OpenJetApp:
             async for event in self.agent.run_turn():
                 if event.kind == ActionKind.TEXT:
                     if not assistant_header_written:
-                        log.write(Rule("[bold cyan]Assistant", style="cyan"))
+                        log.write(Rule(rich_text("Assistant", "assistant"), style="assistant"))
                         assistant_header_written = True
                     text_buf += event.text
                     assistant_turn_text += event.text
@@ -1509,7 +1522,11 @@ class OpenJetApp:
                     self._active_turn_generation_tokens += tokens
                     while "\n" in text_buf:
                         line, text_buf = text_buf.split("\n", 1)
-                        log.write(line)
+                        rendered, assistant_in_code_block = self._format_assistant_output_line(
+                            line,
+                            in_code_block=assistant_in_code_block,
+                        )
+                        log.write(rendered)
                 elif event.kind == ActionKind.TOOL_REQUEST:
                     pending_tool_calls.append(event.tool_call)
                 elif event.kind == ActionKind.CONDENSE:
@@ -1520,12 +1537,16 @@ class OpenJetApp:
                         if recovered:
                             self._start_agent_turn(recovery_attempted=True)
                             return
-                    log.write(f"\n[bold red]error:[/] {event.text}")
+                    log.write(f"\n{rich_text('error:', 'error')} {rich_text(event.text, 'muted')}")
                     self._finish_turn_trace(success=False, status="agent_error", error=event.text)
                     return
                 elif event.kind == ActionKind.DONE:
                     if text_buf:
-                        log.write(text_buf)
+                        rendered, assistant_in_code_block = self._format_assistant_output_line(
+                            text_buf,
+                            in_code_block=assistant_in_code_block,
+                        )
+                        log.write(rendered)
                         text_buf = ""
                     log.write("")
         except asyncio.CancelledError:
@@ -1537,15 +1558,15 @@ class OpenJetApp:
 
         if condense_reason is not None:
             result = await self.agent.condense_context()
-            log.write(f"  [bold bright_white]{result}[/]")
+            log.write(f"  {rich_text(result, 'status')}")
             log.write("")
             self.persist_session_state(reason="auto_condense")
             self.persist_harness_state()
             remaining_pressure = self.agent.resource_pressure_reason()
             if remaining_pressure:
                 log.write(
-                    "  [yellow]Auto-condense stopped: "
-                    f"{remaining_pressure}. Retry after memory/context pressure clears.[/]"
+                    f"  {rich_text('Auto-condense stopped:', 'warning')} "
+                    f"{rich_text(f'{remaining_pressure}. Retry after memory/context pressure clears.', 'muted')}"
                 )
                 log.write("")
                 self.persist_session_state(reason="auto_condense_stopped")
@@ -1574,7 +1595,7 @@ class OpenJetApp:
                         tool_key=tc.id,
                         extra_attributes={"openjet.tool.name": tc.name},
                     )
-                log.write(f"[bold red]tool error ({tc.name}):[/] {exc}")
+                log.write(f"{rich_text(f'tool error ({tc.name}):', 'error')} {rich_text(str(exc), 'muted')}")
                 log.write("")
                 if self.agent:
                     self.agent.complete_tool_call(tc, f"Tool execution failed: {exc}")
@@ -1600,7 +1621,7 @@ class OpenJetApp:
                 self._active_turn_hallucinated_commands += 1
         if tc.name not in allowed_tools_for_mode(self.harness_state.mode):
             denied = f"Tool {tc.name} is not available for this request. Use an approved tool or ask for a different approach."
-            log.write(f"[yellow]{denied}[/]")
+            log.write(rich_text(denied, "warning"))
             log.write("")
             if self.session_logger and self._active_turn_id:
                 self.session_logger.start_tool_call(
@@ -1632,10 +1653,11 @@ class OpenJetApp:
             )
         if needs_confirm:
             self._active_turn_approval_requests += 1
-            log.write(Rule(f"[bold yellow]Tool Request: {tc.name}", style="yellow"))
-            log.write(f"[yellow]{tc.name}:[/]")
+            log.write(Rule(rich_text(f"Tool Request: {tc.name}", "tool"), style="tool"))
+            log.write(rich_text(f"{tc.name}:", "tool"))
             for preview_line in self._tool_preview_lines(tc):
-                log.write(f"  [bold bright_white]{preview_line}[/]")
+                preview_style = "command" if tc.name == "shell" else "muted"
+                log.write(f"  {rich_text(preview_line, preview_style)}")
             approved = await self._wait_for_tool_approval(tc)
             decision_ms = None
             if self._approval_started_at is not None:
@@ -1648,7 +1670,7 @@ class OpenJetApp:
                     decision_ms=decision_ms,
                 )
             if not approved:
-                log.write("[red]  denied[/]")
+                log.write(f"  {rich_text('denied', 'error')}")
                 log.write("")
                 assert self.agent is not None
                 self.agent.complete_tool_call(tc, "User denied this action.")
@@ -1662,7 +1684,7 @@ class OpenJetApp:
                         status="denied",
                     )
                 return {"tool": tc.name, "ok": False, "summary": "User denied this action.", "target": format_tool_args(tc)}
-            log.write("[green]  approved[/]")
+            log.write(f"  {rich_text('approved', 'success')}")
             self._active_turn_approval_grants += 1
 
         if tc.name == "load_file":
@@ -1699,9 +1721,9 @@ class OpenJetApp:
         if execution.ok:
             self._active_turn_tool_successes += 1
         for line in result_for_context.splitlines()[:20]:
-            log.write(f"  [bold bright_white]{line}[/]")
+            log.write(f"  {self._format_tool_output_line(line)}")
         if len(result_for_context.splitlines()) > 20:
-            log.write(f"  [bold bright_white]... ({len(result_for_context.splitlines()) - 20} more lines)[/]")
+            log.write(f"  {rich_text(f'... ({len(result_for_context.splitlines()) - 20} more lines)', 'dim')}")
         log.write("")
         assert self.agent is not None
         self.agent.complete_tool_call(tc, result_for_context)
@@ -1770,7 +1792,7 @@ class OpenJetApp:
     async def _recover_runtime(self, log: LogView, error_text: str) -> bool:
         if not self.client:
             return False
-        log.write("[yellow]LLM runtime interrupted. Restarting runtime once and retrying...[/]")
+        log.write(rich_text("LLM runtime interrupted. Restarting runtime once and retrying...", "warning"))
         self._log_trace_event("runtime_recovery_attempt", recoverable_error=error_text)
         try:
             await self.client.reset_kv_cache()
@@ -1782,12 +1804,12 @@ class OpenJetApp:
                     component="runtime",
                     turn_id=self._active_turn_id,
                 )
-            log.write(f"[bold red]Runtime recovery failed:[/] {exc}")
+            log.write(f"{rich_text('Runtime recovery failed:', 'error')} {rich_text(str(exc), 'muted')}")
             log.write("")
             return False
         if self.session_logger:
             self.session_logger.log_event("runtime_recovery_succeeded")
-        log.write("[bold bright_white]Runtime recovered. Retrying turn.[/]")
+        log.write(rich_text("Runtime recovered. Retrying turn.", "status"))
         log.write("")
         return True
 
@@ -1846,7 +1868,7 @@ class OpenJetApp:
             return
         if self._assistant_status_kind == "generating":
             status.remove_class("hidden")
-            status.update("Generating")
+            status.update("Generating...")
             return
         self._clear_assistant_status()
 
@@ -1854,6 +1876,35 @@ class OpenJetApp:
         status = self.query_one("#assistant-status")
         status.add_class("hidden")
         status.update("")
+
+    def _format_assistant_output_line(self, line: str, *, in_code_block: bool) -> tuple[str, bool]:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            return rich_text(stripped or "```", "tool"), not in_code_block
+        if in_code_block:
+            return rich_text(line, "code"), in_code_block
+        return escape(line), in_code_block
+
+    def _format_tool_output_line(self, line: str) -> str:
+        stripped = line.strip()
+        if not stripped:
+            return ""
+        first = stripped.split(" ", 1)[0]
+        if stripped.startswith("$") or stripped.startswith("/") or first in {
+            "git",
+            "python",
+            "python3",
+            "pytest",
+            "bash",
+            "sh",
+            "npm",
+            "pnpm",
+            "cargo",
+            "make",
+            "rg",
+        }:
+            return rich_text(line, "command")
+        return rich_text(line, "tool_output")
 
     @staticmethod
     def _format_command_status_label(command: str, max_len: int = 72) -> str:
@@ -2048,87 +2099,13 @@ def _extract_file_mentions(text: str) -> list[str]:
     return cleaned
 
 
-def _active_profile_name(cfg: dict[str, Any]) -> str:
-    return str(cfg.get("active_model_profile") or "").strip() or "none"
-
-
-def _format_model_profiles_summary(cfg: dict[str, Any]) -> str:
-    profiles = list_model_profiles(cfg)
-    if not profiles:
-        return "No saved model presets yet. Run `open-jet setup` or `/setup` to add one."
-
-    active_name = _active_profile_name(cfg).lower()
-    lines = [f"Active model preset: {_active_profile_name(cfg)}"]
-    for profile in profiles:
-        runtime = str(profile.get("runtime", "llama_cpp"))
-        model_ref = active_model_ref(dict(profile)) or "n/a"
-        marker = " (active)" if str(profile["name"]).strip().lower() == active_name else ""
-        lines.append(
-            f"- {profile['name']}{marker}: runtime={runtime} "
-            f"context={profile.get('context_window_tokens', 'n/a')} "
-            f"gpu={profile.get('gpu_layers', 'n/a')} "
-            f"model={model_ref}"
-        )
-    return "\n".join(lines)
-
-
-def _format_cli_status(cfg: dict[str, Any]) -> str:
-    runtime = str(cfg.get("runtime", "llama_cpp"))
-    spec = runtime_spec(runtime)
-    model_ref = active_model_ref(cfg) or "n/a"
-    lines = [
-        f"Runtime: {spec.label} ({runtime})",
-        f"Active model preset: {_active_profile_name(cfg)}",
-        f"Model ref: {model_ref}",
-        f"Context window: {cfg.get('context_window_tokens', 'n/a')}",
-        f"GPU layers: {cfg.get('gpu_layers', 'n/a')}",
-        f"Air-gapped: {'true' if airgapped_from_cfg(cfg) else 'false'}",
-    ]
-    return "\n".join(lines)
-
-
-def _format_slash_commands_summary() -> str:
-    lines = ["Slash commands:"]
-    for spec in SlashCommandHandler.COMMANDS:
-        aliases = f" (aliases: {', '.join(f'/{alias}' for alias in spec.aliases)})" if spec.aliases else ""
-        lines.append(f"- /{spec.name}: {spec.description}{aliases}")
-    return "\n".join(lines)
-
-
-def _open_jet_version() -> str:
-    try:
-        return importlib.metadata.version("open-jet")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
-
-
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="open-jet offline agentic terminal UI")
-    parser.add_argument("--setup", action="store_true", help="start in setup wizard mode before launching the chat UI")
-    subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("chat", help="start the interactive chat UI")
-    subparsers.add_parser("setup", help="run setup wizard before launching the chat UI")
-    subparsers.add_parser("models", help="list saved model presets")
-    subparsers.add_parser("commands", help="list available slash commands")
-    subparsers.add_parser("status", help="show runtime and configuration status")
-    subparsers.add_parser("version", help="show version information")
-    args = parser.parse_args(argv)
+    from .cli import main as cli_main
 
-    if args.command == "models":
-        print(_format_model_profiles_summary(load_config()))
-        return
-    if args.command == "commands":
-        print(_format_slash_commands_summary())
-        return
-    if args.command == "status":
-        print(_format_cli_status(load_config()))
-        return
-    if args.command == "version":
-        print(f"open-jet {_open_jet_version()}")
-        return
+    cli_main(argv)
 
-    force_setup = bool(args.setup or args.command == "setup")
-    asyncio.run(OpenJetApp(force_setup=force_setup).run_async())
+
+from .cli import _format_cli_status, _format_model_profiles_summary, _format_slash_commands_summary
 
 
 if __name__ == "__main__":

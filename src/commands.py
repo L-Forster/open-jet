@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -13,56 +12,15 @@ from .model_profiles import get_model_profile, list_model_profiles, replace_mode
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
 from .runtime_registry import runtime_spec
 from .setup import _prompt_text
+from .surfaces.command_specs import COMMANDS, CommandSpec
+from .theme import rich_text
 
 if TYPE_CHECKING:
     from .app import OpenJetApp
 
 
-@dataclass(frozen=True)
-class CommandSpec:
-    name: str
-    description: str
-    aliases: tuple[str, ...] = ()
-
-
 class SlashCommandHandler:
-    COMMANDS: tuple[CommandSpec, ...] = (
-        CommandSpec(name="help", description="Show command help", aliases=("commands", "?")),
-        CommandSpec(name="exit", description="Quit the app", aliases=("quit",)),
-        CommandSpec(
-            name="clear",
-            description="Clear chat and restart runtime (flush KV cache)",
-            aliases=("reset",),
-        ),
-        CommandSpec(
-            name="clear-chat",
-            description="Clear chat only (keep current server/KV state)",
-            aliases=("clear_messages",),
-        ),
-        CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
-        CommandSpec(name="condense", description="Manually condense older context"),
-        CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
-        CommandSpec(name="memory", description="Inspect or update persistent memory: /memory [show|clear <user|agent>]"),
-        CommandSpec(name="reasoning", description="Show or set llama.cpp reasoning mode: /reasoning [status|on|off|default]"),
-        CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
-        CommandSpec(name="resume", description="Load previous session state into chat"),
-        CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
-        CommandSpec(
-            name="model",
-            description="Show or switch saved model presets: /model [status|list|<name>]",
-            aliases=("models",),
-        ),
-        CommandSpec(name="edit-model", description="Edit a saved model preset: /edit-model [name]"),
-        CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
-        CommandSpec(name="skills", description="Show or clear selected harness skills: /skills [status|list|clear]"),
-        CommandSpec(name="skill", description="Pin one or more harness skills: /skill <name[,name...]>"),
-        CommandSpec(name="step", description="Inspect or control the active step: /step [status|next|split]"),
-        CommandSpec(
-            name="util",
-            description="Show/hide utilization line: /util [show|hide|toggle|status]",
-            aliases=("usage",),
-        ),
-    )
+    COMMANDS: tuple[CommandSpec, ...] = COMMANDS
 
     def __init__(self, app: OpenJetApp, banner: str) -> None:
         self.app = app
@@ -73,7 +31,7 @@ class SlashCommandHandler:
             return False
 
         log = self.app.query_one("#chat-log")
-        log.write(f"[bold green]> [/]{text}")
+        log.write(f"{rich_text('> ', 'user')}{rich_text(text, 'command')}")
         log.write("")
         if self.app.session_logger:
             self.app.session_logger.record_slash_command(text)
@@ -148,10 +106,10 @@ class SlashCommandHandler:
         return True
 
     def _render_help(self, log: Any) -> None:
-        lines = ["[bold]Slash commands[/]"]
+        lines = [rich_text("Slash commands", "assistant")]
         for spec in self.COMMANDS:
             aliases = f" (aliases: {', '.join(f'/{a}' for a in spec.aliases)})" if spec.aliases else ""
-            lines.append(f"  [green]/{spec.name}[/] - {spec.description}{aliases}")
+            lines.append(f"  {rich_text('/' + spec.name, 'command')} {rich_text('- ' + spec.description + aliases, 'muted')}")
         for line in lines:
             log.write(line)
         log.write("")
@@ -298,8 +256,8 @@ class SlashCommandHandler:
             self.app.session_logger.record_manual_condense(summary)
 
     def _render_unknown(self, log: Any, text: str) -> None:
-        log.write(f"[yellow]Unknown command:[/] {text}")
-        log.write("[bold bright_white]Run /help to list available commands.[/]")
+        log.write(f"{rich_text('Unknown command:', 'warning')} {rich_text(text, 'command')}")
+        log.write(rich_text("Run /help to list available commands.", "muted"))
         log.write("")
 
     async def _load(self, log: Any, raw_arg: str) -> None:
