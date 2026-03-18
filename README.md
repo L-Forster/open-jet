@@ -137,6 +137,7 @@ OpenJet is built around:
 
 - [Quickstart](docs/quickstart.md)
 - [Installation](docs/installation.md)
+- [Examples](docs/examples/README.md)
 - [Runtime: llama.cpp](docs/runtimes/llama-cpp.md)
 - [Runtime: SGLang](docs/runtimes/sglang.md)
 - [Runtime: TensorRT-LLM](docs/runtimes/tensorrt-llm.md)
