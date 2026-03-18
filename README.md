@@ -141,6 +141,7 @@ OpenJet is built around:
 - [Runtime: SGLang](docs/runtimes/sglang.md)
 - [Runtime: TensorRT-LLM](docs/runtimes/tensorrt-llm.md)
 - [Usage: CLI](docs/usage/cli.md)
+- [Examples](docs/examples/README.md)
 - [Usage: Slash commands](docs/usage/slash-commands.md)
 - [Usage: Workflow harness](docs/usage/workflow-harness.md)
 - [Usage: Session state and logging](docs/usage/session-state-and-logging.md)

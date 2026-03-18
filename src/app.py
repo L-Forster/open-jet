@@ -1716,6 +1716,17 @@ class OpenJetApp:
         self._active_turn_tool_attempts += 1
         t0 = time.monotonic()
         tool_status_token = self._start_tool_status(tc)
+        auto_unload_active = False
+        auto_unload_reason = ""
+        should_auto_unload, auto_unload_reason = self._should_auto_unload_runtime_for_tool(tc)
+        if should_auto_unload and self.client:
+            log.write(rich_text(f"Auto-unloading model runtime before tool execution ({auto_unload_reason}).", "status"))
+            try:
+                await self.client.close()
+                auto_unload_active = True
+            except Exception as exc:
+                log.write(rich_text(f"Runtime unload warning: {exc}", "warning"))
+                log.write("")
         try:
             execution = await execute_tool(tc)
         except Exception as exc:
@@ -1738,6 +1749,15 @@ class OpenJetApp:
                 )
             raise
         finally:
+            if auto_unload_active and self.client:
+                try:
+                    await self.client.start()
+                    if self.agent:
+                        self.agent.client = self.client
+                    log.write(rich_text("Model runtime reloaded after tool execution.", "status"))
+                except Exception as exc:
+                    log.write(rich_text(f"Runtime reload failed after tool execution: {exc}", "error"))
+                    log.write("")
             self._stop_tool_status(tool_status_token)
         result = execution.output
         meta = execution.meta
@@ -1776,6 +1796,36 @@ class OpenJetApp:
             "command": tc.arguments.get("command") if isinstance(tc.arguments, dict) else None,
             "duration_ms": duration_ms,
         }
+
+    def _should_auto_unload_runtime_for_tool(self, tc: ToolCall) -> tuple[bool, str]:
+        if tc.name != "shell" or not isinstance(tc.arguments, dict):
+            return False, ""
+        if not bool(self.cfg.get("auto_unload_runtime_for_heavy_shell", True)):
+            return False, ""
+
+        command = str(tc.arguments.get("command", "")).strip()
+        if not command:
+            return False, ""
+        classified = _classify_shell_command(command)
+        category = _shell_command_category(str(classified.get("primary_command", "")))
+
+        heavy_categories = {"python", "node", "rust", "build"}
+        if category not in heavy_categories:
+            return False, ""
+
+        snapshot = read_memory_snapshot()
+        if snapshot is None:
+            return False, ""
+
+        configured_threshold = self.cfg.get("auto_unload_runtime_min_available_mb")
+        if isinstance(configured_threshold, (int, float)) and configured_threshold > 0:
+            threshold_mb = float(configured_threshold)
+        else:
+            threshold_mb = max(2048.0, snapshot.total_mb * 0.35)
+
+        if snapshot.available_mb > threshold_mb:
+            return False, ""
+        return True, f"{category} task with low available memory ({snapshot.available_mb:.0f}MB <= {threshold_mb:.0f}MB threshold)"
 
     def _clamp_load_file_tool_budget(self, tc: ToolCall) -> None:
         if isinstance(tc.arguments, dict):
