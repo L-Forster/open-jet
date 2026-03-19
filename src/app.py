@@ -73,6 +73,7 @@ from .model_profiles import (
 )
 from .ollama_setup import discover_installed_ollama_models, materialize_setup_model
 from .persistent_memory import build_system_prompt
+from .provisioning import provision_setup_artifacts
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
 from .runtime_registry import active_model_ref, create_runtime_client
@@ -683,7 +684,19 @@ class OpenJetApp:
             status.update("")
             status.add_class("hidden")
 
-        return await materialize_setup_model(setup_result, log, set_status=_set_status, clear_status=_clear_status)
+        resolved = await materialize_setup_model(
+            setup_result,
+            log,
+            set_status=_set_status,
+            clear_status=_clear_status,
+        )
+        return await provision_setup_artifacts(
+            resolved,
+            hardware_info=detect_hardware_info(),
+            log=log,
+            set_status=_set_status,
+            clear_status=_clear_status,
+        )
 
     async def _run_setup_wizard(self) -> dict | None:
         return await run_setup_wizard(

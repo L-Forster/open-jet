@@ -29,7 +29,7 @@ from src.llama_server import (
     _JETSON_VMM_RESERVE_MB,
 )
 from src.runtime_protocol import StreamChunk
-from src.setup import _prompt_choice, run_setup_wizard
+from src.setup import _prompt_choice, build_recommended_payload, run_setup_wizard
 
 
 class FakeAgent:
@@ -234,7 +234,14 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 rendered = message()
                 test_case.assertIn("Hardware profile", rendered.value)
                 handlers[("down",)](event)
-                handlers[("enter",)](event)
+                enter_handler = handlers.get(("enter",))
+                if enter_handler is None:
+                    for keys, handler in handlers.items():
+                        if keys and getattr(keys[0], "value", None) == "c-m":
+                            enter_handler = handler
+                            break
+                test_case.assertIsNotNone(enter_handler)
+                enter_handler(event)
                 return app.result
 
         session = FakeSession()
@@ -253,7 +260,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         manual_model = "/models/custom.gguf"
         profile_name = "Custom Model"
 
-        choices = iter(["auto", "llama_cpp", "__local__", "__manual__", 4096, 99])
+        choices = iter(["manual", "auto", "llama_cpp", "__local__", "__manual__", 4096, 99])
         texts = iter([manual_model, profile_name])
 
         async def fake_choice(*_args, **_kwargs):
@@ -291,6 +298,8 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         captured_options: list[tuple[str, object]] = []
 
         async def fake_choice(_session, _console, title, options, **_kwargs):
+            if title == "Setup mode":
+                return "manual"
             if title == "Hardware profile":
                 return "auto"
             if title == "Runtime":
@@ -315,6 +324,123 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertIn((f"{Path(saved_model).name} (saved)", saved_model), captured_options)
+
+    async def test_run_setup_wizard_prefills_current_llama_defaults(self) -> None:
+        console = Mock()
+        hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
+        current_model = "/models/current.gguf"
+        profile_name = "Current Model"
+        captured_defaults: dict[str, object] = {}
+        text_defaults: list[str] = []
+
+        async def fake_choice(_session, _console, title, options, **kwargs):
+            captured_defaults[title] = kwargs.get("default_index")
+            if title == "Setup mode":
+                return "guided"
+            if title == "Hardware profile":
+                return "auto"
+            if title == "Runtime":
+                return options[kwargs["default_index"]][1]
+            if title == "Model source":
+                return "__local__"
+            if title == "Local model":
+                return "__manual__"
+            if title == "Context window":
+                return options[kwargs["default_index"]][1]
+            if title == "GPU layers":
+                return options[kwargs["default_index"]][1]
+            raise AssertionError(f"Unexpected setup prompt: {title}")
+
+        async def fake_text(*_args, **kwargs):
+            default = str(kwargs.get("default", ""))
+            text_defaults.append(default)
+            if len(text_defaults) == 1:
+                return current_model
+            return profile_name
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.find_ollama_cli", return_value=None
+        ), patch("src.setup.recommended_context_window_tokens", return_value=4096), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=4096
+        ), patch("src.setup.recommended_gpu_layers", return_value=99), patch(
+            "pathlib.Path.is_file", return_value=True
+        ):
+            payload = await run_setup_wizard(
+                session=None,
+                console=console,
+                hardware_info=hardware,
+                recommended_ctx=4096,
+                current_cfg={
+                    "runtime": "llama_cpp",
+                    "llama_model": current_model,
+                    "context_window_tokens": 3072,
+                    "gpu_layers": 20,
+                },
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["llama_model"], current_model)
+        self.assertEqual(payload["context_window_tokens"], 3072)
+        self.assertEqual(payload["gpu_layers"], 20)
+        self.assertEqual(text_defaults[0], current_model)
+        self.assertIsInstance(captured_defaults["Runtime"], int)
+        self.assertIsInstance(captured_defaults["Context window"], int)
+        self.assertIsInstance(captured_defaults["GPU layers"], int)
+
+    def test_build_recommended_payload_marks_missing_runtime_and_prefers_direct_model(self) -> None:
+        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
+        with patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.find_ollama_cli", return_value=None
+        ), patch("src.setup.discover_installed_ollama_models", return_value=[]), patch(
+            "src.setup._discover_llama_server", return_value=None
+        ), patch("src.setup.recommended_context_window_tokens", return_value=2048), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=2048
+        ):
+            payload = build_recommended_payload(
+                hardware_info=hardware,
+                recommended_ctx=2048,
+                current_cfg={},
+            )
+
+        self.assertEqual(payload["runtime"], "llama_cpp")
+        self.assertEqual(payload["model_source"], "direct")
+        self.assertTrue(payload["setup_missing_runtime"])
+        self.assertIn("model_download_url", payload)
+        self.assertIn("model_download_path", payload)
+
+    async def test_run_setup_wizard_returns_recommended_payload_immediately(self) -> None:
+        console = Mock()
+        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
+
+        async def fake_choice(_session, _console, title, _options, **_kwargs):
+            if title == "Setup mode":
+                return "recommended"
+            raise AssertionError(f"Unexpected prompt after recommended selection: {title}")
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup.build_recommended_payload",
+            return_value={
+                "runtime": "llama_cpp",
+                "model_source": "ollama",
+                "ollama_model": "qwen3:4b",
+                "device": "cpu",
+                "context_window_tokens": 2048,
+                "gpu_layers": 0,
+                "setup_complete": True,
+                "model_profile_name": "Qwen3 4B",
+            },
+        ):
+            payload = await run_setup_wizard(
+                session=None,
+                console=console,
+                hardware_info=hardware,
+                recommended_ctx=2048,
+                current_cfg={},
+            )
+
+        self.assertEqual(payload["ollama_model"], "qwen3:4b")
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):

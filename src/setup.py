@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from html import escape as html_escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping
@@ -25,6 +26,7 @@ from .hardware import (
 )
 from .model_profiles import default_profile_name
 from .ollama_setup import discover_installed_ollama_models, find_ollama_cli
+from .provisioning import recommend_direct_model
 from .runtime_registry import runtime_options, runtime_spec
 
 if TYPE_CHECKING:
@@ -127,6 +129,263 @@ def _saved_model_refs(current_cfg: Mapping[str, object] | None, runtime: str) ->
     return _dedupe_refs(refs)
 
 
+def _default_option_index(options: list[tuple[str, object]], value: object, *, fallback: int = 0) -> int:
+    for idx, (_label, option_value) in enumerate(options):
+        if option_value == value:
+            return idx
+    return fallback
+
+
+def _configured_runtime(current_cfg: Mapping[str, object] | None) -> str:
+    value = ""
+    if isinstance(current_cfg, Mapping):
+        value = str(current_cfg.get("runtime") or "").strip()
+    spec = runtime_spec(value)
+    return spec.key if spec.show_in_setup else "llama_cpp"
+
+
+def _discover_llama_server() -> str | None:
+    found = shutil.which("llama-server")
+    if found:
+        return found
+    candidate = Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"
+    if candidate.is_file():
+        return str(candidate)
+    return None
+
+
+def _runtime_prompt_options(
+    current_cfg: Mapping[str, object] | None,
+    *,
+    llama_ready: bool,
+    sglang_models: list[str],
+    trt_models: list[str],
+) -> list[tuple[str, str]]:
+    configured_runtime = _configured_runtime(current_cfg)
+    options: list[tuple[str, str]] = []
+    for label, key in runtime_options():
+        suffix = ""
+        if key == "llama_cpp":
+            suffix = " (detected)" if llama_ready else " (llama-server not found)"
+        elif key == "sglang" and sglang_models:
+            suffix = " (model detected)"
+        elif key == "trtllm_pytorch" and trt_models:
+            suffix = " (model detected)"
+        if key == configured_runtime:
+            suffix = f"{suffix}, current" if suffix else " (current)"
+        options.append((f"{label}{suffix}", key))
+    return options
+
+
+def _current_string(current_cfg: Mapping[str, object] | None, key: str) -> str:
+    if not isinstance(current_cfg, Mapping):
+        return ""
+    return str(current_cfg.get(key) or "").strip()
+
+
+def _current_int(current_cfg: Mapping[str, object] | None, key: str) -> int | None:
+    if not isinstance(current_cfg, Mapping):
+        return None
+    value = current_cfg.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _recommended_model_choice(
+    *,
+    hardware_info: HardwareInfo,
+    current_cfg: Mapping[str, object] | None,
+    runtime: str,
+    model_files: list[str],
+    saved_model_files: list[str],
+    installed_ollama: list[str],
+    ollama_cli: str | None,
+    max_b: float,
+) -> tuple[str, dict[str, object]]:
+    current_model_source = _current_string(current_cfg, "model_source").lower()
+    current_ollama_model = _current_string(current_cfg, "ollama_model")
+    current_local_model = _current_string(current_cfg, runtime_spec(runtime).model_config_key)
+    if current_model_source == "ollama" and current_ollama_model:
+        return "ollama", {
+            "model_source": "ollama",
+            "recommended_llm": current_ollama_model,
+            "ollama_model": current_ollama_model,
+        }
+    if current_local_model:
+        return "local", {
+            "model_source": "local",
+            "model": current_local_model,
+            "llama_model": current_local_model,
+        }
+    if model_files:
+        model_path = model_files[0]
+        return "local", {
+            "model_source": "local",
+            "model": model_path,
+            "llama_model": model_path,
+        }
+    if saved_model_files:
+        model_path = saved_model_files[0]
+        return "local", {
+            "model_source": "local",
+            "model": model_path,
+            "llama_model": model_path,
+        }
+    if installed_ollama:
+        tag = installed_ollama[0]
+        return "ollama", {
+            "model_source": "ollama",
+            "recommended_llm": tag,
+            "ollama_model": tag,
+        }
+    recommended = recommended_llm_models(max_b)
+    if ollama_cli and recommended:
+        tag = recommended[0][1]
+        return "ollama", {
+            "model_source": "ollama",
+            "recommended_llm": tag,
+            "ollama_model": tag,
+        }
+    direct = recommend_direct_model(hardware_info)
+    return "direct", {
+        "model_source": "direct",
+        "model_download_url": direct["url"],
+        "model_download_path": direct["target_path"],
+        "recommended_llm": direct["label"],
+        "setup_missing_model": True,
+    }
+
+
+def build_recommended_payload(
+    *,
+    hardware_info: HardwareInfo,
+    recommended_ctx: int,
+    current_cfg: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    hardware_profile = _current_string(current_cfg, "hardware_profile") or "auto"
+    if hardware_profile != "other":
+        hardware_profile = "auto"
+    hardware_override = _current_string(current_cfg, "hardware_override") if hardware_profile == "other" else ""
+    effective_hw = effective_hardware_info(hardware_profile, hardware_info, hardware_override)
+    runtime = _configured_runtime(current_cfg)
+    device = recommended_device_for_hardware(hardware_profile, hardware_info, hardware_override)
+
+    payload: dict[str, object] = {
+        "runtime": runtime,
+        "hardware_profile": hardware_profile,
+        "hardware_override": hardware_override,
+    }
+
+    if runtime == "llama_cpp":
+        model_files = discover_model_files()
+        saved_model_files = _saved_model_refs(current_cfg, runtime)
+        ollama_cli = find_ollama_cli()
+        installed_ollama = discover_installed_ollama_models() if ollama_cli else []
+        max_b = recommended_param_budget_b(hardware_profile, hardware_info, hardware_override)
+        _source, model_payload = _recommended_model_choice(
+            hardware_info=hardware_info,
+            current_cfg=current_cfg,
+            runtime=runtime,
+            model_files=model_files,
+            saved_model_files=saved_model_files,
+            installed_ollama=installed_ollama,
+            ollama_cli=ollama_cli,
+            max_b=max_b,
+        )
+        payload.update(model_payload)
+        payload["setup_missing_runtime"] = _discover_llama_server() is None
+        if "llama_model" in payload:
+            _remember_model_ref(payload, current_cfg, runtime, str(payload["llama_model"]))
+    elif runtime == "sglang":
+        current_model = _current_string(current_cfg, "sglang_model")
+        discovered = discover_sglang_model_dirs()
+        model_ref = current_model or (discovered[0] if discovered else "")
+        if model_ref:
+            payload.update(
+                {
+                    "model_source": "local",
+                    "model": model_ref,
+                    "sglang_model": model_ref,
+                }
+            )
+            _remember_model_ref(payload, current_cfg, runtime, model_ref)
+        else:
+            payload["setup_missing_model"] = True
+        payload["sglang_launch_mode"] = "managed"
+        payload["sglang_served_model_name"] = "local"
+    else:
+        current_model = _current_string(current_cfg, "trtllm_model")
+        discovered = discover_trt_model_dirs()
+        model_ref = current_model or (discovered[0] if discovered else "")
+        if model_ref:
+            payload.update(
+                {
+                    "model_source": "local",
+                    "model": model_ref,
+                    "trtllm_model": model_ref,
+                }
+            )
+            _remember_model_ref(payload, current_cfg, runtime, model_ref)
+        else:
+            payload["setup_missing_model"] = True
+
+    headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    detected_recommended_ctx = (
+        recommended_context_window_tokens()
+        if hardware_profile == "auto"
+        else recommended_context_window_tokens_from_total(
+            effective_hw.total_ram_gb,
+            headless=headless,
+        )
+    )
+    context_value = _current_int(current_cfg, "context_window_tokens") or max(recommended_ctx, detected_recommended_ctx)
+    gpu_value = 0
+    if runtime == "llama_cpp":
+        gpu_value = _current_int(current_cfg, "gpu_layers")
+        if gpu_value is None:
+            gpu_value = recommended_gpu_layers(device, effective_hw.total_ram_gb)
+
+    payload.update(
+        {
+            "device": device,
+            "context_window_tokens": context_value,
+            "gpu_layers": gpu_value if runtime == "llama_cpp" else 0,
+            "setup_complete": True,
+            "model_profile_name": default_profile_name(payload),
+        }
+    )
+    return payload
+
+
+def _recommended_summary(payload: Mapping[str, object]) -> str:
+    runtime = str(payload.get("runtime") or "llama_cpp")
+    model_source = str(payload.get("model_source") or "local")
+    model_ref = str(
+        payload.get("ollama_model")
+        or payload.get(runtime_spec(runtime).model_config_key)
+        or payload.get("model")
+        or ""
+    ).strip()
+    model_text = model_ref or "missing"
+    notes: list[str] = []
+    if payload.get("setup_missing_runtime"):
+        notes.append("llama-server missing")
+    if payload.get("setup_missing_model"):
+        notes.append("model missing")
+    note_suffix = f" [{', '.join(notes)}]" if notes else ""
+    return (
+        f"runtime={runtime}, model_source={model_source}, model={model_text}, "
+        f"device={payload.get('device', 'auto')}, ctx={payload.get('context_window_tokens', '?')}, "
+        f"gpu_layers={payload.get('gpu_layers', 0)}{note_suffix}"
+    )
+
+
 def _remember_model_ref(
     payload: dict[str, object],
     current_cfg: Mapping[str, object] | None,
@@ -165,12 +424,12 @@ def _choice_prompt_html(
     selected_index: int,
     detail: str | None = None,
 ) -> HTML:
-    lines = [f"<style fg='{ACCENT_GREEN}' bold>{html_escape(title)}</style>"]
+    lines = [f"<style fg='{ACCENT_GREEN}' bold='true'>{html_escape(title)}</style>"]
     if detail:
         lines.append(f"<style fg='ansibrightblack'>{html_escape(detail)}</style>")
     for idx, (label, _value) in enumerate(options):
         marker = "›" if idx == selected_index else " "
-        style = f" fg='{ACCENT_GREEN}' bold" if idx == selected_index else ""
+        style = f" fg='{ACCENT_GREEN}' bold='true'" if idx == selected_index else ""
         lines.append(
             f"{marker} <style{style}>{idx + 1}. {html_escape(str(label))}</style>"
         )
@@ -280,33 +539,80 @@ async def run_setup_wizard(
     console.print(f"[bold {ACCENT_GREEN}]open-jet setup[/]")
     console.print(f"[dim]Detected hardware: {escape(hardware_info.label)} ({escape(ram_text)})[/]")
 
+    recommended_payload = build_recommended_payload(
+        hardware_info=hardware_info,
+        recommended_ctx=recommended_ctx,
+        current_cfg=current_cfg,
+    )
+    setup_mode_options = [
+        ("Use recommended setup", "recommended"),
+        ("Review and edit recommended setup", "guided"),
+        ("Manual setup", "manual"),
+    ]
+    setup_mode = str(
+        await _prompt_choice(
+            session,
+            console,
+            "Setup mode",
+            setup_mode_options,
+            default_index=0,
+            detail=_recommended_summary(recommended_payload),
+        )
+    )
+    if setup_mode == "recommended":
+        return recommended_payload
+
+    hardware_options = [
+        (f"Use detected hardware ({hardware_info.label}, {ram_text})", "auto"),
+        ("Pick hardware profile manually", "other"),
+    ]
+    default_hardware = "other" if setup_mode == "manual" and _current_string(current_cfg, "hardware_profile") == "other" else str(recommended_payload.get("hardware_profile", "auto"))
     hardware = await _prompt_choice(
         session,
         console,
         "Hardware profile",
-        [
-            (f"Use detected hardware ({hardware_info.label}, {ram_text})", "auto"),
-            ("Pick hardware profile manually", "other"),
-        ],
+        hardware_options,
+        default_index=_default_option_index(
+            hardware_options,
+            default_hardware,
+        ),
     )
 
     hardware_override = ""
     if hardware == "other":
+        override_options = [(label, key) for key, label, _ram in JETSON_OVERRIDE_OPTIONS]
         hardware_override = str(
             await _prompt_choice(
                 session,
                 console,
                 "Hardware override",
-                [(label, key) for key, label, _ram in JETSON_OVERRIDE_OPTIONS],
+                override_options,
+                default_index=_default_option_index(
+                    override_options,
+                    _current_string(current_cfg, "hardware_override"),
+                ),
             )
         )
 
+    sglang_models = discover_sglang_model_dirs()
+    trt_models = discover_trt_model_dirs()
+    runtime_prompt_options = _runtime_prompt_options(
+        current_cfg,
+        llama_ready=_discover_llama_server() is not None,
+        sglang_models=sglang_models,
+        trt_models=trt_models,
+    )
+    runtime_default = _configured_runtime(current_cfg) if setup_mode == "manual" else str(recommended_payload.get("runtime", _configured_runtime(current_cfg)))
     runtime = str(
         await _prompt_choice(
             session,
             console,
             "Runtime",
-            runtime_options(),
+            runtime_prompt_options,
+            default_index=_default_option_index(
+                runtime_prompt_options,
+                runtime_default,
+            ),
         )
     )
 
@@ -344,6 +650,20 @@ async def run_setup_wizard(
             if ollama_cli
             else "Ollama not found; using a local GGUF model file."
         )
+        current_model_source = _current_string(current_cfg, "model_source").lower()
+        current_ollama_model = _current_string(current_cfg, "ollama_model")
+        current_llama_model = _current_string(current_cfg, "llama_model")
+        default_model_plan = "__local__"
+        if setup_mode != "manual" and str(recommended_payload.get("model_source")) == "ollama":
+            default_model_plan = str(recommended_payload.get("ollama_model") or current_ollama_model or "__local__")
+        elif current_model_source == "ollama" and current_ollama_model:
+            default_model_plan = current_ollama_model
+        elif current_llama_model or model_files or saved_model_files:
+            default_model_plan = "__local__"
+        elif installed_ollama:
+            default_model_plan = installed_ollama[0]
+        elif download_rows:
+            default_model_plan = str(download_rows[0][1])
         model_plan = "__local__"
         if len(model_plan_options) > 1:
             model_plan = str(
@@ -352,6 +672,7 @@ async def run_setup_wizard(
                     console,
                     "Model source",
                     model_plan_options,
+                    default_index=_default_option_index(model_plan_options, default_model_plan),
                     detail=detail,
                 )
             )
@@ -363,15 +684,25 @@ async def run_setup_wizard(
                 if model not in model_files
             )
             local_rows.append(("Manual path", "__manual__"))
+            preferred_local_model = current_llama_model if current_llama_model else None
+            if setup_mode != "manual":
+                preferred_local_model = str(recommended_payload.get("llama_model") or preferred_local_model or "")
+                preferred_local_model = preferred_local_model or None
+            if preferred_local_model and preferred_local_model not in [value for _label, value in local_rows]:
+                local_rows.insert(0, (f"{Path(preferred_local_model).name or preferred_local_model} (current)", preferred_local_model))
             local_choice = await _prompt_choice(
                 session,
                 console,
                 "Local model",
                 local_rows,
+                default_index=_default_option_index(
+                    local_rows,
+                    preferred_local_model or (local_rows[0][1] if local_rows else "__manual__"),
+                ),
                 detail="Select a detected GGUF file or choose Manual path.",
             )
             if local_choice == "__manual__":
-                model_path = await _prompt_text(session, "model path> ")
+                model_path = await _prompt_text(session, "model path> ", default=current_llama_model)
             else:
                 model_path = str(local_choice)
             model_file = Path(model_path).expanduser()
@@ -392,17 +723,34 @@ async def run_setup_wizard(
             payload["recommended_llm"] = model_plan
             payload["ollama_model"] = model_plan
     elif runtime == "sglang":
-        discovered = discover_sglang_model_dirs()
         saved_refs = _saved_model_refs(current_cfg, runtime)
-        rows = [(Path(model).name, model) for model in discovered]
+        rows = [(Path(model).name, model) for model in sglang_models]
         rows.extend(
             (f"{Path(model).name or model} (saved)", model)
             for model in saved_refs
-            if model not in discovered
+            if model not in sglang_models
         )
         rows.append(("Manual path or HF model id", "__manual__"))
-        choice = await _prompt_choice(session, console, "SGLang model", rows)
-        model_ref = await _prompt_text(session, "sglang model> ") if choice == "__manual__" else str(choice)
+        current_model_ref = _current_string(current_cfg, "sglang_model")
+        if setup_mode != "manual":
+            current_model_ref = str(recommended_payload.get("sglang_model") or current_model_ref or "")
+        if current_model_ref and current_model_ref not in [value for _label, value in rows]:
+            rows.insert(0, (f"{Path(current_model_ref).name or current_model_ref} (current)", current_model_ref))
+        choice = await _prompt_choice(
+            session,
+            console,
+            "SGLang model",
+            rows,
+            default_index=_default_option_index(
+                rows,
+                current_model_ref or (rows[0][1] if rows else "__manual__"),
+            ),
+        )
+        model_ref = (
+            await _prompt_text(session, "sglang model> ", default=current_model_ref)
+            if choice == "__manual__"
+            else str(choice)
+        )
         if not model_ref:
             raise RuntimeError("SGLang model path or HF model id is required.")
         payload["model_source"] = "local"
@@ -412,17 +760,34 @@ async def run_setup_wizard(
         payload["sglang_served_model_name"] = "local"
         _remember_model_ref(payload, current_cfg, runtime, model_ref)
     else:
-        discovered = discover_trt_model_dirs()
         saved_refs = _saved_model_refs(current_cfg, runtime)
-        rows = [(Path(model).name, model) for model in discovered]
+        rows = [(Path(model).name, model) for model in trt_models]
         rows.extend(
             (f"{Path(model).name or model} (saved)", model)
             for model in saved_refs
-            if model not in discovered
+            if model not in trt_models
         )
         rows.append(("Manual path or HF model id", "__manual__"))
-        choice = await _prompt_choice(session, console, "TensorRT model", rows)
-        model_ref = await _prompt_text(session, "trt model> ") if choice == "__manual__" else str(choice)
+        current_model_ref = _current_string(current_cfg, "trtllm_model")
+        if setup_mode != "manual":
+            current_model_ref = str(recommended_payload.get("trtllm_model") or current_model_ref or "")
+        if current_model_ref and current_model_ref not in [value for _label, value in rows]:
+            rows.insert(0, (f"{Path(current_model_ref).name or current_model_ref} (current)", current_model_ref))
+        choice = await _prompt_choice(
+            session,
+            console,
+            "TensorRT model",
+            rows,
+            default_index=_default_option_index(
+                rows,
+                current_model_ref or (rows[0][1] if rows else "__manual__"),
+            ),
+        )
+        model_ref = (
+            await _prompt_text(session, "trt model> ", default=current_model_ref)
+            if choice == "__manual__"
+            else str(choice)
+        )
         if not model_ref:
             raise RuntimeError("TensorRT model path or HF model id is required.")
         payload["model_source"] = "local"
@@ -439,30 +804,46 @@ async def run_setup_wizard(
             headless=headless,
         )
     recommended_ctx_value = max(recommended_ctx, recommended_ctx_value)
+    context_options = [
+        (f"{value} (recommended)" if value == recommended_ctx_value else str(value), value)
+        for value in context_window_options(recommended_ctx_value)
+    ]
+    context_default = _current_int(current_cfg, "context_window_tokens") or recommended_ctx_value
+    if setup_mode != "manual":
+        context_default = int(recommended_payload.get("context_window_tokens", context_default))
     context_value = int(
         await _prompt_choice(
             session,
             console,
             "Context window",
-            [
-                (f"{value} (recommended)" if value == recommended_ctx_value else str(value), value)
-                for value in context_window_options(recommended_ctx_value)
-            ],
+            context_options,
+            default_index=_default_option_index(
+                context_options,
+                context_default,
+            ),
         )
     )
 
     gpu_value = 0
     if runtime == "llama_cpp":
         recommended_gpu = recommended_gpu_layers(device, effective_hw.total_ram_gb)
+        gpu_options = [
+            (f"{value} (recommended)" if value == recommended_gpu else str(value), value)
+            for value in gpu_layer_options(device, recommended_gpu)
+        ]
+        gpu_default = _current_int(current_cfg, "gpu_layers") if _current_int(current_cfg, "gpu_layers") is not None else recommended_gpu
+        if setup_mode != "manual":
+            gpu_default = int(recommended_payload.get("gpu_layers", gpu_default))
         gpu_value = int(
             await _prompt_choice(
                 session,
                 console,
                 "GPU layers",
-                [
-                    (f"{value} (recommended)" if value == recommended_gpu else str(value), value)
-                    for value in gpu_layer_options(device, recommended_gpu)
-                ],
+                gpu_options,
+                default_index=_default_option_index(
+                    gpu_options,
+                    gpu_default,
+                ),
                 detail="Higher offload can be faster but uses more memory.",
             )
         )
@@ -478,6 +859,6 @@ async def run_setup_wizard(
     payload["model_profile_name"] = await _prompt_text(
         session,
         "model name> ",
-        default=default_profile_name(payload),
+        default=str(recommended_payload.get("model_profile_name") or default_profile_name(payload)),
     )
     return payload
