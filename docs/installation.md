@@ -1,12 +1,16 @@
 # Installation
 
-## Python package
+## Clone and install
 
 ```bash
-pip install open-jet
+git clone https://github.com/l-forster/open-jet.git
+cd open-jet
+./install.sh
 ```
 
-The base install is intentionally lighter now. It does not pull in `SGLang` or `TensorRT-LLM`.
+This creates a local virtualenv, installs the repo, and links `open-jet` / `openjet` into `~/.local/bin`.
+
+The base Python install is intentionally lighter now. It does not pull in `SGLang` or `TensorRT-LLM`.
 
 ## Supported runtimes
 

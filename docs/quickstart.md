@@ -3,7 +3,9 @@
 ## 1. Install
 
 ```bash
-pip install open-jet
+git clone https://github.com/l-forster/open-jet.git
+cd open-jet
+./install.sh
 ```
 
 `open-jet` now supports a deliberately smaller runtime set:

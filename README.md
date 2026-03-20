@@ -18,10 +18,12 @@ OpenJet is designed to stay useful when local AI gets messy: tight memory, short
 
 ## Quickstart
 
-Install the package:
+Clone the repo and run the installer:
 
 ```bash
-pip install open-jet
+git clone https://github.com/l-forster/open-jet.git
+cd open-jet
+./install.sh
 ```
 
 OpenJet is positioned for local and self-hosted use first. Hosted APIs are supported, but they are the fallback path, not the main story.
@@ -102,11 +104,15 @@ If you want full install details for each runtime, jump to [Installation](#insta
 
 ## Installation
 
-### 1. Install the Python package
+### 1. Clone the repo and install
 
 ```bash
-pip install open-jet
+git clone https://github.com/l-forster/open-jet.git
+cd open-jet
+./install.sh
 ```
+
+This creates a local virtualenv, installs the repo, and links `open-jet` / `openjet` into `~/.local/bin`.
 
 ### 2. Choose a runtime path
 
