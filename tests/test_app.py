@@ -28,6 +28,7 @@ from src.llama_server import (
     _JETSON_VMM_CHUNK_MB,
     _JETSON_VMM_RESERVE_MB,
 )
+from src.provisioning import ensure_direct_model
 from src.runtime_protocol import StreamChunk
 from src.setup import _prompt_choice, _runtime_prompt_options, build_recommended_payload, run_setup_wizard
 
@@ -538,6 +539,59 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("model_download_url", payload)
         self.assertIn("model_download_path", payload)
         self.assertEqual(payload["model_profile_name"], profile_name)
+
+
+class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ensure_direct_model_downloads_target_file(self) -> None:
+        class FakeResponse:
+            status_code = 200
+            headers = {"Content-Length": "8"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def aiter_bytes(self):
+                yield b"test"
+                yield b"-gguf"
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def stream(self, method, url, headers=None):
+                return FakeResponse()
+
+        updates: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "model.gguf"
+            payload = {
+                "runtime": "llama_cpp",
+                "model_source": "direct",
+                "model_download_url": "https://example.invalid/model.gguf",
+                "model_download_path": str(target),
+                "setup_missing_model": True,
+            }
+
+            with patch("src.provisioning.httpx.AsyncClient", return_value=FakeClient()):
+                resolved = await ensure_direct_model(
+                    payload,
+                    log=Mock(),
+                    set_status=updates.append,
+                    clear_status=lambda: None,
+                )
+            written = target.read_bytes()
+
+        self.assertEqual(written, b"test-gguf")
+        self.assertEqual(resolved["model"], str(target))
+        self.assertEqual(resolved["llama_model"], str(target))
+        self.assertFalse(resolved["setup_missing_model"])
+        self.assertTrue(any(text.startswith("downloading model.gguf") for text in updates))
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):

@@ -127,51 +127,9 @@ Optional hosted path:
 - use `Hosted API: OpenRouter` in setup
 - keep your key in `OPENROUTER_API_KEY`
 
-Linux x86 + NVIDIA:
+### 3. Optional: use an existing local model
 
-```bash
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-mkdir build && cd build
-
-cmake .. -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON
-cmake --build . --target llama-server -j$(nproc)
-```
-
-CPU-only:
-
-```bash
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-mkdir build && cd build
-
-cmake ..
-cmake --build . --target llama-server -j$(nproc)
-```
-
-Jetson:
-
-```bash
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-mkdir build && cd build
-
-cmake .. \
-  -DGGML_CUDA=ON \
-  -DCMAKE_CUDA_ARCHITECTURES=87 \
-  -DGGML_CUDA_FA_ALL_QUANTS=ON
-
-cmake --build . --target llama-server -j$(nproc)
-```
-
-OpenJet looks for `llama-server` on `PATH` first, then at
-`~/llama.cpp/build/bin/llama-server`.
-
-If you prefer to manage `llama.cpp` yourself, the build guides above are the manual path. They are not required before trying `open-jet --setup`.
-
-### 3. Have a local model ready
-
-If you choose the local `llama.cpp` runtime, you need one of:
+If you already have a local model, setup can use one of:
 
 - a local `.gguf` file
 - an installed Ollama model
