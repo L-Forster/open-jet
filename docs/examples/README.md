@@ -93,7 +93,7 @@ open-jet commands
 
 ```python
 import asyncio
-from src import OpenJetSession
+from open_jet import OpenJetSession
 
 
 async def main() -> None:

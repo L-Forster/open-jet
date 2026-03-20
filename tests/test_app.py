@@ -29,7 +29,7 @@ from src.llama_server import (
     _JETSON_VMM_RESERVE_MB,
 )
 from src.runtime_protocol import StreamChunk
-from src.setup import _prompt_choice, build_recommended_payload, run_setup_wizard
+from src.setup import _prompt_choice, _runtime_prompt_options, build_recommended_payload, run_setup_wizard
 
 
 class FakeAgent:
@@ -200,6 +200,11 @@ class AppStatusTests(unittest.TestCase):
 
 
 class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
+    def test_runtime_prompt_options_note_setup_can_provision_llama_server(self) -> None:
+        options = _runtime_prompt_options({}, llama_ready=False)
+        llama_label = next(label for label, key in options if key == "llama_cpp")
+        self.assertIn("setup can provision llama-server", llama_label)
+
     async def test_prompt_choice_supports_arrow_navigation_with_prompt_session(self) -> None:
         test_case = self
 
@@ -410,6 +415,25 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("model_download_url", payload)
         self.assertIn("model_download_path", payload)
 
+    def test_build_recommended_payload_stays_local_first_even_with_api_key_env(self) -> None:
+        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key", "OPENROUTER_API_KEY": "router-key"}, clear=False), patch(
+            "src.setup.discover_model_files", return_value=[]
+        ), patch("src.setup.find_ollama_cli", return_value=None), patch(
+            "src.setup.discover_installed_ollama_models", return_value=[]
+        ), patch("src.setup._discover_llama_server", return_value=None), patch(
+            "src.setup.recommended_context_window_tokens", return_value=2048
+        ), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=2048
+        ):
+            payload = build_recommended_payload(
+                hardware_info=hardware,
+                recommended_ctx=2048,
+                current_cfg={},
+            )
+
+        self.assertEqual(payload["runtime"], "llama_cpp")
+
     async def test_run_setup_wizard_returns_recommended_payload_immediately(self) -> None:
         console = Mock()
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
@@ -441,6 +465,79 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(payload["ollama_model"], "qwen3:4b")
+
+    async def test_run_setup_wizard_supports_openai_compatible_runtime(self) -> None:
+        console = Mock()
+        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
+        profile_name = "Cloud Preset"
+
+        choices = iter(["manual", "auto", "openai_compatible", 4096])
+        texts = iter(["gpt-4o-mini", "https://api.openai.com", "OPENAI_API_KEY", profile_name])
+
+        async def fake_choice(*_args, **_kwargs):
+            return next(choices)
+
+        async def fake_text(*_args, **_kwargs):
+            return next(texts)
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.recommended_context_window_tokens", return_value=4096), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=4096
+        ):
+            payload = await run_setup_wizard(
+                session=None,
+                console=console,
+                hardware_info=hardware,
+                recommended_ctx=4096,
+                current_cfg={},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["runtime"], "openai_compatible")
+        self.assertEqual(payload["model_source"], "remote")
+        self.assertEqual(payload["openai_compatible_model"], "gpt-4o-mini")
+        self.assertEqual(payload["openai_compatible_base_url"], "https://api.openai.com")
+        self.assertEqual(payload["openai_compatible_api_key_env"], "OPENAI_API_KEY")
+        self.assertEqual(payload["gpu_layers"], 0)
+        self.assertEqual(payload["model_profile_name"], profile_name)
+
+    async def test_run_setup_wizard_supports_direct_download_local_runtime(self) -> None:
+        console = Mock()
+        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
+        profile_name = "Downloaded Local Model"
+
+        choices = iter(["manual", "auto", "llama_cpp", "__direct__", 2048, 0])
+        texts = iter([profile_name])
+
+        async def fake_choice(*_args, **_kwargs):
+            return next(choices)
+
+        async def fake_text(*_args, **_kwargs):
+            return next(texts)
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.find_ollama_cli", return_value=None
+        ), patch("src.setup.recommended_context_window_tokens", return_value=2048), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=2048
+        ), patch("src.setup.recommended_gpu_layers", return_value=0):
+            payload = await run_setup_wizard(
+                session=None,
+                console=console,
+                hardware_info=hardware,
+                recommended_ctx=2048,
+                current_cfg={},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["runtime"], "llama_cpp")
+        self.assertEqual(payload["model_source"], "direct")
+        self.assertTrue(payload["setup_missing_model"])
+        self.assertIn("model_download_url", payload)
+        self.assertIn("model_download_path", payload)
+        self.assertEqual(payload["model_profile_name"], profile_name)
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
@@ -665,7 +762,7 @@ class CliCommandTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("Runtime: llama.cpp (GGUF) (llama_cpp)", text)
+        self.assertIn("Runtime: Local model: llama.cpp (GGUF) (llama_cpp)", text)
         self.assertIn("Active model preset: base", text)
         self.assertIn("Air-gapped: true", text)
 
@@ -691,24 +788,17 @@ class CliCommandTests(unittest.TestCase):
             ],
         }
 
-        with patch("src.app.load_config", return_value=cfg), patch("builtins.print") as printer:
+        with patch("src.cli.load_config", return_value=cfg), patch("builtins.print") as printer:
             main(["models"])
 
         printer.assert_called_once()
         self.assertIn("Active model preset: base", printer.call_args.args[0])
 
     def test_main_setup_command_launches_app_in_setup_mode(self) -> None:
-        fake_app = Mock()
-        fake_app.run_async = AsyncMock()
-
-        with patch("src.app.OpenJetApp", return_value=fake_app) as app_cls, patch("asyncio.run") as run_async:
+        with patch("src.cli.launch_tui") as launch_tui:
             main(["setup"])
 
-        app_cls.assert_called_once_with(force_setup=True)
-        run_async.assert_called_once()
-        scheduled = run_async.call_args.args[0]
-        self.assertTrue(asyncio.iscoroutine(scheduled))
-        scheduled.close()
+        launch_tui.assert_called_once_with(force_setup=True)
 
 
 class AppCondenseTests(unittest.IsolatedAsyncioTestCase):

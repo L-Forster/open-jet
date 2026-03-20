@@ -1191,22 +1191,23 @@ class OpenJetApp:
         if self._power_max_watts is None or watts > self._power_max_watts:
             self._power_max_watts = watts
 
+    @staticmethod
+    def _toolbar_row(label: str, value: str, *, value_style: str = "toolbar-value") -> str:
+        return (
+            f"<toolbar-chip> {html.escape(label)} </toolbar-chip> "
+            f"<{value_style}>{html.escape(value)}</{value_style}>"
+        )
+
     def _toolbar_text(self) -> HTML:
         rows: list[str] = []
         if self.is_airgapped():
-            rows.append("<toolbar-label>mode</toolbar-label>: <toolbar-warning>AIR-GAPPED</toolbar-warning>")
+            rows.append(self._toolbar_row("mode", "AIR-GAPPED", value_style="toolbar-warning"))
         else:
-            rows.append("<toolbar-label>mode</toolbar-label>: <toolbar-accent>local</toolbar-accent>")
+            rows.append(self._toolbar_row("mode", "LOCAL", value_style="toolbar-accent"))
         if not self.query_one("#approval-bar").hidden and self.query_one("#approval-bar").text:
-            rows.append(
-                "<toolbar-label>approval</toolbar-label>: "
-                f"<toolbar-warning>{html.escape(_plain_markup(self.query_one('#approval-bar').text))}</toolbar-warning>"
-            )
+            rows.append(self._toolbar_row("approval", _plain_markup(self.query_one("#approval-bar").text), value_style="toolbar-warning"))
         if not self.query_one("#token-counter").hidden and self.query_one("#token-counter").text:
-            rows.append(
-                "<toolbar-label>context</toolbar-label>: "
-                f"<toolbar-value>{html.escape(self.query_one('#token-counter').text)}</toolbar-value>"
-            )
+            rows.append(self._toolbar_row("context", self.query_one("#token-counter").text))
         if self._utilization_visible:
             cpu_pct = self.metrics.read_cpu_percent()
             mem = read_memory_snapshot()
@@ -1216,10 +1217,7 @@ class OpenJetApp:
             mem_text = self._format_percent("mem", mem.used_percent if mem else None)
             cpu_text = self._format_percent("cpu", cpu_pct)
             power_text = self._format_power_text(power_watts, power_pct, battery)
-            rows.append(
-                "<toolbar-label>util</toolbar-label>: "
-                f"<toolbar-value>{html.escape(f'{cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}')}</toolbar-value>"
-            )
+            rows.append(self._toolbar_row("util", f"{cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}"))
         return HTML("\n".join(row for row in rows if row))
 
     def _loading_blocks_html(self) -> str:
@@ -1239,9 +1237,10 @@ class OpenJetApp:
     def _render_prompt_status_html(self, text: str) -> str:
         escaped = html.escape(text)
         if self._assistant_status_kind == "command":
-            return f"<prompt-command>{escaped}</prompt-command>"
+            return f"<prompt-status-label> tool </prompt-status-label> <prompt-command>{escaped}</prompt-command>"
         if self._assistant_status_kind == "generating":
             return (
+                f"<prompt-status-label> model </prompt-status-label> "
                 f"{self._loading_blocks_html()} "
                 f"<prompt-splash-text>{escaped}</prompt-splash-text>"
             )
@@ -1254,10 +1253,15 @@ class OpenJetApp:
             status_html = f"{self._render_prompt_status_html(status.text)}\n"
         if self.is_airgapped():
             return HTML(
-                f"{status_html}<brand-airgapped> open-jet air-gap </brand-airgapped>"
-                "<prompt-airgapped>  > </prompt-airgapped>"
+                f"{status_html}<brand-chip-airgapped> open-jet air-gap </brand-chip-airgapped>"
+                "<prompt-divider-airgapped> //</prompt-divider-airgapped>"
+                "<prompt-airgapped> ></prompt-airgapped>"
             )
-        return HTML(f"{status_html}<brand> open-jet </brand><prompt>  > </prompt>")
+        return HTML(
+            f"{status_html}<brand-chip> open-jet </brand-chip>"
+            "<prompt-divider> //</prompt-divider>"
+            "<prompt> ></prompt>"
+        )
 
     def set_utilization_visible(self, visible: bool) -> None:
         self._utilization_visible = bool(visible)
@@ -2011,7 +2015,9 @@ class OpenJetApp:
         summary = self._approval_summary_text(self._approval_tool_call)
         approve = "[Approve]" if self._approval_choice == 0 else "Approve"
         deny = "[Deny]" if self._approval_choice == 1 else "Deny"
-        bar.update(f"Tool request: {summary} | Left/Right choose | Enter confirm | y/n quick reply | {approve} {deny}")
+        bar.update(
+            f"Approval needed | {summary} | Left/Right choose | Enter confirm | y/n quick reply | {approve} {deny}"
+        )
 
     def _approval_summary_text(self, tc: ToolCall) -> str:
         if tc.name == "write_file":

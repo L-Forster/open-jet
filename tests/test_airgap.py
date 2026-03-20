@@ -5,11 +5,12 @@ import socket
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+import open_jet
 from src import create_agent
 from src.airgap import AirgapViolationError, assert_endpoint_allowed, set_airgapped
 from src.app import OpenJetApp
 from src import runtime_limits
-from src.runtime_registry import create_runtime_client
+from src.runtime_registry import create_runtime_client, runtime_options
 
 
 class _CreateSessionClient:
@@ -48,6 +49,22 @@ class AirgapGuardTests(AirgapBaseTestCase):
 
 
 class RuntimeRegistryAirgapTests(AirgapBaseTestCase):
+    def test_runtime_options_only_include_simplified_backends(self) -> None:
+        options = runtime_options()
+
+        self.assertEqual(
+            options,
+            [
+                ("Local model: llama.cpp (GGUF)", "llama_cpp"),
+                ("Self-hosted API: OpenAI-compatible", "openai_compatible"),
+                ("Hosted API: OpenRouter", "openrouter"),
+            ],
+        )
+
+    def test_create_runtime_client_rejects_disabled_backends(self) -> None:
+        with self.assertRaisesRegex(ValueError, "disabled in this simplified build"):
+            create_runtime_client({"runtime": "sglang", "sglang_model": "model"})
+
     def test_create_runtime_client_blocks_openrouter_when_airgapped(self) -> None:
         with self.assertRaises(AirgapViolationError):
             create_runtime_client(
@@ -129,6 +146,10 @@ class AppAirgapTests(AirgapBaseTestCase):
 
 
 class SDKAirgapTests(AirgapBaseTestCase):
+    def test_open_jet_package_reexports_sdk_api(self) -> None:
+        self.assertIs(open_jet.create_agent, create_agent)
+        self.assertTrue(hasattr(open_jet, "OpenJetSession"))
+
     def test_create_agent_supports_airgapped_sessions(self) -> None:
         fake_client = _CreateSessionClient()
 

@@ -141,7 +141,7 @@ def _configured_runtime(current_cfg: Mapping[str, object] | None) -> str:
     if isinstance(current_cfg, Mapping):
         value = str(current_cfg.get("runtime") or "").strip()
     spec = runtime_spec(value)
-    return spec.key if spec.show_in_setup else "llama_cpp"
+    return spec.key if spec.show_in_setup and spec.enabled else "llama_cpp"
 
 
 def _discover_llama_server() -> str | None:
@@ -158,19 +158,17 @@ def _runtime_prompt_options(
     current_cfg: Mapping[str, object] | None,
     *,
     llama_ready: bool,
-    sglang_models: list[str],
-    trt_models: list[str],
 ) -> list[tuple[str, str]]:
     configured_runtime = _configured_runtime(current_cfg)
     options: list[tuple[str, str]] = []
     for label, key in runtime_options():
         suffix = ""
         if key == "llama_cpp":
-            suffix = " (detected)" if llama_ready else " (llama-server not found)"
-        elif key == "sglang" and sglang_models:
-            suffix = " (model detected)"
-        elif key == "trtllm_pytorch" and trt_models:
-            suffix = " (model detected)"
+            suffix = " (recommended)" if llama_ready else " (recommended, setup can provision llama-server)"
+        elif key == "openai_compatible":
+            suffix = " (self-hosted gateway or compatible API)"
+        elif key == "openrouter":
+            suffix = " (optional hosted fallback)"
         if key == configured_runtime:
             suffix = f"{suffix}, current" if suffix else " (current)"
         options.append((f"{label}{suffix}", key))
@@ -195,6 +193,36 @@ def _current_int(current_cfg: Mapping[str, object] | None, key: str) -> int | No
         except ValueError:
             return None
     return None
+
+
+def _current_bool(current_cfg: Mapping[str, object] | None, key: str) -> bool | None:
+    if not isinstance(current_cfg, Mapping):
+        return None
+    value = current_cfg.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _recommended_setup_runtime(current_cfg: Mapping[str, object] | None) -> str:
+    raw_runtime = _current_string(current_cfg, "runtime")
+    if raw_runtime:
+        spec = runtime_spec(raw_runtime)
+        if spec.enabled and spec.show_in_setup:
+            return spec.key
+    return "llama_cpp"
+
+
+def _default_remote_model(runtime: str) -> str:
+    if runtime == "openrouter":
+        return "openai/gpt-4o-mini"
+    return "gpt-4o-mini"
 
 
 def _recommended_model_choice(
@@ -273,7 +301,7 @@ def build_recommended_payload(
         hardware_profile = "auto"
     hardware_override = _current_string(current_cfg, "hardware_override") if hardware_profile == "other" else ""
     effective_hw = effective_hardware_info(hardware_profile, hardware_info, hardware_override)
-    runtime = _configured_runtime(current_cfg)
+    runtime = _recommended_setup_runtime(current_cfg)
     device = recommended_device_for_hardware(hardware_profile, hardware_info, hardware_override)
 
     payload: dict[str, object] = {
@@ -302,38 +330,35 @@ def build_recommended_payload(
         payload["setup_missing_runtime"] = _discover_llama_server() is None
         if "llama_model" in payload:
             _remember_model_ref(payload, current_cfg, runtime, str(payload["llama_model"]))
-    elif runtime == "sglang":
-        current_model = _current_string(current_cfg, "sglang_model")
-        discovered = discover_sglang_model_dirs()
-        model_ref = current_model or (discovered[0] if discovered else "")
-        if model_ref:
-            payload.update(
-                {
-                    "model_source": "local",
-                    "model": model_ref,
-                    "sglang_model": model_ref,
-                }
-            )
-            _remember_model_ref(payload, current_cfg, runtime, model_ref)
-        else:
-            payload["setup_missing_model"] = True
-        payload["sglang_launch_mode"] = "managed"
-        payload["sglang_served_model_name"] = "local"
+    elif runtime == "openai_compatible":
+        model_ref = _current_string(current_cfg, "openai_compatible_model") or _default_remote_model(runtime)
+        base_url = _current_string(current_cfg, "openai_compatible_base_url") or os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
+        api_key_env = _current_string(current_cfg, "openai_compatible_api_key_env") or "OPENAI_API_KEY"
+        payload.update(
+            {
+                "model_source": "remote",
+                "model": model_ref,
+                "openai_compatible_model": model_ref,
+                "openai_compatible_base_url": base_url,
+                "openai_compatible_api_key_env": api_key_env,
+                "openai_compatible_verify_connection": _current_bool(current_cfg, "openai_compatible_verify_connection") or False,
+                "setup_missing_api_key": not bool(os.environ.get(api_key_env, "").strip()),
+            }
+        )
     else:
-        current_model = _current_string(current_cfg, "trtllm_model")
-        discovered = discover_trt_model_dirs()
-        model_ref = current_model or (discovered[0] if discovered else "")
-        if model_ref:
-            payload.update(
-                {
-                    "model_source": "local",
-                    "model": model_ref,
-                    "trtllm_model": model_ref,
-                }
-            )
-            _remember_model_ref(payload, current_cfg, runtime, model_ref)
-        else:
-            payload["setup_missing_model"] = True
+        model_ref = _current_string(current_cfg, "openrouter_model") or _default_remote_model(runtime)
+        api_key_env = _current_string(current_cfg, "openrouter_api_key_env") or "OPENROUTER_API_KEY"
+        payload.update(
+            {
+                "model_source": "remote",
+                "model": model_ref,
+                "openrouter_model": model_ref,
+                "openrouter_base_url": _current_string(current_cfg, "openrouter_base_url") or "https://openrouter.ai/api/v1",
+                "openrouter_api_key_env": api_key_env,
+                "openrouter_verify_connection": _current_bool(current_cfg, "openrouter_verify_connection") or False,
+                "setup_missing_api_key": not bool(os.environ.get(api_key_env, "").strip()),
+            }
+        )
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     detected_recommended_ctx = (
@@ -375,9 +400,14 @@ def _recommended_summary(payload: Mapping[str, object]) -> str:
     model_text = model_ref or "missing"
     notes: list[str] = []
     if payload.get("setup_missing_runtime"):
-        notes.append("llama-server missing")
+        notes.append("llama-server will be provisioned")
     if payload.get("setup_missing_model"):
-        notes.append("model missing")
+        if model_source == "direct":
+            notes.append("recommended GGUF will be downloaded")
+        else:
+            notes.append("model missing")
+    if payload.get("setup_missing_api_key"):
+        notes.append("API key env missing")
     note_suffix = f" [{', '.join(notes)}]" if notes else ""
     return (
         f"runtime={runtime}, model_source={model_source}, model={model_text}, "
@@ -538,6 +568,10 @@ async def run_setup_wizard(
     ram_text = f"{hardware_info.total_ram_gb:.1f} GB RAM" if hardware_info.total_ram_gb > 0 else "RAM unknown"
     console.print(f"[bold {ACCENT_GREEN}]open-jet setup[/]")
     console.print(f"[dim]Detected hardware: {escape(hardware_info.label)} ({escape(ram_text)})[/]")
+    console.print(
+        "[dim]Local setup can reuse an existing llama.cpp or Ollama install, "
+        "or provision llama-server and a recommended model when the required tools and network access are available.[/]"
+    )
 
     recommended_payload = build_recommended_payload(
         hardware_info=hardware_info,
@@ -594,13 +628,9 @@ async def run_setup_wizard(
             )
         )
 
-    sglang_models = discover_sglang_model_dirs()
-    trt_models = discover_trt_model_dirs()
     runtime_prompt_options = _runtime_prompt_options(
         current_cfg,
         llama_ready=_discover_llama_server() is not None,
-        sglang_models=sglang_models,
-        trt_models=trt_models,
     )
     runtime_default = _configured_runtime(current_cfg) if setup_mode == "manual" else str(recommended_payload.get("runtime", _configured_runtime(current_cfg)))
     runtime = str(
@@ -632,6 +662,8 @@ async def run_setup_wizard(
         ollama_cli = find_ollama_cli()
         installed_ollama = discover_installed_ollama_models() if ollama_cli else []
         max_b = recommended_param_budget_b(str(hardware), hardware_info, hardware_override)
+        direct = recommend_direct_model(effective_hw)
+        direct_plan = "__direct__"
         download_rows = [
             (f"Download with Ollama: {label}", tag)
             for label, tag in recommended_llm_models(max_b)[:3]
@@ -645,17 +677,22 @@ async def run_setup_wizard(
         model_plan_options: list[tuple[str, object]] = [("Use a local .gguf model file", "__local__")]
         model_plan_options.extend(installed_rows)
         model_plan_options.extend(download_rows)
+        model_plan_options.append((f"Download recommended GGUF: {direct['label']}", direct_plan))
         detail = (
-            "Choose local GGUF, an installed Ollama model, or a recommended Ollama download."
+            "Choose a local GGUF, an installed Ollama model, or let setup pull or download a recommended local model."
             if ollama_cli
-            else "Ollama not found; using a local GGUF model file."
+            else "Choose a local GGUF or let setup download a recommended local GGUF."
         )
         current_model_source = _current_string(current_cfg, "model_source").lower()
         current_ollama_model = _current_string(current_cfg, "ollama_model")
         current_llama_model = _current_string(current_cfg, "llama_model")
         default_model_plan = "__local__"
-        if setup_mode != "manual" and str(recommended_payload.get("model_source")) == "ollama":
-            default_model_plan = str(recommended_payload.get("ollama_model") or current_ollama_model or "__local__")
+        if setup_mode != "manual":
+            recommended_source = str(recommended_payload.get("model_source") or "local")
+            if recommended_source == "ollama":
+                default_model_plan = str(recommended_payload.get("ollama_model") or current_ollama_model or "__local__")
+            elif recommended_source == "direct":
+                default_model_plan = direct_plan
         elif current_model_source == "ollama" and current_ollama_model:
             default_model_plan = current_ollama_model
         elif current_llama_model or model_files or saved_model_files:
@@ -664,6 +701,8 @@ async def run_setup_wizard(
             default_model_plan = installed_ollama[0]
         elif download_rows:
             default_model_plan = str(download_rows[0][1])
+        else:
+            default_model_plan = direct_plan
         model_plan = "__local__"
         if len(model_plan_options) > 1:
             model_plan = str(
@@ -714,6 +753,12 @@ async def run_setup_wizard(
             payload["model"] = str(model_file)
             payload["llama_model"] = str(model_file)
             _remember_model_ref(payload, current_cfg, runtime, str(model_file))
+        elif model_plan == direct_plan:
+            payload["model_source"] = "direct"
+            payload["model_download_url"] = str(direct["url"])
+            payload["model_download_path"] = str(direct["target_path"])
+            payload["recommended_llm"] = str(direct["label"])
+            payload["setup_missing_model"] = True
         else:
             if not ollama_cli:
                 raise RuntimeError("Ollama CLI not found.")
@@ -722,78 +767,63 @@ async def run_setup_wizard(
             payload["model_source"] = "ollama"
             payload["recommended_llm"] = model_plan
             payload["ollama_model"] = model_plan
-    elif runtime == "sglang":
-        saved_refs = _saved_model_refs(current_cfg, runtime)
-        rows = [(Path(model).name, model) for model in sglang_models]
-        rows.extend(
-            (f"{Path(model).name or model} (saved)", model)
-            for model in saved_refs
-            if model not in sglang_models
-        )
-        rows.append(("Manual path or HF model id", "__manual__"))
-        current_model_ref = _current_string(current_cfg, "sglang_model")
+    elif runtime == "openai_compatible":
+        current_model_ref = _current_string(current_cfg, "openai_compatible_model")
+        current_base_url = _current_string(current_cfg, "openai_compatible_base_url") or "https://api.openai.com"
+        current_api_env = _current_string(current_cfg, "openai_compatible_api_key_env") or "OPENAI_API_KEY"
         if setup_mode != "manual":
-            current_model_ref = str(recommended_payload.get("sglang_model") or current_model_ref or "")
-        if current_model_ref and current_model_ref not in [value for _label, value in rows]:
-            rows.insert(0, (f"{Path(current_model_ref).name or current_model_ref} (current)", current_model_ref))
-        choice = await _prompt_choice(
+            current_model_ref = str(recommended_payload.get("openai_compatible_model") or current_model_ref or "")
+            current_base_url = str(recommended_payload.get("openai_compatible_base_url") or current_base_url)
+            current_api_env = str(recommended_payload.get("openai_compatible_api_key_env") or current_api_env)
+        model_ref = await _prompt_text(
             session,
-            console,
-            "SGLang model",
-            rows,
-            default_index=_default_option_index(
-                rows,
-                current_model_ref or (rows[0][1] if rows else "__manual__"),
-            ),
-        )
-        model_ref = (
-            await _prompt_text(session, "sglang model> ", default=current_model_ref)
-            if choice == "__manual__"
-            else str(choice)
+            "model id> ",
+            default=current_model_ref or _default_remote_model(runtime),
         )
         if not model_ref:
-            raise RuntimeError("SGLang model path or HF model id is required.")
-        payload["model_source"] = "local"
+            raise RuntimeError("OpenAI-compatible runtime requires a model id.")
+        base_url = await _prompt_text(
+            session,
+            "base url> ",
+            default=current_base_url,
+        )
+        if not base_url:
+            raise RuntimeError("OpenAI-compatible runtime requires a base URL.")
+        api_key_env = await _prompt_text(
+            session,
+            "api key env> ",
+            default=current_api_env,
+        )
+        payload["model_source"] = "remote"
         payload["model"] = model_ref
-        payload["sglang_model"] = model_ref
-        payload["sglang_launch_mode"] = "jetson_container" if jetson_target else "managed"
-        payload["sglang_served_model_name"] = "local"
-        _remember_model_ref(payload, current_cfg, runtime, model_ref)
+        payload["openai_compatible_model"] = model_ref
+        payload["openai_compatible_base_url"] = base_url
+        payload["openai_compatible_api_key_env"] = api_key_env or "OPENAI_API_KEY"
+        payload["openai_compatible_verify_connection"] = False
     else:
-        saved_refs = _saved_model_refs(current_cfg, runtime)
-        rows = [(Path(model).name, model) for model in trt_models]
-        rows.extend(
-            (f"{Path(model).name or model} (saved)", model)
-            for model in saved_refs
-            if model not in trt_models
-        )
-        rows.append(("Manual path or HF model id", "__manual__"))
-        current_model_ref = _current_string(current_cfg, "trtllm_model")
+        current_model_ref = _current_string(current_cfg, "openrouter_model")
+        current_api_env = _current_string(current_cfg, "openrouter_api_key_env") or "OPENROUTER_API_KEY"
         if setup_mode != "manual":
-            current_model_ref = str(recommended_payload.get("trtllm_model") or current_model_ref or "")
-        if current_model_ref and current_model_ref not in [value for _label, value in rows]:
-            rows.insert(0, (f"{Path(current_model_ref).name or current_model_ref} (current)", current_model_ref))
-        choice = await _prompt_choice(
+            current_model_ref = str(recommended_payload.get("openrouter_model") or current_model_ref or "")
+            current_api_env = str(recommended_payload.get("openrouter_api_key_env") or current_api_env)
+        model_ref = await _prompt_text(
             session,
-            console,
-            "TensorRT model",
-            rows,
-            default_index=_default_option_index(
-                rows,
-                current_model_ref or (rows[0][1] if rows else "__manual__"),
-            ),
-        )
-        model_ref = (
-            await _prompt_text(session, "trt model> ", default=current_model_ref)
-            if choice == "__manual__"
-            else str(choice)
+            "model id> ",
+            default=current_model_ref or _default_remote_model(runtime),
         )
         if not model_ref:
-            raise RuntimeError("TensorRT model path or HF model id is required.")
-        payload["model_source"] = "local"
+            raise RuntimeError("OpenRouter runtime requires a model id.")
+        api_key_env = await _prompt_text(
+            session,
+            "api key env> ",
+            default=current_api_env,
+        )
+        payload["model_source"] = "remote"
         payload["model"] = model_ref
-        payload["trtllm_model"] = model_ref
-        _remember_model_ref(payload, current_cfg, runtime, model_ref)
+        payload["openrouter_model"] = model_ref
+        payload["openrouter_base_url"] = "https://openrouter.ai/api/v1"
+        payload["openrouter_api_key_env"] = api_key_env or "OPENROUTER_API_KEY"
+        payload["openrouter_verify_connection"] = False
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     if hardware == "auto":

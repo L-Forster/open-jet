@@ -17,8 +17,6 @@ from ..runtime_registry import (
     runtime_options,
     runtime_spec,
 )
-from ..sglang_server import SglangServerClient
-from ..trtllm_server import TrtllmServerClient
 
 __all__ = [
     "DEFAULT_RUNTIME",
@@ -27,10 +25,8 @@ __all__ = [
     "RUNTIME_SPECS",
     "RuntimeClient",
     "RuntimeSpec",
-    "SglangServerClient",
     "StreamChunk",
     "ToolCall",
-    "TrtllmServerClient",
     "active_model_ref",
     "create_runtime_client",
     "normalize_runtime",

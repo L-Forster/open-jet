@@ -31,7 +31,7 @@ class LlamaSwapPlugin(SwapPlugin):
         messages: list[dict] | None = None,
     ) -> None:
         self._client = client
-        self._messages = messages or []
+        self._messages = messages if messages is not None else []
         # Rough estimate — actual varies by model size / quant.
         self._estimated_model_mb: float = 0.0
 

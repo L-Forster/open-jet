@@ -29,8 +29,6 @@ dependencies = [
     "pyyaml>=6.0",
     "rich>=13.0",
     "tiktoken>=0.7",
-    "sglang[all]",
-    "tensorrt_llm",
 ]
 
 [project.urls]
@@ -52,7 +50,7 @@ include-package-data = false
 license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
-include = ["src", "src.*"]
+include = ["src", "src.*", "open_jet", "open_jet.*"]
 
 [tool.setuptools.package-data]
 src = ["app.tcss"]

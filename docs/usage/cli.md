@@ -14,6 +14,12 @@ open-jet --setup
 open-jet setup
 ```
 
+Setup supports:
+
+- `Local model: llama.cpp (GGUF)`
+- `Self-hosted API: OpenAI-compatible`
+- `Hosted API: OpenRouter`
+
 Read-only helpers:
 
 ```bash

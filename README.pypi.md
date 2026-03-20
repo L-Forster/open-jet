@@ -12,7 +12,7 @@ OpenJet is designed to stay useful when local AI gets messy: tight memory, short
 
 ## Why use OpenJet
 
-- start quickly with a local runtime and model you already control
+- start with a local or self-hosted runtime you control
 - keep working without losing the thread when sessions get interrupted
 - use tools with explicit approvals and predictable behavior
 - run the same backend from the TUI or Python SDK
@@ -26,20 +26,65 @@ Install the package:
 pip install open-jet
 ```
 
-On first run, OpenJet walks you through connecting a local runtime and model.
+OpenJet is positioned for local and self-hosted use first. Hosted APIs are supported, but they are the fallback path, not the main story.
 
-Start setup:
+### Recommended start: local `llama.cpp`
+
+If you want the intended OpenJet path, start with:
 
 ```bash
 open-jet --setup
 ```
 
-The setup flow guides you through:
+Choose `Local model: llama.cpp (GGUF)` and follow the prompts for:
 
-1. runtime selection
-2. model source or path
+1. model source
+2. model path or Ollama model
 3. context window size
 4. GPU offload configuration
+
+On the local path, setup can work behind the scenes:
+
+- reuse an existing `llama-server` if one is already installed
+- provision `llama.cpp` and build `llama-server` if it is missing
+- use a local `.gguf`, resolve an installed Ollama model, pull an Ollama model, or download a recommended GGUF
+
+Automatic provisioning still relies on normal local prerequisites:
+
+- network access for downloads and git clone operations
+- `git`, `cmake`, and a working build toolchain when `llama.cpp` needs to be built
+- enough disk space for the model and build artifacts
+
+### Self-hosted or existing API gateway
+
+If you already have a self-hosted gateway or another OpenAI-compatible endpoint, OpenJet can use that too.
+
+OpenAI-compatible API:
+
+```bash
+export OPENAI_API_KEY=your-key
+open-jet --setup
+```
+
+In setup, choose `Self-hosted API: OpenAI-compatible`, then enter:
+
+1. model id
+2. base URL
+3. API key env var name
+
+### Optional hosted fallback: OpenRouter
+
+If you want a hosted profile alongside your local or self-hosted setup:
+
+```bash
+export OPENROUTER_API_KEY=your-key
+open-jet --setup
+```
+
+In setup, choose `Hosted API: OpenRouter`, then enter:
+
+1. model id
+2. API key env var name
 
 Then launch OpenJet normally:
 
@@ -47,7 +92,13 @@ Then launch OpenJet normally:
 open-jet
 ```
 
-By default, OpenJet uses `llama-server` from [`llama.cpp`](https://github.com/ggerganov/llama.cpp), and setup can also configure `SGLang` or `TensorRT-LLM`.
+Supported runtimes in this simplified build:
+
+- `llama.cpp` for local/offline use
+- OpenAI-compatible APIs for self-hosted gateways and compatible services
+- OpenRouter as an optional hosted profile
+
+`SGLang` and `TensorRT-LLM` are intentionally disabled to keep setup simpler.
 
 If you want full install details for each runtime, jump to [Installation](#installation) or the [Quickstart docs](https://github.com/l-forster/open-jet/blob/main/docs/quickstart.md).
 
@@ -59,11 +110,24 @@ If you want full install details for each runtime, jump to [Installation](#insta
 pip install open-jet
 ```
 
-### 2. Install `llama-server` from `llama.cpp`
+### 2. Choose a runtime path
 
-`llama.cpp` setup is required for the default OpenJet runtime. If you choose
-`SGLang` or `TensorRT-LLM` in `open-jet --setup`, follow the runtime-specific
-model/runtime setup for those backends instead.
+Recommended local/self-hosted path:
+
+- run `open-jet --setup`
+- let setup reuse or provision `llama-server`
+- use a local `.gguf`, an installed Ollama model, an Ollama pull, or a recommended GGUF download
+
+Self-hosted API path:
+
+- use `Self-hosted API: OpenAI-compatible` in setup
+- point OpenJet at your existing gateway or compatible endpoint
+- keep the API key in an environment variable if your gateway requires one
+
+Optional hosted path:
+
+- use `Hosted API: OpenRouter` in setup
+- keep your key in `OPENROUTER_API_KEY`
 
 Linux x86 + NVIDIA:
 
@@ -105,13 +169,16 @@ cmake --build . --target llama-server -j$(nproc)
 OpenJet looks for `llama-server` on `PATH` first, then at
 `~/llama.cpp/build/bin/llama-server`.
 
+If you prefer to manage `llama.cpp` yourself, the build guides above are the manual path. They are not required before trying `open-jet --setup`.
+
 ### 3. Have a local model ready
 
-You need a model reference for the selected runtime:
+If you choose the local `llama.cpp` runtime, you need one of:
 
-- `llama.cpp`: typically a local `.gguf` file, or an Ollama-backed model selected during setup
-- `SGLang`: a local model directory or supported HF model id
-- `TensorRT-LLM`: a local model directory or supported HF model id
+- a local `.gguf` file
+- an installed Ollama model
+- an Ollama tag you want setup to pull for you
+- or nothing up front if you want setup to download a recommended GGUF
 
 ### 4. Run setup
 
@@ -122,10 +189,10 @@ open-jet --setup
 The setup flow guides you through:
 
 1. hardware detection/profile
-2. model source selection
-3. model path or download choice
+2. runtime selection
+3. runtime-specific model or API details
 4. context window size
-5. GPU offload configuration
+5. GPU offload configuration for local `llama.cpp`
 
 After setup:
 
@@ -136,6 +203,7 @@ open-jet
 ## What it provides
 
 - bounded-context local chat with your on-device model
+- self-hosted and hosted OpenAI-compatible API support through the same session layer
 - automatic context condensing under pressure
 - low-memory shell execution that can unload and reload `llama.cpp` models around heavy commands
 - session resume and harness state recovery
@@ -162,8 +230,8 @@ OpenJet is built around:
 - [Installation](https://github.com/l-forster/open-jet/blob/main/docs/installation.md)
 - [Examples](https://github.com/l-forster/open-jet/blob/main/docs/examples/README.md)
 - [Runtime: llama.cpp](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/llama-cpp.md)
-- [Runtime: SGLang](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/sglang.md)
-- [Runtime: TensorRT-LLM](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/tensorrt-llm.md)
+- [Runtime: OpenAI-compatible](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/openai-compatible.md)
+- [Runtime: OpenRouter](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/openrouter.md)
 - [Usage: CLI](https://github.com/l-forster/open-jet/blob/main/docs/usage/cli.md)
 - [Usage: Slash commands](https://github.com/l-forster/open-jet/blob/main/docs/usage/slash-commands.md)
 - [Usage: Workflow harness](https://github.com/l-forster/open-jet/blob/main/docs/usage/workflow-harness.md)
