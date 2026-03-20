@@ -1,5 +1,5 @@
 # OpenJet
-<img height="150" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
+<img height="225" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
 
 
 `open-jet` is an offline-first local agent you can actually use for real work.
