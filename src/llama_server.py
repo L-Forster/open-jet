@@ -296,6 +296,9 @@ class LlamaServerClient:
         fit_off: bool,
         no_warmup: bool,
     ) -> None:
+        # Ensure swap state directory exists for KV cache save/restore.
+        slot_save_dir = Path(".openjet/state/swap")
+        slot_save_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
             binary,
             "-m",
@@ -307,6 +310,8 @@ class LlamaServerClient:
             "--parallel",
             "1",
             "--no-mmap",
+            "--slot-save-path",
+            str(slot_save_dir.resolve()),
         ]
         if fit_off:
             cmd.extend(["--fit", "off"])
@@ -547,6 +552,36 @@ class LlamaServerClient:
         if os.path.exists("/usr/local/cuda") or os.path.exists("/dev/nvhost-gpu"):
             return "cuda"
         return "cpu"
+
+    async def save_kv_cache(self, path: Path) -> bool:
+        """Save KV cache for slot 0 to *path* via llama-server slot API.
+
+        The server resolves *filename* relative to ``--slot-save-path``,
+        so we pass just the stem (filename without directory).
+        """
+        try:
+            r = await self._http.post(
+                f"{self.base_url}/slots/0?action=save",
+                json={"filename": path.name},
+                timeout=60.0,
+            )
+            return r.status_code == 200
+        except (httpx.HTTPError, Exception) as exc:
+            self._emit_diagnostic("runtime_llama_kv_save_failed", error=str(exc))
+            return False
+
+    async def restore_kv_cache(self, path: Path) -> bool:
+        """Restore KV cache for slot 0 from *path* via llama-server slot API."""
+        try:
+            r = await self._http.post(
+                f"{self.base_url}/slots/0?action=restore",
+                json={"filename": path.name},
+                timeout=60.0,
+            )
+            return r.status_code == 200
+        except (httpx.HTTPError, Exception) as exc:
+            self._emit_diagnostic("runtime_llama_kv_restore_failed", error=str(exc))
+            return False
 
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True

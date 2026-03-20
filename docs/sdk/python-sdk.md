@@ -2,7 +2,16 @@
 
 `open-jet` exposes a programmatic session API so you can drive the same bounded-memory agent backend from scripts.
 
-## Example
+Public exports:
+
+- `OpenJetSession`
+- `SDKEvent`
+- `SDKEventKind`
+- `SDKResponse`
+- `ToolResult`
+- `create_agent()`
+
+## Basic example
 
 ```python
 import asyncio
@@ -31,7 +40,40 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Approval handler for mutating/shell tools
+`run()` returns an `SDKResponse` with:
+
+- `text`: final assistant text
+- `tool_results`: executed tool outputs and metadata
+- `condense_messages`: any context-condense notices emitted during the turn
+
+`stream()` yields `SDKEvent` values with kinds:
+
+- `TEXT`
+- `TOOL_REQUEST`
+- `TOOL_RESULT`
+- `CONDENSE`
+- `DONE`
+- `ERROR`
+
+## Session creation options
+
+```python
+session = await OpenJetSession.create(
+    cfg={"runtime": {"active": "llama_cpp"}},
+    system_prompt="You are concise and tool-aware.",
+    airgapped=True,
+)
+```
+
+`OpenJetSession.create()` and `create_agent()` accept:
+
+- `cfg`: config override dict
+- `system_prompt`: replacement base system prompt
+- `approval_handler`: sync or async callback for approval-gated tools
+- `allowed_tools`: explicit allowed tool-name set
+- `airgapped`: override air-gapped mode for the session
+
+## Approval handler for gated tools
 
 ```python
 session = await OpenJetSession.create(
@@ -39,8 +81,24 @@ session = await OpenJetSession.create(
 )
 ```
 
+If no `approval_handler` is provided, approval-gated tools are denied by default.
+
 ## Restricting tools
 
 ```python
 session = await OpenJetSession.create(allowed_tools={"read_file", "load_file", "grep"})
 ```
+
+## Runtime controls
+
+```python
+session.set_airgapped(True)
+session.add_turn_context(
+    [{"role": "system", "content": "Focus on files under src/ only."}]
+)
+session.clear_turn_context()
+```
+
+- `set_airgapped()` updates the session's network-restriction mode
+- `add_turn_context()` injects bounded extra messages for the next turn
+- `clear_turn_context()` removes that temporary turn context

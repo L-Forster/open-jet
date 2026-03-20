@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .executor import (
     DEFAULT_SHELL_TIMEOUT_SECONDS,
@@ -17,6 +18,9 @@ from .executor import (
 from .persistent_memory import update_persistent_memory
 from .runtime_protocol import ToolCall
 
+if TYPE_CHECKING:
+    from .swap_manager import SwapManager
+
 
 @dataclass(frozen=True)
 class ToolExecutionResult:
@@ -26,6 +30,16 @@ class ToolExecutionResult:
     @property
     def ok(self) -> bool:
         return bool(self.meta.get("ok", False))
+
+
+# Optional SwapManager — set by app.py at startup when available.
+_swap_manager: SwapManager | None = None
+
+
+def set_swap_manager(manager: SwapManager | None) -> None:
+    """Register a SwapManager for memory-guarded shell execution."""
+    global _swap_manager
+    _swap_manager = manager
 
 
 async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
@@ -54,7 +68,22 @@ async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
                     output="Error: invalid arguments for shell (timeout_seconds must be > 0)",
                     meta={"ok": False},
                 )
-        res = await run_shell(command, timeout_seconds=timeout_seconds or DEFAULT_SHELL_TIMEOUT_SECONDS)
+        effective_timeout = timeout_seconds or DEFAULT_SHELL_TIMEOUT_SECONDS
+        swap_meta: dict = {}
+
+        # Check if we should unload the model to free memory for this command.
+        if _swap_manager is not None and _swap_manager.should_unload(estimated_need_mb=0):
+            swap_result = await _swap_manager.run_with_swap(command, timeout=effective_timeout)
+            res = swap_result.exec_result
+            swap_meta = {
+                "swapped": swap_result.unloaded,
+                "swap_reload_ok": swap_result.reload_ok,
+                "swap_restore_ok": swap_result.restore_ok,
+                "swap_duration_s": swap_result.swap_duration_s,
+            }
+        else:
+            res = await run_shell(command, timeout_seconds=effective_timeout)
+
         return ToolExecutionResult(
             output=res.summary,
             meta={
@@ -64,6 +93,7 @@ async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
                 "stderr": res.stderr,
                 "timed_out": res.timed_out,
                 "timeout_seconds": res.timeout_seconds,
+                **swap_meta,
             },
         )
 

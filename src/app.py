@@ -82,7 +82,7 @@ from .session_state import SessionStateStore
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
-from .tool_executor import execute_tool, format_tool_args
+from .tool_executor import execute_tool, format_tool_args, set_swap_manager
 
 
 def _format_error(exc: Exception) -> str:
@@ -668,6 +668,26 @@ class OpenJetApp:
             keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
             trace_hook=self._agent_trace,
         )
+        self._init_swap_manager()
+
+    def _init_swap_manager(self) -> None:
+        """Create and register a SwapManager if the runtime supports it."""
+        from .llama_server import LlamaServerClient
+        from .swap_llama import LlamaSwapPlugin
+        from .swap_manager import SwapManager
+
+        if not isinstance(self.client, LlamaServerClient):
+            set_swap_manager(None)
+            return
+
+        plugin = LlamaSwapPlugin(self.client, messages=self.agent.messages)
+
+        def _swap_status(text: str) -> None:
+            if self.session_logger:
+                self.session_logger.log_event("swap_status", text=text)
+
+        manager = SwapManager(plugin, status_hook=_swap_status)
+        set_swap_manager(manager)
 
     def _runtime_diagnostic(self, event_type: str, data: dict[str, object]) -> None:
         if self.session_logger:
@@ -1754,6 +1774,21 @@ class OpenJetApp:
             self._stop_tool_status(tool_status_token)
         result = execution.output
         meta = execution.meta
+
+        # Handle model swap restore failure — KV cache is stale, re-prompt.
+        if meta.get("swapped") and not meta.get("swap_restore_ok", True):
+            log.write(f"  {rich_text('KV cache restore failed after swap — re-prompting context', 'warning')}")
+            if self.agent and self.client:
+                try:
+                    await self.client.reset_kv_cache()
+                except Exception:
+                    pass  # reset_kv_cache restarts the server, best effort
+            if self.session_logger:
+                self.session_logger.log_event(
+                    "swap_restore_fallback",
+                    swap_duration_s=meta.get("swap_duration_s"),
+                )
+
         result_for_context, output_truncated = self._fit_tool_result_to_budget(result)
         if execution.ok:
             self._active_turn_tool_successes += 1

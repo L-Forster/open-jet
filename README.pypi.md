@@ -137,11 +137,12 @@ open-jet
 
 - bounded-context local chat with your on-device model
 - automatic context condensing under pressure
+- low-memory shell execution that can unload and reload `llama.cpp` models around heavy commands
 - session resume and harness state recovery
 - OpenTelemetry instrumentation with collector export
 - hardware-aware runtime setup for local Linux systems, including Jetson
 - controlled tool use and slash commands
-- Python SDK access to the same backend
+- Python SDK access to the same backend, including streaming, approvals, tool limits, turn context, and image inputs
 
 ## Why OpenJet exists
 
@@ -159,6 +160,7 @@ OpenJet is built around:
 
 - [Quickstart](https://github.com/l-forster/open-jet/blob/main/docs/quickstart.md)
 - [Installation](https://github.com/l-forster/open-jet/blob/main/docs/installation.md)
+- [Examples](https://github.com/l-forster/open-jet/blob/main/docs/examples/README.md)
 - [Runtime: llama.cpp](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/llama-cpp.md)
 - [Runtime: SGLang](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/sglang.md)
 - [Runtime: TensorRT-LLM](https://github.com/l-forster/open-jet/blob/main/docs/runtimes/tensorrt-llm.md)

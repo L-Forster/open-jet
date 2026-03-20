@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 
 
@@ -18,4 +19,12 @@ class RuntimeClient(Protocol):
         ...
 
     async def chat_stream(self, messages: list[dict], *, use_tools: bool = True):
+        ...
+
+    async def save_kv_cache(self, path: Path) -> bool:
+        """Save KV cache state to *path*. Returns True on success."""
+        ...
+
+    async def restore_kv_cache(self, path: Path) -> bool:
+        """Restore KV cache state from *path*. Returns True on success."""
         ...

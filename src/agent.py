@@ -21,6 +21,7 @@ class ActionKind(Enum):
     TOOL_RESULT = auto()  # result after tool execution
     DONE = auto()         # turn finished
     ERROR = auto()        # something went wrong
+    UNLOAD = auto()       # signal that model should be unloaded for a heavy task
 
 
 @dataclass
