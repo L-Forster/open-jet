@@ -30,7 +30,7 @@ It does not send:
 
 ```yaml
 logging:
-  directory: session_logs
+  directory: .openjet/state/sessions
   enabled: true
   retention_days: 30
   max_sessions: 100
@@ -51,7 +51,7 @@ telemetry:
 
 `telemetry.broadcast.endpoint` is the collector base URL. `open-jet` appends `/v1/logs`, `/v1/metrics`, and `/v1/traces`.
 
-`logging.directory` now stores session manifests only. Telemetry signal storage belongs to the collector and its configured exporters.
+`logging.directory` now stores session manifests only under `.openjet/state/` by default. Telemetry signal storage belongs to the collector and its configured exporters.
 
 Useful emitted attributes now include:
 

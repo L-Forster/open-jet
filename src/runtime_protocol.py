@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 import httpx
+
+from .runtime_limits import estimate_tokens
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "shell",
-            "description": "Run a shell command.",
+            "description": (
+                "Run a shell command. For heavy local work you may set "
+                "resource_mode=unload_first to unload the local model before the command "
+                "and reload it afterward."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -23,8 +30,44 @@ TOOLS = [
                         "type": "integer",
                         "description": "Timeout in seconds",
                     },
+                    "resource_mode": {
+                        "type": "string",
+                        "description": "Resource strategy: normal, auto, or unload_first",
+                    },
+                    "estimated_ram_mb": {
+                        "type": "integer",
+                        "description": "Optional estimated RAM needed by the command in MB",
+                    },
+                    "estimated_vram_mb": {
+                        "type": "integer",
+                        "description": "Optional estimated VRAM needed by the command in MB",
+                    },
+                    "reload_delay_seconds": {
+                        "type": "integer",
+                        "description": "Optional delay before reloading the model after an unload-run cycle",
+                    },
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system_info",
+            "description": (
+                "Inspect local system resource information such as RAM, disk, load, "
+                "and GPU memory when detectable. Use this before heavy shell commands."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "description": "Info scope: summary, memory, gpu, disk, or all",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -236,6 +279,77 @@ class StreamChunk:
     done: bool = False
 
 
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+_FUNCTION_BLOCK_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)\s*</function>", re.IGNORECASE | re.DOTALL)
+_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.IGNORECASE | re.DOTALL)
+
+
+def tool_schema_token_estimate() -> int:
+    payload = json.dumps(TOOLS, ensure_ascii=True, separators=(",", ":"))
+    return estimate_tokens(payload)
+
+
+def _coerce_reasoning_parameter(raw: str) -> object:
+    value = raw.strip()
+    if not value:
+        return ""
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        pass
+    lowered = value.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    if re.fullmatch(r"-?\d+", value):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if re.fullmatch(r"-?\d+\.\d+", value):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _extract_reasoning_tool_calls(reasoning_text: str) -> list[ToolCall]:
+    tool_calls: list[ToolCall] = []
+    if not reasoning_text.strip():
+        return tool_calls
+
+    for block in _TOOL_CALL_BLOCK_RE.findall(reasoning_text):
+        match = _FUNCTION_BLOCK_RE.search(block)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        if not name:
+            continue
+        arguments: dict[str, object] = {}
+        for param_name, param_value in _PARAMETER_BLOCK_RE.findall(match.group(2)):
+            key = param_name.strip()
+            if not key:
+                continue
+            arguments[key] = _coerce_reasoning_parameter(param_value)
+        tool_calls.append(ToolCall(name=name, arguments=arguments))
+    return tool_calls
+
+
+def _extract_reasoning_display_text(reasoning_text: str) -> str:
+    if not reasoning_text.strip():
+        return ""
+    visible = reasoning_text
+    marker = re.search(r"<tool_call>\s*", visible, flags=re.IGNORECASE)
+    if marker:
+        visible = visible[: marker.start()]
+    visible = visible.strip()
+    return visible
+
+
 async def stream_openai_chat(
     http: httpx.AsyncClient,
     *,
@@ -259,6 +373,8 @@ async def stream_openai_chat(
     tool_id_by_index: dict[int, str] = {}
     tool_name_by_index: dict[int, str] = {}
     tool_args_by_index: dict[int, str] = {}
+    reasoning_buf = ""
+    saw_text = False
 
     async with http.stream(
         "POST",
@@ -266,7 +382,19 @@ async def stream_openai_chat(
         json=payload,
         headers=headers,
     ) as resp:
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = ""
+            try:
+                body = await resp.aread()
+                text = body.decode("utf-8", errors="replace").strip()
+                if text:
+                    detail = f": {text[:500]}"
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"{exc}{detail}") from exc
+
         async for line in resp.aiter_lines():
             line = line.strip()
             if not line or line == "data: [DONE]":
@@ -287,7 +415,12 @@ async def stream_openai_chat(
 
             text = delta.get("content", "") or ""
             if text:
+                saw_text = True
                 yield StreamChunk(text=text)
+
+            reasoning_text = delta.get("reasoning_content", "") or ""
+            if reasoning_text:
+                reasoning_buf += reasoning_text
 
             for tc in delta.get("tool_calls", []) or []:
                 idx = int(tc.get("index", 0))
@@ -325,6 +458,14 @@ async def stream_openai_chat(
                         id=tool_id_by_index.get(idx),
                     )
                 )
+
+            if not tool_calls and reasoning_buf:
+                tool_calls = _extract_reasoning_tool_calls(reasoning_buf)
+
+            if tool_calls and not saw_text and reasoning_buf:
+                display_text = _extract_reasoning_display_text(reasoning_buf)
+                if display_text:
+                    yield StreamChunk(text=display_text)
 
             yield StreamChunk(tool_calls=tool_calls, done=True)
             return

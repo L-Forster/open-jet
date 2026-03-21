@@ -9,6 +9,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -35,6 +36,16 @@ class SwapResult:
     swap_duration_s: float = 0.0
 
 
+@dataclass(frozen=True)
+class SwapPlan:
+    estimated_need_mb: float
+    available_mb: float
+    model_mb: float
+    projected_available_mb: float
+    required_available_mb: float
+    unload_recommended: bool
+
+
 class SwapManager:
     """Orchestrates the unload → run → reload → restore cycle."""
 
@@ -53,24 +64,36 @@ class SwapManager:
     def plugin(self) -> SwapPlugin:
         return self._plugin
 
+    def plan_unload(self, estimated_need_mb: float) -> SwapPlan:
+        estimated = max(0.0, float(estimated_need_mb))
+        available = float(self._plugin.available_memory_mb())
+        model_mb = float(self._plugin.model_memory_mb())
+        required = estimated + _MIN_HEADROOM_MB
+        projected = available + model_mb
+        return SwapPlan(
+            estimated_need_mb=estimated,
+            available_mb=available,
+            model_mb=model_mb,
+            projected_available_mb=projected,
+            required_available_mb=required,
+            unload_recommended=(available < required and projected >= required),
+        )
+
     def should_unload(self, estimated_need_mb: float) -> bool:
         """Return True if we need to free the model to run the task."""
-        available = self._plugin.available_memory_mb()
-        if available >= estimated_need_mb + _MIN_HEADROOM_MB:
-            return False
-        # Would freeing the model give us enough?
-        model_mb = self._plugin.model_memory_mb()
-        projected = available + model_mb
-        return projected >= estimated_need_mb + _MIN_HEADROOM_MB
+        return self.plan_unload(estimated_need_mb).unload_recommended
 
     async def run_with_swap(
         self,
         command: str,
         timeout: int = 120,
+        *,
+        reload_delay_seconds: float = 0.0,
     ) -> SwapResult:
         """Full cycle: save → unload → run → reload → restore → return."""
         t0 = time.monotonic()
-        self._emit("Saving model state...")
+        pre_swap_available = self._plugin.available_memory_mb()
+        self._emit(f"Saving model state... (available={pre_swap_available:.0f}MB)")
 
         save_ok = await self._plugin.save_state(self._state_dir)
         if not save_ok:
@@ -83,6 +106,13 @@ class SwapManager:
 
         self._emit(f"Running: {command[:80]}...")
         exec_result = await run_shell(command, timeout_seconds=timeout)
+
+        if reload_delay_seconds > 0:
+            self._emit(
+                "Waiting before reload... "
+                f"({reload_delay_seconds:.1f}s, available={self._plugin.available_memory_mb():.0f}MB)"
+            )
+            await self._poll_delay_before_reload(reload_delay_seconds)
 
         self._emit("Reloading model...")
         reload_ok = True
@@ -112,6 +142,13 @@ class SwapManager:
             restore_ok=restore_ok,
             swap_duration_s=round(swap_duration, 2),
         )
+
+    async def _poll_delay_before_reload(self, delay_seconds: float) -> None:
+        remaining = max(0.0, float(delay_seconds))
+        while remaining > 0:
+            sleep_for = min(0.25, remaining)
+            await asyncio.sleep(sleep_for)
+            remaining -= sleep_for
 
     def _emit(self, text: str) -> None:
         if self._status_hook:

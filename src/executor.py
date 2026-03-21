@@ -8,6 +8,7 @@ import difflib
 import fnmatch
 import os
 import re
+import shutil
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,6 +165,89 @@ async def run_shell(command: str, timeout_seconds: int = DEFAULT_SHELL_TIMEOUT_S
         timed_out=timed_out,
         timeout_seconds=timeout_seconds,
     )
+
+
+async def read_system_info(scope: str | None = None) -> str:
+    """Return a compact local system summary for agent planning."""
+    normalized_scope = (scope or "summary").strip().lower() or "summary"
+    if normalized_scope not in {"summary", "memory", "gpu", "disk", "all"}:
+        return "Error: invalid arguments for system_info (scope must be summary, memory, gpu, disk, or all)"
+
+    lines = ["SYSTEM INFO", f"cwd: {Path.cwd()}"]
+
+    if normalized_scope in {"summary", "memory", "all"}:
+        mem = read_memory_snapshot()
+        if mem is None:
+            lines.append("memory: unavailable")
+        else:
+            lines.append(
+                "memory: "
+                f"available={mem.available_mb:.0f}MB total={mem.total_mb:.0f}MB used={mem.used_percent:.1f}%"
+            )
+
+    if normalized_scope in {"summary", "disk", "all"}:
+        try:
+            usage = shutil.disk_usage(Path.cwd())
+            gb = 1024 ** 3
+            lines.append(
+                "disk: "
+                f"free={usage.free / gb:.1f}GB total={usage.total / gb:.1f}GB"
+            )
+        except OSError:
+            lines.append("disk: unavailable")
+
+    if normalized_scope in {"summary", "all"} and hasattr(os, "getloadavg"):
+        try:
+            load1, load5, load15 = os.getloadavg()
+            lines.append(f"load: 1m={load1:.2f} 5m={load5:.2f} 15m={load15:.2f}")
+        except OSError:
+            lines.append("load: unavailable")
+
+    if normalized_scope in {"summary", "gpu", "all"}:
+        lines.extend(await _gpu_info_lines())
+
+    return "\n".join(lines)
+
+
+async def _gpu_info_lines() -> list[str]:
+    tool = shutil.which("nvidia-smi")
+    if not tool:
+        if Path("/dev/nvhost-gpu").exists():
+            return ["gpu: detected (Jetson/unified memory), dedicated VRAM query unavailable"]
+        return ["gpu: unavailable"]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tool,
+            "--query-gpu=name,memory.total,memory.used,memory.free",
+            "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=3)
+    except (OSError, asyncio.TimeoutError):
+        return ["gpu: query failed"]
+
+    if proc.returncode != 0:
+        stderr = stderr_bytes.decode(errors="replace").strip()
+        detail = stderr or f"exit {proc.returncode}"
+        return [f"gpu: query failed ({detail})"]
+
+    lines = [line.strip() for line in stdout_bytes.decode(errors="replace").splitlines() if line.strip()]
+    if not lines:
+        return ["gpu: unavailable"]
+
+    rendered: list[str] = []
+    for index, line in enumerate(lines, start=1):
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 4:
+            rendered.append(f"gpu[{index}]: {line}")
+            continue
+        name, total_mb, used_mb, free_mb = parts
+        rendered.append(
+            f"gpu[{index}]: {name} total={total_mb}MB used={used_mb}MB free={free_mb}MB"
+        )
+    return rendered
 
 
 # -- File tools (no shell needed) -------------------------------------------
@@ -556,6 +640,8 @@ _DEFAULT_GLOB_IGNORE = {
     ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
     "dist", "build", ".eggs", "*.egg-info",
 }
+_DEFAULT_TOOL_STATE_DIRS = {".openjet", "session_logs"}
+_DEFAULT_TOOL_STATE_FILES = {"session_state.json"}
 
 _MAX_GLOB_RESULTS = 200
 
@@ -571,11 +657,7 @@ async def glob_files(pattern: str, path: str | None = None) -> str:
     matches: list[str] = []
     try:
         for match in sorted(base.glob(pattern)):
-            # Skip ignored directories
-            parts = match.relative_to(base).parts
-            if any(part in _DEFAULT_GLOB_IGNORE for part in parts):
-                continue
-            if any(fnmatch.fnmatch(part, p) for part in parts for p in _DEFAULT_GLOB_IGNORE):
+            if _should_skip_tool_path(match, base):
                 continue
             matches.append(str(match))
             if len(matches) >= _MAX_GLOB_RESULTS:
@@ -625,14 +707,7 @@ async def grep_files(
     for fp in files:
         if not fp.is_file():
             continue
-        # Skip ignored directories
-        try:
-            rel_parts = fp.relative_to(base).parts if base.is_dir() else ()
-        except ValueError:
-            rel_parts = ()
-        if any(part in _DEFAULT_GLOB_IGNORE for part in rel_parts):
-            continue
-        if any(fnmatch.fnmatch(part, p) for part in rel_parts for p in _DEFAULT_GLOB_IGNORE):
+        if _should_skip_tool_path(fp, base):
             continue
 
         # Skip binary files
@@ -680,7 +755,7 @@ async def list_directory(path: str | None = None) -> str:
     entries: list[str] = []
     try:
         for item in sorted(base.iterdir()):
-            if item.name.startswith(".") and item.name in {".git"}:
+            if _should_skip_tool_path(item, base):
                 continue
             try:
                 if item.is_dir():
@@ -721,6 +796,30 @@ def _normalize_tool_path(path: str) -> Path:
     elif raw.startswith("/home/user/"):
         raw = str(Path.home() / raw.removeprefix("/home/user/"))
     return Path(raw).expanduser()
+
+
+def _path_points_inside_tool_state(path: Path) -> bool:
+    return any(part in _DEFAULT_TOOL_STATE_DIRS for part in path.parts) or path.name in _DEFAULT_TOOL_STATE_FILES
+
+
+def _should_skip_tool_path(path: Path, base: Path) -> bool:
+    if _path_points_inside_tool_state(base):
+        return False
+
+    try:
+        rel_parts = path.relative_to(base).parts if base.is_dir() else (path.name,)
+    except ValueError:
+        rel_parts = path.parts
+
+    if any(part in _DEFAULT_GLOB_IGNORE for part in rel_parts):
+        return True
+    if any(fnmatch.fnmatch(part, pattern) for part in rel_parts for pattern in _DEFAULT_GLOB_IGNORE):
+        return True
+    if any(part in _DEFAULT_TOOL_STATE_DIRS for part in rel_parts):
+        return True
+    if path.name in _DEFAULT_TOOL_STATE_FILES:
+        return True
+    return False
 
 
 def _is_supported_text_file(path: Path) -> bool:

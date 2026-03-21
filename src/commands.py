@@ -208,6 +208,7 @@ class SlashCommandHandler:
             f"Context tokens: {snapshot['context_tokens']}/{snapshot['context_window_tokens']} | "
             f"Prompt budget: {snapshot['prompt_budget_tokens']} | "
             f"Reserve: {snapshot['reserve_tokens']} | "
+            f"Overhead: {snapshot.get('runtime_overhead_tokens', 0)} | "
             f"Remaining: {snapshot['remaining_prompt_tokens']}"
             "[/]"
         )
@@ -225,7 +226,10 @@ class SlashCommandHandler:
             log.write(
                 "[bold bright_white]"
                 f"Workflow: active_step={snapshot.get('harness_active_step') or 'n/a'} | "
-                f"docs={snapshot.get('harness_doc_tokens', 0)}t"
+                f"docs={snapshot.get('harness_doc_tokens', 0)}t | "
+                f"state={snapshot.get('harness_state_summary_tokens', 0)}t | "
+                f"docs_budget={snapshot.get('turn_docs_budget', 0)}t | "
+                f"candidate_docs={snapshot.get('harness_candidate_count', 0)}"
                 "[/]"
             )
             docs = snapshot.get("harness_docs") or []
@@ -235,6 +239,9 @@ class SlashCommandHandler:
                     f"Loaded harness docs: {', '.join(str(doc) for doc in docs)}"
                     "[/]"
                 )
+            alerts = snapshot.get("harness_budget_alerts") or []
+            for alert in alerts:
+                log.write(f"[bold yellow]Budget alert:[/] {alert}")
         log.write("")
 
     async def _condense(self, log: Any) -> None:

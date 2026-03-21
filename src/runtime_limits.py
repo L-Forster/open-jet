@@ -12,7 +12,6 @@ from pathlib import Path
 import tiktoken
 from typing import Any
 
-from .airgap import is_airgapped
 from .config import load_config
 
 
@@ -42,10 +41,9 @@ class ContextBudget:
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
-    if is_airgapped():
-        counter = _get_airgapped_token_counter()
-        if counter is not None:
-            return counter(text)
+    counter = _get_local_gguf_token_counter(_active_local_gguf_model_ref())
+    if counter is not None:
+        return counter(text)
     return len(_get_encoder().encode_ordinary(text))
 
 
@@ -55,11 +53,20 @@ def _get_encoder() -> tiktoken.Encoding:
     return tiktoken.get_encoding(encoding_name)
 
 
-@lru_cache(maxsize=1)
-def _get_airgapped_token_counter() -> Any | None:
-    model_path = _resolve_airgapped_model_path()
-    if model_path is None:
+def _active_local_gguf_model_ref() -> str | None:
+    cfg = load_config()
+    runtime = str(cfg.get("runtime", "llama_cpp") or "llama_cpp").strip().lower()
+    if runtime != "llama_cpp":
         return None
+    model_ref = str(cfg.get("llama_model") or cfg.get("model") or "").strip()
+    return model_ref or None
+
+
+@lru_cache(maxsize=4)
+def _get_local_gguf_token_counter(model_ref: str | None) -> Any | None:
+    if not model_ref:
+        return None
+    model_path = Path(model_ref).expanduser()
     if model_path.suffix.lower() != ".gguf" or not model_path.is_file():
         return None
 
@@ -84,14 +91,6 @@ def _get_airgapped_token_counter() -> Any | None:
     cache_dir = _materialize_qwen_tokenizer_files(model_path, tokens=tokens, merges=merges)
     tokenizer = Qwen2Tokenizer(str(cache_dir / "vocab.json"), str(cache_dir / "merges.txt"))
     return lambda text: len(tokenizer.encode(text, add_special_tokens=False))
-
-
-def _resolve_airgapped_model_path() -> Path | None:
-    cfg = load_config()
-    model_ref = str(cfg.get("llama_model") or cfg.get("model") or "").strip()
-    if not model_ref:
-        return None
-    return Path(model_ref).expanduser()
 
 
 def _materialize_qwen_tokenizer_files(

@@ -238,37 +238,56 @@ class OpenJetSession:
     def _clamp_load_file_tool_budget(self, tool_call: ToolCall) -> None:
         if not isinstance(tool_call.arguments, dict):
             return
-        remaining = self._remaining_prompt_tokens()
+        remaining = self._remaining_prompt_tokens(reserve_next_turn_overhead=True)
         current = tool_call.arguments.get("max_tokens")
         if not isinstance(current, int):
             tool_call.arguments["max_tokens"] = remaining
             return
         tool_call.arguments["max_tokens"] = max(128, min(current, remaining))
 
-    def _remaining_prompt_tokens(self) -> int:
+    def _remaining_prompt_tokens(self, *, reserve_next_turn_overhead: bool = False) -> int:
         current = self.agent.estimated_context_tokens()
         budget = self.agent.context_budget()
         if not budget:
             window = self.agent.context_window_tokens or 2048
             budget = derive_context_budget(window)
-        return max(128, budget.prompt_tokens - current)
+        runtime_overhead = (
+            self.agent.runtime_overhead_tokens(force_post_tool_continuation=True)
+            if reserve_next_turn_overhead
+            else 0
+        )
+        return max(0, budget.prompt_tokens - current - runtime_overhead)
 
     def _fit_tool_result_to_budget(self, result: str) -> str:
         if not result:
             return result
 
-        budget_tokens = self._remaining_prompt_tokens()
-        if estimate_tokens(result) <= budget_tokens:
+        budget_tokens = self._remaining_prompt_tokens(reserve_next_turn_overhead=True)
+        runtime_overhead = self.agent.runtime_overhead_tokens(force_post_tool_continuation=True)
+        result_tokens = estimate_tokens(result)
+        if budget_tokens <= 0:
+            return (
+                "...[tool output omitted: no prompt budget remaining]\n"
+                "[tool context limit reached: "
+                f"tool~{result_tokens}t, available~0t after overhead~{runtime_overhead}t; "
+                "narrow the next tool call or condense context]"
+            )
+        if result_tokens <= budget_tokens:
             return result
 
         prefix = "...[tool output truncated]\n"
+        suffix = (
+            "\n[tool context limit reached: "
+            f"tool~{result_tokens}t, available~{budget_tokens}t after overhead~{runtime_overhead}t; "
+            "narrow the next tool call or condense context]"
+        )
         max_chars = max(256, budget_tokens * 4)
         clipped = result[-max_chars:]
-        candidate = prefix + clipped
+        candidate = prefix + clipped + suffix
 
         while estimate_tokens(candidate) > budget_tokens and len(clipped) > 64:
             clipped = clipped[max(64, int(len(clipped) * 0.85)):]
-            candidate = prefix + clipped
+            candidate = prefix + clipped + suffix
 
         return candidate
 

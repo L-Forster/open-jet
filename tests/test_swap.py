@@ -443,7 +443,7 @@ class LlamaServerKvCacheTests(unittest.IsolatedAsyncioTestCase):
 class ToolExecutorSwapTests(unittest.IsolatedAsyncioTestCase):
     """Test that tool_executor routes through SwapManager when registered."""
 
-    async def test_shell_uses_swap_when_should_unload(self) -> None:
+    async def test_shell_unload_first_uses_swap_when_manager_available(self) -> None:
         from src.runtime_protocol import ToolCall
         from src.swap_manager import SwapManager
         from src.tool_executor import execute_tool, set_swap_manager
@@ -463,22 +463,68 @@ class ToolExecutorSwapTests(unittest.IsolatedAsyncioTestCase):
             )
             set_swap_manager(mgr)
             try:
-                tc = ToolCall(name="shell", arguments={"command": "echo hi"}, id="c1")
+                tc = ToolCall(
+                    name="shell",
+                    arguments={
+                        "command": "echo hi",
+                        "resource_mode": "unload_first",
+                        "reload_delay_seconds": 1,
+                    },
+                    id="c1",
+                )
                 result = await execute_tool(tc)
 
                 self.assertTrue(result.ok)
                 self.assertTrue(result.meta.get("swapped"))
                 self.assertEqual(result.meta.get("swap_duration_s"), 5.0)
+                self.assertEqual(result.meta.get("swap_mode"), "unload_first")
                 mock_swap.assert_awaited_once()
             finally:
                 set_swap_manager(None)
 
-    async def test_shell_direct_when_enough_memory(self) -> None:
+    async def test_shell_auto_uses_swap_when_plan_recommends(self) -> None:
         from src.runtime_protocol import ToolCall
         from src.swap_manager import SwapManager
         from src.tool_executor import execute_tool, set_swap_manager
 
-        plugin = FakeSwapPlugin(available_mb=5000.0, model_mb=2500.0)
+        plugin = FakeSwapPlugin(available_mb=500.0, model_mb=2500.0)
+        mgr = SwapManager(plugin)
+        with patch.object(mgr, "run_with_swap", new_callable=AsyncMock) as mock_swap:
+            mock_swap.return_value = SwapResult(
+                exec_result=ExecResult(
+                    command="python train.py", exit_code=0, stdout="done", stderr="",
+                ),
+                unloaded=True,
+                reload_ok=True,
+                restore_ok=True,
+                swap_duration_s=3.0,
+            )
+            set_swap_manager(mgr)
+            try:
+                tc = ToolCall(
+                    name="shell",
+                    arguments={
+                        "command": "python train.py",
+                        "resource_mode": "auto",
+                        "estimated_ram_mb": 2000,
+                    },
+                    id="c2",
+                )
+                result = await execute_tool(tc)
+
+                self.assertTrue(result.ok)
+                self.assertTrue(result.meta.get("swapped"))
+                self.assertEqual(result.meta.get("swap_mode"), "auto")
+                mock_swap.assert_awaited_once()
+            finally:
+                set_swap_manager(None)
+
+    async def test_shell_normal_mode_stays_direct_even_when_swap_could_help(self) -> None:
+        from src.runtime_protocol import ToolCall
+        from src.swap_manager import SwapManager
+        from src.tool_executor import execute_tool, set_swap_manager
+
+        plugin = FakeSwapPlugin(available_mb=500.0, model_mb=2500.0)
         mgr = SwapManager(plugin)
         set_swap_manager(mgr)
 
@@ -487,11 +533,12 @@ class ToolExecutorSwapTests(unittest.IsolatedAsyncioTestCase):
                 mock_shell.return_value = ExecResult(
                     command="ls", exit_code=0, stdout="file.txt", stderr="",
                 )
-                tc = ToolCall(name="shell", arguments={"command": "ls"}, id="c2")
+                tc = ToolCall(name="shell", arguments={"command": "ls"}, id="c3")
                 result = await execute_tool(tc)
 
                 self.assertTrue(result.ok)
                 self.assertNotIn("swapped", result.meta)
+                self.assertEqual(result.meta.get("swap_mode"), "normal")
                 mock_shell.assert_awaited_once()
         finally:
             set_swap_manager(None)
@@ -506,11 +553,47 @@ class ToolExecutorSwapTests(unittest.IsolatedAsyncioTestCase):
             mock_shell.return_value = ExecResult(
                 command="pwd", exit_code=0, stdout="/home", stderr="",
             )
-            tc = ToolCall(name="shell", arguments={"command": "pwd"}, id="c3")
+            tc = ToolCall(
+                name="shell",
+                arguments={"command": "pwd", "resource_mode": "unload_first"},
+                id="c4",
+            )
             result = await execute_tool(tc)
 
             self.assertTrue(result.ok)
+            self.assertEqual(result.meta.get("swap_mode"), "unload_first")
+            self.assertFalse(result.meta.get("swap_available"))
             mock_shell.assert_awaited_once()
+
+    async def test_shell_resource_failure_appends_retry_hint(self) -> None:
+        from src.runtime_protocol import ToolCall
+        from src.tool_executor import execute_tool, set_swap_manager
+
+        set_swap_manager(None)
+
+        with patch("src.tool_executor.run_shell", new_callable=AsyncMock) as mock_shell:
+            mock_shell.return_value = ExecResult(
+                command="python train.py",
+                exit_code=1,
+                stdout="",
+                stderr="CUDA out of memory",
+            )
+            tc = ToolCall(name="shell", arguments={"command": "python train.py"}, id="c5")
+            result = await execute_tool(tc)
+
+            self.assertFalse(result.ok)
+            self.assertTrue(result.meta.get("resource_failure_detected"))
+            self.assertIn("resource failure detected", result.output)
+
+    async def test_system_info_tool_returns_ok(self) -> None:
+        from src.runtime_protocol import ToolCall
+        from src.tool_executor import execute_tool
+
+        tc = ToolCall(name="system_info", arguments={"scope": "summary"}, id="sys-1")
+        result = await execute_tool(tc)
+
+        self.assertTrue(result.ok)
+        self.assertIn("SYSTEM INFO", result.output)
 
 
 # ---------------------------------------------------------------------------

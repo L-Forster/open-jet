@@ -6,11 +6,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.agent import ActionKind, Agent
+from src.agent import (
+    ActionKind,
+    Agent,
+    EMPTY_COMPLETION_RETRY_NOTE,
+    POST_TOOL_CONTINUATION_NOTE,
+)
 from src.executor import edit_file
 from src.harness import (
+    CONFIRMATION_GATED_TOOLS,
     HarnessState,
     active_step,
+    allowed_tools_for_mode,
     advance_step,
     build_turn_context,
     clear_preferred_skills,
@@ -72,7 +79,42 @@ class SequencedRuntimeClient:
             yield chunk
 
 
+class RecordingRuntimeClient:
+    def __init__(self, turns: list[list[StreamChunk]]) -> None:
+        self.model = "fake"
+        self.context_window_tokens = 4096
+        self.gpu_layers = 0
+        self._turns = list(turns)
+        self.calls: list[list[dict]] = []
+
+    async def start(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    async def reset_kv_cache(self) -> None:
+        return None
+
+    async def chat_stream(self, messages: list[dict], *, use_tools: bool = True):
+        self.calls.append(messages)
+        chunks = self._turns.pop(0) if self._turns else []
+        for chunk in chunks:
+            yield chunk
+
+
 class HarnessContextTests(unittest.TestCase):
+    def test_confirmation_gated_tools_are_allowed_in_every_mode(self) -> None:
+        for mode in ("chat", "code", "review", "debug"):
+            with self.subTest(mode=mode):
+                allowed = allowed_tools_for_mode(mode)
+                self.assertTrue(CONFIRMATION_GATED_TOOLS <= allowed)
+
+    def test_system_info_is_allowed_in_every_mode(self) -> None:
+        for mode in ("chat", "code", "review", "debug"):
+            with self.subTest(mode=mode):
+                self.assertIn("system_info", allowed_tools_for_mode(mode))
+
     def test_build_turn_context_shifts_file_context_between_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -405,6 +447,149 @@ class HarnessStateTests(unittest.TestCase):
         self.assertIn("inspect narrowly", active_step(split).title)
 
 class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_turn_traces_runtime_token_usage_for_tool_call_response(self) -> None:
+        traces: list[tuple[str, dict[str, object]]] = []
+        tool_call = ToolCall(name="read_file", arguments={"path": "README.md"})
+        client = FakeRuntimeClient([StreamChunk(text="checking", tool_calls=[tool_call])])
+        agent = Agent(
+            client=client,
+            system_prompt="system",
+            context_window_tokens=4096,
+            trace_hook=lambda event, data: traces.append((event, data)),
+        )
+        agent.add_user_message("inspect README")
+
+        _ = [event async for event in agent.run_turn()]
+
+        runtime_events = [data for event, data in traces if event == "runtime_exchange_complete"]
+        self.assertEqual(len(runtime_events), 1)
+        self.assertEqual(runtime_events[0]["request_kind"], "turn")
+        self.assertEqual(runtime_events[0]["tool_call_count"], 1)
+        self.assertGreater(int(runtime_events[0]["prompt_tokens"]), 0)
+        self.assertGreater(int(runtime_events[0]["completion_tokens"]), 0)
+
+    async def test_condense_context_traces_runtime_token_usage(self) -> None:
+        traces: list[tuple[str, dict[str, object]]] = []
+        client = FakeRuntimeClient([StreamChunk(text="summary text")])
+        agent = Agent(
+            client=client,
+            system_prompt="system",
+            context_window_tokens=4096,
+            trace_hook=lambda event, data: traces.append((event, data)),
+        )
+        agent.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+        ]
+
+        await agent.condense_context()
+
+        runtime_events = [
+            data
+            for event, data in traces
+            if event == "runtime_exchange_complete" and data.get("request_kind") == "condense_summary"
+        ]
+        self.assertGreaterEqual(len(runtime_events), 1)
+        self.assertTrue(all(event["tool_call_count"] == 0 for event in runtime_events))
+        self.assertTrue(all(int(event["prompt_tokens"]) > 0 for event in runtime_events))
+        self.assertTrue(all(int(event["completion_tokens"]) > 0 for event in runtime_events))
+
+    async def test_condense_context_keeps_most_recent_user_message(self) -> None:
+        client = FakeRuntimeClient([StreamChunk(text="summary text")])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        agent.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "latest question"},
+            {"role": "assistant", "content": "tool planning"},
+            {"role": "tool", "content": "tool result"},
+        ]
+
+        message = await agent.condense_context()
+
+        self.assertIn("Context condensed automatically.", message)
+        self.assertIn("target<=", message)
+        self.assertIn("kept_latest_user=yes", message)
+        self.assertEqual(agent.messages[0]["role"], "system")
+        self.assertEqual(agent.messages[1]["role"], "system")
+        self.assertEqual(agent.messages[2]["role"], "user")
+        self.assertEqual(agent.messages[2]["content"], "latest question")
+        report = agent.last_condense_report()
+        self.assertIsNotNone(report)
+        assert report is not None
+        self.assertTrue(report.kept_latest_user)
+
+    async def test_condense_context_includes_source_trail_in_saved_summary(self) -> None:
+        client = FakeRuntimeClient([StreamChunk(text="GOAL:\ninspect training\nKEY FINDINGS:\n- found config")])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        agent.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "inspect training"},
+            {
+                "role": "assistant",
+                "content": "I will inspect the training script.",
+                "tool_calls": [
+                    {
+                        "id": "call-read-train",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"src/train.py\"}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-read-train",
+                "content": "src/train.py\nreport_to=\"wandb\" if has_gpu else \"none\"",
+            },
+        ]
+
+        await agent.condense_context()
+
+        condensed = agent.messages[1]["content"]
+        self.assertIn("Source trail to preserve:", condensed)
+        self.assertIn("read_file path=src/train.py", condensed)
+        self.assertIn("src/train.py", condensed)
+
+    async def test_condense_request_contains_structured_tool_provenance(self) -> None:
+        client = FakeRuntimeClient([StreamChunk(text="GOAL:\ninspect training")])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        agent.messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "inspect training"},
+            {
+                "role": "assistant",
+                "content": "Inspecting files first.",
+                "tool_calls": [
+                    {
+                        "id": "call-grep-train",
+                        "type": "function",
+                        "function": {
+                            "name": "grep",
+                            "arguments": "{\"pattern\":\"logging_steps|report_to\",\"path\":\"src/train.py\"}",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-grep-train",
+                "content": "src/train.py:120: report_to=\"wandb\" if has_gpu else \"none\"",
+            },
+        ]
+
+        await agent.condense_context()
+
+        self.assertIsNotNone(client.last_messages)
+        condense_prompt = str(client.last_messages[-1]["content"])
+        self.assertIn("TOOL_CALL: grep pattern=logging_steps|report_to path=src/train.py", condense_prompt)
+        self.assertIn("TOOL_RESULT: grep pattern=logging_steps|report_to path=src/train.py", condense_prompt)
+        self.assertIn("files: src/train.py", condense_prompt)
+
     async def test_turn_context_is_sent_to_runtime_but_not_persisted_in_history(self) -> None:
         client = FakeRuntimeClient([StreamChunk(text="done")])
         agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
@@ -437,6 +622,73 @@ class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
         agent.complete_tool_call(tool_call, "README contents")
         self.assertEqual(agent.messages[-1]["role"], "tool")
         self.assertEqual(agent.messages[-1]["tool_call_id"], tool_call.id)
+
+    async def test_run_turn_retries_empty_completion_after_tool_result(self) -> None:
+        tool_call = ToolCall(name="read_file", arguments={"path": "README.md"}, id="call-1")
+        client = RecordingRuntimeClient(
+            [
+                [],
+                [StreamChunk(text="final answer")],
+            ]
+        )
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        agent.add_user_message("inspect README")
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": "{\"path\":\"README.md\"}",
+                        },
+                    }
+                ],
+            }
+        )
+        agent.complete_tool_call(tool_call, "README contents")
+
+        events = [event async for event in agent.run_turn()]
+
+        self.assertEqual(events[-1].kind, ActionKind.DONE)
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn(POST_TOOL_CONTINUATION_NOTE, client.calls[0][0]["content"])
+        self.assertIn(POST_TOOL_CONTINUATION_NOTE, client.calls[1][0]["content"])
+        self.assertIn(EMPTY_COMPLETION_RETRY_NOTE, client.calls[1][0]["content"])
+        self.assertEqual(agent.messages[-1]["role"], "assistant")
+        self.assertEqual(agent.messages[-1]["content"], "final answer")
+
+    async def test_run_turn_errors_after_repeated_empty_completions(self) -> None:
+        tool_call = ToolCall(name="read_file", arguments={"path": "README.md"}, id="call-1")
+        client = RecordingRuntimeClient([[], [], []])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        agent.add_user_message("inspect README")
+        agent.messages.append(
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": "{\"path\":\"README.md\"}",
+                        },
+                    }
+                ],
+            }
+        )
+        agent.complete_tool_call(tool_call, "README contents")
+
+        events = [event async for event in agent.run_turn()]
+
+        self.assertEqual(events[-1].kind, ActionKind.ERROR)
+        self.assertIn("empty completion", events[-1].text.lower())
+        self.assertEqual(len(client.calls), 3)
 
     async def test_image_attachment_is_serialized_for_runtime(self) -> None:
         client = FakeRuntimeClient([StreamChunk(text="vision done")])

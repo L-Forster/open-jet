@@ -20,11 +20,13 @@ ROLE_BY_MODE = {
     "debug": "debugger",
 }
 
+CONFIRMATION_GATED_TOOLS = {"shell", "write_file", "edit_file", "memory"}
+
 TOOL_BUNDLES = {
-    "chat": {"memory", "read_file", "load_file", "glob", "grep", "list_directory", "shell"},
-    "code": {"memory", "read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},
-    "review": {"memory", "read_file", "load_file", "glob", "grep", "list_directory", "shell"},
-    "debug": {"memory", "read_file", "load_file", "write_file", "edit_file", "glob", "grep", "list_directory", "shell"},
+    "chat": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
+    "code": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
+    "review": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
+    "debug": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
 }
 
 DEFAULT_BASE_PROMPT = """You are operating inside open-jet on an edge Linux device.
@@ -32,6 +34,8 @@ Keep work decomposed into small turns.
 Prefer exact file excerpts over broad repo context.
 Prefer dedicated tools over shell unless shell is the right fit.
 Preserve enough state for the next turn to continue cleanly.
+Use system_info before proposing heavy local commands when resource limits matter.
+Default to a normal shell run first; if it fails for RAM/VRAM pressure, retry explicitly with unload-first shell mode.
 """
 
 DEFAULT_ROLE_PROMPTS = {
@@ -617,7 +621,7 @@ def normalize_skill_name(name: str) -> str:
 
 
 def allowed_tools_for_mode(mode: str) -> set[str]:
-    return set(TOOL_BUNDLES.get(mode, TOOL_BUNDLES["code"]))
+    return set(TOOL_BUNDLES.get(mode, TOOL_BUNDLES["code"])) | set(CONFIRMATION_GATED_TOOLS)
 
 
 def shell_command_is_verification(command: str) -> bool:

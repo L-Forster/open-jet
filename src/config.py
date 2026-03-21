@@ -5,6 +5,10 @@ from pathlib import Path
 import yaml
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+DEFAULT_SESSION_STATE_PATH = ".openjet/state/session_state.json"
+DEFAULT_LOG_DIRECTORY = ".openjet/state/sessions"
+LEGACY_SESSION_STATE_PATH = "session_state.json"
+LEGACY_LOG_DIRECTORY = "session_logs"
 
 # Curated, size-banded shortlist used by setup recommendations.
 # Band limit = max param budget in billions for that RAM tier.
@@ -70,9 +74,30 @@ HARDWARE_OVERRIDE_OPTIONS: tuple[tuple[str, str, float, bool], ...] = (
 def load_config() -> dict:
     for candidate in [Path("config.yaml"), CONFIG_PATH]:
         if candidate.exists():
-            return yaml.safe_load(candidate.read_text()) or {}
+            raw = yaml.safe_load(candidate.read_text()) or {}
+            return normalize_config(raw)
     return {}
 
 
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(yaml.dump(cfg, default_flow_style=False))
+
+
+def normalize_config(cfg: dict) -> dict:
+    normalized = dict(cfg or {})
+
+    state_cfg = dict(normalized.get("state") or {})
+    state_path = str(state_cfg.get("path", "")).strip()
+    if not state_path or state_path == LEGACY_SESSION_STATE_PATH:
+        state_cfg["path"] = DEFAULT_SESSION_STATE_PATH
+    if state_cfg:
+        normalized["state"] = state_cfg
+
+    log_cfg = dict(normalized.get("logging") or {})
+    log_dir = str(log_cfg.get("directory", "")).strip()
+    if not log_dir or log_dir == LEGACY_LOG_DIRECTORY:
+        log_cfg["directory"] = DEFAULT_LOG_DIRECTORY
+    if log_cfg:
+        normalized["logging"] = log_cfg
+
+    return normalized

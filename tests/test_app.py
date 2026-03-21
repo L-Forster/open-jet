@@ -12,6 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from rich.console import Console
+from rich.syntax import Syntax
+from rich.text import Text
 
 from src.agent import ActionKind, Agent
 from src.app import (
@@ -29,7 +31,7 @@ from src.llama_server import (
     _JETSON_VMM_RESERVE_MB,
 )
 from src.provisioning import ensure_direct_model
-from src.runtime_protocol import StreamChunk
+from src.runtime_protocol import StreamChunk, ToolCall
 from src.setup import _prompt_choice, _runtime_prompt_options, build_recommended_payload, run_setup_wizard
 
 
@@ -42,6 +44,39 @@ class FakeAgent:
 
     def estimated_context_tokens(self) -> int:
         return 256
+
+    def runtime_overhead_tokens(self, *, empty_retry_count: int = 0, force_post_tool_continuation: bool = False) -> int:
+        return 0
+
+    def persistent_context_tokens(self) -> int:
+        return 128
+
+    def set_turn_context(self, messages) -> None:
+        self.turn_context_messages = list(messages)
+
+    def _messages_for_runtime(self):
+        return []
+
+
+class FakeBudgetAgent(FakeAgent):
+    def __init__(self, *, estimated: int = 256, persistent: int = 128, overhead: int = 0, prompt_tokens: int = 1024) -> None:
+        self._estimated = estimated
+        self._persistent = persistent
+        self._overhead = overhead
+        self._prompt_tokens = prompt_tokens
+        self.turn_context_messages = []
+
+    def context_budget(self):
+        return SimpleNamespace(prompt_tokens=self._prompt_tokens)
+
+    def estimated_context_tokens(self) -> int:
+        return self._estimated
+
+    def runtime_overhead_tokens(self, *, empty_retry_count: int = 0, force_post_tool_continuation: bool = False) -> int:
+        return self._overhead
+
+    def persistent_context_tokens(self) -> int:
+        return self._persistent
 
 
 class FakeReasoningClient:
@@ -119,6 +154,21 @@ class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(with_tool_calls, base + 10)
 
+    async def test_context_pressure_accounts_for_runtime_overhead(self) -> None:
+        agent = Agent(
+            client=FakeRuntimeClient(),
+            system_prompt="system",
+            context_window_tokens=1000,
+            context_reserved_tokens=200,
+        )
+        agent.add_user_message("x " * 700)
+
+        with patch("src.agent.tool_schema_token_estimate", return_value=120):
+            reason = agent.resource_pressure_reason()
+
+        self.assertIsNotNone(reason)
+        self.assertIn("exceeds prompt budget", reason or "")
+
 
 class AppStatusTests(unittest.TestCase):
     def test_prompt_message_includes_generating_status_above_prompt(self) -> None:
@@ -138,6 +188,44 @@ class AppStatusTests(unittest.TestCase):
         rendered = app._format_tool_output_line("git status --short")
 
         self.assertIn("[command]", rendered)
+
+    def test_assistant_output_line_styles_inline_code(self) -> None:
+        app = OpenJetApp()
+
+        rendered, in_code_block = app._format_assistant_output_line(
+            "Look in `libcity/` first.",
+            in_code_block=False,
+        )
+
+        self.assertFalse(in_code_block)
+        self.assertIsInstance(rendered, Text)
+        self.assertEqual(rendered.plain, "Look in libcity/ first.")
+        self.assertTrue(any(span.style == "code" for span in rendered.spans))
+
+    def test_assistant_output_line_styles_markdown_bold(self) -> None:
+        app = OpenJetApp()
+
+        rendered, in_code_block = app._format_assistant_output_line(
+            "Use **focused context** before broad search.",
+            in_code_block=False,
+        )
+
+        self.assertFalse(in_code_block)
+        self.assertIsInstance(rendered, Text)
+        self.assertEqual(rendered.plain, "Use focused context before broad search.")
+        self.assertTrue(any(span.style == "bold" for span in rendered.spans))
+
+    def test_tool_result_syntax_uses_python_for_read_file(self) -> None:
+        app = OpenJetApp()
+        tool_call = ToolCall(name="read_file", arguments={"path": "libcity/model/demo.py"})
+
+        rendered = app._tool_result_syntax(
+            ["def demo():", "    return 1"],
+            tool_call=tool_call,
+        )
+
+        self.assertIsInstance(rendered, Syntax)
+        self.assertEqual(rendered.lexer.name.lower(), "python")
 
     def test_status_cli_does_not_import_tui_surface(self) -> None:
         sys.modules.pop("src.app", None)
@@ -186,6 +274,26 @@ class AppStatusTests(unittest.TestCase):
 
         self.assertEqual(snapshot["reasoning_mode"], "on")
 
+    def test_runtime_status_snapshot_includes_runtime_overhead_and_context_breakdown(self) -> None:
+        app = OpenJetApp()
+        app.agent = FakeBudgetAgent(overhead=222)
+        app.client = SimpleNamespace(context_window_tokens=4096, reasoning_status=lambda: "default")
+        app._last_turn_context_snapshot = SimpleNamespace(
+            state_summary_tokens=111,
+            budget_alerts=["layer2 high"],
+            candidate_decisions=[{"label": "a"}, {"label": "b"}],
+            budget=SimpleNamespace(docs_budget=333, remaining_budget=444),
+        )
+
+        with patch("src.app.read_memory_snapshot", return_value=None):
+            snapshot = app.runtime_status_snapshot()
+
+        self.assertEqual(snapshot["runtime_overhead_tokens"], 222)
+        self.assertEqual(snapshot["harness_state_summary_tokens"], 111)
+        self.assertEqual(snapshot["harness_candidate_count"], 2)
+        self.assertEqual(snapshot["turn_docs_budget"], 333)
+        self.assertEqual(snapshot["turn_context_remaining_budget"], 444)
+
     def test_current_tps_uses_decode_window_not_prefill(self) -> None:
         app = OpenJetApp()
         app._thinking_timer = True
@@ -198,6 +306,51 @@ class AppStatusTests(unittest.TestCase):
             tps = app._current_tps()
 
         self.assertEqual(tps, 30.0)
+
+    def test_remaining_prompt_tokens_reserves_runtime_overhead_when_requested(self) -> None:
+        app = OpenJetApp()
+        app.agent = FakeBudgetAgent(estimated=600, overhead=300, prompt_tokens=1400)
+
+        self.assertEqual(app._remaining_prompt_tokens(), 800)
+        self.assertEqual(app._remaining_prompt_tokens(reserve_next_turn_overhead=True), 500)
+
+    def test_prepare_turn_context_accounts_for_runtime_overhead(self) -> None:
+        app = OpenJetApp()
+        app.agent = FakeBudgetAgent(persistent=900, overhead=250)
+        app.client = SimpleNamespace(context_window_tokens=4096)
+        app.harness_state = SimpleNamespace(mode="chat")
+        app._active_turn_id = None
+
+        with patch("src.app.build_turn_context") as build_turn_context, patch(
+            "src.app.read_memory_snapshot",
+            return_value=None,
+        ):
+            build_turn_context.return_value = SimpleNamespace(
+                messages=[],
+                docs_loaded=[],
+                docs_tokens=0,
+                state_summary="",
+                state_summary_tokens=0,
+                layer_tokens={},
+                layer_docs={},
+                budget_alerts=[],
+                candidate_decisions=[],
+                budget=SimpleNamespace(
+                    effective_window=4096,
+                    usable_prompt_budget=3000,
+                    remaining_budget=1000,
+                    docs_budget=300,
+                    layer1_budget=100,
+                    layer2_budget=100,
+                    layer3_budget=100,
+                    layer_alert_tokens=100,
+                ),
+            )
+
+            app._prepare_turn_context()
+
+        _, kwargs = build_turn_context.call_args
+        self.assertEqual(kwargs["current_context_tokens"], 1150)
 
 
 class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
@@ -760,6 +913,20 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AppQuitTests(unittest.TestCase):
+    def test_request_terminal_exit_clears_nonempty_buffer_before_exit(self) -> None:
+        app = OpenJetApp()
+        prompt_app = Mock()
+        prompt_app.is_running = True
+        current_buffer = Mock()
+        current_buffer.text = "draft command"
+
+        app._request_terminal_exit(prompt_app, current_buffer)
+
+        current_buffer.reset.assert_called_once()
+        prompt_app.exit.assert_not_called()
+        entries = app.query_one("#chat-log")._entries
+        self.assertTrue(any("Current input cleared" in str(entry) for entry in entries))
+
     def test_request_terminal_exit_exits_active_prompt_app(self) -> None:
         app = OpenJetApp()
         prompt_app = Mock()
@@ -780,6 +947,31 @@ class AppQuitTests(unittest.TestCase):
         scheduled = create_task.call_args.args[0]
         self.assertTrue(asyncio.iscoroutine(scheduled))
         scheduled.close()
+
+
+class AppQuitAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_action_quit_writes_paid_api_equivalent_token_summary(self) -> None:
+        app = OpenJetApp()
+        app.agent = SimpleNamespace(messages=[{"role": "system", "content": "system"}])
+        app.client = AsyncMock()
+        app.session_logger = AsyncMock()
+        app.state_store = Mock()
+        app._session_prompt_tokens = 1234
+        app._session_completion_tokens = 56
+        app._session_runtime_requests = 3
+
+        await app.action_quit()
+
+        entries = app.query_one("#chat-log")._entries
+        self.assertTrue(any("By using OpenJet, paid API tokens you saved:" in str(entry) for entry in entries))
+        self.assertTrue(any("input: 1,234, output: 56 (3 requests)" in str(entry) for entry in entries))
+        app.client.close.assert_awaited_once()
+        app.session_logger.stop.assert_awaited_once()
+        app.state_store.save.assert_called_once()
+        saved_payload = app.state_store.save.call_args.args[0]
+        self.assertEqual(saved_payload["token_usage"]["prompt_tokens"], 1234)
+        self.assertEqual(saved_payload["token_usage"]["completion_tokens"], 56)
+        self.assertEqual(saved_payload["token_usage"]["runtime_requests"], 3)
 
 
 class CliCommandTests(unittest.TestCase):
@@ -861,6 +1053,7 @@ class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
 
         class CondenseLoopAgent:
             messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "hi"}]
+            turn_context_messages = []
 
             async def run_turn(self):
                 yield SimpleNamespace(kind=ActionKind.CONDENSE, text="mem_available=300MB < 512MB")
@@ -870,6 +1063,18 @@ class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
 
             def resource_pressure_reason(self) -> str | None:
                 return "mem_available=300MB < 512MB"
+
+            def persistent_context_tokens(self) -> int:
+                return 0
+
+            def runtime_overhead_tokens(self, *, force_post_tool_continuation: bool = False, empty_retry_count: int = 0) -> int:
+                return 0
+
+            def set_turn_context(self, messages) -> None:
+                self.turn_context_messages = list(messages)
+
+            def _messages_for_runtime(self):
+                return list(self.turn_context_messages)
 
         app.agent = CondenseLoopAgent()
 
@@ -891,6 +1096,60 @@ class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
                 for entry in app.query_one("#chat-log")._entries
             )
         )
+
+    async def test_run_agent_turn_continues_after_tool_calls_without_restarting_task(self) -> None:
+        app = OpenJetApp()
+
+        class ToolThenAnswerAgent:
+            def __init__(self) -> None:
+                self.run_count = 0
+                self.turn_context_messages = []
+            messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "inspect"}]
+
+            async def run_turn(self):
+                self.run_count += 1
+                if self.run_count == 1:
+                    yield SimpleNamespace(
+                        kind=ActionKind.TOOL_REQUEST,
+                        tool_call=ToolCall(name="list_directory", arguments={"path": "."}, id="call-1"),
+                    )
+                    return
+                yield SimpleNamespace(kind=ActionKind.TEXT, text="done")
+                yield SimpleNamespace(kind=ActionKind.DONE)
+
+            def complete_tool_call(self, tool_call, result) -> None:
+                self.messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+
+            def persistent_context_tokens(self) -> int:
+                return 0
+
+            def runtime_overhead_tokens(self, *, force_post_tool_continuation: bool = False, empty_retry_count: int = 0) -> int:
+                return 0
+
+            def set_turn_context(self, messages) -> None:
+                self.turn_context_messages = list(messages)
+
+            def _messages_for_runtime(self):
+                return list(self.turn_context_messages)
+
+        app.agent = ToolThenAnswerAgent()
+
+        async def handle_tool(tool_call, log):
+            app.agent.complete_tool_call(tool_call, "listing")
+            return {"tool": "list_directory", "ok": True}
+
+        with patch.object(app, "_handle_tool_call", AsyncMock(side_effect=handle_tool)), patch.object(
+            app, "_start_agent_turn"
+        ) as start_next, patch.object(app, "persist_session_state") as persist_session, patch.object(
+            app, "persist_harness_state"
+        ) as persist_harness:
+            await app.run_agent_turn()
+
+        start_next.assert_not_called()
+        persist_harness.assert_called_once()
+        self.assertEqual(app.agent.run_count, 2)
+        persist_session.assert_any_call(reason="assistant_turn_with_tools")
+        persist_session.assert_any_call(reason="assistant_turn_done")
 
 
 class LlamaServerStartupTests(unittest.TestCase):
