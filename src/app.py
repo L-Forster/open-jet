@@ -260,6 +260,14 @@ class LogView:
     def clear(self) -> None:
         self._entries.clear()
 
+    def replace(self, index: int, content: object) -> None:
+        self._entries[index] = content
+
+    def repaint(self) -> None:
+        self.console.clear(home=False)
+        for entry in self._entries:
+            self.console.print(entry)
+
     def scroll_page_up(self, animate: bool = False) -> None:
         return
 
@@ -381,6 +389,7 @@ class OpenJetApp:
         self._approval_future: asyncio.Future[bool] | None = None
         self._approval_tool_call: ToolCall | None = None
         self._approval_started_at: float | None = None
+        self._approval_prompt_selection_index: int | None = None
         self.commands = SlashCommandHandler(self, banner=BANNER)
         self.completion = CompletionEngine(
             [
@@ -1089,7 +1098,12 @@ class OpenJetApp:
     async def submit_text(self, text: str) -> None:
         prompt = self.query_one("#prompt")
         prompt.value = text
-        if self._awaiting_approval or (self._generation_worker and not self._generation_worker.done()):
+        if self._awaiting_approval:
+            self.query_one("#chat-log").write("[warning]Respond to the pending tool confirmation first.[/]")
+            self.query_one("#chat-log").write("")
+            prompt.value = ""
+            return
+        if self._generation_worker and not self._generation_worker.done():
             self.query_one("#chat-log").write("[warning]Wait for the current generation to finish, then retry.[/]")
             self.query_one("#chat-log").write("")
             prompt.value = ""
@@ -1314,8 +1328,6 @@ class OpenJetApp:
             rows.append(self._toolbar_row("mode", "AIR-GAPPED", value_style="toolbar-warning"))
         else:
             rows.append(self._toolbar_row("mode", "LOCAL", value_style="toolbar-accent"))
-        if not self.query_one("#approval-bar").hidden and self.query_one("#approval-bar").text:
-            rows.append(self._toolbar_row("approval", _plain_markup(self.query_one("#approval-bar").text), value_style="toolbar-warning"))
         if not self.query_one("#token-counter").hidden and self.query_one("#token-counter").text:
             rows.append(self._toolbar_row("context", self.query_one("#token-counter").text))
         if self._utilization_visible:
@@ -1553,6 +1565,11 @@ class OpenJetApp:
             log.write(f"  {rich_text(f'... ({len(lines) - 20} more lines)', 'dim')}")
         log.write("")
 
+    def _complete_tool_call_and_refresh(self, tc: ToolCall, result: str) -> None:
+        assert self.agent is not None
+        self.agent.complete_tool_call(tc, result)
+        self._render_token_counter()
+
     def persist_session_state(self, *, reason: str) -> None:
         if not self.agent:
             return
@@ -1718,6 +1735,7 @@ class OpenJetApp:
         try:
             assert self.agent is not None
             while True:
+                self._set_generating_status()
                 self._prepare_turn_context()
                 pending_tool_calls: list[ToolCall] = []
                 condense_reason: str | None = None
@@ -1833,7 +1851,7 @@ class OpenJetApp:
                             )
                         log.write(f"{rich_text(f'tool error ({tc.name}):', 'error')} {rich_text(str(exc), 'muted')}")
                         log.write("")
-                        self.agent.complete_tool_call(tc, f"Tool execution failed: {exc}")
+                        self._complete_tool_call_and_refresh(tc, f"Tool execution failed: {exc}")
 
                 self.persist_session_state(reason="assistant_turn_with_tools")
         except asyncio.CancelledError:
@@ -1879,7 +1897,7 @@ class OpenJetApp:
                     attributes={"openjet.tool.denial_reason": "mode_restricted"},
                 )
             if self.agent:
-                self.agent.complete_tool_call(tc, denied)
+                self._complete_tool_call_and_refresh(tc, denied)
             return {"tool": tc.name, "ok": False, "summary": denied, "target": format_tool_args(tc)}
         needs_confirm = self.agent.needs_confirmation(tc) if self.agent else False
         if self.session_logger and self._active_turn_id:
@@ -1911,8 +1929,7 @@ class OpenJetApp:
             if not approved:
                 log.write(f"  {rich_text('denied', 'error')}")
                 log.write("")
-                assert self.agent is not None
-                self.agent.complete_tool_call(tc, "User denied this action.")
+                self._complete_tool_call_and_refresh(tc, "User denied this action.")
                 self.persist_session_state(reason=f"tool_denied:{tc.name}")
                 if self.session_logger:
                     self.session_logger.finish_tool_call(
@@ -1975,8 +1992,7 @@ class OpenJetApp:
         if execution.ok:
             self._active_turn_tool_successes += 1
         self._write_tool_result(log, result_for_context, tool_call=tc)
-        assert self.agent is not None
-        self.agent.complete_tool_call(tc, result_for_context)
+        self._complete_tool_call_and_refresh(tc, result_for_context)
         self.persist_session_state(reason=f"tool_result:{tc.name}")
         duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
         if self.session_logger:
@@ -2116,15 +2132,20 @@ class OpenJetApp:
 
     def _start_thinking(self) -> int:
         self._thinking_token += 1
-        self._assistant_status_kind = "generating"
-        self._assistant_status_command = None
         self._generation_started_at = time.monotonic()
         self._generation_decode_started_at = None
         self._generation_tokens_streamed = 0
         self._generation_decode_tokens_streamed = 0
         self._thinking_timer = True
-        self._render_assistant_status()
+        self._set_generating_status()
         return self._thinking_token
+
+    def _set_generating_status(self) -> None:
+        if self._awaiting_approval:
+            return
+        self._assistant_status_kind = "generating"
+        self._assistant_status_command = None
+        self._render_assistant_status()
 
     def _stop_thinking(self, token: int | None = None) -> None:
         if token is not None and token != self._thinking_token:
@@ -2166,10 +2187,14 @@ class OpenJetApp:
         if self._assistant_status_kind == "command" and self._assistant_status_command:
             status.remove_class("hidden")
             status.update(f"Running {self._format_command_status_label(self._assistant_status_command)}")
+            if self._session and self._session.app:
+                self._session.app.invalidate()
             return
         if self._assistant_status_kind == "generating":
             status.remove_class("hidden")
             status.update("Generating...")
+            if self._session and self._session.app:
+                self._session.app.invalidate()
             return
         self._clear_assistant_status()
 
@@ -2177,6 +2202,8 @@ class OpenJetApp:
         status = self.query_one("#assistant-status")
         status.add_class("hidden")
         status.update("")
+        if self._session and self._session.app:
+            self._session.app.invalidate()
 
     def _format_assistant_output_line(self, line: str, *, in_code_block: bool) -> tuple[object, bool]:
         stripped = line.strip()
@@ -2292,8 +2319,14 @@ class OpenJetApp:
         self._approval_choice = 0
         self._approval_tool_call = tc
         self._approval_started_at = time.monotonic()
+        self._approval_prompt_selection_index = None
         self._approval_future = asyncio.get_running_loop().create_future()
-        bar.remove_class("hidden")
+        self._assistant_status_kind = None
+        self._assistant_status_command = None
+        self._clear_assistant_status()
+        self._write_approval_prompt(self.query_one("#chat-log"), tc)
+        bar.add_class("hidden")
+        bar.update("")
         self._render_approval_bar()
         try:
             return await self._approval_future
@@ -2302,19 +2335,45 @@ class OpenJetApp:
             self._approval_tool_call = None
             self._approval_future = None
             self._approval_started_at = None
+            self._approval_prompt_selection_index = None
             bar.add_class("hidden")
             bar.update("")
 
     def _render_approval_bar(self) -> None:
+        bar = self.query_one("#approval-bar")
+        bar.add_class("hidden")
+        bar.update("")
         if not self._awaiting_approval or not self._approval_tool_call:
             return
-        bar = self.query_one("#approval-bar")
-        summary = self._approval_summary_text(self._approval_tool_call)
+        self._refresh_approval_prompt_selection()
+        if self._session and self._session.app:
+            self._session.app.invalidate()
+
+    def _write_approval_prompt(self, log: LogView, tc: ToolCall) -> None:
+        log.write(Rule(rich_text("Approval Needed", "warning"), style="warning"))
+        log.write(f"  {rich_text(self._approval_summary_text(tc), 'warning')}")
+        log.write(self._approval_selection_line())
+        self._approval_prompt_selection_index = len(log._entries) - 1
+        log.write("")
+
+    def _approval_selection_line(self) -> str:
         approve = "[Approve]" if self._approval_choice == 0 else "Approve"
         deny = "[Deny]" if self._approval_choice == 1 else "Deny"
-        bar.update(
-            f"Approval needed | {summary} | Left/Right choose | Enter confirm | y/n quick reply | {approve} {deny}"
+        return (
+            f"  {rich_text(approve, 'success')} {rich_text(deny, 'error')} "
+            f"{rich_text('Left/Right select | Enter confirm | y/n quick reply', 'muted')}"
         )
+
+    def _refresh_approval_prompt_selection(self) -> None:
+        index = self._approval_prompt_selection_index
+        if index is None:
+            return
+        log = self.query_one("#chat-log")
+        if not 0 <= index < len(log._entries):
+            return
+        log.replace(index, self._approval_selection_line())
+        if self._session and self._session.app:
+            log.repaint()
 
     def _approval_summary_text(self, tc: ToolCall) -> str:
         if tc.name == "write_file":
@@ -2400,7 +2459,9 @@ class OpenJetApp:
     def _bindings(self) -> KeyBindings:
         bindings = KeyBindings()
         awaiting_approval = Condition(lambda: self._awaiting_approval)
-        generating = Condition(lambda: bool(self._generation_worker and not self._generation_worker.done()))
+        generating = Condition(
+            lambda: bool(self._generation_worker and not self._generation_worker.done() and not self._awaiting_approval)
+        )
 
         @bindings.add("c-c")
         def _ctrl_c(event) -> None:
@@ -2410,7 +2471,7 @@ class OpenJetApp:
         def _ctrl_z(event) -> None:
             self._request_terminal_exit(event.app)
 
-        @bindings.add("escape", filter=awaiting_approval)
+        @bindings.add("escape", filter=awaiting_approval, eager=True)
         def _escape_approval(event) -> None:
             self._approval_choice = 1
             self._resolve_approval(False)
@@ -2421,31 +2482,31 @@ class OpenJetApp:
             self.action_stop_generation()
             event.current_buffer.reset()
 
-        @bindings.add("left", filter=awaiting_approval)
+        @bindings.add("left", filter=awaiting_approval, eager=True)
         def _left(event) -> None:
             self._approval_choice = 0
             self._render_approval_bar()
             event.current_buffer.reset()
 
-        @bindings.add("right", filter=awaiting_approval)
+        @bindings.add("right", filter=awaiting_approval, eager=True)
         def _right(event) -> None:
             self._approval_choice = 1
             self._render_approval_bar()
             event.current_buffer.reset()
 
-        @bindings.add("y", filter=awaiting_approval)
+        @bindings.add("y", filter=awaiting_approval, eager=True)
         def _yes(event) -> None:
             self._approval_choice = 0
             self._resolve_approval(True)
             event.current_buffer.reset()
 
-        @bindings.add("n", filter=awaiting_approval)
+        @bindings.add("n", filter=awaiting_approval, eager=True)
         def _no(event) -> None:
             self._approval_choice = 1
             self._resolve_approval(False)
             event.current_buffer.reset()
 
-        @bindings.add("enter", filter=awaiting_approval)
+        @bindings.add("enter", filter=awaiting_approval, eager=True)
         def _enter_approval(event) -> None:
             self._resolve_approval(self._approval_choice == 0)
             event.current_buffer.reset()

@@ -227,6 +227,87 @@ class AppStatusTests(unittest.TestCase):
         self.assertIsInstance(rendered, Syntax)
         self.assertEqual(rendered.lexer.name.lower(), "python")
 
+    def test_render_approval_bar_keeps_toolbar_bar_hidden(self) -> None:
+        app = OpenJetApp()
+        app._awaiting_approval = True
+        app._approval_choice = 0
+        app._approval_tool_call = ToolCall(name="shell", arguments={"command": "nvidia-smi"})
+
+        app._render_approval_bar()
+
+        approval_bar = app.query_one("#approval-bar")
+        self.assertTrue(approval_bar.hidden)
+        self.assertEqual(approval_bar.text, "")
+        assistant_status = app.query_one("#assistant-status")
+        self.assertTrue(assistant_status.hidden)
+        self.assertEqual(assistant_status.text, "")
+
+    def test_prompt_message_does_not_include_approval_status_above_prompt(self) -> None:
+        app = OpenJetApp()
+        app._awaiting_approval = True
+        app._approval_choice = 1
+        app._approval_tool_call = ToolCall(name="shell", arguments={"command": "nvidia-smi"})
+
+        app._render_approval_bar()
+        prompt = app._prompt_message()
+
+        self.assertNotIn("Awaiting confirmation", prompt.value)
+        self.assertNotIn("Generating...", prompt.value)
+
+    def test_render_approval_bar_updates_chat_selection_line(self) -> None:
+        app = OpenJetApp()
+        app._awaiting_approval = True
+        app._approval_choice = 0
+        app._approval_tool_call = ToolCall(name="shell", arguments={"command": "nvidia-smi"})
+
+        app._write_approval_prompt(app.query_one("#chat-log"), app._approval_tool_call)
+        app._approval_choice = 1
+        app._render_approval_bar()
+
+        entries = app.query_one("#chat-log")._entries
+        self.assertIn("Approve [Deny]", str(entries[2]))
+        self.assertNotIn("[Approve] Deny", str(entries[2]))
+
+    def test_write_approval_prompt_writes_visible_chat_block(self) -> None:
+        app = OpenJetApp()
+        tool_call = ToolCall(name="edit_file", arguments={"path": "src/app.py"})
+
+        app._write_approval_prompt(app.query_one("#chat-log"), tool_call)
+
+        entries = app.query_one("#chat-log")._entries
+        self.assertGreaterEqual(len(entries), 3)
+        self.assertIn("edit_file -> src/app.py", str(entries[1]))
+        self.assertIn("[Approve]", str(entries[2]))
+        self.assertIn("Left/Right select", str(entries[2]))
+        self.assertIn("Enter confirm", str(entries[2]))
+
+
+class AppInputTests(unittest.IsolatedAsyncioTestCase):
+    async def test_submit_text_while_awaiting_approval_prompts_for_confirmation(self) -> None:
+        app = OpenJetApp()
+        app._awaiting_approval = True
+
+        await app.submit_text("hello")
+
+        entries = app.query_one("#chat-log")._entries
+        self.assertGreaterEqual(len(entries), 2)
+        self.assertIn("Respond to the pending tool confirmation first.", str(entries[0]))
+
+    async def test_wait_for_tool_approval_clears_generating_status(self) -> None:
+        app = OpenJetApp()
+        app._assistant_status_kind = "generating"
+        app._render_assistant_status()
+        tool_call = ToolCall(name="shell", arguments={"command": "nvidia-smi"})
+
+        wait_task = asyncio.create_task(app._wait_for_tool_approval(tool_call))
+        await asyncio.sleep(0)
+
+        prompt = app._prompt_message()
+        self.assertNotIn("Generating...", prompt.value)
+
+        app._resolve_approval(True)
+        await wait_task
+
     def test_status_cli_does_not_import_tui_surface(self) -> None:
         sys.modules.pop("src.app", None)
         stdout = io.StringIO()
@@ -972,6 +1053,46 @@ class AppQuitAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved_payload["token_usage"]["prompt_tokens"], 1234)
         self.assertEqual(saved_payload["token_usage"]["completion_tokens"], 56)
         self.assertEqual(saved_payload["token_usage"]["runtime_requests"], 3)
+
+
+class AppToolHandlingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handle_tool_call_refreshes_token_counter_immediately_after_result(self) -> None:
+        app = OpenJetApp()
+
+        class ToolAgent:
+            def __init__(self) -> None:
+                self.messages = [{"role": "system", "content": "system"}]
+
+            def needs_confirmation(self, tool_call) -> bool:
+                return False
+
+            def complete_tool_call(self, tool_call, result) -> None:
+                self.messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+
+            def estimated_context_tokens(self) -> int:
+                return 128
+
+            def runtime_overhead_tokens(self, *, force_post_tool_continuation: bool = False, empty_retry_count: int = 0) -> int:
+                return 0
+
+            def context_budget(self):
+                return None
+
+        app.agent = ToolAgent()
+        tool_call = ToolCall(name="list_directory", arguments={"path": "."}, id="call-1")
+
+        execution = SimpleNamespace(output="listing", meta={"ok": True}, ok=True)
+        with patch("src.app.execute_tool", AsyncMock(return_value=execution)), patch.object(
+            app, "_fit_tool_result_to_budget", return_value=("listing", False)
+        ), patch.object(app, "_render_token_counter") as render_counter, patch.object(
+            app, "persist_session_state"
+        ) as persist_session:
+            event = await app._handle_tool_call(tool_call, app.query_one("#chat-log"))
+
+        self.assertEqual(event["tool"], "list_directory")
+        self.assertEqual(app.agent.messages[-1]["content"], "listing")
+        render_counter.assert_called_once()
+        persist_session.assert_called_once_with(reason="tool_result:list_directory")
 
 
 class CliCommandTests(unittest.TestCase):
