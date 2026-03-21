@@ -263,10 +263,16 @@ class LogView:
     def replace(self, index: int, content: object) -> None:
         self._entries[index] = content
 
-    def repaint(self) -> None:
-        self.console.clear(home=False)
-        for entry in self._entries:
-            self.console.print(entry)
+    def refresh_recent_line(self, index: int, content: object, *, lines_up: int) -> None:
+        self._entries[index] = content
+        stream = self.console.file
+        stream.write("\x1b[s")
+        stream.write(f"\x1b[{lines_up}A")
+        stream.write("\r\x1b[2K")
+        stream.flush()
+        self.console.print(content, end="")
+        stream.write("\x1b[u")
+        stream.flush()
 
     def scroll_page_up(self, animate: bool = False) -> None:
         return
@@ -477,12 +483,9 @@ class OpenJetApp:
         log = self.query_one("#chat-log")
         prompt_tokens = self._session_prompt_tokens
         completion_tokens = self._session_completion_tokens
-        total_tokens = prompt_tokens + completion_tokens
-        request_word = "request" if self._session_runtime_requests == 1 else "requests"
         log.write(
-            f"[bold]By using OpenJet, paid API tokens you saved:[/] "
-            f"input: {prompt_tokens:,}, output: {completion_tokens:,} "
-            f"({self._session_runtime_requests:,} {request_word})"
+            f"[bold]Saved with OpenJet[/] "
+            f"{prompt_tokens:,} input tokens • {completion_tokens:,} output tokens • $0 API Cost"
         )
         log.write("")
 
@@ -2359,10 +2362,7 @@ class OpenJetApp:
     def _approval_selection_line(self) -> str:
         approve = "[Approve]" if self._approval_choice == 0 else "Approve"
         deny = "[Deny]" if self._approval_choice == 1 else "Deny"
-        return (
-            f"  {rich_text(approve, 'success')} {rich_text(deny, 'error')} "
-            f"{rich_text('Left/Right select | Enter confirm | y/n quick reply', 'muted')}"
-        )
+        return f"  {rich_text(approve, 'success')} {rich_text(deny, 'error')} {rich_text('←/→ Enter y/n', 'muted')}"
 
     def _refresh_approval_prompt_selection(self) -> None:
         index = self._approval_prompt_selection_index
@@ -2371,9 +2371,11 @@ class OpenJetApp:
         log = self.query_one("#chat-log")
         if not 0 <= index < len(log._entries):
             return
-        log.replace(index, self._approval_selection_line())
+        selection_line = self._approval_selection_line()
         if self._session and self._session.app:
-            log.repaint()
+            log.refresh_recent_line(index, selection_line, lines_up=2)
+            return
+        log.replace(index, selection_line)
 
     def _approval_summary_text(self, tc: ToolCall) -> str:
         if tc.name == "write_file":

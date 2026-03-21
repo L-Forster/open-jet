@@ -267,6 +267,7 @@ class AppStatusTests(unittest.TestCase):
         entries = app.query_one("#chat-log")._entries
         self.assertIn("Approve [Deny]", str(entries[2]))
         self.assertNotIn("[Approve] Deny", str(entries[2]))
+        self.assertIn("←/→ Enter y/n", str(entries[2]))
 
     def test_write_approval_prompt_writes_visible_chat_block(self) -> None:
         app = OpenJetApp()
@@ -278,8 +279,7 @@ class AppStatusTests(unittest.TestCase):
         self.assertGreaterEqual(len(entries), 3)
         self.assertIn("edit_file -> src/app.py", str(entries[1]))
         self.assertIn("[Approve]", str(entries[2]))
-        self.assertIn("Left/Right select", str(entries[2]))
-        self.assertIn("Enter confirm", str(entries[2]))
+        self.assertIn("←/→ Enter y/n", str(entries[2]))
 
 
 class AppInputTests(unittest.IsolatedAsyncioTestCase):
@@ -1044,8 +1044,8 @@ class AppQuitAsyncTests(unittest.IsolatedAsyncioTestCase):
         await app.action_quit()
 
         entries = app.query_one("#chat-log")._entries
-        self.assertTrue(any("By using OpenJet, paid API tokens you saved:" in str(entry) for entry in entries))
-        self.assertTrue(any("input: 1,234, output: 56 (3 requests)" in str(entry) for entry in entries))
+        self.assertTrue(any("Saved with OpenJet" in str(entry) for entry in entries))
+        self.assertTrue(any("1,234 input tokens • 56 output tokens • $0 API Cost" in str(entry) for entry in entries))
         app.client.close.assert_awaited_once()
         app.session_logger.stop.assert_awaited_once()
         app.state_store.save.assert_called_once()
