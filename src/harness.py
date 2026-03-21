@@ -665,14 +665,14 @@ def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list
     candidates: list[tuple[str, str, str]] = []
     repo_index = load_repo_context_index(root)
     if repo_index.project_summary:
-        candidates.append(("layer1", "project-context", repo_index.project_summary))
+        candidates.append(("layer1", "[project summary]", repo_index.project_summary))
     base_doc = _load_doc(root / ".openjet" / "agents" / "base.md")
-    candidates.append(("layer1", "agents/base.md", base_doc or DEFAULT_BASE_PROMPT))
+    candidates.append(("layer1", ".openjet/agents/base.md", base_doc or DEFAULT_BASE_PROMPT))
     role_doc = _load_doc(root / ".openjet" / "agents" / f"{role_name}.md")
-    candidates.append(("layer2", f"agents/{role_name}.md", role_doc or DEFAULT_ROLE_PROMPTS.get(role_name, "")))
+    candidates.append(("layer2", f".openjet/agents/{role_name}.md", role_doc or DEFAULT_ROLE_PROMPTS.get(role_name, "")))
     project_doc = _load_doc(root / ".openjet" / "projects" / "default.md")
     if project_doc:
-        candidates.append(("layer1", "projects/default.md", project_doc))
+        candidates.append(("layer1", ".openjet/projects/default.md", project_doc))
 
     for file_summary in _file_context_docs(repo_index, state):
         candidates.append(("layer2", file_summary[0], file_summary[1]))

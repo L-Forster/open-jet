@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import JETSON_OVERRIDE_OPTIONS, RECOMMENDED_LLM_BANDS
+from .config import HARDWARE_OVERRIDE_OPTIONS, RECOMMENDED_LLM_BANDS
 from .runtime_limits import read_memory_snapshot
 
 
@@ -13,11 +14,24 @@ class HardwareInfo:
     label: str
     total_ram_gb: float
     has_cuda: bool
+    has_vulkan: bool = False
+
+
+def _detect_vulkan() -> bool:
+    if shutil.which("vulkaninfo"):
+        return True
+    for candidate in ("/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"):
+        p = Path(candidate)
+        if p.is_dir() and any(p.iterdir()):
+            return True
+    return False
 
 
 def recommended_device() -> str:
     if Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists():
         return "cuda"
+    if _detect_vulkan():
+        return "vulkan"
     return "cpu"
 
 
@@ -34,29 +48,36 @@ def detect_hardware_info() -> HardwareInfo:
     mem = read_memory_snapshot()
     total_ram_gb = (mem.total_mb / 1024.0) if mem else 0.0
     has_cuda = bool(Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists())
+    has_vulkan = _detect_vulkan()
     board = read_device_model()
     if board:
         label = board
     elif has_cuda:
         label = "CUDA-capable device"
+    elif has_vulkan:
+        label = "Vulkan-capable device"
     else:
         label = "CPU-only device"
-    return HardwareInfo(label=label, total_ram_gb=total_ram_gb, has_cuda=has_cuda)
+    return HardwareInfo(label=label, total_ram_gb=total_ram_gb, has_cuda=has_cuda, has_vulkan=has_vulkan)
 
 
 def effective_hardware_info(profile: str, detected: HardwareInfo, override_key: str | None = None) -> HardwareInfo:
     if profile != "other":
         return detected
-    for key, label, ram_gb in JETSON_OVERRIDE_OPTIONS:
+    for key, label, ram_gb, has_cuda in HARDWARE_OVERRIDE_OPTIONS:
         if key == override_key:
             clean_label = label.split(" (", 1)[0]
-            return HardwareInfo(label=clean_label, total_ram_gb=ram_gb, has_cuda=True)
+            return HardwareInfo(label=clean_label, total_ram_gb=ram_gb, has_cuda=has_cuda)
     return detected
 
 
 def recommended_device_for_hardware(profile: str, detected: HardwareInfo, override_key: str | None = None) -> str:
     hw = effective_hardware_info(profile, detected, override_key)
-    return "cuda" if hw.has_cuda else "cpu"
+    if hw.has_cuda:
+        return "cuda"
+    if hw.has_vulkan:
+        return "vulkan"
+    return "cpu"
 
 
 def recommended_param_budget_b(profile: str, detected: HardwareInfo, override_key: str | None = None) -> float:
@@ -72,7 +93,7 @@ def recommended_param_budget_b(profile: str, detected: HardwareInfo, override_ke
         cap = 14.0
     else:
         cap = 32.0
-    if not hw.has_cuda:
+    if not hw.has_cuda and not hw.has_vulkan:
         cap = min(cap, 8.0)
     return cap
 
@@ -123,9 +144,9 @@ def recommended_context_window_tokens_from_total(
 
 
 def recommended_gpu_layers(device: str, total_ram_gb: float | None = None) -> int:
-    if device == "cpu":
-        return 0
-    return 99
+    if device in ("cuda", "vulkan"):
+        return 99
+    return 0
 
 
 def is_jetson_label(label: str | None) -> bool:

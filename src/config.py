@@ -53,13 +53,17 @@ RECOMMENDED_LLM_BANDS: tuple[tuple[float, tuple[tuple[str, float, str], ...]], .
     ),
 )
 
-JETSON_OVERRIDE_OPTIONS: tuple[tuple[str, str, float], ...] = (
-    ("jetson_nano_4", "Jetson Nano (4GB RAM)", 4.0),
-    ("jetson_xavier_nx_8", "Jetson Xavier NX (8GB RAM)", 8.0),
-    ("jetson_orin_nano_8", "Jetson Orin Nano (8GB RAM)", 8.0),
-    ("jetson_orin_nx_16", "Jetson Orin NX (16GB RAM)", 16.0),
-    ("jetson_agx_orin_32", "Jetson AGX Orin (32GB RAM)", 32.0),
-    ("jetson_agx_orin_64", "Jetson AGX Orin (64GB RAM)", 64.0),
+HARDWARE_OVERRIDE_OPTIONS: tuple[tuple[str, str, float, bool], ...] = (
+    ("desktop_8", "Desktop / Laptop (8GB RAM)", 8.0, False),
+    ("desktop_16", "Desktop / Laptop (16GB RAM)", 16.0, False),
+    ("desktop_32", "Desktop / Laptop (32GB RAM)", 32.0, False),
+    ("desktop_64", "Desktop / Laptop (64GB RAM)", 64.0, False),
+    ("jetson_nano_4", "Jetson Nano (4GB RAM)", 4.0, True),
+    ("jetson_xavier_nx_8", "Jetson Xavier NX (8GB RAM)", 8.0, True),
+    ("jetson_orin_nano_8", "Jetson Orin Nano (8GB RAM)", 8.0, True),
+    ("jetson_orin_nx_16", "Jetson Orin NX (16GB RAM)", 16.0, True),
+    ("jetson_agx_orin_32", "Jetson AGX Orin (32GB RAM)", 32.0, True),
+    ("jetson_agx_orin_64", "Jetson AGX Orin (64GB RAM)", 64.0, True),
 )
 
 

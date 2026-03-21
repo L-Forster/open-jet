@@ -12,7 +12,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.markup import escape
 
-from .config import JETSON_OVERRIDE_OPTIONS
+from .config import HARDWARE_OVERRIDE_OPTIONS
 from .hardware import (
     HardwareInfo,
     effective_hardware_info,
@@ -88,7 +88,7 @@ def estimate_model_params_b_from_text(text: str) -> float | None:
 
 
 def context_window_options(recommended: int) -> list[int]:
-    options = [1024, 1536, 2048, 3072, 4096, 6144, 8192]
+    options = [1024, 2048, 4096, 8192, 16384, 32768]
     if recommended not in options:
         options.append(recommended)
     return sorted(set(options))
@@ -245,7 +245,7 @@ def _recommended_model_choice(
             "recommended_llm": current_ollama_model,
             "ollama_model": current_ollama_model,
         }
-    if current_local_model:
+    if current_local_model and Path(current_local_model).is_file():
         return "local", {
             "model_source": "local",
             "model": current_local_model,
@@ -258,8 +258,9 @@ def _recommended_model_choice(
             "model": model_path,
             "llama_model": model_path,
         }
-    if saved_model_files:
-        model_path = saved_model_files[0]
+    existing_saved = [p for p in saved_model_files if Path(p).is_file()]
+    if existing_saved:
+        model_path = existing_saved[0]
         return "local", {
             "model_source": "local",
             "model": model_path,
@@ -443,7 +444,7 @@ async def _prompt_text(
 ) -> str:
     if session is not None:
         result = await session.prompt_async(prompt, default=default)
-        return result.strip()
+        return str(result).strip()
     return input(f"{prompt}{default}").strip()
 
 
@@ -614,7 +615,7 @@ async def run_setup_wizard(
 
     hardware_override = ""
     if hardware == "other":
-        override_options = [(label, key) for key, label, _ram in JETSON_OVERRIDE_OPTIONS]
+        override_options = [(label, key) for key, label, _ram, _cuda in HARDWARE_OVERRIDE_OPTIONS]
         hardware_override = str(
             await _prompt_choice(
                 session,

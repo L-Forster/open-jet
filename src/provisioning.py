@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import shutil
 import stat
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 import httpx
 
 from .hardware import HardwareInfo, is_jetson_label
+
+def _fmt_size(nbytes: int) -> str:
+    if nbytes >= 1 << 30:
+        return f"{nbytes / (1 << 30):.1f} GB"
+    if nbytes >= 1 << 20:
+        return f"{nbytes / (1 << 20):.0f} MB"
+    return f"{nbytes / (1 << 10):.0f} KB"
+
 
 OPENJET_HOME = Path.home() / ".openjet"
 MODELS_DIR = OPENJET_HOME / "models"
@@ -20,21 +30,27 @@ LLAMA_SERVER_BIN = BIN_DIR / "llama-server"
 _MODEL_CATALOG: tuple[dict[str, object], ...] = (
     {
         "max_ram_gb": 6.0,
-        "label": "Qwen2.5 Coder 1.5B",
-        "filename": "Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf",
-        "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf?download=true",
+        "label": "Qwen3.5 2B",
+        "filename": "Qwen_Qwen3.5-2B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/Qwen_Qwen3.5-2B-Q4_K_M.gguf?download=true",
+    },
+    {
+        "max_ram_gb": 12.0,
+        "label": "Qwen3.5 4B",
+        "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-Q4_K_M.gguf?download=true",
     },
     {
         "max_ram_gb": 24.0,
-        "label": "Qwen2.5 Coder 7B",
-        "filename": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
-        "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf?download=true",
+        "label": "Qwen3.5 9B",
+        "filename": "Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF/resolve/main/Qwen_Qwen3.5-9B-Q4_K_M.gguf?download=true",
     },
     {
         "max_ram_gb": 10_000.0,
-        "label": "Qwen2.5 Coder 14B",
-        "filename": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
-        "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-14B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf?download=true",
+        "label": "Qwen3.5 27B",
+        "filename": "Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-27B-GGUF/resolve/main/Qwen_Qwen3.5-27B-Q4_K_M.gguf?download=true",
     },
 )
 
@@ -89,7 +105,24 @@ def _llama_cmake_args(hardware_info: HardwareInfo) -> list[str]:
         args.extend(["-DGGML_CUDA=ON", "-DGGML_CUDA_FA_ALL_QUANTS=ON"])
         if is_jetson_label(hardware_info.label):
             args.append("-DCMAKE_CUDA_ARCHITECTURES=87")
+    elif hardware_info.has_vulkan:
+        args.append("-DGGML_VULKAN=ON")
     return args
+
+
+def _needs_rebuild(hardware_info: HardwareInfo, existing_binary: str) -> bool:
+    """Check if the existing llama-server needs rebuilding for GPU support."""
+    if not hardware_info.has_vulkan and not hardware_info.has_cuda:
+        return False
+    try:
+        ldd_output = os.popen(f"ldd {shlex.quote(existing_binary)} 2>/dev/null").read().lower()
+    except Exception:
+        return False
+    if hardware_info.has_cuda and "libcuda" not in ldd_output:
+        return True
+    if hardware_info.has_vulkan and not hardware_info.has_cuda and "libvulkan" not in ldd_output:
+        return True
+    return False
 
 
 async def ensure_llama_server(
@@ -103,15 +136,22 @@ async def ensure_llama_server(
     if str(setup_result.get("runtime", "llama_cpp")) != "llama_cpp":
         return setup_result
     existing = current_llama_server_path()
-    if existing:
+    if existing and not _needs_rebuild(hardware_info, existing):
         merged = dict(setup_result)
         merged["llama_server_path"] = existing
         merged["setup_missing_runtime"] = False
         return merged
 
-    set_status("provisioning llama-server")
-    log.write("[bold bright_white]Provisioning llama-server...[/]")
+    rebuilding = existing is not None
+    if rebuilding:
+        set_status("rebuilding llama-server for GPU support")
+        log.write("[bold bright_white]Rebuilding llama-server for GPU support...[/]")
+    else:
+        set_status("provisioning llama-server")
+        log.write("[bold bright_white]Provisioning llama-server...[/]")
     if not LLAMA_CPP_DIR.exists():
+        set_status("cloning llama.cpp")
+        log.write("  [dim]Cloning llama.cpp...[/]")
         rc, out, err = await _run_exec(
             "git",
             "clone",
@@ -125,15 +165,22 @@ async def ensure_llama_server(
             raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
 
     build_dir = LLAMA_CPP_DIR / "build"
+    if rebuilding and build_dir.exists():
+        shutil.rmtree(build_dir)
     build_dir.mkdir(parents=True, exist_ok=True)
+    set_status("configuring llama.cpp")
+    log.write("  [dim]Configuring build...[/]")
     rc, out, err = await _run_exec(*_llama_cmake_args(hardware_info), cwd=build_dir)
     if rc != 0:
         clear_status()
         raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp")
+    set_status("building llama-server (this may take a few minutes)")
+    log.write("  [dim]Building llama-server (this may take a few minutes)...[/]")
     rc, out, err = await _run_exec("cmake", "--build", ".", "--target", "llama-server", "-j4", cwd=build_dir)
     clear_status()
     if rc != 0:
         raise RuntimeError((err or out).strip() or "Failed to build llama-server")
+    log.write("[bold bright_white]llama-server built successfully.[/]")
 
     built = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
     if not built.is_file():
@@ -170,7 +217,10 @@ async def ensure_direct_model(
     downloaded = temp_path.stat().st_size if temp_path.exists() else 0
     headers = {"Range": f"bytes={downloaded}-"} if downloaded > 0 else None
     set_status(f"downloading {target_path.name}")
-    log.write(f"[bold bright_white]Downloading {target_path.name}...[/]")
+    size_hint = ""
+    if downloaded > 0:
+        size_hint = f" (resuming from {_fmt_size(downloaded)})"
+    log.write(f"[bold bright_white]Downloading {target_path.name}{size_hint}...[/]")
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
         async with client.stream("GET", url, headers=headers) as response:
@@ -180,6 +230,8 @@ async def ensure_direct_model(
             total = response.headers.get("Content-Length")
             total_bytes = int(total) + downloaded if total and total.isdigit() else None
             mode = "ab" if downloaded > 0 else "wb"
+            last_log_pct = -10
+            last_log_time = time.monotonic()
             with temp_path.open(mode) as fh:
                 async for chunk in response.aiter_bytes():
                     if not chunk:
@@ -188,9 +240,15 @@ async def ensure_direct_model(
                     downloaded += len(chunk)
                     if total_bytes:
                         pct = max(0, min(100, int(downloaded * 100 / total_bytes)))
+                        now = time.monotonic()
                         set_status(f"downloading {target_path.name} {pct}%")
+                        if pct - last_log_pct >= 10 and now - last_log_time >= 2.0:
+                            log.write(f"  [dim]{pct}% ({_fmt_size(downloaded)} / {_fmt_size(total_bytes)})[/]")
+                            last_log_pct = pct
+                            last_log_time = now
 
     temp_path.replace(target_path)
+    log.write(f"[bold bright_white]Download complete: {_fmt_size(downloaded)}[/]")
     clear_status()
     merged = dict(setup_result)
     merged["model"] = str(target_path)

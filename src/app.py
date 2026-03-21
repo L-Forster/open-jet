@@ -719,8 +719,10 @@ class OpenJetApp:
         )
 
     async def _run_setup_wizard(self) -> dict | None:
+        from prompt_toolkit import PromptSession as _PS
+        setup_session = _PS()
         return await run_setup_wizard(
-            session=self._session,
+            session=setup_session,
             console=self.console,
             hardware_info=detect_hardware_info(),
             recommended_ctx=recommended_context_window_tokens(),
@@ -944,15 +946,23 @@ class OpenJetApp:
             save_config(self.cfg)
 
         active_model = self._active_model_ref()
-        log.write(f"  [bold bright_white]Loading {Path(active_model).name or active_model}...[/]")
+        model_name = Path(active_model).name or active_model
+        log.write(f"  [bold bright_white]Loading {escape(model_name)}...[/]")
+        status = self.query_one("#assistant-status")
+        status.update(f"[bold {ACCENT_GREEN}]loading {escape(model_name)}...[/]")
+        status.remove_class("hidden")
         try:
             await self._init_client()
         except Exception as exc:
+            status.update("")
+            status.add_class("hidden")
             if self.session_logger:
                 self.session_logger.record_exception("runtime_start_failed", exc, component="runtime")
             log.write(f"\n[bold red]Failed to start LLM:[/] {_format_error(exc)}")
             self._quit_requested = True
             return
+        status.update("")
+        status.add_class("hidden")
         if self.session_logger:
             self.session_logger.record_runtime_ready(**self._trace_runtime_context())
         log.write("  [bold bright_white]Ready.[/]")
@@ -993,6 +1003,7 @@ class OpenJetApp:
             return
 
         attached_images = list(self._pending_image_paths)
+        text = str(text)
         stripped = text.strip()
         image_only = extract_pasted_image_paths(text) if not stripped else []
         for image_path in image_only:
@@ -1217,7 +1228,8 @@ class OpenJetApp:
             mem_text = self._format_percent("mem", mem.used_percent if mem else None)
             cpu_text = self._format_percent("cpu", cpu_pct)
             power_text = self._format_power_text(power_watts, power_pct, battery)
-            rows.append(self._toolbar_row("util", f"{cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}"))
+            device_text = str(self.cfg.get("device", "cpu")).upper()
+            rows.append(self._toolbar_row("util", f"{device_text} | {cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}"))
         return HTML("\n".join(row for row in rows if row))
 
     def _loading_blocks_html(self) -> str:
