@@ -170,7 +170,7 @@ open-jet
 - low-memory shell execution that can unload and reload `llama.cpp` models around heavy commands
 - session resume and harness state recovery
 - OpenTelemetry instrumentation with collector export
-- hardware-aware runtime setup for local Linux systems, including Jetson
+- hardware-aware runtime setup and on-demand hardware I/O for local Linux systems, including Jetson
 - controlled tool use and slash commands
 - Python SDK access to the same backend, including streaming, approvals, tool limits, turn context, and image inputs
 
@@ -212,3 +212,5 @@ OpenJet is built around:
 ## License
 
 `AGPL-3.0-only`, with commercial licensing available under separate terms.
+
+
