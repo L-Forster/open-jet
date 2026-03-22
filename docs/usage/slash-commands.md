@@ -5,6 +5,10 @@
 - `/clear` clear chat and restart runtime (flush KV cache)
 - `/clear-chat` clear chat only
 - `/status` show context/RAM status
+- `/devices` list discovered devices, write `devices.md`, and show their `@` ids (`/sources` still works as an alias)
+- `/device-add <source> <id>` add or rename a persistent device id (`/source-name` still works as an alias)
+- `/device-on <id>` enable a previously disabled device (`/source-on` still works as an alias)
+- `/device-off <id>` disable a device (`/source-off` still works as an alias)
 - `/condense` condense older context
 - `/load <path>` load a file into context
 - `/resume` load previous saved session

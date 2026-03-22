@@ -15,6 +15,7 @@ from src.agent import (
 from src.executor import edit_file
 from src.harness import (
     CONFIRMATION_GATED_TOOLS,
+    DEVICE_TOOLS,
     HarnessState,
     active_step,
     allowed_tools_for_mode,
@@ -114,6 +115,11 @@ class HarnessContextTests(unittest.TestCase):
         for mode in ("chat", "code", "review", "debug"):
             with self.subTest(mode=mode):
                 self.assertIn("system_info", allowed_tools_for_mode(mode))
+
+    def test_device_tools_are_allowed_in_every_mode(self) -> None:
+        for mode in ("chat", "code", "review", "debug"):
+            with self.subTest(mode=mode):
+                self.assertTrue(DEVICE_TOOLS <= allowed_tools_for_mode(mode))
 
     def test_build_turn_context_shifts_file_context_between_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -747,7 +753,7 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_results[0].output, "User denied this action.")
 
     async def test_stream_approves_confirmed_tool_with_handler(self) -> None:
-        tool_call = ToolCall(name="shell", arguments={"command": "printf sdk"})
+        tool_call = ToolCall(name="shell", arguments={"command": 'python -c "print(\'sdk\')"'} )
         client = SequencedRuntimeClient([[StreamChunk(tool_calls=[tool_call])], [StreamChunk(text="done")]])
         agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
         session = OpenJetSession(agent, approval_handler=lambda tc: tc.name == "shell")
@@ -834,13 +840,14 @@ class PersistentMemoryTests(unittest.IsolatedAsyncioTestCase):
             root = Path(tmp)
             await update_persistent_memory(root, scope="user", action="replace", content="- prefers concise answers")
             await update_persistent_memory(root, scope="agent", action="replace", content="- repo uses apply_patch")
-
-            prompt = await build_system_prompt("base system", root)
+            with unittest.mock.patch("src.persistent_memory.load_config", return_value={}):
+                prompt = await build_system_prompt("base system", root)
 
         self.assertIn("Persistent user preferences", prompt)
         self.assertIn("prefers concise answers", prompt)
         self.assertIn("Persistent agent memory", prompt)
         self.assertIn("repo uses apply_patch", prompt)
+        self.assertIn(str(root / ".openjet" / "state" / "devices.md"), prompt)
 
 
 if __name__ == "__main__":

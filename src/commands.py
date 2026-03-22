@@ -9,6 +9,7 @@ from prompt_toolkit.shortcuts import radiolist_dialog
 
 from .config import save_config
 from .model_profiles import get_model_profile, list_model_profiles, replace_model_profile
+from .peripherals.system import device_discovery_hint
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
 from .runtime_registry import runtime_spec
 from .setup import _prompt_text
@@ -58,6 +59,18 @@ class SlashCommandHandler:
             return True
         if cmd == "status":
             self._status(log)
+            return True
+        if cmd == "devices":
+            self._devices(log)
+            return True
+        if cmd == "device-add":
+            self._device_add(log, arg)
+            return True
+        if cmd == "device-on":
+            self._device_toggle(log, arg, enabled=True)
+            return True
+        if cmd == "device-off":
+            self._device_toggle(log, arg, enabled=False)
             return True
         if cmd == "condense":
             await self._condense(log)
@@ -131,6 +144,7 @@ class SlashCommandHandler:
         self.app.agent.system_prompt = await build_system_prompt(
             str(self.app.cfg.get("system_prompt", "")),
             Path.cwd(),
+            cfg=self.app.cfg,
         )
         self.app.agent.reset_conversation()
         self.app.agent.clear_turn_context()
@@ -261,6 +275,78 @@ class SlashCommandHandler:
         self.app.persist_session_state(reason="manual_condense")
         if self.app.session_logger:
             self.app.session_logger.record_manual_condense(summary)
+
+    def _devices(self, log: Any) -> None:
+        sources = self.app.list_device_sources()
+        if not sources:
+            log.write("[yellow]No devices detected.[/]")
+            hint = device_discovery_hint()
+            if hint:
+                log.write(f"[yellow]{hint}[/]")
+            log.write("")
+            return
+        log.write("[bold bright_white]Discovered devices:[/]")
+        registry_path = self.app.write_devices_registry()
+        log.write(f"[bold bright_white]Device registry:[/] {registry_path}")
+        for source in sources:
+            aliases = ", ".join(f"@{ref}" for ref in source.refs)
+            label = source.device.label
+            kind = source.device.kind.value
+            transport = source.device.transport.value
+            state = "enabled" if source.enabled else "disabled"
+            log.write(
+                "[bold bright_white]"
+                f"- {source.primary_ref}: {label} | tag=@{source.primary_ref} | kind={kind} | transport={transport} | state={state} | refs={aliases}"
+                "[/]"
+            )
+        log.write("")
+
+    def _device_add(self, log: Any, raw_arg: str) -> None:
+        parts = raw_arg.split()
+        if len(parts) != 2:
+            log.write("[yellow]Usage:[/] /device-add <source> <id>")
+            log.write("")
+            return
+        source_ref, device_id = parts
+        try:
+            source = self.app.assign_device_alias(source_ref, device_id)
+        except ValueError as exc:
+            log.write(f"[yellow]{exc}[/]")
+            log.write("")
+            return
+        save_config(self.app.cfg)
+        registry_path = self.app.write_devices_registry()
+        log.write(
+            "[bold bright_white]"
+            f"Saved device id {source.primary_ref} for {source.device.label}."
+            "[/]"
+        )
+        log.write(f"[bold bright_white]Device registry:[/] {registry_path}")
+        log.write("")
+
+    def _device_toggle(self, log: Any, raw_arg: str, *, enabled: bool) -> None:
+        source_ref = raw_arg.strip()
+        if not source_ref:
+            usage = "/device-on <id>" if enabled else "/device-off <id>"
+            log.write(f"[yellow]Usage:[/] {usage}")
+            log.write("")
+            return
+        try:
+            source = self.app.set_device_enabled(source_ref, enabled)
+        except ValueError as exc:
+            log.write(f"[yellow]{exc}[/]")
+            log.write("")
+            return
+        save_config(self.app.cfg)
+        registry_path = self.app.write_devices_registry()
+        state = "enabled" if source.enabled else "disabled"
+        log.write(
+            "[bold bright_white]"
+            f"Device {source.primary_ref} is now {state}."
+            "[/]"
+        )
+        log.write(f"[bold bright_white]Device registry:[/] {registry_path}")
+        log.write("")
 
     def _render_unknown(self, log: Any, text: str) -> None:
         log.write(f"{rich_text('Unknown command:', 'warning')} {rich_text(text, 'command')}")

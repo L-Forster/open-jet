@@ -16,6 +16,16 @@ fi
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
 
+if "${VENV_DIR}/bin/python" - <<'PY'
+from src.observation.processors import provision_default_faster_whisper_model
+raise SystemExit(0 if provision_default_faster_whisper_model() else 1)
+PY
+then
+  echo "Provisioned bundled local transcription assets"
+else
+  echo "warning: could not pre-provision local transcription assets; OpenJet will retry on first microphone use"
+fi
+
 mkdir -p "${LOCAL_BIN_DIR}"
 ln -sf "${VENV_DIR}/bin/open-jet" "${LOCAL_BIN_DIR}/open-jet"
 ln -sf "${VENV_DIR}/bin/openjet" "${LOCAL_BIN_DIR}/openjet"

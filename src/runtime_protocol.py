@@ -13,6 +13,124 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "device_list",
+            "description": "List detected camera, microphone, speaker, and sensor sources available to the agent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional filter: camera, microphone, speaker, or sensor",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "camera_snapshot",
+            "description": "Capture a single image from a detected camera source and return it to the model.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Camera source reference such as camera0 or a saved alias",
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Optional output path for the captured image",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "microphone_record",
+            "description": "Record a short audio clip from a detected microphone, try bundled local transcription first, and fall back to speech-activity detection if transcription is unavailable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Microphone source reference such as mic0 or a saved alias",
+                    },
+                    "duration_seconds": {
+                        "type": "integer",
+                        "description": "Recording length in seconds",
+                    },
+                    "output_path": {
+                        "type": "string",
+                        "description": "Optional output path for the recorded WAV clip",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "microphone_set_enabled",
+            "description": "Toggle a detected microphone source on or off.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Microphone source reference such as mic0 or a saved alias",
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Set true to enable the microphone source, false to disable it",
+                    },
+                },
+                "required": ["enabled"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gpio_read",
+            "description": "Read a GPIO-backed source and return the current text snapshot/buffer for that specific device.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "GPIO source reference such as gpio0 or a saved alias",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sensor_read",
+            "description": "Legacy alias for gpio_read. Current implementation supports GPIO-backed sensor text snapshots only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "GPIO source reference such as gpio0 or a saved alias",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "shell",
             "description": (
                 "Run a shell command. For heavy local work you may set "

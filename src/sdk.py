@@ -9,6 +9,7 @@ from typing import Awaitable, Callable
 from .airgap import airgapped_from_cfg, set_airgapped
 from .agent import ActionKind, Agent
 from .config import load_config
+from .multimodal import build_user_content, content_to_plain_text
 from .persistent_memory import build_system_prompt
 from .runtime_limits import derive_context_budget, estimate_tokens
 from .runtime_protocol import ToolCall
@@ -91,6 +92,7 @@ class OpenJetSession:
             system_prompt=await build_system_prompt(
                 system_prompt if system_prompt is not None else str(resolved_cfg.get("system_prompt", "")),
                 Path.cwd(),
+                cfg=resolved_cfg,
             ),
             context_window_tokens=client.context_window_tokens,
             context_reserved_tokens=(
@@ -221,7 +223,7 @@ class OpenJetSession:
             self._clamp_load_file_tool_budget(tool_call)
 
         result = await execute_tool(tool_call)
-        context_output = self._fit_tool_result_to_budget(result.output)
+        context_output = self._fit_tool_result_content_to_budget(result)
         self.agent.complete_tool_call(tool_call, context_output)
         if bool(result.meta.get("internal_retry")):
             return None
@@ -290,6 +292,26 @@ class OpenJetSession:
             candidate = prefix + clipped + suffix
 
         return candidate
+
+    def _fit_tool_result_content_to_budget(self, result: ToolExecutionResult) -> object:
+        content = result.context_content
+        if content is None:
+            return self._fit_tool_result_to_budget(result.output)
+        if isinstance(content, str):
+            return self._fit_tool_result_to_budget(content)
+
+        image_paths: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type", "")).strip().lower() != "input_image":
+                continue
+            path = str(block.get("path", "")).strip()
+            if path:
+                image_paths.append(path)
+
+        text = self._fit_tool_result_to_budget(content_to_plain_text(content))
+        return build_user_content(text, image_paths or None)
 
 
 async def create_agent(

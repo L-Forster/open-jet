@@ -58,6 +58,44 @@ class SlashCompletionProvider:
         return CompletionState(start=0, end=len(text), items=items)
 
 
+class DeviceMentionCompletionProvider:
+    TOKEN_RE = re.compile(r"(?:^|\s)@([^\s/]*)$")
+    BRACKET_TOKEN_RE = re.compile(r"(?:^|\s)@\[([^\]]*)$")
+
+    def __init__(self, sources_provider, *, max_items: int = 20) -> None:
+        self.sources_provider = sources_provider
+        self.max_items = max_items
+
+    def suggest(self, text: str) -> CompletionState | None:
+        bracketed = False
+        match = self.BRACKET_TOKEN_RE.search(text)
+        if match:
+            bracketed = True
+            prefix = match.group(1)
+            at_index = match.start(1) - 2
+        else:
+            match = self.TOKEN_RE.search(text)
+            if not match:
+                return None
+            prefix = match.group(1)
+            at_index = match.start(1) - 1
+        if "/" in prefix:
+            return None
+        needle = prefix.strip().lower()
+        matches: list[CompletionItem] = []
+        for ref, detail in self.sources_provider():
+            if needle and not ref.lower().startswith(needle):
+                continue
+            insert = f"@[{ref}]" if bracketed else f"@{ref}"
+            label = insert
+            matches.append(CompletionItem(label=label, insert=insert, detail=detail))
+            if len(matches) >= self.max_items:
+                break
+        if not matches:
+            return None
+        return CompletionState(start=at_index, end=len(text), items=matches)
+
+
 class FileMentionCompletionProvider:
     TOKEN_RE = re.compile(r"(?:^|\s)@([^\s]*)$")
     BRACKET_TOKEN_RE = re.compile(r"(?:^|\s)@\[([^\]]*)$")

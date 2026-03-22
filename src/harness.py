@@ -21,12 +21,20 @@ ROLE_BY_MODE = {
 }
 
 CONFIRMATION_GATED_TOOLS = {"shell", "write_file", "edit_file", "memory"}
+DEVICE_TOOLS = {
+    "device_list",
+    "camera_snapshot",
+    "microphone_record",
+    "microphone_set_enabled",
+    "gpio_read",
+    "sensor_read",
+}
 
 TOOL_BUNDLES = {
-    "chat": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
-    "code": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
-    "review": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
-    "debug": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"},
+    "chat": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
+    "code": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
+    "review": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
+    "debug": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
 }
 
 DEFAULT_BASE_PROMPT = """You are operating inside open-jet on an edge Linux device.

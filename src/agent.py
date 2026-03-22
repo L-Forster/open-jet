@@ -306,7 +306,7 @@ class Agent:
         except Exception:
             return
 
-    def complete_tool_call(self, tool_call: ToolCall, result: str) -> None:
+    def complete_tool_call(self, tool_call: ToolCall, result: object) -> None:
         """Record a tool result in conversation history so the model sees it."""
         msg = {"role": "tool", "content": result}
         if tool_call.id:
@@ -658,6 +658,20 @@ class Agent:
         if isinstance(arguments, dict):
             if name in {"read_file", "write_file", "load_file", "edit_file"}:
                 return f"{name} path={str(arguments.get('path', '')).strip() or '<unknown>'}"
+            if name in {"camera_snapshot", "microphone_record", "sensor_read", "gpio_read"}:
+                source = str(arguments.get("source", "")).strip() or "<auto>"
+                if name == "microphone_record":
+                    duration_seconds = arguments.get("duration_seconds")
+                    if isinstance(duration_seconds, int):
+                        return f"{name} source={source} duration={duration_seconds}s"
+                return f"{name} source={source}"
+            if name == "microphone_set_enabled":
+                source = str(arguments.get("source", "")).strip() or "<auto>"
+                enabled = arguments.get("enabled")
+                return f"{name} source={source} enabled={enabled}"
+            if name == "device_list":
+                kind = str(arguments.get("kind", "")).strip() or "all"
+                return f"{name} kind={kind}"
             if name == "grep":
                 pattern = self._compact_history_text(str(arguments.get("pattern", "")).strip(), max_len=80)
                 path = str(arguments.get("path", "")).strip()

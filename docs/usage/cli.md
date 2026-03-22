@@ -33,6 +33,7 @@ open-jet version
 
 - Type normally and press Enter to chat
 - Use `@file` or `@[path with spaces]` to add file content to context
+- Use `@camera0`, `@mic0`, `@gpio0`, or another concrete device id from `/devices`
 - Use `@image.png` or paste local image file paths to attach images to the next turn
 - Type `/` to open slash-command suggestions
 - `Tab`/`Enter` can autocomplete slash commands and file mentions

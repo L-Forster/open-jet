@@ -68,7 +68,13 @@ def _open_jet_version() -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="open-jet offline agentic terminal UI")
+    parser = argparse.ArgumentParser(
+        description="open-jet offline agentic terminal UI",
+        epilog=(
+            "Useful commands: `open-jet commands` for slash commands, `open-jet status` for runtime/config status. "
+            "In the TUI, use `/devices` and `@device_id` tags for device inputs. See docs/usage/device-sources.md."
+        ),
+    )
     parser.add_argument("--setup", action="store_true", help="start in setup wizard mode before launching the chat UI")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("chat", help="start the interactive chat UI")

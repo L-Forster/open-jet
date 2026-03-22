@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
+from .config import load_config
+from .device_sources import sync_devices_registry
+from .observation import ObservationStore
 from .runtime_limits import MIN_TOKEN_BUDGET, derive_file_token_budget, estimate_tokens, read_memory_snapshot
 
 
@@ -76,14 +80,17 @@ async def update_persistent_memory(
     raise ValueError("action must be one of: read, append, replace, clear")
 
 
-async def build_system_prompt(base_prompt: str, root: Path) -> str:
+async def build_system_prompt(
+    base_prompt: str,
+    root: Path,
+    *,
+    cfg: Mapping[str, object] | None = None,
+) -> str:
     snapshot = await load_persistent_memory(root)
     memory_prompt = snapshot.as_system_prompt()
-    if not memory_prompt:
-        return base_prompt
-    if not base_prompt.strip():
-        return memory_prompt
-    return f"{base_prompt.rstrip()}\n\n{memory_prompt}"
+    devices_prompt = _device_registry_prompt(root, cfg=cfg)
+    sections = [base_prompt.strip(), memory_prompt, devices_prompt]
+    return "\n\n".join(section for section in sections if section).strip()
 
 
 async def _read_bounded_memory(path: Path) -> str:
@@ -121,3 +128,43 @@ def _clip_text_to_dynamic_budget(text: str) -> str:
         suffix = suffix[drop:]
         candidate = f"...[persistent memory truncated]\n{suffix}"
     return candidate
+
+
+def _device_registry_prompt(
+    root: Path,
+    *,
+    cfg: Mapping[str, object] | None = None,
+) -> str:
+    registry_path = _write_device_registry(root, cfg=cfg)
+    if registry_path is None:
+        return ""
+    return (
+        f"IO device registry located in {registry_path}.\n"
+        "Open it if wanting to interact with devices.\n"
+        "Do not assume any device logs or payload files are already loaded.\n"
+        "Available device tools include `device_list`, `camera_snapshot`, "
+        "`microphone_record`, `microphone_set_enabled`, `gpio_read`, and `sensor_read`."
+    )
+
+
+def _write_device_registry(
+    root: Path,
+    *,
+    cfg: Mapping[str, object] | None = None,
+) -> Path | None:
+    output_path = root / ".openjet" / "state" / "devices.md"
+    try:
+        resolved_cfg = cfg if isinstance(cfg, Mapping) else load_config()
+        store = ObservationStore(root / ".openjet" / "state" / "observations")
+        return sync_devices_registry(resolved_cfg, store=store, output_path=output_path)
+    except Exception:
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                "# Devices\n\n"
+                "Device discovery failed while refreshing this registry.\n",
+                encoding="utf-8",
+            )
+            return output_path
+        except Exception:
+            return None

@@ -7,6 +7,8 @@
 - `src/context/`: context budgets, harness state, multimodal user content, persistent memory, and prompt shaping.
 - `src/runtime/`: runtime registry, protocol adaptation, and transport clients.
 - `src/tools/`: tool dispatch plus filesystem and shell helpers.
+- `src/peripherals/`: hardware discovery, shared observation types, and device adapters for cameras, audio, GPIO, buses, and sensors.
+- `src/observation/`: saved payloads, basic input processing, and agent-facing conversion of frames, speech events, and text buffers.
 - `src/surfaces/`: user-facing entry points such as TUI and CLI launchers.
 - `src/sdk.py`: programmatic session API that composes `context`, `runtime`, and `tools` without depending on the TUI.
 - `docs/`: operational and user documentation.
@@ -39,3 +41,5 @@ The next step is to move concrete modules behind those facades in small batches,
 2. move slash-command orchestration under `src/surfaces/`
 3. move harness and memory helpers under `src/context/`
 4. move runtime clients under `src/runtime/`
+5. introduce `src/peripherals/` for edge-device input flows described in [Edge Inputs Phase 1](edge-inputs-phase-1.md)
+6. keep lightweight processing in `src/observation/` before adding workflows or background schedulers

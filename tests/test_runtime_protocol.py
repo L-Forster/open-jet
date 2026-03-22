@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from src.runtime_protocol import stream_openai_chat, tool_schema_token_estimate
+from src.runtime_protocol import TOOLS, stream_openai_chat, tool_schema_token_estimate
 
 
 class _FakeResponse:
@@ -39,6 +39,19 @@ class _FakeHTTPClient:
 class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_schema_token_estimate_is_nonzero(self) -> None:
         self.assertGreater(tool_schema_token_estimate(), 0)
+
+    async def test_tool_schema_includes_device_tools(self) -> None:
+        names = {tool["function"]["name"] for tool in TOOLS}
+        self.assertTrue(
+            {
+                "device_list",
+                "camera_snapshot",
+                "microphone_record",
+                "microphone_set_enabled",
+                "gpio_read",
+                "sensor_read",
+            }.issubset(names)
+        )
 
     async def test_stream_openai_chat_extracts_tool_call_from_reasoning_content(self) -> None:
         http = _FakeHTTPClient(

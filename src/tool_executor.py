@@ -2,8 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from .config import load_config, save_config
+from .device_sources import (
+    collect_device_observation,
+    list_device_sources,
+    resolve_device_source,
+    set_device_enabled,
+    sync_devices_registry,
+)
 from .executor import (
     DEFAULT_SHELL_TIMEOUT_SECONDS,
     edit_file,
@@ -16,6 +24,10 @@ from .executor import (
     run_shell,
     write_file,
 )
+from .multimodal import content_to_plain_text
+from .observation import ObservationStore, observation_to_agent_content
+from .peripherals import PeripheralKind, PeripheralTransport
+from .peripherals.system import device_discovery_hint
 from .persistent_memory import update_persistent_memory
 from .runtime_protocol import ToolCall
 
@@ -27,6 +39,7 @@ if TYPE_CHECKING:
 class ToolExecutionResult:
     output: str
     meta: dict
+    context_content: Any | None = None
 
     @property
     def ok(self) -> bool:
@@ -169,6 +182,126 @@ async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
             )
         text = await read_system_info(scope=scope)
         return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error:")})
+
+    if tool_call.name == "device_list":
+        kind = tool_call.arguments.get("kind")
+        if kind is not None and not isinstance(kind, str):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for device_list (kind must be string)",
+                meta={"ok": False},
+            )
+        try:
+            text, meta = _device_list_output(kind=kind)
+        except ValueError as exc:
+            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
+        return ToolExecutionResult(output=text, meta=meta)
+
+    if tool_call.name == "camera_snapshot":
+        source_ref = tool_call.arguments.get("source")
+        output_path = tool_call.arguments.get("output_path")
+        if source_ref is not None and not isinstance(source_ref, str):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for camera_snapshot (source must be string)",
+                meta={"ok": False},
+            )
+        if output_path is not None and not isinstance(output_path, str):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for camera_snapshot (output_path must be string)",
+                meta={"ok": False},
+            )
+        try:
+            result = _device_observation_result(
+                source_ref=source_ref,
+                expected_kind=PeripheralKind.CAMERA,
+                output_path=output_path,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
+        return result
+
+    if tool_call.name == "microphone_record":
+        source_ref = tool_call.arguments.get("source")
+        duration_seconds = tool_call.arguments.get("duration_seconds", 5)
+        output_path = tool_call.arguments.get("output_path")
+        if source_ref is not None and not isinstance(source_ref, str):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for microphone_record (source must be string)",
+                meta={"ok": False},
+            )
+        if not isinstance(duration_seconds, int):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for microphone_record (duration_seconds must be int)",
+                meta={"ok": False},
+            )
+        if duration_seconds <= 0:
+            return ToolExecutionResult(
+                output="Error: invalid arguments for microphone_record (duration_seconds must be > 0)",
+                meta={"ok": False},
+            )
+        if output_path is not None and not isinstance(output_path, str):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for microphone_record (output_path must be string)",
+                meta={"ok": False},
+            )
+        try:
+            result = _device_observation_result(
+                source_ref=source_ref,
+                expected_kind=PeripheralKind.MICROPHONE,
+                duration_seconds=duration_seconds,
+                output_path=output_path,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
+        return result
+
+    if tool_call.name == "microphone_set_enabled":
+        source_ref = tool_call.arguments.get("source")
+        enabled = tool_call.arguments.get("enabled")
+        if source_ref is not None and not isinstance(source_ref, str):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for microphone_set_enabled (source must be string)",
+                meta={"ok": False},
+            )
+        if not isinstance(enabled, bool):
+            return ToolExecutionResult(
+                output="Error: invalid arguments for microphone_set_enabled (enabled must be boolean)",
+                meta={"ok": False},
+            )
+        try:
+            cfg = _tool_config()
+            source = _select_device_source(cfg, source_ref=source_ref, expected_kind=PeripheralKind.MICROPHONE)
+            updated = set_device_enabled(cfg, reference=source.primary_ref, enabled=enabled)
+            save_config(cfg)
+            registry_path = _sync_tool_device_registry(cfg)
+        except ValueError as exc:
+            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
+        state = "enabled" if updated.enabled else "disabled"
+        return ToolExecutionResult(
+            output=f"Microphone @{updated.primary_ref} is now {state}.",
+            meta={
+                "ok": True,
+                "source_ref": updated.primary_ref,
+                "enabled": updated.enabled,
+                "registry_path": str(registry_path) if registry_path else None,
+            },
+        )
+
+    if tool_call.name in {"sensor_read", "gpio_read"}:
+        source_ref = tool_call.arguments.get("source")
+        if source_ref is not None and not isinstance(source_ref, str):
+            return ToolExecutionResult(
+                output=f"Error: invalid arguments for {tool_call.name} (source must be string)",
+                meta={"ok": False},
+            )
+        try:
+            result = _device_observation_result(
+                source_ref=source_ref,
+                expected_kind=PeripheralKind.SENSOR,
+                required_transport=PeripheralTransport.GPIO,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
+        return result
 
     if tool_call.name == "read_file":
         path = tool_call.arguments.get("path", "")
@@ -340,6 +473,20 @@ def format_tool_args(tool_call: ToolCall) -> str:
     if tool_call.name == "system_info":
         scope = str(tool_call.arguments.get("scope", "summary") or "summary").strip()
         return f"scope={scope}"
+    if tool_call.name == "device_list":
+        kind = str(tool_call.arguments.get("kind", "") or "").strip()
+        return f"kind={kind}" if kind else "all devices"
+    if tool_call.name in {"camera_snapshot", "microphone_record", "sensor_read", "gpio_read"}:
+        source = str(tool_call.arguments.get("source", "") or "").strip()
+        if tool_call.name == "microphone_record":
+            duration_seconds = tool_call.arguments.get("duration_seconds")
+            if isinstance(duration_seconds, int):
+                return f"{source or '<auto>'} ({duration_seconds}s)"
+        return source or "<auto>"
+    if tool_call.name == "microphone_set_enabled":
+        source = str(tool_call.arguments.get("source", "") or "").strip() or "<auto>"
+        enabled = tool_call.arguments.get("enabled")
+        return f"{source} -> {'on' if enabled else 'off'}"
     if tool_call.name == "memory":
         scope = str(tool_call.arguments.get("scope", ""))
         action = str(tool_call.arguments.get("action", ""))
@@ -394,3 +541,138 @@ def _resource_failure_hint(result) -> str:
         "[resource failure detected: consider `system_info` and, if needed, retry the shell command "
         "with `resource_mode` set to `unload_first`]"
     )
+
+
+def _device_list_output(*, kind: str | None) -> tuple[str, dict[str, object]]:
+    cfg = _tool_config()
+    sources = list_device_sources(cfg)
+    registry_path = _sync_tool_device_registry(cfg)
+    parsed_kind = _parse_device_kind(kind)
+    if parsed_kind is not None:
+        sources = [source for source in sources if source.device.kind is parsed_kind]
+
+    if not sources:
+        label = f"{parsed_kind.value} " if parsed_kind is not None else ""
+        message = f"No {label}device sources detected.".strip()
+        hint = device_discovery_hint()
+        if hint:
+            message = f"{message}\n{hint}"
+        return (
+            message,
+            {
+                "ok": True,
+                "count": 0,
+                "registry_path": str(registry_path) if registry_path else None,
+            },
+        )
+
+    lines = ["Discovered device sources:"]
+    for source in sources:
+        refs = ", ".join(f"@{ref}" for ref in source.refs)
+        path = f" | path={source.device.path}" if source.device.path else ""
+        lines.append(
+            f"- @{source.primary_ref}: {source.device.label} | kind={source.device.kind.value} "
+            f"| transport={source.device.transport.value} | state={'enabled' if source.enabled else 'disabled'} | refs={refs}{path}"
+        )
+    return (
+        "\n".join(lines),
+        {
+            "ok": True,
+            "count": len(sources),
+            "kind": parsed_kind.value if parsed_kind else None,
+            "registry_path": str(registry_path) if registry_path else None,
+        },
+    )
+
+
+def _device_observation_result(
+    *,
+    source_ref: str | None,
+    expected_kind: PeripheralKind,
+    duration_seconds: int = 5,
+    output_path: str | None = None,
+    required_transport: PeripheralTransport | None = None,
+) -> ToolExecutionResult:
+    cfg = _tool_config()
+    source = _select_device_source(cfg, source_ref=source_ref, expected_kind=expected_kind)
+    if required_transport is not None and source.device.transport is not required_transport:
+        raise ValueError(
+            f"{expected_kind.value} source {source.primary_ref} uses {source.device.transport.value}; "
+            f"only {required_transport.value} is supported right now"
+        )
+
+    store = ObservationStore()
+    observation = collect_device_observation(
+        source,
+        store=store,
+        cfg=cfg,
+        duration_seconds=duration_seconds,
+        output_path=output_path,
+    )
+    registry_path = _sync_tool_device_registry(cfg, store=store)
+    context_content = observation_to_agent_content(observation, store=store)
+    output = content_to_plain_text(context_content)
+    return ToolExecutionResult(
+        output=output,
+        context_content=context_content,
+        meta={
+            "ok": True,
+            "source_ref": source.primary_ref,
+            "source_id": source.device.id,
+            "kind": source.device.kind.value,
+            "transport": source.device.transport.value,
+            "payload_ref": observation.payload_ref,
+            "registry_path": str(registry_path) if registry_path else None,
+        },
+    )
+
+
+def _tool_config() -> dict[str, object]:
+    try:
+        cfg = load_config()
+    except Exception:
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _select_device_source(
+    cfg: dict[str, object],
+    *,
+    source_ref: str | None,
+    expected_kind: PeripheralKind,
+):
+    if isinstance(source_ref, str) and source_ref.strip():
+        source = resolve_device_source(source_ref, cfg)
+        if source is None:
+            raise ValueError(f"unknown source: {source_ref}")
+        if source.device.kind is not expected_kind:
+            raise ValueError(f"source {source.primary_ref} is not a {expected_kind.value}")
+        return source
+
+    candidates = [source for source in list_device_sources(cfg) if source.device.kind is expected_kind]
+    if not candidates:
+        raise ValueError(f"no {expected_kind.value} sources detected")
+    if len(candidates) > 1:
+        raise ValueError(f"multiple {expected_kind.value} sources detected; specify source")
+    return candidates[0]
+
+
+def _parse_device_kind(kind: str | None) -> PeripheralKind | None:
+    text = str(kind or "").strip().lower()
+    if not text:
+        return None
+    try:
+        return PeripheralKind(text)
+    except ValueError as exc:
+        raise ValueError("kind must be one of: camera, microphone, speaker, sensor") from exc
+
+
+def _sync_tool_device_registry(
+    cfg: dict[str, object],
+    *,
+    store: ObservationStore | None = None,
+) -> Path | None:
+    try:
+        return sync_devices_registry(cfg, store=store)
+    except Exception:
+        return None

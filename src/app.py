@@ -31,8 +31,9 @@ from rich.text import Text
 from .airgap import airgapped_from_cfg, set_airgapped
 from .agent import ActionKind, Agent, ToolCall
 from .commands import SlashCommandHandler
-from .completion import CompletionEngine, FileMentionCompletionProvider, SlashCompletionProvider
+from .completion import CompletionEngine, DeviceMentionCompletionProvider, FileMentionCompletionProvider, SlashCompletionProvider
 from .config import load_config, save_config
+from .device_sources import DeviceSource, assign_device_alias, list_device_sources, resolve_device_source, set_device_enabled, sync_devices_registry
 from .executor import load_file
 from .harness import (
     HarnessSessionStore,
@@ -74,6 +75,7 @@ from .model_profiles import (
     sync_active_model_profile,
 )
 from .ollama_setup import discover_installed_ollama_models, materialize_setup_model
+from .observation import ObservationStore
 from .persistent_memory import build_system_prompt
 from .provisioning import provision_setup_artifacts
 from .runtime_client import RuntimeClient
@@ -84,7 +86,7 @@ from .session_state import SessionStateStore
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
-from .tool_executor import execute_tool, format_tool_args, set_swap_manager
+from .tool_executor import ToolExecutionResult, execute_tool, format_tool_args, set_swap_manager
 
 
 def _format_error(exc: Exception) -> str:
@@ -366,6 +368,7 @@ class OpenJetApp:
             path=Path(state_cfg.get("path", ".openjet/state/session_state.json")),
             enabled=bool(state_cfg.get("enabled", True)),
         )
+        self.observation_store = ObservationStore()
         self.harness_store = HarnessSessionStore()
         self.harness_state = HarnessState()
         self._turn_context_docs: list[str] = []
@@ -400,6 +403,7 @@ class OpenJetApp:
         self.completion = CompletionEngine(
             [
                 SlashCompletionProvider(self.commands),
+                DeviceMentionCompletionProvider(self.device_completion_rows),
                 FileMentionCompletionProvider(Path.cwd()),
             ]
         )
@@ -456,6 +460,32 @@ class OpenJetApp:
             except ValueError:
                 return 0
         return 0
+
+    def list_device_sources(self) -> list[DeviceSource]:
+        return list_device_sources(self.cfg)
+
+    def resolve_device_source(self, reference: str) -> DeviceSource | None:
+        return resolve_device_source(reference, self.cfg)
+
+    def assign_device_alias(self, reference: str, alias: str) -> DeviceSource:
+        return assign_device_alias(self.cfg, reference=reference, alias=alias)
+
+    def set_device_enabled(self, reference: str, enabled: bool) -> DeviceSource:
+        return set_device_enabled(self.cfg, reference=reference, enabled=enabled)
+
+    def device_completion_rows(self) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        for source in self.list_device_sources():
+            rows.append(
+                (
+                    source.primary_ref,
+                    (
+                        f"{source.device.kind.value} | {source.device.transport.value} | "
+                        f"{'enabled' if source.enabled else 'disabled'} | {source.device.label}"
+                    ),
+                )
+            )
+        return rows
 
     def _clear_terminal_input(self, current_buffer: object | None = None) -> bool:
         buffer = current_buffer
@@ -749,7 +779,11 @@ class OpenJetApp:
             save_config(self.cfg)
         self.agent = Agent(
             client=self.client,
-            system_prompt=await build_system_prompt(str(self.cfg.get("system_prompt", "")), Path.cwd()),
+            system_prompt=await build_system_prompt(
+                str(self.cfg.get("system_prompt", "")),
+                Path.cwd(),
+                cfg=self.cfg,
+            ),
             context_window_tokens=self.client.context_window_tokens,
             context_reserved_tokens=int(mem_cfg["context_reserved_tokens"]) if mem_cfg.get("context_reserved_tokens") is not None else None,
             min_prompt_tokens=int(mem_cfg.get("min_prompt_tokens", 256)),
@@ -1146,7 +1180,8 @@ class OpenJetApp:
             log.write(f"  {rich_text('attached image:', 'dim')} {rich_text(image_path, 'muted')}")
         log.write("")
 
-        mentioned_files = _extract_file_mentions(stripped)
+        mentions = _extract_at_mentions(stripped)
+        device_refs, mentioned_files = self._split_device_and_file_mentions(mentions)
         attached_from_mentions = [
             str(Path(path).expanduser().resolve())
             for path in mentioned_files
@@ -1155,6 +1190,11 @@ class OpenJetApp:
         for image_path in attached_from_mentions:
             if image_path not in attached_images:
                 attached_images.append(image_path)
+        processed_text = await self._load_mentioned_devices_registry_into_prompt(
+            stripped,
+            device_refs,
+            log,
+        )
         self.harness_state = update_state_for_user_message(self.harness_state, history_text, files=mentioned_files)
         self._begin_turn_trace(history_text)
         self.persist_harness_state()
@@ -1166,16 +1206,71 @@ class OpenJetApp:
                 attached_images=attached_images,
                 mode=self.harness_state.mode,
             )
-        await self._load_mentioned_files_into_context(stripped, log)
-        self.agent.add_user_message(stripped, image_paths=attached_images)
+        await self._load_mentioned_files_into_context(mentioned_files, log)
+        self.agent.messages.append({"role": "user", "content": build_user_content(processed_text, attached_images)})
         self.persist_session_state(reason="user_message")
         self._render_token_counter()
         self._start_agent_turn()
 
-    async def _load_mentioned_files_into_context(self, text: str, log: LogView) -> None:
+    def _split_device_and_file_mentions(self, mentions: list[str]) -> tuple[list[str], list[str]]:
+        device_refs: list[str] = []
+        file_mentions: list[str] = []
+        for mention in mentions:
+            if self.resolve_device_source(mention):
+                device_refs.append(mention)
+            else:
+                file_mentions.append(mention)
+        return device_refs, file_mentions
+
+    def write_devices_registry(self) -> Path:
+        return sync_devices_registry(self.cfg, store=self.observation_store)
+
+    async def _load_mentioned_devices_registry_into_prompt(
+        self,
+        prompt_text: str,
+        source_refs: list[str],
+        log: LogView,
+    ) -> str:
+        if not source_refs:
+            return prompt_text
+        resolved: list[DeviceSource] = []
+        seen: set[str] = set()
+        for source_ref in source_refs:
+            source = self.resolve_device_source(source_ref)
+            if source is None or source.primary_ref in seen:
+                continue
+            seen.add(source.primary_ref)
+            resolved.append(source)
+        if not resolved:
+            return prompt_text
+        try:
+            registry_path = self.write_devices_registry()
+        except Exception as exc:
+            log.write(f"[yellow]devices:[/] {_format_error(exc)}")
+            log.write("")
+            return prompt_text
+        refs_text = ", ".join(source.primary_ref for source in resolved)
+        log.write(
+            "[bold bright_white]"
+            f"Registered device refs via {escape(str(registry_path))}: {escape(refs_text)}"
+            "[/]"
+        )
+        log.write("")
+        cleaned_prompt = _strip_consumed_mentions(prompt_text, source_refs).strip()
+        registry_context = (
+            f"IO device registry located in {registry_path}.\n"
+            "Open if wanting to interact with devices.\n"
+            "Referenced device ids for this turn: "
+            f"{refs_text}."
+        )
+        if cleaned_prompt:
+            return f"{registry_context}\n\nUser request:\n{cleaned_prompt}"
+        return registry_context
+
+    async def _load_mentioned_files_into_context(self, mentioned_files: list[str], log: LogView) -> None:
         if not self.agent:
             return
-        for mention_path in _extract_file_mentions(text):
+        for mention_path in mentioned_files:
             if is_image_path(mention_path):
                 continue
             await self.load_context_file(mention_path, log)
@@ -1472,7 +1567,7 @@ class OpenJetApp:
             return False
         first = valid_messages[0]
         if first.get("role") != "system":
-            valid_messages = [{"role": "system", "content": self.cfg.get("system_prompt", "")}, *valid_messages]
+            valid_messages = [{"role": "system", "content": self.agent.system_prompt}, *valid_messages]
         self.agent.messages = valid_messages
         self._replay_restored_history(log, self.agent.messages)
         self._seed_prompt_history_from_messages(self.agent.messages)
@@ -1568,7 +1663,7 @@ class OpenJetApp:
             log.write(f"  {rich_text(f'... ({len(lines) - 20} more lines)', 'dim')}")
         log.write("")
 
-    def _complete_tool_call_and_refresh(self, tc: ToolCall, result: str) -> None:
+    def _complete_tool_call_and_refresh(self, tc: ToolCall, result: object) -> None:
         assert self.agent is not None
         self.agent.complete_tool_call(tc, result)
         self._render_token_counter()
@@ -1991,10 +2086,10 @@ class OpenJetApp:
                     swap_duration_s=meta.get("swap_duration_s"),
                 )
 
-        result_for_context, output_truncated = self._fit_tool_result_to_budget(result)
+        result_for_context, result_for_display, output_truncated = self._fit_tool_result_content_to_budget(execution)
         if execution.ok:
             self._active_turn_tool_successes += 1
-        self._write_tool_result(log, result_for_context, tool_call=tc)
+        self._write_tool_result(log, result_for_display, tool_call=tc)
         self._complete_tool_call_and_refresh(tc, result_for_context)
         self.persist_session_state(reason=f"tool_result:{tc.name}")
         duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
@@ -2093,6 +2188,33 @@ class OpenJetApp:
             clipped = clipped[max(64, int(len(clipped) * 0.85)):]
             candidate = prefix + clipped + suffix
         return candidate, True
+
+    def _fit_tool_result_content_to_budget(
+        self,
+        execution: ToolExecutionResult,
+    ) -> tuple[object, str, bool]:
+        if execution.context_content is None:
+            result_for_context, output_truncated = self._fit_tool_result_to_budget(execution.output)
+            return result_for_context, result_for_context, output_truncated
+
+        content = execution.context_content
+        if isinstance(content, str):
+            result_for_context, output_truncated = self._fit_tool_result_to_budget(content)
+            return result_for_context, result_for_context, output_truncated
+
+        image_paths: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type", "")).strip().lower() != "input_image":
+                continue
+            path = str(block.get("path", "")).strip()
+            if path:
+                image_paths.append(path)
+
+        result_for_display, output_truncated = self._fit_tool_result_to_budget(content_to_plain_text(content))
+        result_for_context = build_user_content(result_for_display, image_paths or None)
+        return result_for_context, result_for_display, output_truncated
 
     def _is_recoverable_runtime_error(self, error_text: str) -> bool:
         lowered = error_text.lower()
@@ -2567,7 +2689,7 @@ class OpenJetApp:
                 self._toolbar_task.cancel()
 
 
-def _extract_file_mentions(text: str) -> list[str]:
+def _extract_at_mentions(text: str) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for match in re.finditer(r"@\[([^\]]+)\]|(?<!\S)@([^\s]+)", text):
@@ -2580,6 +2702,52 @@ def _extract_file_mentions(text: str) -> list[str]:
             seen.add(candidate)
             cleaned.append(candidate)
     return cleaned
+
+
+def _extract_file_mentions(text: str) -> list[str]:
+    return _extract_at_mentions(text)
+
+
+def _strip_consumed_mentions(text: str, consumed: list[str]) -> str:
+    if not consumed:
+        return text
+    consumed_set = {item.strip().lower() for item in consumed if item.strip()}
+    parts: list[str] = []
+    last_index = 0
+    for match in re.finditer(r"@\[([^\]]+)\]|(?<!\S)@([^\s]+)", text):
+        bracketed = match.group(1)
+        bare = match.group(2)
+        candidate = (bracketed if bracketed is not None else bare or "").strip()
+        if bracketed is None:
+            candidate = candidate.rstrip(".,;:!?)]}")
+        if candidate.lower() not in consumed_set:
+            continue
+        parts.append(text[last_index:match.start()])
+        last_index = match.end()
+    parts.append(text[last_index:])
+    return re.sub(r"\s{2,}", " ", "".join(parts)).strip()
+
+
+def _flatten_user_content(content: Any) -> tuple[str, list[str]]:
+    if isinstance(content, str):
+        return content, []
+    if not isinstance(content, list):
+        return str(content), []
+    text_parts: list[str] = []
+    image_paths: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type", "")).strip().lower()
+        if block_type == "text":
+            value = str(block.get("text", "")).strip()
+            if value:
+                text_parts.append(value)
+        elif block_type == "input_image":
+            path = str(block.get("path", "")).strip()
+            if path and path not in image_paths:
+                image_paths.append(path)
+    return "\n\n".join(text_parts).strip(), image_paths
 
 
 def main(argv: list[str] | None = None) -> None:
