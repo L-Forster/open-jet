@@ -8,11 +8,14 @@ It gives you a practical agent interface on top of your own local model and runt
 
 OpenJet is designed to stay useful when local AI gets messy: tight memory, short context windows, interrupted sessions, and hardware-specific runtime issues.
 
+OpenJet can also interface with local input and output devices through the same chat and tool runtime.
+
 ## Why use OpenJet
 
 - start with a local or self-hosted runtime you control
 - keep working without losing the thread when sessions get interrupted
 - use tools with explicit approvals and predictable behavior
+- discover and use local cameras, microphones, speakers, GPIO, and simple sensor inputs from chat, with device refs like @camera0 and on-demand snapshots, short recordings, playback targets, and GPIO reads
 - run the same backend from the TUI or Python SDK
 - avoid building your own glue layer around local inference
 
@@ -212,5 +215,6 @@ OpenJet is built around:
 ## License
 
 `AGPL-3.0-only`, with commercial licensing available under separate terms.
+
 
 
