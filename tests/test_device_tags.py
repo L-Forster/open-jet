@@ -291,6 +291,18 @@ class AppDeviceTagTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeviceCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_help_shows_device_namespace_and_hides_compat_aliases(self) -> None:
+        app = OpenJetApp()
+
+        handled = await app.commands.maybe_handle("/help")
+
+        self.assertTrue(handled)
+        rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("/device", rendered)
+        self.assertNotIn("/device-add", rendered)
+        self.assertNotIn("/device-on", rendered)
+        self.assertNotIn("/device-off", rendered)
+
     async def test_devices_command_lists_device_refs(self) -> None:
         app = OpenJetApp()
         source = DeviceSource(
@@ -310,6 +322,31 @@ class DeviceCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         entries = app.query_one("#chat-log")._entries
         self.assertTrue(any("tag=@front" in str(entry) for entry in entries))
+
+    async def test_device_list_namespace_lists_device_refs(self) -> None:
+        app = OpenJetApp()
+        source = DeviceSource(
+            primary_ref="camera0",
+            refs=("camera0", "camera:/dev/video0", "video0"),
+            device=PeripheralDevice(
+                id="camera:/dev/video0",
+                kind=PeripheralKind.CAMERA,
+                transport=PeripheralTransport.V4L2,
+                label="Front Camera",
+                path="/dev/video0",
+            ),
+        )
+        with patch.object(app, "write_devices_registry", return_value=Path("/tmp/devices.md")), patch.object(
+            app,
+            "list_device_sources",
+            return_value=[source],
+        ):
+            handled = await app.commands.maybe_handle("/device list")
+
+        self.assertTrue(handled)
+        rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Device registry:", rendered)
+        self.assertIn("open-jet device add <existing_id> <new_id>", rendered)
 
     async def test_devices_command_writes_registry_for_spoofed_devices(self) -> None:
         app = OpenJetApp()
@@ -364,7 +401,7 @@ class DeviceCommandTests(unittest.IsolatedAsyncioTestCase):
         ) as write_devices_registry, patch(
             "src.commands.save_config"
         ) as save_config:
-            handled = await app.commands.maybe_handle("/device-add camera0 front")
+            handled = await app.commands.maybe_handle("/device add camera0 front")
 
         self.assertTrue(handled)
         assign_alias.assert_called_once_with("camera0", "front")
@@ -387,7 +424,7 @@ class DeviceCommandTests(unittest.IsolatedAsyncioTestCase):
             with patch("src.device_sources.discover_peripherals", return_value=[device]), patch(
                 "src.commands.save_config"
             ):
-                handled = await app.commands.maybe_handle("/device-add camera0 deskcam")
+                handled = await app.commands.maybe_handle("/device add camera0 deskcam")
             registry = root / ".openjet" / "state" / "devices.md"
             rendered = registry.read_text(encoding="utf-8")
 
@@ -415,7 +452,7 @@ class DeviceCommandTests(unittest.IsolatedAsyncioTestCase):
         ) as write_devices_registry, patch(
             "src.commands.save_config"
         ) as save_config:
-            handled = await app.commands.maybe_handle("/device-off room-mic")
+            handled = await app.commands.maybe_handle("/device off room-mic")
 
         self.assertTrue(handled)
         set_enabled.assert_called_once_with("room-mic", False)
@@ -438,10 +475,10 @@ class DeviceCommandTests(unittest.IsolatedAsyncioTestCase):
             with patch("src.device_sources.discover_peripherals", return_value=[device]), patch(
                 "src.commands.save_config"
             ):
-                handled_off = await app.commands.maybe_handle("/device-off mic0")
+                handled_off = await app.commands.maybe_handle("/device off mic0")
                 registry = root / ".openjet" / "state" / "devices.md"
                 off_rendered = registry.read_text(encoding="utf-8")
-                handled_on = await app.commands.maybe_handle("/device-on mic0")
+                handled_on = await app.commands.maybe_handle("/device on mic0")
                 on_rendered = registry.read_text(encoding="utf-8")
 
         self.assertTrue(handled_off)

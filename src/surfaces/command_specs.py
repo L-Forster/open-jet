@@ -10,6 +10,7 @@ class CommandSpec:
     name: str
     description: str
     aliases: tuple[str, ...] = ()
+    hidden: bool = False
 
 
 COMMANDS: tuple[CommandSpec, ...] = (
@@ -26,10 +27,29 @@ COMMANDS: tuple[CommandSpec, ...] = (
         aliases=("clear_messages",),
     ),
     CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
-    CommandSpec(name="devices", description="List discovered devices and aliases", aliases=("sources",)),
-    CommandSpec(name="device-add", description="Add or rename a device id: /device-add <source> <id>", aliases=("source-name",)),
-    CommandSpec(name="device-on", description="Enable a device: /device-on <id>", aliases=("source-on",)),
-    CommandSpec(name="device-off", description="Disable a device: /device-off <id>", aliases=("source-off",)),
+    CommandSpec(
+        name="device",
+        description="List or configure devices: /device [list|add <existing_id> <new_id>|on <id>|off <id>|help]",
+        aliases=("devices", "sources"),
+    ),
+    CommandSpec(
+        name="device-add",
+        description="Compatibility alias for /device add <existing_id> <new_id>",
+        aliases=("source-name",),
+        hidden=True,
+    ),
+    CommandSpec(
+        name="device-on",
+        description="Compatibility alias for /device on <id>",
+        aliases=("source-on",),
+        hidden=True,
+    ),
+    CommandSpec(
+        name="device-off",
+        description="Compatibility alias for /device off <id>",
+        aliases=("source-off",),
+        hidden=True,
+    ),
     CommandSpec(name="condense", description="Manually condense older context"),
     CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
     CommandSpec(name="memory", description="Inspect or update persistent memory: /memory [show|clear <user|agent>]"),

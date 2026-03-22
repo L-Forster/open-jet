@@ -2,6 +2,17 @@
 
 OpenJet keeps a shared device registry in `devices.md` and lets you tag device ids in the TUI.
 
+Persistent device setup is usually clearer from the regular CLI, not from chat. Use:
+
+```bash
+open-jet device list
+open-jet device add <existing_id> <new_id>
+open-jet device on <id>
+open-jet device off <id>
+```
+
+Run `open-jet device list` first. Do not guess ids. Use the current id shown on the left as `<existing_id>` if you want to rename a device for chat.
+
 ## What Exists At Startup
 
 - OpenJet keeps the device registry at `.openjet/state/devices.md`.
@@ -12,31 +23,32 @@ OpenJet keeps a shared device registry in `devices.md` and lets you tag device i
 
 ## Commands
 
-- `/devices`
-  Lists discovered devices, writes `devices.md`, and shows the ids you can tag in chat.
+- `open-jet device list`
+  Lists discovered devices, writes `devices.md`, and shows the current ids you can tag in chat.
 
-- `/sources`
-  Backward-compatible alias for `/devices`.
-
-- `/device-add <source> <id>`
+- `open-jet device add <existing_id> <new_id>`
   Adds or renames a persistent device id for a discovered device and rewrites `devices.md`.
 
-- `/source-name <source> <id>`
-  Backward-compatible alias for `/device-add`.
-
-- `/device-on <id>`
+- `open-jet device on <id>`
   Enables a device that was previously turned off.
 
-- `/device-off <id>`
+- `open-jet device off <id>`
   Disables a device. This is useful for microphones when you want them visible but not capturable.
+
+- `/device [list|add <existing_id> <new_id>|on <id>|off <id>|help]`
+  Chat-side mirror of the same persistent device configuration.
+
+- `/devices`
+  Backward-compatible alias for `/device`.
 
 Examples:
 
 ```text
-/devices
-/device-add camera0 camera0
-/device-add mic0 mic0
-/device-add gpio0 gpio0
+open-jet device list
+open-jet device add camera0 desk_camera
+open-jet device off mic0
+/device list
+/device add camera0 desk_camera
 ```
 
 ## User Flows
@@ -44,7 +56,7 @@ Examples:
 ### 1. List Devices
 
 ```text
-/devices
+open-jet device list
 ```
 
 Current flow:
@@ -52,30 +64,30 @@ Current flow:
 1. OpenJet discovers currently available local peripherals.
 2. It merges those with any saved ids and disabled state from config.
 3. It rewrites `.openjet/state/devices.md`.
-4. It prints each usable id in the TUI.
+4. It prints each usable id.
 
 This command does not capture a frame, record audio, or read GPIO by itself.
 
 ### 2. Add Or Rename A Device Id
 
 ```text
-/device-add camera0 deskcam
+open-jet device add camera0 desk_camera
 ```
 
 Current flow:
 
-1. OpenJet resolves the existing discovered device reference such as `camera0`.
-2. It saves the chosen id such as `deskcam` into config as a persistent alias.
+1. OpenJet resolves the existing device id such as `camera0`.
+2. It saves the chosen id such as `desk_camera` into config as a persistent alias.
 3. It rewrites `.openjet/state/devices.md`.
-4. Future chats can use `@deskcam`.
+4. Future chats can use `@desk_camera`.
 
 This command does not create a new hardware device. It assigns a stable chat id to an already discovered device.
 
 ### 3. Enable Or Disable A Device
 
 ```text
-/device-off mic0
-/device-on mic0
+open-jet device off mic0
+open-jet device on mic0
 ```
 
 Current flow:
@@ -90,7 +102,7 @@ Disabled devices still appear in the registry, but capture tools reject them unt
 
 ```text
 @camera0 what is on the desk?
-@deskcam compare this with @gpio0
+@desk_camera compare this with @gpio0
 ```
 
 Current flow:
@@ -155,7 +167,7 @@ Once a device exists, tag its id directly in the prompt. Tagging the id adds a p
 ## Current Behavior
 
 - `devices.md` is a registry, not a payload dump
-- slash commands that change device naming or enabled state rewrite `devices.md`
+- `open-jet device ...` and `/device ...` both rewrite `devices.md` when they change naming or enabled state
 - device tools that capture or read devices also rewrite `devices.md`
 - tagged device ids do not capture or load logs by themselves
 - the model can open `devices.md` and then choose a specific backing file only when relevant

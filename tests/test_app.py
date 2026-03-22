@@ -1139,6 +1139,42 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("/model: Show or switch saved model presets", text)
         self.assertIn("/models", text)
 
+    def test_main_context_command_updates_active_profile(self) -> None:
+        cfg = {
+            "active_model_profile": "base",
+            "context_window_tokens": 4096,
+            "model_profiles": [
+                {
+                    "name": "base",
+                    "runtime": "llama_cpp",
+                    "model_source": "local",
+                    "model": "/models/base.gguf",
+                    "llama_model": "/models/base.gguf",
+                    "context_window_tokens": 4096,
+                    "gpu_layers": 99,
+                }
+            ],
+        }
+
+        with patch("src.cli.load_config", return_value=cfg), patch("src.cli.save_config") as save_cfg, patch(
+            "builtins.print"
+        ) as printer:
+            main(["context", "8192"])
+
+        printer.assert_called_once()
+        saved_cfg = save_cfg.call_args.args[0]
+        self.assertEqual(saved_cfg["context_window_tokens"], 8192)
+        self.assertEqual(saved_cfg["model_profiles"][0]["context_window_tokens"], 8192)
+        self.assertIn("Context window set to 8192 tokens", printer.call_args.args[0])
+
+    def test_main_context_command_rejects_small_values(self) -> None:
+        with patch("src.cli.load_config", return_value={}), patch("src.cli.save_config") as save_cfg:
+            with self.assertRaises(SystemExit) as exc:
+                main(["context", "128"])
+
+        save_cfg.assert_not_called()
+        self.assertIn("at least 512", str(exc.exception))
+
     def test_main_models_command_prints_saved_presets(self) -> None:
         cfg = {
             "active_model_profile": "base",

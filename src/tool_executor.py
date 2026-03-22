@@ -644,7 +644,7 @@ def _select_device_source(
     if isinstance(source_ref, str) and source_ref.strip():
         source = resolve_device_source(source_ref, cfg)
         if source is None:
-            raise ValueError(f"unknown source: {source_ref}")
+            raise ValueError(f"unknown device reference: {source_ref}")
         if source.device.kind is not expected_kind:
             raise ValueError(f"source {source.primary_ref} is not a {expected_kind.value}")
         return source

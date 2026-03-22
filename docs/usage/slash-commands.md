@@ -5,10 +5,8 @@
 - `/clear` clear chat and restart runtime (flush KV cache)
 - `/clear-chat` clear chat only
 - `/status` show context/RAM status
-- `/devices` list discovered devices, write `devices.md`, and show their `@` ids (`/sources` still works as an alias)
-- `/device-add <source> <id>` add or rename a persistent device id (`/source-name` still works as an alias)
-- `/device-on <id>` enable a previously disabled device (`/source-on` still works as an alias)
-- `/device-off <id>` disable a device (`/source-off` still works as an alias)
+- `/device [list|add <existing_id> <new_id>|on <id>|off <id>|help]` list or configure devices in chat
+- `/devices` alias for `/device`
 - `/condense` condense older context
 - `/load <path>` load a file into context
 - `/resume` load previous saved session
@@ -25,3 +23,12 @@
 - `/skill <name[,name...]>` pin harness skills
 - `/step [status|next|split]` inspect or control the active workflow step
 - `/util [show|hide|toggle|status]` show or hide the utilization line
+
+Persistent device setup is usually clearer from the regular CLI:
+
+```bash
+open-jet device list
+open-jet device add <existing_id> <new_id>
+open-jet device on <id>
+open-jet device off <id>
+```

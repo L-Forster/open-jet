@@ -60,17 +60,17 @@ class SlashCommandHandler:
         if cmd == "status":
             self._status(log)
             return True
-        if cmd == "devices":
-            self._devices(log)
+        if cmd == "device":
+            self._device(log, arg)
             return True
         if cmd == "device-add":
-            self._device_add(log, arg)
+            self._device(log, f"add {arg}".strip())
             return True
         if cmd == "device-on":
-            self._device_toggle(log, arg, enabled=True)
+            self._device(log, f"on {arg}".strip())
             return True
         if cmd == "device-off":
-            self._device_toggle(log, arg, enabled=False)
+            self._device(log, f"off {arg}".strip())
             return True
         if cmd == "condense":
             await self._condense(log)
@@ -121,6 +121,8 @@ class SlashCommandHandler:
     def _render_help(self, log: Any) -> None:
         lines = [rich_text("Slash commands", "assistant")]
         for spec in self.COMMANDS:
+            if spec.hidden:
+                continue
             aliases = f" (aliases: {', '.join(f'/{a}' for a in spec.aliases)})" if spec.aliases else ""
             lines.append(f"  {rich_text('/' + spec.name, 'command')} {rich_text('- ' + spec.description + aliases, 'muted')}")
         for line in lines:
@@ -276,18 +278,51 @@ class SlashCommandHandler:
         if self.app.session_logger:
             self.app.session_logger.record_manual_condense(summary)
 
+    def _device(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip()
+        if not arg or arg.lower() == "list":
+            self._devices(log)
+            return
+
+        parts = arg.split(maxsplit=1)
+        action = parts[0].strip().lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if action == "help":
+            self._device_help(log)
+            return
+        if action == "add":
+            self._device_add(log, rest)
+            return
+        if action == "on":
+            self._device_toggle(log, rest, enabled=True)
+            return
+        if action == "off":
+            self._device_toggle(log, rest, enabled=False)
+            return
+        self._device_help(log)
+
+    def _device_help(self, log: Any) -> None:
+        log.write("[bold bright_white]Device commands:[/]")
+        log.write("[bold bright_white]- /device[/] list currently discovered devices and current ids")
+        log.write("[bold bright_white]- /device add <existing_id> <new_id>[/] assign a persistent chat id")
+        log.write("[bold bright_white]- /device on <id>[/] enable a device")
+        log.write("[bold bright_white]- /device off <id>[/] disable a device")
+        log.write("[bold bright_white]- /devices[/] is still an alias for `/device`")
+        log.write("")
+
     def _devices(self, log: Any) -> None:
+        registry_path = self.app.write_devices_registry()
         sources = self.app.list_device_sources()
+        log.write(f"[bold bright_white]Device registry:[/] {registry_path}")
         if not sources:
             log.write("[yellow]No devices detected.[/]")
             hint = device_discovery_hint()
             if hint:
                 log.write(f"[yellow]{hint}[/]")
+            log.write("[bold bright_white]Persistent setup uses `open-jet device ...` outside chat.[/]")
             log.write("")
             return
         log.write("[bold bright_white]Discovered devices:[/]")
-        registry_path = self.app.write_devices_registry()
-        log.write(f"[bold bright_white]Device registry:[/] {registry_path}")
         for source in sources:
             aliases = ", ".join(f"@{ref}" for ref in source.refs)
             label = source.device.label
@@ -299,19 +334,25 @@ class SlashCommandHandler:
                 f"- {source.primary_ref}: {label} | tag=@{source.primary_ref} | kind={kind} | transport={transport} | state={state} | refs={aliases}"
                 "[/]"
             )
+        log.write(
+            "[bold bright_white]"
+            "Use the current id on the left with `/device add <existing_id> <new_id>` or "
+            "`open-jet device add <existing_id> <new_id>` if you want a different stable chat id."
+            "[/]"
+        )
         log.write("")
 
     def _device_add(self, log: Any, raw_arg: str) -> None:
         parts = raw_arg.split()
         if len(parts) != 2:
-            log.write("[yellow]Usage:[/] /device-add <source> <id>")
+            log.write("[yellow]Usage:[/] /device add <existing_id> <new_id>")
             log.write("")
             return
         source_ref, device_id = parts
         try:
             source = self.app.assign_device_alias(source_ref, device_id)
         except ValueError as exc:
-            log.write(f"[yellow]{exc}[/]")
+            log.write(f"[yellow]{_format_device_error(exc)}[/]")
             log.write("")
             return
         save_config(self.app.cfg)
@@ -322,19 +363,20 @@ class SlashCommandHandler:
             "[/]"
         )
         log.write(f"[bold bright_white]Device registry:[/] {registry_path}")
+        log.write(f"[bold bright_white]Use `@{source.primary_ref}` in chat to reference this device.[/]")
         log.write("")
 
     def _device_toggle(self, log: Any, raw_arg: str, *, enabled: bool) -> None:
         source_ref = raw_arg.strip()
         if not source_ref:
-            usage = "/device-on <id>" if enabled else "/device-off <id>"
+            usage = "/device on <id>" if enabled else "/device off <id>"
             log.write(f"[yellow]Usage:[/] {usage}")
             log.write("")
             return
         try:
             source = self.app.set_device_enabled(source_ref, enabled)
         except ValueError as exc:
-            log.write(f"[yellow]{exc}[/]")
+            log.write(f"[yellow]{_format_device_error(exc)}[/]")
             log.write("")
             return
         save_config(self.app.cfg)
@@ -763,10 +805,19 @@ class SlashCommandHandler:
 
     def matching_commands(self, prefix: str) -> list[str]:
         needle = prefix.strip().lower()
-        return sorted(spec.name for spec in self.COMMANDS if spec.name.startswith(needle))
+        return sorted(spec.name for spec in self.COMMANDS if not spec.hidden and spec.name.startswith(needle))
 
     def command_description(self, canonical_name: str) -> str:
         for spec in self.COMMANDS:
             if spec.name == canonical_name:
                 return spec.description
         return ""
+
+
+def _format_device_error(exc: ValueError) -> str:
+    text = str(exc)
+    if text.startswith("unknown device reference: "):
+        return text
+    if text.startswith("unknown source: "):
+        return "unknown device reference: " + text.split(": ", 1)[1]
+    return text

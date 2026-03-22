@@ -72,7 +72,7 @@ def assign_device_alias(
         raise ValueError("alias must contain letters, numbers, '.', '_' or '-'")
     source = resolve_device_source(reference, cfg)
     if source is None:
-        raise ValueError(f"unknown source: {reference}")
+        raise ValueError(f"unknown device reference: {reference}")
     for existing in list_device_sources(cfg):
         if normalized.lower() in {ref.lower() for ref in existing.refs} and existing.device.id != source.device.id:
             raise ValueError(f"alias already in use: {normalized}")
@@ -90,7 +90,7 @@ def set_device_enabled(
 ) -> DeviceSource:
     source = resolve_device_source(reference, cfg)
     if source is None:
-        raise ValueError(f"unknown source: {reference}")
+        raise ValueError(f"unknown device reference: {reference}")
     disabled_ids = set(_disabled_device_ids(cfg))
     if enabled:
         disabled_ids.discard(source.device.id)
