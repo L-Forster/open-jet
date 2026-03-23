@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.peripherals import (
     AudioDiscoveryAdapter,
@@ -184,6 +186,48 @@ class AdapterOperationTests(unittest.TestCase):
         self.assertEqual(observation.modality, ObservationModality.AUDIO_CLIP)
         self.assertEqual(observation.payload_ref, str(target))
         self.assertIn("hw:2,0", calls[0])
+
+    def test_record_clip_uses_parecord_for_audio_server_sources(self) -> None:
+        device = PeripheralDevice(
+            id="microphone:alsa_input.platform-sound.analog-stereo",
+            kind=PeripheralKind.MICROPHONE,
+            transport=PeripheralTransport.AUDIO_SERVER,
+            label="Board Mic",
+            path="alsa_input.platform-sound.analog-stereo",
+        )
+        calls: list[tuple[str, ...]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "clip.wav"
+            observation = record_clip(
+                device,
+                duration_seconds=3,
+                output_path=target,
+                runner=lambda args: calls.append(tuple(args)) or CommandResult(tuple(args), 0),
+                which=lambda name: f"/usr/bin/{name}" if name == "parecord" else None,
+            )
+
+        self.assertEqual(observation.modality, ObservationModality.AUDIO_CLIP)
+        self.assertEqual(observation.metadata["backend"], "parecord")
+        self.assertEqual(calls[0][:3], ("/usr/bin/parecord", "--device", "alsa_input.platform-sound.analog-stereo"))
+
+    def test_run_timed_capture_marks_empty_file_as_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "clip.wav"
+            target.write_bytes(b"RIFF" + b"\x00" * 40)
+            fake_proc = SimpleNamespace(
+                wait=lambda timeout=None: 0,
+                returncode=0,
+                stderr=SimpleNamespace(read=lambda: "", close=lambda: None),
+            )
+            with patch("src.peripherals.audio.subprocess.Popen", return_value=fake_proc):
+                result = record_clip.__globals__["_run_timed_capture"](
+                    ("parecord", str(target)),
+                    duration_seconds=1,
+                    target=target,
+                )
+
+        self.assertFalse(result.ok)
+        self.assertIn("empty audio file", result.stderr)
 
     def test_build_sensor_observation_normalizes_values(self) -> None:
         device = PeripheralDevice(

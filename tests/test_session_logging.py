@@ -124,6 +124,31 @@ class SessionLoggerTests(unittest.TestCase):
             self.assertEqual(attrs["openjet.system.memory.total_mb"], 7620.5)
             self.assertEqual(attrs["openjet.use_case_tag"], "robotics")
 
+    def test_none_mode_is_normalized_for_turn_and_message_logging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = SessionLogger(base_dir=Path(tmp), label="trace-test")
+
+            asyncio.run(logger.start())
+            logger.record_user_message(
+                turn_id="turn-1",
+                text="hello",
+                mentioned_files=[],
+                attached_images=[],
+                mode=None,
+            )
+            logger.start_turn(
+                turn_id="turn-1",
+                prompt="hello",
+                mode=None,
+                resumed_session=False,
+                active_step=None,
+                files_in_play=[],
+                runtime_context={},
+            )
+            asyncio.run(logger.stop())
+
+            self.assertTrue(logger.manifest_path.exists())
+
 
 class ShellCommandClassificationTests(unittest.TestCase):
     def test_classifies_tool_like_shell_as_false_positive(self) -> None:

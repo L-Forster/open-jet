@@ -88,6 +88,11 @@ def _safe_model_name(model: str | None) -> str | None:
     return Path(str(model)).name or str(model)
 
 
+def _normalize_mode(mode: str | None) -> str:
+    text = str(mode or "").strip()
+    return text or "unset"
+
+
 def _normalize_slug(value: str | None, *, default: str = "unknown") -> str:
     text = (value or "").strip().lower()
     if not text:
@@ -473,14 +478,15 @@ class SessionLogger:
         text: str,
         mentioned_files: list[str],
         attached_images: list[str],
-        mode: str,
+        mode: str | None,
     ) -> None:
+        normalized_mode = _normalize_mode(mode)
         self.emit_event(
             "openjet.user.message",
             body="user message",
             turn_id=turn_id,
             attributes={
-                "openjet.mode": mode,
+                "openjet.mode": normalized_mode,
                 "openjet.prompt.char_count": len(text),
                 "openjet.prompt.token_estimate": estimate_tokens(text),
                 "openjet.mentioned_file_count": len(mentioned_files),
@@ -546,15 +552,16 @@ class SessionLogger:
         *,
         turn_id: str,
         prompt: str,
-        mode: str,
+        mode: str | None,
         resumed_session: bool,
         active_step: str | None,
         files_in_play: list[str],
         runtime_context: Mapping[str, Any],
     ) -> None:
+        normalized_mode = _normalize_mode(mode)
         attrs = {
             **self._sanitize_runtime_context(runtime_context),
-            "openjet.mode": mode,
+            "openjet.mode": normalized_mode,
             "openjet.resumed_session": resumed_session,
             "openjet.active_step_present": bool(active_step),
             "openjet.files_in_play_count": len(files_in_play),
@@ -568,7 +575,7 @@ class SessionLogger:
         )
         self._turn_spans[turn_id] = span
         self._turn_started_at[turn_id] = time.monotonic()
-        self._turns_started.add(1, {"openjet.mode": mode})
+        self._turns_started.add(1, {"openjet.mode": normalized_mode})
         self.emit_event(
             "openjet.turn.start",
             body="turn started",

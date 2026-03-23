@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import signal
+import subprocess
 import tempfile
 from pathlib import Path
 
 from .system import resolve_binary, run_command
 from .types import (
+    CommandResult,
     CommandRunner,
     Observation,
     ObservationModality,
@@ -33,7 +36,13 @@ def record_clip(
     target = Path(output_path) if output_path is not None else _default_recording_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     command, backend = _record_command(device, target=target, duration_seconds=duration_seconds, which=which)
-    result = runner(command)
+    result = _run_record_command(
+        command,
+        backend=backend,
+        duration_seconds=duration_seconds,
+        target=target,
+        runner=runner,
+    )
     if not result.ok:
         detail = result.stderr.strip()
         raise RuntimeError(f"audio capture failed: {detail or 'unknown error'}")
@@ -74,6 +83,18 @@ def _record_command(
             ),
             "arecord",
         )
+    parecord = which("parecord")
+    if parecord and device.transport is PeripheralTransport.AUDIO_SERVER:
+        return (
+            (
+                parecord,
+                "--device",
+                device.path or "default",
+                "--file-format=wav",
+                str(target),
+            ),
+            "parecord",
+        )
     ffmpeg = which("ffmpeg")
     if ffmpeg and device.transport in {PeripheralTransport.AUDIO_SERVER, PeripheralTransport.ALSA}:
         input_format = "pulse" if device.transport is PeripheralTransport.AUDIO_SERVER else "alsa"
@@ -92,6 +113,59 @@ def _record_command(
             "ffmpeg",
         )
     raise RuntimeError("no supported audio capture backend found")
+
+
+def _run_record_command(
+    command: tuple[str, ...],
+    *,
+    backend: str,
+    duration_seconds: int,
+    target: Path,
+    runner: CommandRunner,
+) -> CommandResult:
+    if backend == "parecord" and runner is _run:
+        return _run_timed_capture(command, duration_seconds=duration_seconds, target=target)
+    return runner(command)
+
+
+def _run_timed_capture(
+    args: tuple[str, ...],
+    *,
+    duration_seconds: int,
+    target: Path,
+) -> CommandResult:
+    proc = subprocess.Popen(
+        list(args),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stderr = ""
+    returncode = 0
+    try:
+        proc.wait(timeout=duration_seconds)
+        returncode = proc.returncode or 0
+    except subprocess.TimeoutExpired:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+        returncode = proc.returncode or 0
+    finally:
+        if proc.stderr is not None:
+            stderr = proc.stderr.read() or ""
+            proc.stderr.close()
+    if returncode == 0 and target.is_file() and target.stat().st_size <= 44:
+        returncode = 1
+        if not stderr.strip():
+            stderr = "capture produced an empty audio file"
+    return CommandResult(args=args, returncode=returncode, stderr=stderr)
 
 
 def _default_recording_path() -> Path:
