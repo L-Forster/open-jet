@@ -19,6 +19,11 @@ OpenJet can also interface with local input and output devices through the same 
 - run the same backend from the TUI or Python SDK
 - avoid building your own glue layer around local inference
 
+## Contact
+
+X: https://x.com/FlouisLF
+
+
 ## Quickstart
 
 Clone the repo and run the installer:
