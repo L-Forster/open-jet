@@ -2,7 +2,7 @@
 <img height="225" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
 
 
-`open-jet` is an offline-first local agent you can actually use for real work.
+`open-jet` is an offline-first local agent you can actually use for real work on the edge.
 
 It gives you a practical agent interface on top of your own local model and runtime, without making you assemble chat, tools, session recovery, and prompt management yourself.
 
@@ -15,7 +15,7 @@ OpenJet can also interface with local input and output devices through the same 
 - start with a local or self-hosted runtime you control
 - keep working without losing the thread when sessions get interrupted
 - use tools with explicit approvals and predictable behavior
-- discover and use local cameras, microphones, speakers, GPIO, and simple sensor inputs from chat, with device refs like @camera0 and on-demand snapshots, short recordings, playback targets, and GPIO reads
+- work with local cameras, microphones, GPIO, and simple sensor inputs through the same chat and tool flow
 - run the same backend from the TUI or Python SDK
 - avoid building your own glue layer around local inference
 
