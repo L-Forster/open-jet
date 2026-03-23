@@ -11,7 +11,20 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
-"${PYTHON_BIN}" -m venv "${VENV_DIR}"
+create_virtualenv() {
+  rm -rf "${VENV_DIR}"
+
+  if "${PYTHON_BIN}" -c "import ensurepip" >/dev/null 2>&1; then
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+    return 0
+  fi
+
+  echo "stdlib venv support is unavailable; falling back to virtualenv" >&2
+  "${PYTHON_BIN}" -m pip install --user virtualenv
+  "${PYTHON_BIN}" -m virtualenv "${VENV_DIR}"
+}
+
+create_virtualenv
 "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
