@@ -15,6 +15,7 @@ session_state.json
 .openjet/state/
 .openjet/memory/
 .openjet/memories/
+.openjet/skills.md
 AGENTS.md
 claude.md
 config.yaml
