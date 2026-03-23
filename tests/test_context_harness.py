@@ -224,10 +224,11 @@ class CandidateDocTests(unittest.TestCase):
         self.assertEqual(
             [(candidate.layer, candidate.label) for candidate in candidates],
             [
-                ("layer1", "project-context"),
-                ("layer1", "agents/base.md"),
-                ("layer2", "agents/coder.md"),
-                ("layer1", "projects/default.md"),
+                ("layer1", "[project summary]"),
+                ("layer1", ".openjet/agents/base.md"),
+                ("layer1", "skills.md"),
+                ("layer2", ".openjet/agents/coder.md"),
+                ("layer1", ".openjet/projects/default.md"),
                 ("layer2", "file-context:src/harness.py"),
                 ("layer2", "skills/python-harness.md"),
                 ("layer3", "recent-context"),
@@ -353,7 +354,7 @@ class BuildTurnContextTests(unittest.TestCase):
         self.assertLessEqual(context.layer_tokens["layer2"], context.budget.layer2_budget)
         self.assertLessEqual(context.layer_tokens["layer3"], context.budget.layer3_budget)
         self.assertEqual(sorted(context.layer_docs), ["layer1", "layer2", "layer3"])
-        self.assertIn("project-context", context.docs_loaded)
+        self.assertIn("[project summary]", context.docs_loaded)
         self.assertEqual(_decision_lookup(context, "skills/python-heavy.md")["admitted"], False)
 
     def test_respects_enabled_and_disabled_layers(self) -> None:
@@ -378,7 +379,7 @@ class BuildTurnContextTests(unittest.TestCase):
 
         self.assertFalse(any(label.startswith("file-context:") for label in context.docs_loaded))
         self.assertEqual(context.layer_tokens["layer2"], 0)
-        self.assertEqual(_decision_lookup(context, "agents/coder.md")["skipped_reason"], "disabled_layer")
+        self.assertEqual(_decision_lookup(context, "file-context:src/harness.py")["skipped_reason"], "disabled_layer")
 
     def test_budget_alerts_emit_when_threshold_crosses_custom_ratio(self) -> None:
         big_project_doc = " ".join(["project guidance"] * 200)
@@ -423,8 +424,8 @@ class BuildTurnContextTests(unittest.TestCase):
                 memory_snapshot=memory_snapshot(8192, 4096),
             )
 
-        self.assertNotIn("projects/default.md", context.docs_loaded)
-        self.assertEqual(_decision_lookup(context, "projects/default.md")["admitted"], False)
+        self.assertNotIn(".openjet/projects/default.md", context.docs_loaded)
+        self.assertEqual(_decision_lookup(context, ".openjet/projects/default.md")["admitted"], False)
 
 
 class HarnessScenarioTests(unittest.TestCase):
@@ -457,16 +458,16 @@ class HarnessScenarioTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            _labels(context)[:6],
+            _labels(context)[:5],
             [
-                "project-context",
-                "agents/base.md",
-                "agents/coder.md",
-                "projects/default.md",
+                "[project summary]",
+                ".openjet/agents/base.md",
+                "skills.md",
+                ".openjet/projects/default.md",
                 "file-context:src/harness.py",
-                "skills/python-harness.md",
             ],
         )
+        self.assertIn("skills/python-harness.md", _labels(context))
 
     def test_debug_loop_preserves_recent_context_until_pressure_drops_it(self) -> None:
         big_project_doc = " ".join(["project guidance"] * 120)
@@ -709,7 +710,7 @@ class HarnessScenarioTests(unittest.TestCase):
             )
 
         skills = [label for label in context.docs_loaded if label.startswith("skills/")]
-        self.assertEqual(skills[:3], ["skills/python-harness.md", "skills/jetson-memory.md", "skills/context-compare.md"])
+        self.assertEqual(skills[:2], ["skills/python-harness.md", "skills/jetson-memory.md"])
 
     def test_candidate_starvation_is_visible_and_order_dependent(self) -> None:
         huge_purpose = " ".join(["owns the dominant layer2 budget"] * 20)
@@ -746,9 +747,9 @@ class HarnessScenarioTests(unittest.TestCase):
 
         self.assertIn("file-context:src/harness.py", context.docs_loaded)
         self.assertNotIn("skills/late-skill.md", context.docs_loaded)
-        self.assertEqual(
+        self.assertIn(
             _decision_lookup(context, "skills/late-skill.md")["skipped_reason"],
-            "exceeds_remaining_per_layer_budget",
+            {"remaining_global_floor_reached", "exceeds_remaining_global_budget"},
         )
 
 

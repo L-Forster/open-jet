@@ -6,6 +6,11 @@ The session folder contains:
 
 - `session.json`: manifest with session id, install id, runtime context, and collector configuration
 - `.openjet/state/session_state.json`: chat/session state if state persistence is enabled
+- `.openjet/state/chats/<chat_id>/session_state.json`: latest saved transcript for each chat
+- `.openjet/state/chats/<chat_id>/resume_state.json`: last resumable checkpoint for that chat
+- `.openjet/state/swap/resume_<chat_id>.bin`: llama.cpp KV cache snapshot for resumable checkpoints when available
+
+`/resume` now lists saved chats from `.openjet/state/` and prefers the `resume_state.json` checkpoint so the TUI and runtime can be restored together. If the active runtime/model does not match, open-jet falls back to loading the transcript and resetting the runtime so the next turn can re-prompt cleanly.
 
 Normal chat turns do not dump full prompt payloads into the session directory. Full runtime prompt dumps are only written in debug mode under `.openjet/state/debug_prompts/`.
 

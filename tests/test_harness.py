@@ -196,6 +196,18 @@ class HarnessContextTests(unittest.TestCase):
         self.assertIn("layer2", context.layer_docs)
         self.assertGreaterEqual(context.layer_tokens["layer2"], 1)
 
+    def test_update_state_for_user_message_preserves_existing_mode_without_inference(self) -> None:
+        initial = HarnessState(mode="review")
+
+        updated = update_state_for_user_message(
+            initial,
+            "Implement a change and fix the failing bug",
+            files=["src/harness.py"],
+        )
+
+        self.assertEqual(updated.mode, "review")
+        self.assertEqual(active_step(updated).kind, "inspect")
+
     def test_build_turn_context_respects_layered_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -335,7 +347,7 @@ class HarnessContextTests(unittest.TestCase):
             joined = "\n".join(message["content"] for message in context.messages)
             self.assertIn("python-refactor.md", ",".join(context.docs_loaded))
             self.assertIn("preferred refactor skill", joined)
-            self.assertNotIn("review docs", joined)
+            self.assertNotIn("USER-EDITABLE HARNESS DOC: skills/irrelevant.md", joined)
             self.assertLessEqual(context.docs_tokens, context.budget.docs_budget + 64)
 
     def test_clear_preferred_skills_removes_manual_skill_selection(self) -> None:

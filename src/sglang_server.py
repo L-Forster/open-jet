@@ -152,6 +152,14 @@ class SglangServerClient:
         await self._stop_server()
         await self.start()
 
+    async def save_kv_cache(self, path: Path) -> bool:
+        del path
+        return False
+
+    async def restore_kv_cache(self, path: Path) -> bool:
+        del path
+        return False
+
     async def _stop_server(self) -> None:
         if self._proc and self._proc.returncode is None:
             self._proc.send_signal(signal.SIGTERM)

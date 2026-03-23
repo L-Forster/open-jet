@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -12,12 +13,14 @@ from .model_profiles import get_model_profile, list_model_profiles, replace_mode
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
 from .runtime_registry import runtime_spec
+from .skills_registry import skills_manifest_path, sync_skills_manifest
 from .setup import _prompt_text
 from .surfaces.command_specs import COMMANDS, CommandSpec
 from .theme import rich_text
 
 if TYPE_CHECKING:
     from .app import OpenJetApp
+    from .session_state import SavedChatEntry
 
 
 class SlashCommandHandler:
@@ -103,10 +106,10 @@ class SlashCommandHandler:
             self._mode(log, arg)
             return True
         if cmd == "skills":
-            self._skills(log, arg)
+            await self._skills(log, arg)
             return True
         if cmd == "skill":
-            self._skill(log, arg)
+            await self._skill(log, arg)
             return True
         if cmd == "step":
             self._step(log, arg)
@@ -144,7 +147,7 @@ class SlashCommandHandler:
             return
 
         self.app.agent.system_prompt = await build_system_prompt(
-            str(self.app.cfg.get("system_prompt", "")),
+            "",
             Path.cwd(),
             cfg=self.app.cfg,
         )
@@ -155,6 +158,7 @@ class SlashCommandHandler:
         self.app.harness_state = type(self.app.harness_state)()
         self.app._turn_context_docs = []
         self.app._turn_context_tokens = 0
+        self.app._start_new_chat_session()
         log.clear()
         log.write(self.banner)
         log.write("  [bold bright_white]Conversation history cleared.[/]")
@@ -622,16 +626,42 @@ class SlashCommandHandler:
             log.write("[bold red]error:[/] Agent not initialized.")
             log.write("")
             return
+        entries = self.app.list_resume_candidates()
+        if not entries:
+            log.write("  [bold bright_white]No saved chats found under .openjet/state.[/]")
+            log.write("")
+            self.app.refresh_token_counter()
+            return
 
-        self.app.agent.reset_conversation()
+        selected = await radiolist_dialog(
+            title="Resume saved chat",
+            text="Choose a saved chat checkpoint to load back into the transcript and runtime.",
+            values=[(str(entry.state_path), self._format_resume_entry(entry)) for entry in entries],
+        ).run_async()
+        if selected is None:
+            log.write("[bold bright_white]Resume cancelled.[/]")
+            log.write("")
+            return
+
         self.app.loaded_files.clear()
         self.app._pending_image_paths.clear()
         log.clear()
         log.write(self.banner)
-        if not self.app._restore_session_state(log):
-            log.write("  [bold bright_white]No previous session state found.[/]")
+        if not await self.app.restore_saved_chat(str(selected), log):
+            log.write("  [bold bright_white]Saved chat could not be loaded.[/]")
         log.write("")
         self.app.refresh_token_counter()
+
+    @staticmethod
+    def _format_resume_entry(entry: "SavedChatEntry") -> str:
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.saved_at))
+        model_name = Path(entry.model_ref).name or entry.model_ref or "unknown"
+        checkpoint = "KV checkpoint" if entry.kv_cache_available else "transcript only"
+        preview = entry.preview or "(no preview)"
+        return (
+            f"{stamp} | {entry.message_count} messages | {checkpoint} | "
+            f"model={model_name} | {preview}"
+        )
 
     def _reasoning(self, log: Any, raw_arg: str) -> None:
         client = self.app.client
@@ -704,43 +734,67 @@ class SlashCommandHandler:
         log.write(f"[bold bright_white]Harness mode set to {arg}.[/]")
         log.write("")
 
-    def _skills(self, log: Any, raw_arg: str) -> None:
-        arg = raw_arg.strip().lower()
-        if not arg or arg == "status":
+    async def _skills(self, log: Any, raw_arg: str) -> None:
+        await self._skill(log, raw_arg)
+
+    async def _skill(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip()
+        lowered = arg.lower()
+        load_only = lowered.startswith("load ")
+        if not arg or lowered == "status":
+            manifest = sync_skills_manifest(Path.cwd())
             selected = self.app.harness_state.preferred_skills
             available = ", ".join(self.app.available_harness_skills()) or "none"
-            log.write(
-                "[bold bright_white]"
-                f"Selected skills: {', '.join(selected) if selected else 'none'}"
-                "[/]"
-            )
+            log.write(f"[bold bright_white]Selected skills: {', '.join(selected) if selected else 'none'}[/]")
             log.write(f"[bold bright_white]Available skills: {available}[/]")
+            log.write(f"[bold bright_white]Skills manifest:[/] {manifest}")
             log.write("")
             return
-        if arg == "list":
+        if lowered == "list":
+            manifest = sync_skills_manifest(Path.cwd())
             available = self.app.available_harness_skills()
             log.write(f"[bold bright_white]Available skills: {', '.join(available) if available else 'none'}[/]")
+            log.write(f"[bold bright_white]Skills manifest:[/] {manifest}")
             log.write("")
             return
-        if arg == "clear":
+        if lowered == "clear":
             self.app.clear_harness_skills()
             log.write("[bold bright_white]Selected harness skills cleared.[/]")
             log.write("")
             return
-        log.write("[yellow]Usage:[/] /skills [status|list|clear]")
-        log.write("")
-
-    def _skill(self, log: Any, raw_arg: str) -> None:
-        names = [part.strip() for part in raw_arg.split(",") if part.strip()]
+        names_arg = arg[5:].strip() if load_only else arg
+        names = [part.strip() for part in names_arg.split(",") if part.strip()]
         if not names:
-            log.write("[yellow]Usage:[/] /skill <name[,name...]>")
+            log.write("[yellow]Usage:[/] /skill [status|list|clear|load <name[,name...]>|<name[,name...]>]")
             log.write("")
             return
+        loaded: list[str] = []
+        if load_only:
+            available = set(self.app.available_harness_skills())
+            requested = [Path(name).stem for name in names if Path(name).stem]
+            missing = [name for name in requested if name not in available]
+            for name in requested:
+                if name in available and await self.app.load_skill_into_context(name, log):
+                    loaded.append(name)
+            if loaded:
+                log.write(f"[bold bright_white]Loaded into current chat: {', '.join(loaded)}[/]")
+            if missing:
+                log.write(f"[yellow]Unknown skills:[/] {', '.join(missing)}")
+            log.write(f"[bold bright_white]Skills manifest:[/] {skills_manifest_path(Path.cwd())}")
+            log.write("")
+            return
+
         applied, missing = self.app.set_harness_skills(names)
+        for name in applied:
+            if await self.app.load_skill_into_context(name, log):
+                loaded.append(name)
         if applied:
             log.write(f"[bold bright_white]Selected skills: {', '.join(applied)}[/]")
+        if loaded:
+            log.write(f"[bold bright_white]Loaded into current chat: {', '.join(loaded)}[/]")
         if missing:
             log.write(f"[yellow]Unknown skills:[/] {', '.join(missing)}")
+        log.write(f"[bold bright_white]Skills manifest:[/] {skills_manifest_path(Path.cwd())}")
         log.write("")
 
     def _step(self, log: Any, raw_arg: str) -> None:

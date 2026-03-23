@@ -32,6 +32,7 @@ from src.llama_server import (
 )
 from src.provisioning import ensure_direct_model
 from src.runtime_protocol import StreamChunk, ToolCall
+from src.session_state import ChatArchiveStore, SavedChatEntry, SessionStateStore
 from src.setup import _prompt_choice, _runtime_prompt_options, build_recommended_payload, run_setup_wizard
 
 
@@ -906,6 +907,20 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
             ["Alt", "Base"],
         )
 
+    def test_persist_setup_result_discards_system_prompt_from_config(self) -> None:
+        app = OpenJetApp()
+        app.cfg["system_prompt"] = "old prompt"
+
+        with patch("src.app.save_config"):
+            app._persist_setup_result(
+                {
+                    "runtime": "llama_cpp",
+                    "system_prompt": "should not persist",
+                }
+            )
+
+        self.assertNotIn("system_prompt", app.cfg)
+
 
 class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_command_switches_to_saved_profile(self) -> None:
@@ -1053,6 +1068,228 @@ class AppQuitAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved_payload["token_usage"]["prompt_tokens"], 1234)
         self.assertEqual(saved_payload["token_usage"]["completion_tokens"], 56)
         self.assertEqual(saved_payload["token_usage"]["runtime_requests"], 3)
+
+
+class AppResumeStateTests(unittest.TestCase):
+    def test_persist_session_state_writes_live_chat_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / ".openjet" / "state" / "session_state.json"
+
+            app = OpenJetApp()
+            app.state_store = SessionStateStore(path=state_path, enabled=True)
+            app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
+            app._chat_session_id = "chat123"
+            app.agent = SimpleNamespace(
+                messages=[
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "hello"},
+                ]
+            )
+            app.client = SimpleNamespace(context_window_tokens=4096)
+            app.loaded_files = {"src/app.py": {"path": "src/app.py"}}
+
+            app.persist_session_state(reason="user_message")
+
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            archived = json.loads(
+                app.chat_archive.live_state_path("chat123").read_text(encoding="utf-8")
+            )
+            self.assertEqual(saved["chat_id"], "chat123")
+            self.assertEqual(saved["reason"], "user_message")
+            self.assertEqual(archived["chat_id"], "chat123")
+            self.assertEqual(archived["loaded_files"]["src/app.py"]["path"], "src/app.py")
+
+    def test_list_resume_candidates_prefers_resume_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / ".openjet" / "state" / "session_state.json"
+            app = OpenJetApp()
+            app.state_store = SessionStateStore(path=state_path, enabled=True)
+            app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
+
+            payload = {
+                "chat_id": "chat123",
+                "saved_at": 100.0,
+                "reason": "assistant_turn_done",
+                "runtime": "llama_cpp",
+                "model_ref": "/models/demo.gguf",
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "hello world"},
+                ],
+                "loaded_files": {},
+                "harness_state": {},
+                "token_usage": {},
+            }
+            app.chat_archive.save_live_state("chat123", payload)
+            app.chat_archive.save_resume_state("chat123", payload)
+            app.chat_archive.kv_cache_path("chat123").parent.mkdir(parents=True, exist_ok=True)
+            app.chat_archive.kv_cache_path("chat123").write_bytes(b"kv")
+
+            entries = app.list_resume_candidates()
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].state_path.name, "resume_state.json")
+            self.assertTrue(entries[0].kv_cache_available)
+
+
+class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_persist_resumable_session_state_saves_checkpoint_and_kv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / ".openjet" / "state" / "session_state.json"
+            app = OpenJetApp()
+            app.state_store = SessionStateStore(path=state_path, enabled=True)
+            app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
+            app._chat_session_id = "chat123"
+            app.agent = SimpleNamespace(messages=[{"role": "system", "content": "system"}])
+            app.client = SimpleNamespace(
+                context_window_tokens=4096,
+                save_kv_cache=AsyncMock(return_value=True),
+            )
+
+            saved = await app.persist_resumable_session_state(reason="assistant_turn_done")
+
+            self.assertTrue(saved)
+            self.assertTrue(app.chat_archive.resume_state_path("chat123").is_file())
+            app.client.save_kv_cache.assert_awaited_once_with(
+                app.chat_archive.kv_cache_path("chat123")
+            )
+
+    async def test_restore_saved_chat_restores_kv_cache_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / ".openjet" / "state" / "session_state.json"
+            app = OpenJetApp()
+            app.state_store = SessionStateStore(path=state_path, enabled=True)
+            app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
+            app.cfg["runtime"] = "llama_cpp"
+            app.cfg["model"] = "/models/demo.gguf"
+            app.cfg["llama_model"] = "/models/demo.gguf"
+            app.agent = SimpleNamespace(
+                system_prompt="system",
+                messages=[{"role": "system", "content": "system"}],
+                clear_turn_context=Mock(),
+            )
+            app.client = SimpleNamespace(
+                context_window_tokens=4096,
+                restore_kv_cache=AsyncMock(return_value=True),
+                reset_kv_cache=AsyncMock(return_value=None),
+            )
+            payload = {
+                "chat_id": "savedchat",
+                "saved_at": 100.0,
+                "reason": "assistant_turn_done",
+                "runtime": "llama_cpp",
+                "model_ref": "/models/demo.gguf",
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ],
+                "loaded_files": {},
+                "harness_state": {},
+                "token_usage": {},
+            }
+            app.chat_archive.save_resume_state("savedchat", payload)
+            app.chat_archive.kv_cache_path("savedchat").parent.mkdir(parents=True, exist_ok=True)
+            app.chat_archive.kv_cache_path("savedchat").write_bytes(b"kv")
+
+            restored = await app.restore_saved_chat(
+                app.chat_archive.resume_state_path("savedchat"),
+                app.query_one("#chat-log"),
+            )
+
+            self.assertTrue(restored)
+            app.client.restore_kv_cache.assert_awaited_once_with(
+                app.chat_archive.kv_cache_path("savedchat")
+            )
+            app.client.reset_kv_cache.assert_not_awaited()
+            self.assertEqual(app.agent.messages[-1]["content"], "hi")
+            self.assertTrue(
+                any("KV cache restored" in str(entry) for entry in app.query_one("#chat-log")._entries)
+            )
+
+    async def test_restore_saved_chat_resets_runtime_when_model_differs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_path = root / ".openjet" / "state" / "session_state.json"
+            app = OpenJetApp()
+            app.state_store = SessionStateStore(path=state_path, enabled=True)
+            app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
+            app.cfg["runtime"] = "llama_cpp"
+            app.cfg["model"] = "/models/current.gguf"
+            app.cfg["llama_model"] = "/models/current.gguf"
+            app.agent = SimpleNamespace(
+                system_prompt="system",
+                messages=[{"role": "system", "content": "system"}],
+                clear_turn_context=Mock(),
+            )
+            app.client = SimpleNamespace(
+                context_window_tokens=4096,
+                restore_kv_cache=AsyncMock(return_value=True),
+                reset_kv_cache=AsyncMock(return_value=None),
+            )
+            payload = {
+                "chat_id": "savedchat",
+                "saved_at": 100.0,
+                "reason": "assistant_turn_done",
+                "runtime": "llama_cpp",
+                "model_ref": "/models/other.gguf",
+                "messages": [
+                    {"role": "system", "content": "system"},
+                    {"role": "user", "content": "hello"},
+                ],
+                "loaded_files": {},
+                "harness_state": {},
+                "token_usage": {},
+            }
+            app.chat_archive.save_resume_state("savedchat", payload)
+            app.chat_archive.kv_cache_path("savedchat").parent.mkdir(parents=True, exist_ok=True)
+            app.chat_archive.kv_cache_path("savedchat").write_bytes(b"kv")
+
+            restored = await app.restore_saved_chat(
+                app.chat_archive.resume_state_path("savedchat"),
+                app.query_one("#chat-log"),
+            )
+
+            self.assertTrue(restored)
+            app.client.restore_kv_cache.assert_not_awaited()
+            app.client.reset_kv_cache.assert_awaited_once()
+            self.assertTrue(
+                any("active runtime/model differs" in str(entry) for entry in app.query_one("#chat-log")._entries)
+            )
+
+
+class SlashResumeCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_command_uses_picker_and_loads_selected_chat(self) -> None:
+        app = OpenJetApp()
+        app.agent = SimpleNamespace(messages=[{"role": "system", "content": "system"}])
+        entry = SavedChatEntry(
+            chat_id="chat123",
+            state_path=Path("/tmp/resume_state.json"),
+            saved_at=100.0,
+            reason="assistant_turn_done",
+            preview="hello world",
+            message_count=2,
+            loaded_file_count=0,
+            runtime="llama_cpp",
+            model_ref="/models/demo.gguf",
+            uses_resume_checkpoint=True,
+            kv_cache_available=True,
+        )
+        picker = AsyncMock(return_value=str(entry.state_path))
+        dialog = Mock(run_async=picker)
+
+        with patch.object(app, "list_resume_candidates", return_value=[entry]), patch(
+            "src.commands.radiolist_dialog",
+            return_value=dialog,
+        ), patch.object(app, "restore_saved_chat", AsyncMock(return_value=True)) as restore_chat:
+            handled = await app.commands.maybe_handle("/resume")
+
+        self.assertTrue(handled)
+        restore_chat.assert_awaited_once_with(str(entry.state_path), app.query_one("#chat-log"))
 
 
 class AppToolHandlingTests(unittest.IsolatedAsyncioTestCase):

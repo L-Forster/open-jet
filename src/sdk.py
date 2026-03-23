@@ -90,7 +90,7 @@ class OpenJetSession:
         agent = Agent(
             client=client,
             system_prompt=await build_system_prompt(
-                system_prompt if system_prompt is not None else str(resolved_cfg.get("system_prompt", "")),
+                system_prompt or "",
                 Path.cwd(),
                 cfg=resolved_cfg,
             ),

@@ -74,6 +74,14 @@ class OpenAICompatibleClient:
     async def reset_kv_cache(self) -> None:
         return None
 
+    async def save_kv_cache(self, path) -> bool:
+        del path
+        return False
+
+    async def restore_kv_cache(self, path) -> bool:
+        del path
+        return False
+
     async def chat_stream(
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:

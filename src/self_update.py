@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import subprocess
 import sys
@@ -14,6 +15,15 @@ from .config import CONFIG_PATH, normalize_config
 
 RELEASES_LATEST_URL = "https://api.github.com/repos/l-forster/open-jet/releases/latest"
 USER_AGENT = "open-jet-updater"
+DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS = 4.0
+DEFAULT_RELEASE_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+
+
+@dataclass(frozen=True)
+class ReleaseInfo:
+    tag_name: str
+    version: str
+    tarball_url: str
 
 
 def _active_config_snapshot() -> tuple[Path, str] | None:
@@ -75,7 +85,7 @@ def _preserve_user_config(snapshot: tuple[Path, str] | None, *, latest_version: 
     path.write_text(yaml.safe_dump(normalize_config(merged_cfg), sort_keys=False))
 
 
-def _latest_release() -> dict[str, object]:
+def _latest_release(*, timeout_seconds: float = DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS) -> dict[str, object]:
     request = Request(
         RELEASES_LATEST_URL,
         headers={
@@ -84,7 +94,7 @@ def _latest_release() -> dict[str, object]:
         },
     )
     try:
-        with urlopen(request) as response:
+        with urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read().decode("utf-8")
     except HTTPError as exc:
         raise RuntimeError(f"Failed to fetch latest release metadata: HTTP {exc.code}.") from exc
@@ -101,10 +111,15 @@ def _latest_release() -> dict[str, object]:
     return release
 
 
-def _download_release_archive(url: str, destination: Path) -> Path:
+def _download_release_archive(
+    url: str,
+    destination: Path,
+    *,
+    timeout_seconds: float = DEFAULT_RELEASE_DOWNLOAD_TIMEOUT_SECONDS,
+) -> Path:
     request = Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urlopen(request) as response:
+        with urlopen(request, timeout=timeout_seconds) as response:
             destination.write_bytes(response.read())
     except HTTPError as exc:
         raise RuntimeError(f"Failed to download release archive: HTTP {exc.code}.") from exc
@@ -113,14 +128,34 @@ def _download_release_archive(url: str, destination: Path) -> Path:
     return destination
 
 
-def update_from_latest_release(*, current_version: str | None = None) -> str:
-    release = _latest_release()
+def latest_release_info(*, timeout_seconds: float = DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS) -> ReleaseInfo:
+    release = _latest_release(timeout_seconds=timeout_seconds)
     tag_name = str(release.get("tag_name") or "").strip()
     tarball_url = str(release.get("tarball_url") or "").strip()
     if not tag_name or not tarball_url:
         raise RuntimeError("Latest release metadata is missing tag_name or tarball_url.")
+    version = tag_name[1:] if tag_name.startswith("v") else tag_name
+    return ReleaseInfo(tag_name=tag_name, version=version, tarball_url=tarball_url)
 
-    latest_version = tag_name[1:] if tag_name.startswith("v") else tag_name
+
+def available_release_update(
+    *,
+    current_version: str | None = None,
+    timeout_seconds: float = DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS,
+) -> ReleaseInfo | None:
+    installed_version = str(current_version or "").strip()
+    if not installed_version or installed_version.lower() == "unknown":
+        return None
+    release = latest_release_info(timeout_seconds=timeout_seconds)
+    if installed_version == release.version:
+        return None
+    return release
+
+
+def install_release(release: ReleaseInfo, *, current_version: str | None = None) -> str:
+    latest_version = release.version
+    tarball_url = release.tarball_url
+
     installed_version = str(current_version or "").strip()
     if installed_version and installed_version == latest_version:
         return f"open-jet {installed_version} is already up to date."
@@ -142,3 +177,8 @@ def update_from_latest_release(*, current_version: str | None = None) -> str:
     if installed_version:
         return f"Updated open-jet from {installed_version} to {latest_version}."
     return f"Installed open-jet {latest_version}."
+
+
+def update_from_latest_release(*, current_version: str | None = None) -> str:
+    release = latest_release_info()
+    return install_release(release, current_version=current_version)

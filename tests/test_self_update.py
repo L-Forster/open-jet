@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.self_update import update_from_latest_release
+from src.self_update import available_release_update, update_from_latest_release
 
 
 class _FakeResponse:
@@ -27,6 +27,13 @@ class _FakeResponse:
 
 
 class SelfUpdateTests(unittest.TestCase):
+    def test_available_release_update_skips_unknown_installed_version(self) -> None:
+        with patch("src.self_update.urlopen") as urlopen_mock:
+            release = available_release_update(current_version="unknown")
+
+        self.assertIsNone(release)
+        urlopen_mock.assert_not_called()
+
     def test_update_from_latest_release_merges_new_release_config_with_user_settings(self) -> None:
         release_payload = json.dumps(
             {
@@ -42,7 +49,8 @@ class SelfUpdateTests(unittest.TestCase):
             config_path = root / "config.yaml"
             config_path.write_text("runtime: llama_cpp\n")
 
-            def fake_urlopen(request):
+            def fake_urlopen(request, timeout=None):
+                del timeout
                 url = request.full_url
                 if url.endswith("/releases/latest"):
                     return release_response
@@ -101,7 +109,8 @@ class SelfUpdateTests(unittest.TestCase):
         release_response = _FakeResponse(release_payload)
         archive_response = _FakeResponse(b"tarball-bytes")
 
-        def fake_urlopen(request):
+        def fake_urlopen(request, timeout=None):
+            del timeout
             url = request.full_url
             if url.endswith("/releases/latest"):
                 return release_response

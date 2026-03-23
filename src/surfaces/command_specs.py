@@ -55,7 +55,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(name="memory", description="Inspect or update persistent memory: /memory [show|clear <user|agent>]"),
     CommandSpec(name="reasoning", description="Show or set llama.cpp reasoning mode: /reasoning [status|on|off|default]"),
     CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
-    CommandSpec(name="resume", description="Load previous session state into chat"),
+    CommandSpec(name="resume", description="Pick and load a saved chat back into chat/runtime"),
     CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
     CommandSpec(
         name="model",
@@ -64,8 +64,8 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(name="edit-model", description="Edit a saved model preset: /edit-model [name]"),
     CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
-    CommandSpec(name="skills", description="Show or clear selected harness skills: /skills [status|list|clear]"),
-    CommandSpec(name="skill", description="Pin one or more harness skills: /skill <name[,name...]>"),
+    CommandSpec(name="skills", description="Alias for /skill [status|list|clear|load <name[,name...]>|<name[,name...]>]"),
+    CommandSpec(name="skill", description="Inspect, load, or pin harness skills: /skill [status|list|clear|load <name[,name...]>|<name[,name...]>]"),
     CommandSpec(name="step", description="Inspect or control the active step: /step [status|next|split]"),
     CommandSpec(
         name="util",

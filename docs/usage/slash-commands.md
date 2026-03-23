@@ -9,7 +9,7 @@
 - `/devices` alias for `/device`
 - `/condense` condense older context
 - `/load <path>` load a file into context
-- `/resume` load previous saved session
+- `/resume` pick a saved chat checkpoint from `.openjet/state/` and load it back into the TUI
 - `/setup` reopen setup wizard
 - `/model` open an arrow-key picker to switch saved model presets
 - `/model [status|list|<name>]` show or switch saved model presets
@@ -19,8 +19,8 @@
 - `/reasoning [status|on|off|default]` control llama.cpp reasoning mode
 - `/air-gapped [status|true|false]` control air-gapped mode
 - `/mode [chat|code|review|debug|status]` set harness mode
-- `/skills [status|list|clear]` inspect or clear selected harness skills
-- `/skill <name[,name...]>` pin harness skills
+- `/skill [status|list|clear|load <name[,name...]>|<name[,name...]>]` inspect, load into the current chat, and pin harness skills
+- `/skills [status|list|clear|load <name[,name...]>|<name[,name...]>]` alias for `/skill`
 - `/step [status|next|split]` inspect or control the active workflow step
 - `/util [show|hide|toggle|status]` show or hide the utilization line
 

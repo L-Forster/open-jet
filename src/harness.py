@@ -11,6 +11,9 @@ import yaml
 
 from .context_index import load_repo_context_index, lookup_file_summary
 from .runtime_limits import MemorySnapshot, estimate_tokens
+from .skills_registry import available_skill_names as registry_available_skill_names
+from .skills_registry import render_skills_manifest
+from .skills_registry import skill_summaries, sync_skills_manifest
 
 
 ROLE_BY_MODE = {
@@ -37,23 +40,6 @@ TOOL_BUNDLES = {
     "debug": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
 }
 
-DEFAULT_BASE_PROMPT = """You are operating inside open-jet on an edge Linux device.
-Keep work decomposed into small turns.
-Prefer exact file excerpts over broad repo context.
-Prefer dedicated tools over shell unless shell is the right fit.
-Preserve enough state for the next turn to continue cleanly.
-Use system_info before proposing heavy local commands when resource limits matter.
-Default to a normal shell run first; if it fails for RAM/VRAM pressure, retry explicitly with unload-first shell mode.
-"""
-
-DEFAULT_ROLE_PROMPTS = {
-    "chat": "Answer directly. Avoid unnecessary tool use.",
-    "coder": "Implement the active step only. Keep edits narrow and verify the changed behavior.",
-    "reviewer": "Prioritize bugs, regressions, and missing verification over style commentary.",
-    "debugger": "Reproduce, localize, fix, and verify. Prefer small experiments over broad rewrites.",
-}
-
-
 @dataclass
 class PlanStep:
     id: str
@@ -68,7 +54,7 @@ class PlanStep:
 @dataclass
 class HarnessState:
     goal: str = ""
-    mode: str = "code"
+    mode: str | None = None
     preferred_skills: list[str] = field(default_factory=list)
     plan: list[PlanStep] = field(default_factory=list)
     active_step_id: str | None = None
@@ -112,7 +98,7 @@ class HarnessState:
                     continue
         return cls(
             goal=str(payload.get("goal", "")),
-            mode=str(payload.get("mode", "code")),
+            mode=str(payload["mode"]) if payload.get("mode") else None,
             preferred_skills=[str(item) for item in payload.get("preferred_skills", []) if str(item)],
             plan=plan,
             active_step_id=str(payload["active_step_id"]) if payload.get("active_step_id") else None,
@@ -207,18 +193,7 @@ class HarnessSessionStore:
         temp.replace(self.path)
 
 
-def infer_mode(text: str) -> str:
-    lowered = text.lower()
-    if any(token in lowered for token in ("review", "audit", "finding", "regression")):
-        return "review"
-    if any(token in lowered for token in ("debug", "fix", "failing", "error", "bug", "traceback")):
-        return "debug"
-    if any(token in lowered for token in ("write", "edit", "change", "implement", "refactor", "@")):
-        return "code"
-    return "chat"
-
-
-def create_plan(goal: str, mode: str, files: list[str]) -> list[PlanStep]:
+def create_plan(goal: str, mode: str | None, files: list[str]) -> list[PlanStep]:
     focus = ", ".join(files[:2]) if files else "the relevant area"
     if mode == "review":
         return [
@@ -250,7 +225,7 @@ def update_state_for_user_message(
     mode: str | None = None,
     files: list[str] | None = None,
 ) -> HarnessState:
-    chosen_mode = mode or infer_mode(text)
+    chosen_mode = mode or state.mode
     mentioned_files = [path for path in (files or []) if path]
     next_state = HarnessState.from_dict(state.to_dict())
     next_state.goal = text.strip()
@@ -553,10 +528,7 @@ def update_state_after_turn(
 
 
 def available_skill_names(root: Path) -> list[str]:
-    skills_dir = root / ".openjet" / "skills"
-    if not skills_dir.exists():
-        return []
-    return sorted(path.stem for path in skills_dir.glob("*.md"))
+    return registry_available_skill_names(root)
 
 
 def set_mode(state: HarnessState, mode: str) -> HarnessState:
@@ -628,8 +600,11 @@ def normalize_skill_name(name: str) -> str:
     return Path(str(name).strip()).stem
 
 
-def allowed_tools_for_mode(mode: str) -> set[str]:
-    return set(TOOL_BUNDLES.get(mode, TOOL_BUNDLES["code"])) | set(CONFIRMATION_GATED_TOOLS)
+def allowed_tools_for_mode(mode: str | None) -> set[str]:
+    allowed: set[str] = set(CONFIRMATION_GATED_TOOLS)
+    for bundle in TOOL_BUNDLES.values():
+        allowed |= set(bundle)
+    return allowed
 
 
 def shell_command_is_verification(command: str) -> bool:
@@ -673,15 +648,20 @@ def _complete_and_advance(state: HarnessState, step_id: str) -> None:
 
 
 def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list[HarnessDocCandidate]:
-    role_name = ROLE_BY_MODE.get(state.mode, "coder")
     candidates: list[tuple[str, str, str]] = []
     repo_index = load_repo_context_index(root)
     if repo_index.project_summary:
         candidates.append(("layer1", "[project summary]", repo_index.project_summary))
     base_doc = _load_doc(root / ".openjet" / "agents" / "base.md")
-    candidates.append(("layer1", ".openjet/agents/base.md", base_doc or DEFAULT_BASE_PROMPT))
-    role_doc = _load_doc(root / ".openjet" / "agents" / f"{role_name}.md")
-    candidates.append(("layer2", f".openjet/agents/{role_name}.md", role_doc or DEFAULT_ROLE_PROMPTS.get(role_name, "")))
+    if base_doc:
+        candidates.append(("layer1", ".openjet/agents/base.md", base_doc))
+    skills_index = render_skills_manifest(root)
+    if skills_index:
+        candidates.append(("layer1", "skills.md", skills_index))
+    role_name = ROLE_BY_MODE.get(state.mode) if state.mode else None
+    role_doc = _load_doc(root / ".openjet" / "agents" / f"{role_name}.md") if role_name else ""
+    if role_name and role_doc:
+        candidates.append(("layer2", f".openjet/agents/{role_name}.md", role_doc))
     project_doc = _load_doc(root / ".openjet" / "projects" / "default.md")
     if project_doc:
         candidates.append(("layer1", ".openjet/projects/default.md", project_doc))
@@ -708,9 +688,6 @@ def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list
 
 
 def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str, str]]:
-    skills_dir = root / ".openjet" / "skills"
-    if not skills_dir.exists():
-        return []
     query = " ".join(
         part
         for part in [
@@ -723,23 +700,21 @@ def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[
     query_terms = set(re.findall(r"[a-z0-9_+-]+", query))
     scored: list[tuple[int, str, str]] = []
     preferred = {normalize_skill_name(name) for name in state.preferred_skills}
-    for path in sorted(skills_dir.glob("*.md")):
-        body = _load_doc(path)
-        if not body:
-            continue
+    for summary in skill_summaries(root):
+        body = _load_doc(summary.path)
         metadata, content = _split_frontmatter(body)
         score = 0
-        name_terms = set(re.findall(r"[a-z0-9_+-]+", path.stem.lower()))
+        name_terms = set(re.findall(r"[a-z0-9_+-]+", summary.name.lower()))
         tags = {str(tag).lower() for tag in metadata.get("tags", [])} if isinstance(metadata.get("tags"), list) else set()
         score += len(query_terms & name_terms) * 4
         score += len(query_terms & tags) * 5
-        if metadata.get("mode") == state.mode:
+        if state.mode and metadata.get("mode") == state.mode:
             score += 3
-        if path.stem in preferred:
+        if summary.name in preferred:
             score += 100
         if score <= 0:
             continue
-        scored.append((score, path.name, content.strip()))
+        scored.append((score, summary.path.name, content.strip()))
     scored.sort(key=lambda item: (-item[0], item[1]))
     limit = max_skill_docs_for_window(window_tokens)
     active = active_step(state)

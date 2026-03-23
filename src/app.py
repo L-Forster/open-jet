@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import importlib.metadata
 import os
 import re
 import shlex
@@ -21,6 +22,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markup import escape
@@ -78,11 +80,13 @@ from .ollama_setup import discover_installed_ollama_models, materialize_setup_mo
 from .observation import ObservationStore
 from .persistent_memory import build_system_prompt
 from .provisioning import provision_setup_artifacts
+from .skills_registry import resolve_skill_path
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
 from .runtime_registry import active_model_ref, create_runtime_client
 from .session_logging import BroadcastConfig, SessionLogger
-from .session_state import SessionStateStore
+from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
+from .self_update import available_release_update, install_release
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
@@ -92,6 +96,13 @@ from .tool_executor import ToolExecutionResult, execute_tool, format_tool_args, 
 def _format_error(exc: Exception) -> str:
     text = str(exc).strip()
     return text or f"{type(exc).__name__} (no message)"
+
+
+def _open_jet_version() -> str:
+    try:
+        return importlib.metadata.version("open-jet")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def _plain_markup(text: str) -> str:
@@ -345,6 +356,7 @@ class OpenJetCompleter(Completer):
 class OpenJetApp:
     TITLE = "open-jet"
     _SPLASH_BLOCKS = ("▉", "▉", "▉", "▉")
+    _STARTUP_UPDATE_CHECK_TIMEOUT_SECONDS = 2.5
 
     def __init__(self, *, force_setup: bool = False) -> None:
         self.force_setup = force_setup
@@ -368,6 +380,11 @@ class OpenJetApp:
             path=Path(state_cfg.get("path", ".openjet/state/session_state.json")),
             enabled=bool(state_cfg.get("enabled", True)),
         )
+        self.chat_archive = ChatArchiveStore.from_session_state_path(
+            self.state_store.path,
+            enabled=self.state_store.enabled,
+        )
+        self._chat_session_id = self.chat_archive.new_chat_id()
         self.observation_store = ObservationStore()
         self.harness_store = HarnessSessionStore()
         self.harness_state = HarnessState()
@@ -779,11 +796,7 @@ class OpenJetApp:
             save_config(self.cfg)
         self.agent = Agent(
             client=self.client,
-            system_prompt=await build_system_prompt(
-                str(self.cfg.get("system_prompt", "")),
-                Path.cwd(),
-                cfg=self.cfg,
-            ),
+            system_prompt=await build_system_prompt("", Path.cwd(), cfg=self.cfg),
             context_window_tokens=self.client.context_window_tokens,
             context_reserved_tokens=int(mem_cfg["context_reserved_tokens"]) if mem_cfg.get("context_reserved_tokens") is not None else None,
             min_prompt_tokens=int(mem_cfg.get("min_prompt_tokens", 256)),
@@ -870,6 +883,8 @@ class OpenJetApp:
     def _persist_setup_result(self, setup_result: dict[str, Any]) -> None:
         payload = dict(setup_result)
         profile_name = str(payload.pop("model_profile_name", "")).strip() or None
+        payload.pop("system_prompt", None)
+        self.cfg.pop("system_prompt", None)
         self.cfg.update(payload)
         sync_active_model_profile(self.cfg, preferred_name=profile_name)
         save_config(self.cfg)
@@ -933,6 +948,7 @@ class OpenJetApp:
         status.update("")
         status.add_class("hidden")
         self.loaded_files.clear()
+        self._start_new_chat_session()
         self.persist_session_state(reason="model_switch")
         self._render_token_counter()
         log.write("[bold bright_white]Model switched. Runtime restarted and context reset.[/]")
@@ -1010,6 +1026,7 @@ class OpenJetApp:
         status.update("")
         status.add_class("hidden")
         self.loaded_files.clear()
+        self._start_new_chat_session()
         self.persist_session_state(reason="setup_command")
         self._render_token_counter()
         log.write("[bold bright_white]Setup applied. Runtime restarted and context reset.[/]")
@@ -1021,6 +1038,77 @@ class OpenJetApp:
         if self._setup_task and not self._setup_task.done():
             return
         self._setup_task = asyncio.create_task(self.run_setup_command(log))
+
+    async def _maybe_prompt_for_startup_update(self, log: LogView) -> None:
+        if self.is_airgapped():
+            return
+        current_version = _open_jet_version()
+        if current_version == "unknown":
+            return
+        try:
+            release = await asyncio.to_thread(
+                available_release_update,
+                current_version=current_version,
+                timeout_seconds=self._STARTUP_UPDATE_CHECK_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            if self.session_logger:
+                self.session_logger.record_exception("update_check_failed", exc, component="update")
+            return
+        if release is None:
+            return
+
+        selected = await radiolist_dialog(
+            title="Update open-jet",
+            text=(
+                f"A newer release is available ({current_version} -> {release.version}). "
+                "Use arrow keys to choose what to do."
+            ),
+            values=[
+                ("install", f"Install {release.version} now and restart open-jet"),
+                ("skip", "Skip for now"),
+            ],
+        ).run_async()
+        if selected != "install":
+            if self.session_logger:
+                self.session_logger.log_event(
+                    "startup_update_skipped",
+                    current_version=current_version,
+                    latest_version=release.version,
+                )
+            return
+
+        status = self.query_one("#assistant-status")
+        log.write(f"  [bold bright_white]Installing open-jet {escape(release.version)}...[/]")
+        status.update(f"[bold {ACCENT_GREEN}]installing open-jet {escape(release.version)}...[/]")
+        status.remove_class("hidden")
+        try:
+            message = await asyncio.to_thread(install_release, release, current_version=current_version)
+        except Exception as exc:
+            status.update("")
+            status.add_class("hidden")
+            if self.session_logger:
+                self.session_logger.record_exception("startup_update_failed", exc, component="update")
+            log.write(f"[bold red]Update failed:[/] {_format_error(exc)}")
+            log.write("")
+            return
+
+        status.update("")
+        status.add_class("hidden")
+        log.write(f"  [bold bright_white]{escape(message)}[/]")
+        log.write("  [bold bright_white]Restart open-jet to use the new release.[/]")
+        log.write("")
+        if self.session_logger:
+            self.session_logger.log_event(
+                "startup_update_installed",
+                current_version=current_version,
+                latest_version=release.version,
+            )
+            try:
+                await self.session_logger.stop()
+            except Exception:
+                pass
+        self._quit_requested = True
 
     async def _startup_sequence(self) -> None:
         log = self.query_one("#chat-log")
@@ -1041,6 +1129,9 @@ class OpenJetApp:
             )
             await self.session_logger.start()
             self.session_logger.log_event("app_mount", cwd=str(Path.cwd()))
+        await self._maybe_prompt_for_startup_update(log)
+        if self._quit_requested:
+            return
         if self.force_setup or not self._has_any_configured_model():
             try:
                 setup_result = await self._run_setup_wizard()
@@ -1335,6 +1426,60 @@ class OpenJetApp:
         self._render_token_counter()
         return True
 
+    async def load_skill_into_context(self, skill_name: str, log: LogView) -> bool:
+        if not self.agent:
+            return False
+        normalized = normalize_skill_name(skill_name)
+        skill_path = resolve_skill_path(Path.cwd(), normalized)
+        if skill_path is None:
+            log.write(f"[yellow]skill:[/] unknown skill {escape(normalized)}")
+            return False
+        current_tokens = self.agent.estimated_context_tokens()
+        remaining_tokens = self._remaining_prompt_tokens(reserve_next_turn_overhead=True)
+        if remaining_tokens <= 0:
+            log.write("[yellow]skill:[/] no prompt budget remaining. Condense or clear context, then retry.")
+            return False
+        result = await load_file(str(skill_path), max_tokens=remaining_tokens)
+        if not result.ok:
+            log.write(f"[yellow]skill {escape(normalized)}:[/] {result.detail}")
+            return False
+        context_text = (
+            "User-loaded skill context:\n"
+            f"name: {normalized}\n"
+            f"path: {result.path}\n"
+            f"tokens_estimated: {result.estimated_tokens}\n"
+            f"tokens_loaded: {result.returned_tokens}\n"
+            f"token_budget: {result.token_budget}\n"
+            f"truncated: {'yes' if result.truncated else 'no'}\n"
+            "content:\n"
+            f"{result.content}"
+        )
+        self.agent.messages.append({"role": "system", "content": context_text})
+        self.loaded_files[f"skill:{normalized}"] = {
+            "path": result.path,
+            "estimated_tokens": result.estimated_tokens,
+            "loaded_tokens": result.returned_tokens,
+            "truncated": result.truncated,
+            "kind": "skill",
+            "name": normalized,
+        }
+        log.write(f"[bold bright_white]Loaded skill {escape(normalized)} into context ({result.summary}).[/]")
+        if self.session_logger:
+            self.session_logger.record_context_file_loaded(
+                mention_path=f"skill:{normalized}",
+                resolved_path=result.path,
+                context_tokens_before=current_tokens,
+                estimated_tokens=result.estimated_tokens,
+                returned_tokens=result.returned_tokens,
+                token_budget=result.token_budget,
+                remaining_prompt_tokens=remaining_tokens,
+                truncated=result.truncated,
+                mem_available_mb=result.mem_available_mb,
+            )
+        self.persist_session_state(reason="skill_context_loaded")
+        self._render_token_counter()
+        return True
+
     def _render_token_counter(self, draft_text: str = "") -> None:
         counter = self.query_one("#token-counter")
         if not self.agent:
@@ -1541,18 +1686,52 @@ class OpenJetApp:
     def refresh_token_counter(self) -> None:
         self._render_token_counter()
 
-    def _restore_session_state(self, log: LogView) -> bool:
-        if not self.agent:
-            return False
-        state = self.state_store.load()
-        if not state:
-            return False
-        airgapped = state.get("airgapped")
-        if isinstance(airgapped, bool):
-            self.set_airgapped(airgapped, persist=False)
+    def _start_new_chat_session(self) -> None:
+        self._chat_session_id = self.chat_archive.new_chat_id()
+
+    def _build_session_payload(self, *, reason: str) -> dict[str, Any]:
+        return {
+            "version": 2,
+            "saved_at": time.time(),
+            "reason": reason,
+            "chat_id": self._chat_session_id,
+            "session_id": self.session_logger.session_id if self.session_logger else None,
+            "airgapped": self.is_airgapped(),
+            "runtime": str(self.cfg.get("runtime", "llama_cpp")),
+            "model": self.cfg.get("model"),
+            "model_ref": self._active_model_ref(),
+            "device": self.cfg.get("device", "auto"),
+            "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
+            "messages": self.agent.messages if self.agent else [],
+            "loaded_files": self.loaded_files,
+            "harness_state": self.harness_state.to_dict(),
+            "token_usage": {
+                "prompt_tokens": self._session_prompt_tokens,
+                "completion_tokens": self._session_completion_tokens,
+                "runtime_requests": self._session_runtime_requests,
+            },
+        }
+
+    def list_resume_candidates(self) -> list[SavedChatEntry]:
+        entries = self.chat_archive.list_chats()
+        legacy = self.state_store.load()
+        if legacy:
+            legacy_entry = build_saved_chat_entry(
+                chat_id=str(legacy.get("chat_id") or "legacy"),
+                payload=legacy,
+                state_path=self.state_store.path,
+                uses_resume_checkpoint=False,
+                kv_cache_available=False,
+            )
+            if legacy_entry is not None and not any(entry.chat_id == legacy_entry.chat_id for entry in entries):
+                entries.append(legacy_entry)
+        entries.sort(key=lambda entry: (entry.saved_at, str(entry.state_path)), reverse=True)
+        return entries
+
+    def _validated_session_messages(self, state: dict[str, Any]) -> list[dict] | None:
         messages = state.get("messages")
         if not isinstance(messages, list) or not messages:
-            return False
+            return None
         valid_messages: list[dict] = []
         for msg in messages:
             if not isinstance(msg, dict):
@@ -1564,30 +1743,140 @@ class OpenJetApp:
                 continue
             valid_messages.append(msg)
         if not valid_messages:
-            return False
-        first = valid_messages[0]
-        if first.get("role") != "system":
+            return None
+        if valid_messages[0].get("role") != "system":
             valid_messages = [{"role": "system", "content": self.agent.system_prompt}, *valid_messages]
+        return valid_messages
+
+    def _apply_session_payload(
+        self,
+        state: dict[str, Any],
+        log: LogView,
+        *,
+        summary_label: str,
+        runtime_note: str | None = None,
+        chat_id_override: str | None = None,
+    ) -> bool:
+        if not self.agent:
+            return False
+        valid_messages = self._validated_session_messages(state)
+        if not valid_messages:
+            return False
+        airgapped = state.get("airgapped")
+        if isinstance(airgapped, bool):
+            self.set_airgapped(airgapped, persist=False)
+        self.agent.clear_turn_context()
         self.agent.messages = valid_messages
         self._replay_restored_history(log, self.agent.messages)
         self._seed_prompt_history_from_messages(self.agent.messages)
         loaded_files = state.get("loaded_files")
         self.loaded_files = loaded_files if isinstance(loaded_files, dict) else {}
-        harness_payload = state.get("harness_state")
-        if isinstance(harness_payload, dict):
-            self.harness_state = HarnessState.from_dict(harness_payload)
+        self._pending_image_paths.clear()
+        self._turn_context_docs = []
+        self._turn_context_tokens = 0
+        self._last_turn_context_snapshot = None
+        self.harness_state = HarnessState.from_dict(
+            state.get("harness_state") if isinstance(state.get("harness_state"), dict) else None
+        )
         token_usage = state.get("token_usage")
         if isinstance(token_usage, dict):
             self._session_prompt_tokens = self._coerce_token_count(token_usage.get("prompt_tokens"))
             self._session_completion_tokens = self._coerce_token_count(token_usage.get("completion_tokens"))
             self._session_runtime_requests = self._coerce_token_count(token_usage.get("runtime_requests"))
+        else:
+            self._session_prompt_tokens = 0
+            self._session_completion_tokens = 0
+            self._session_runtime_requests = 0
+        restored_chat_id = chat_id_override or str(state.get("chat_id") or "").strip()
+        if restored_chat_id:
+            self._chat_session_id = restored_chat_id
         log.write(
             "  [bold bright_white]"
-            f"Resumed previous session: {max(0, len(self.agent.messages) - 1)} messages, "
+            f"{summary_label}: {max(0, len(self.agent.messages) - 1)} messages, "
             f"{len(self.loaded_files)} loaded files.[/]"
         )
+        if runtime_note:
+            log.write(f"  [bold bright_white]{runtime_note}[/]")
         self._session_was_resumed = True
         return True
+
+    def _restore_session_state(self, log: LogView) -> bool:
+        if not self.agent:
+            return False
+        state = self.state_store.load()
+        if not state:
+            return False
+        return self._apply_session_payload(
+            state,
+            log,
+            summary_label="Resumed previous session",
+        )
+
+    async def _restore_runtime_for_saved_chat(
+        self,
+        state: dict[str, Any],
+        *,
+        chat_id: str,
+        kv_cache_available: bool,
+    ) -> str:
+        if not self.client:
+            return "Saved chat loaded into the transcript only."
+        saved_runtime = str(state.get("runtime") or "").strip()
+        current_runtime = str(self.cfg.get("runtime", "llama_cpp") or "").strip()
+        saved_model = str(state.get("model_ref") or state.get("model") or "").strip()
+        current_model = self._active_model_ref()
+        runtime_matches = not saved_runtime or saved_runtime == current_runtime
+        model_matches = not saved_model or saved_model == current_model
+
+        if kv_cache_available and runtime_matches and model_matches:
+            try:
+                restored = await self.client.restore_kv_cache(self.chat_archive.kv_cache_path(chat_id))
+            except Exception:
+                restored = False
+            if restored:
+                return "KV cache restored from the saved chat."
+
+        try:
+            await self.client.reset_kv_cache()
+        except Exception:
+            if kv_cache_available and runtime_matches and model_matches:
+                return "Saved chat loaded, but KV cache restore failed and the runtime could not be reset."
+            if not runtime_matches or not model_matches:
+                return "Saved chat loaded, but the active runtime/model differs and the runtime reset failed."
+            return "Saved chat loaded, but the runtime reset failed; future turns may need /clear."
+
+        if kv_cache_available and runtime_matches and model_matches:
+            return "Saved chat loaded; KV cache restore failed, so the runtime was reset and will re-prompt next turn."
+        if not runtime_matches or not model_matches:
+            return "Saved chat loaded; the active runtime/model differs, so the runtime was reset and will re-prompt next turn."
+        return "Saved chat loaded into the transcript. The runtime was reset and will re-prompt next turn."
+
+    async def restore_saved_chat(self, selected_path: str | Path, log: LogView) -> bool:
+        if not self.agent:
+            return False
+        state_path = Path(selected_path)
+        state = SessionStateStore(path=state_path, enabled=True).load()
+        if not state:
+            return False
+        default_chat_id = self._chat_session_id if state_path == self.state_store.path else state_path.parent.name
+        chat_id = str(state.get("chat_id") or default_chat_id or self._chat_session_id).strip()
+        uses_resume_checkpoint = state_path.name == "resume_state.json"
+        kv_cache_available = uses_resume_checkpoint and self.chat_archive.kv_cache_path(chat_id).exists()
+        runtime_note = await self._restore_runtime_for_saved_chat(
+            state,
+            chat_id=chat_id,
+            kv_cache_available=kv_cache_available,
+        )
+        restored = self._apply_session_payload(
+            state,
+            log,
+            summary_label="Loaded saved chat",
+            runtime_note=runtime_note,
+            chat_id_override=chat_id,
+        )
+        if restored:
+            self.persist_session_state(reason="resume_command")
+        return restored
 
     def _restore_harness_state(self) -> None:
         try:
@@ -1669,30 +1958,36 @@ class OpenJetApp:
         self._render_token_counter()
 
     def persist_session_state(self, *, reason: str) -> None:
-        if not self.agent:
+        if not self.agent or not self.state_store.enabled:
             return
-        payload = {
-            "version": 1,
-            "saved_at": time.time(),
-            "reason": reason,
-            "session_id": self.session_logger.session_id if self.session_logger else None,
-            "airgapped": self.is_airgapped(),
-            "model": self.cfg.get("model"),
-            "device": self.cfg.get("device", "auto"),
-            "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
-            "messages": self.agent.messages,
-            "loaded_files": self.loaded_files,
-            "harness_state": self.harness_state.to_dict(),
-            "token_usage": {
-                "prompt_tokens": self._session_prompt_tokens,
-                "completion_tokens": self._session_completion_tokens,
-                "runtime_requests": self._session_runtime_requests,
-            },
-        }
+        payload = self._build_session_payload(reason=reason)
         try:
             self.state_store.save(payload)
         except Exception:
+            pass
+        try:
+            self.chat_archive.save_live_state(self._chat_session_id, payload)
+        except Exception:
             return
+
+    async def persist_resumable_session_state(self, *, reason: str) -> bool:
+        if not self.agent or not self.state_store.enabled:
+            return False
+        payload = self._build_session_payload(reason=reason)
+        try:
+            self.chat_archive.save_resume_state(self._chat_session_id, payload)
+        except Exception:
+            return False
+        if not self.client:
+            self.chat_archive.delete_kv_cache(self._chat_session_id)
+            return False
+        try:
+            saved = await self.client.save_kv_cache(self.chat_archive.kv_cache_path(self._chat_session_id))
+        except Exception:
+            saved = False
+        if not saved:
+            self.chat_archive.delete_kv_cache(self._chat_session_id)
+        return saved
 
     def persist_harness_state(self) -> None:
         self.harness_state.updated_at = time.time()
@@ -1962,6 +2257,7 @@ class OpenJetApp:
         self.harness_state = update_state_after_turn(self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
         self.persist_harness_state()
         self.persist_session_state(reason="assistant_turn_done")
+        await self.persist_resumable_session_state(reason="assistant_turn_done")
         self._finish_turn_trace(success=True, status="completed")
         self._render_token_counter()
 
