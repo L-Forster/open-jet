@@ -1,8 +1,8 @@
-airgapped: true
-context_window_tokens: 6144
-device: cuda
+active_model_profile: '99'
+airgapped: false
+context_window_tokens: 16384
+device: vulkan
 gpu_layers: 99
-hardware_override: ''
 hardware_profile: auto
 layered_context:
   alert_ratio: 0.4
@@ -13,28 +13,70 @@ layered_context:
   layer2_ratio: 0.2
   layer3_enabled: true
   layer3_ratio: 0.1
-llama_model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
+llama_model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+llama_server_path: /home/louis/llama.cpp/build/bin/llama-server
 logging:
-  directory: session_logs
-  enabled: true
-  label: open-jet
-  max_sessions: 100
-  metrics_interval_seconds: 5
-  retention_days: 30
+  directory: .openjet/state/sessions
+  enabled: false
 memory_guard:
   check_interval_chunks: 16
   condense_target_tokens: 900
   keep_last_messages: 6
   max_used_percent: null
   min_available_mb: null
-model: /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
+model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+model_download_path: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+model_download_url: https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF/resolve/main/Qwen_Qwen3.5-9B-Q4_K_M.gguf?download=true
+model_profiles:
+- context_window_tokens: 16384
+  device: vulkan
+  gpu_layers: 99
+  hardware_profile: auto
+  llama_model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model_source: local
+  name: '99'
+  recommended_llm: Qwen3.5 9B
+  runtime: llama_cpp
+  setup_complete: true
+- context_window_tokens: 8192
+  device: vulkan
+  gpu_layers: 70
+  hardware_profile: auto
+  llama_model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model_source: local
+  name: Qwen_Qwen3.5-9B-Q4_K_M
+  recommended_llm: Qwen3.5 9B
+  runtime: llama_cpp
+  setup_complete: true
+- context_window_tokens: 8192
+  device: vulkan
+  gpu_layers: 70
+  hardware_profile: auto
+  llama_model: /models/alt.gguf
+  model: /models/resolved.gguf
+  model_source: local
+  name: Alt
+  recommended_llm: Qwen3.5 9B
+  runtime: llama_cpp
+  setup_complete: true
+- context_window_tokens: 4096
+  gpu_layers: 99
+  llama_model: /models/base.gguf
+  model: /models/base.gguf
+  model_source: local
+  name: Base
+  runtime: llama_cpp
 model_source: local
-ollama_model: null
-recommended_llm: null
+recommended_llm: Qwen3.5 9B
 runtime: llama_cpp
 setup_complete: true
+setup_missing_model: false
+setup_missing_runtime: false
 setup_model_history:
   llama_cpp:
+  - /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
   - /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
   - /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
 sglang_launch_mode: jetson_container
@@ -43,10 +85,11 @@ sglang_served_model_name: local
 state:
   auto_resume: false
   enabled: true
-  path: session_state.json
-system_prompt: 'AI assistant on a Jetson edge device with filesystem access.
+  path: .openjet/state/session_state.json
+system_prompt: 'AI assistant with filesystem access.
 
-  Tools: shell, read_file, write_file, edit_file, glob, grep, list_directory, load_file.
+  Tools: shell, system_info, read_file, write_file, edit_file, glob, grep, list_directory,
+  load_file.
 
   Prefer dedicated tools over shell (e.g. grep not shell grep, glob not shell find,
   edit_file not write_file for edits). Use shell only for git, builds, installs.
@@ -57,6 +100,17 @@ system_prompt: 'AI assistant on a Jetson edge device with filesystem access.
 
   Before making one or more tool calls, first write one brief sentence explaining
   what you are about to do and why, then make the tool calls.
+
+  If you do not yet have enough context about the current directory, gather it first
+  with narrow inspection such as reading a README or listing the relevant top-level
+  files.
+
+  If a task may be resource-heavy, inspect system_info first before proposing a heavy
+  local command.
+
+  Default to trying shell commands normally first. If a heavy command fails for RAM
+  or VRAM pressure, you may retry explicitly with shell resource_mode set to unload_first
+  and an optional short reload_delay_seconds.
 
   Act directly with tools. Be concise. Never chain destructive commands.
 

@@ -11,6 +11,7 @@ from .device_sources import assign_device_alias, list_device_sources, set_device
 from .model_profiles import list_model_profiles, sync_active_model_profile
 from .peripherals.system import device_discovery_hint
 from .runtime_registry import active_model_ref, runtime_spec
+from .self_update import update_from_latest_release
 from .surfaces import launch_tui
 from .surfaces.command_specs import COMMANDS
 
@@ -146,6 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("commands", help="list available slash commands")
     subparsers.add_parser("status", help="show runtime and configuration status")
     subparsers.add_parser("version", help="show version information")
+    subparsers.add_parser("update", help="install the latest GitHub release into the current environment")
     context_parser = subparsers.add_parser("context", help="set the configured context window token count")
     context_parser.add_argument("tokens", type=int, help="new context window token count")
     device_parser = subparsers.add_parser("device", aliases=("devices",), help="list and configure persistent device ids")
@@ -200,6 +202,12 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("Usage: open-jet device [list|add <existing_id> <new_id>|on <id>|off <id>]")
     if args.command == "version":
         print(f"open-jet {_open_jet_version()}")
+        return
+    if args.command == "update":
+        try:
+            print(update_from_latest_release(current_version=_open_jet_version()))
+        except RuntimeError as exc:
+            raise SystemExit(str(exc))
         return
 
     force_setup = bool(args.setup or args.command == "setup")

@@ -27,6 +27,7 @@ open-jet status
 open-jet models
 open-jet commands
 open-jet version
+open-jet update
 ```
 
 Persistent device setup:
