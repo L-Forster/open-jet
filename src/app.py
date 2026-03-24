@@ -7,8 +7,6 @@ import html
 import importlib.metadata
 import os
 import re
-import shlex
-import shutil
 import signal
 import time
 from dataclasses import dataclass
@@ -31,11 +29,37 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from .airgap import airgapped_from_cfg, set_airgapped
+from .app_rendering import (
+    approval_summary_text,
+    format_assistant_output_line,
+    format_command_status_label,
+    format_tool_output_line,
+    lexer_for_path as _lexer_for_path,
+    render_markdown_inline_segments,
+    tool_preview_lines,
+    tool_result_lexer as _tool_result_lexer,
+    tool_result_syntax,
+)
+from .app_telemetry import (
+    _classify_shell_command,
+    _shell_command_category,
+    _telemetry_backend,
+    _telemetry_hardware_fields,
+    _telemetry_model_fields,
+)
 from .agent import ActionKind, Agent, ToolCall
 from .commands import SlashCommandHandler
 from .completion import CompletionEngine, DeviceMentionCompletionProvider, FileMentionCompletionProvider, SlashCompletionProvider
 from .config import load_config, save_config
-from .device_sources import DeviceSource, assign_device_alias, list_device_sources, resolve_device_source, set_device_enabled, sync_devices_registry
+from .device_sources import (
+    DeviceSource,
+    assign_device_alias,
+    format_device_registry_prompt,
+    list_device_sources,
+    resolve_device_source,
+    set_device_enabled,
+    sync_devices_registry,
+)
 from .executor import load_file
 from .harness import (
     HarnessSessionStore,
@@ -107,143 +131,6 @@ def _open_jet_version() -> str:
 
 def _plain_markup(text: str) -> str:
     return re.sub(r"\[[^\]]*\]", "", text)
-
-
-def _normalize_telemetry_slug(value: str | None, *, default: str = "unknown") -> str:
-    text = (value or "").strip().lower()
-    if not text:
-        return default
-    cleaned = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
-    return cleaned or default
-
-
-def _telemetry_backend(cfg: dict[str, Any]) -> str:
-    model_source = str(cfg.get("model_source", "") or "").strip().lower()
-    runtime = str(cfg.get("runtime", "llama_cpp") or "").strip().lower()
-    if model_source:
-        return _normalize_telemetry_slug(model_source)
-    if runtime == "openai_compatible":
-        return "openai_compatible"
-    if runtime == "openrouter":
-        return "openrouter"
-    return _normalize_telemetry_slug(runtime)
-
-
-def _telemetry_model_fields(model_ref: str) -> tuple[str, str]:
-    model_name = Path(model_ref).name or model_ref or "unknown"
-    base = re.sub(r"\.(gguf|bin|safetensors)$", "", model_name, flags=re.IGNORECASE)
-    parts = [part for part in re.split(r"[-_]+", base) if part]
-    variant_tokens: list[str] = []
-    id_tokens: list[str] = []
-    variant_started = False
-    for part in parts:
-        lower = part.lower()
-        if variant_started or re.fullmatch(r"(q\d.*|awq|gptq|fp\d+|bf16|int\d+)", lower):
-            variant_started = True
-            variant_tokens.append(lower)
-        else:
-            id_tokens.append(lower)
-    model_id = _normalize_telemetry_slug("-".join(id_tokens) or base)
-    model_variant = _normalize_telemetry_slug("-".join(variant_tokens), default="unknown")
-    return model_id, model_variant
-
-
-def _telemetry_hardware_fields(cfg: dict[str, Any]) -> dict[str, object]:
-    detected = detect_hardware_info()
-    hardware = effective_hardware_info(
-        str(cfg.get("hardware_profile", "auto")),
-        detected,
-        str(cfg.get("hardware_override", "")).strip() or None,
-    )
-    label = hardware.label.strip() or "unknown"
-    lowered = label.lower()
-    if "jetson" in lowered:
-        family = "jetson"
-    elif hardware.has_cuda:
-        family = "cuda"
-    else:
-        family = "cpu"
-    return {
-        "hardware_class": _normalize_telemetry_slug(label),
-        "hardware_family": family,
-        "accelerator": "cuda" if hardware.has_cuda else "cpu",
-        "system_memory_total_mb": round(hardware.total_ram_gb * 1024.0, 2),
-    }
-
-
-_SHELL_BUILTINS = {
-    ".", ":", "alias", "bg", "bind", "break", "builtin", "caller", "cd", "command",
-    "compgen", "complete", "compopt", "continue", "declare", "dirs", "disown", "echo",
-    "enable", "eval", "exec", "exit", "export", "fc", "fg", "getopts", "hash", "help",
-    "history", "jobs", "kill", "let", "local", "logout", "mapfile", "popd", "printf",
-    "pushd", "pwd", "read", "readarray", "readonly", "return", "set", "shift", "shopt",
-    "source", "suspend", "test", "times", "trap", "type", "typeset", "ulimit", "umask",
-    "unalias", "unset", "wait",
-}
-
-def _classify_shell_command(command: str) -> dict[str, object]:
-    stripped = command.strip()
-    if not stripped:
-        return {
-            "primary_command": "",
-            "classified_verification": False,
-            "hallucinated_command": False,
-            "false_positive_proposal": True,
-            "classification_reason": "empty command",
-        }
-
-    try:
-        parts = shlex.split(stripped)
-    except ValueError:
-        parts = stripped.split()
-    primary = parts[0] if parts else ""
-    verification = shell_command_is_verification(stripped)
-    builtin = primary in _SHELL_BUILTINS
-    executable_found = builtin or bool(shutil.which(primary)) or "/" in primary
-    false_positive = False
-    reasons: list[str] = []
-
-    if primary in {"cat", "ls", "find", "grep"}:
-        false_positive = True
-        reasons.append("covered by dedicated tool")
-    if primary == "echo" and not verification:
-        false_positive = True
-        reasons.append("non-actionable shell proposal")
-    if not executable_found:
-        reasons.append("command not found on PATH")
-
-    return {
-        "primary_command": primary,
-        "classified_verification": verification,
-        "hallucinated_command": not executable_found,
-        "false_positive_proposal": false_positive,
-        "classification_reason": ", ".join(reasons) if reasons else None,
-    }
-
-
-def _shell_command_category(primary_command: str) -> str:
-    primary = primary_command.strip().lower()
-    if not primary:
-        return "empty"
-    if primary in _SHELL_BUILTINS:
-        return "builtin"
-    if primary in {"git", "gh"}:
-        return "git"
-    if primary in {"pytest", "unittest", "nose"}:
-        return "test"
-    if primary in {"python", "python3", "uv", "pip", "pip3"}:
-        return "python"
-    if primary in {"cargo", "rustc"}:
-        return "rust"
-    if primary in {"npm", "pnpm", "yarn", "node"}:
-        return "node"
-    if primary in {"make", "cmake", "ninja"}:
-        return "build"
-    if primary in {"bash", "sh", "zsh"}:
-        return "shell"
-    if primary in {"ls", "cat", "find", "grep", "rg"}:
-        return "filesystem"
-    return "other"
 
 
 BANNER = """[#14532d] ██████╗ ██████╗ ███████╗███╗   ██╗      ██╗███████╗████████╗[/]
@@ -1348,11 +1235,10 @@ class OpenJetApp:
         )
         log.write("")
         cleaned_prompt = _strip_consumed_mentions(prompt_text, source_refs).strip()
-        registry_context = (
-            f"IO device registry located in {registry_path}.\n"
-            "Open if wanting to interact with devices.\n"
-            "Referenced device ids for this turn: "
-            f"{refs_text}."
+        registry_context = format_device_registry_prompt(
+            registry_path,
+            referenced_ids=[source.primary_ref for source in resolved],
+            include_tool_names=False,
         )
         if cleaned_prompt:
             return f"{registry_context}\n\nUser request:\n{cleaned_prompt}"
@@ -2627,112 +2513,26 @@ class OpenJetApp:
             self._session.app.invalidate()
 
     def _format_assistant_output_line(self, line: str, *, in_code_block: bool) -> tuple[object, bool]:
-        stripped = line.strip()
-        if stripped.startswith("```"):
-            return rich_text(stripped or "```", "tool"), not in_code_block
-        if in_code_block:
-            return rich_text(line, "code"), in_code_block
-        if re.fullmatch(r"\s{0,3}#{1,6}\s+.+", line):
-            return Text(re.sub(r"^\s{0,3}#{1,6}\s+", "", line), style="bold"), in_code_block
-        return self._render_markdown_inline_segments(line), in_code_block
+        return format_assistant_output_line(line, in_code_block=in_code_block)
 
     def _format_tool_output_line(self, line: str) -> str:
-        stripped = line.strip()
-        if not stripped:
-            return ""
-        first = stripped.split(" ", 1)[0]
-        if stripped.startswith("$") or stripped.startswith("/") or first in {
-            "git",
-            "python",
-            "python3",
-            "pytest",
-            "bash",
-            "sh",
-            "npm",
-            "pnpm",
-            "cargo",
-            "make",
-            "rg",
-        }:
-            return rich_text(line, "command")
-        return rich_text(line, "tool_output")
+        return format_tool_output_line(line)
 
     def _render_markdown_inline_segments(self, line: str) -> Text:
-        if "`" not in line and "**" not in line and "__" not in line:
-            return Text(line)
-        text = Text()
-        parts = re.split(r"(`[^`]+`)", line)
-        for part in parts:
-            if not part:
-                continue
-            if len(part) >= 2 and part.startswith("`") and part.endswith("`"):
-                text.append(part[1:-1], style="code")
-            else:
-                self._append_markdown_emphasis(text, part)
-        return text
-
-    def _append_markdown_emphasis(self, text: Text, segment: str) -> None:
-        cursor = 0
-        for match in re.finditer(r"(\*\*.+?\*\*|__.+?__)", segment):
-            start, end = match.span()
-            if start > cursor:
-                text.append(segment[cursor:start])
-            inner = match.group(0)[2:-2]
-            if inner:
-                text.append(inner, style="bold")
-            cursor = end
-        if cursor < len(segment):
-            text.append(segment[cursor:])
+        return render_markdown_inline_segments(line)
 
     def _tool_result_syntax(self, lines: list[str], *, tool_call: ToolCall | None = None) -> Syntax | None:
-        if not lines:
-            return None
-        lexer = self._tool_result_lexer(lines, tool_call=tool_call)
-        if not lexer:
-            return None
-        code = "\n".join(lines)
-        return Syntax(code, lexer, theme="monokai", word_wrap=True, line_numbers=False, background_color="default")
+        return tool_result_syntax(lines, tool_call=tool_call)
 
     def _tool_result_lexer(self, lines: list[str], *, tool_call: ToolCall | None = None) -> str | None:
-        if tool_call is not None:
-            if tool_call.name in {"list_directory", "grep", "glob"}:
-                return "text"
-            if tool_call.name in {"read_file", "load_file"}:
-                path = str(tool_call.arguments.get("path", "")).strip() if isinstance(tool_call.arguments, dict) else ""
-                return self._lexer_for_path(path) or "text"
-        sample = "\n".join(lines)
-        if re.search(r"^[\w./-]+:\d+:", sample, flags=re.MULTILINE):
-            return "text"
-        if re.search(r"^\s*(def |class |from |import )", sample, flags=re.MULTILINE):
-            return "python"
-        if re.search(r"^\s*[{\[]", sample):
-            return "json"
-        return None
+        return _tool_result_lexer(lines, tool_call=tool_call)
 
     def _lexer_for_path(self, path: str) -> str | None:
-        suffix = Path(path).suffix.lower()
-        if suffix == ".py":
-            return "python"
-        if suffix == ".json":
-            return "json"
-        if suffix in {".md", ".markdown"}:
-            return "markdown"
-        if suffix in {".yml", ".yaml"}:
-            return "yaml"
-        if suffix in {".toml"}:
-            return "toml"
-        if suffix in {".sh", ".bash"}:
-            return "bash"
-        if suffix:
-            return "text"
-        return None
+        return _lexer_for_path(path)
 
     @staticmethod
     def _format_command_status_label(command: str, max_len: int = 72) -> str:
-        compact = " ".join(command.split())
-        if len(compact) <= max_len:
-            return compact
-        return compact[: max_len - 3] + "..."
+        return format_command_status_label(command, max_len)
 
     async def _wait_for_tool_approval(self, tc: ToolCall) -> bool:
         bar = self.query_one("#approval-bar")
@@ -2796,62 +2596,14 @@ class OpenJetApp:
         log.replace(index, selection_line)
 
     def _approval_summary_text(self, tc: ToolCall) -> str:
-        if tc.name == "write_file":
-            path = str(tc.arguments.get("path", "")).strip()
-            content = str(tc.arguments.get("content", ""))
-            return f"write_file -> {path} ({len(content)} bytes)"
-        if tc.name == "edit_file":
-            return f"edit_file -> {str(tc.arguments.get('path', '')).strip()}"
-        if tc.name == "memory":
-            return f"memory -> {str(tc.arguments.get('action', '')).strip()} {str(tc.arguments.get('scope', '')).strip()}".strip()
-        if tc.name == "shell":
-            command = str(tc.arguments.get("command", "")).strip()
-            resource_mode = str(tc.arguments.get("resource_mode", "normal") or "normal").strip()
-            reload_delay = tc.arguments.get("reload_delay_seconds")
-            if len(command) > 120:
-                command = command[:117] + "..."
-            suffix = f" [{resource_mode}]"
-            if isinstance(reload_delay, int) and reload_delay > 0:
-                suffix += f" delay={reload_delay}s"
-            return f"shell{suffix} -> {command}"
-        if tc.name == "system_info":
-            scope = str(tc.arguments.get("scope", "summary") or "summary").strip()
-            return f"system_info -> {scope}"
-        return f"{tc.name} -> {format_tool_args(tc)}"
+        return approval_summary_text(tc)
 
     def _resolve_approval(self, approved: bool) -> None:
         if self._approval_future and not self._approval_future.done():
             self._approval_future.set_result(approved)
 
     def _tool_preview_lines(self, tc: ToolCall) -> list[str]:
-        if tc.name == "shell":
-            command = str(tc.arguments.get("command", "")).strip()
-            timeout_seconds = tc.arguments.get("timeout_seconds")
-            resource_mode = str(tc.arguments.get("resource_mode", "normal") or "normal").strip()
-            estimated_ram_mb = tc.arguments.get("estimated_ram_mb")
-            estimated_vram_mb = tc.arguments.get("estimated_vram_mb")
-            reload_delay_seconds = tc.arguments.get("reload_delay_seconds")
-            lines = [f"command: {command[:200] + ('...' if len(command) > 200 else '')}"]
-            if isinstance(timeout_seconds, int):
-                lines.append(f"timeout_seconds: {timeout_seconds}")
-            lines.append(f"resource_mode: {resource_mode}")
-            if isinstance(estimated_ram_mb, int):
-                lines.append(f"estimated_ram_mb: {estimated_ram_mb}")
-            if isinstance(estimated_vram_mb, int):
-                lines.append(f"estimated_vram_mb: {estimated_vram_mb}")
-            if isinstance(reload_delay_seconds, int) and reload_delay_seconds > 0:
-                lines.append(f"reload_delay_seconds: {reload_delay_seconds}")
-            return lines
-        if tc.name == "system_info":
-            return [f"scope: {str(tc.arguments.get('scope', 'summary') or 'summary').strip()}"]
-        if tc.name == "write_file":
-            path = str(tc.arguments.get("path", "")).strip()
-            return [f"path: {path}", f"bytes: {len(str(tc.arguments.get('content', '')))}"]
-        if tc.name == "edit_file":
-            return [f"path: {str(tc.arguments.get('path', '')).strip()}"]
-        if tc.name == "memory":
-            return [f"scope: {str(tc.arguments.get('scope', '')).strip()}", f"action: {str(tc.arguments.get('action', '')).strip()}"]
-        return [str(format_tool_args(tc))]
+        return tool_preview_lines(tc)
 
     def _write_condense_trace(self, log: LogView, reason: str | None) -> None:
         if not self.agent:
@@ -3000,10 +2752,6 @@ def _extract_at_mentions(text: str) -> list[str]:
     return cleaned
 
 
-def _extract_file_mentions(text: str) -> list[str]:
-    return _extract_at_mentions(text)
-
-
 def _strip_consumed_mentions(text: str, consumed: list[str]) -> str:
     if not consumed:
         return text
@@ -3022,28 +2770,6 @@ def _strip_consumed_mentions(text: str, consumed: list[str]) -> str:
         last_index = match.end()
     parts.append(text[last_index:])
     return re.sub(r"\s{2,}", " ", "".join(parts)).strip()
-
-
-def _flatten_user_content(content: Any) -> tuple[str, list[str]]:
-    if isinstance(content, str):
-        return content, []
-    if not isinstance(content, list):
-        return str(content), []
-    text_parts: list[str] = []
-    image_paths: list[str] = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        block_type = str(block.get("type", "")).strip().lower()
-        if block_type == "text":
-            value = str(block.get("text", "")).strip()
-            if value:
-                text_parts.append(value)
-        elif block_type == "input_image":
-            path = str(block.get("path", "")).strip()
-            if path and path not in image_paths:
-                image_paths.append(path)
-    return "\n\n".join(text_parts).strip(), image_paths
 
 
 def main(argv: list[str] | None = None) -> None:

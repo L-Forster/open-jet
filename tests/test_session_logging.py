@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.app import _classify_shell_command
+from src.app_telemetry import _classify_shell_command
 from src.session_logging import BroadcastConfig, SessionLogger
 
 
