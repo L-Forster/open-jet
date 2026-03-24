@@ -2,37 +2,30 @@
 <img height="225" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
 
 
-`open-jet` is a self-hosted agent runtime for local models that need to do more than chat.
+**Local LLMs usually stop at chat. OpenJet gives them real system and sensor I/O.**
 
-Most local LLM tools stop at prompts and text. OpenJet lets a local model interact with the machine and devices around it: shell workflows, files, cameras, microphones, GPIO, and simple sensor inputs.
+`open-jet` is a local agent runtime for models that need to interact with the machine and devices around them: shell workflows, files, cameras, microphones, GPIO, and simple sensor inputs.
 
 It is built for the environments where local agents usually become brittle: tight memory, short context windows, interrupted sessions, and hardware-specific runtime issues.
 
-Use OpenJet when you want a local model that can stay useful while interfacing with real systems and device I/O on hardware you control.
+Use OpenJet when you want local models to stay useful while interfacing with real systems and device I/O on hardware you control.
 
 ## Why use OpenJet
 
-- connect local models to local devices and system workflows, not just chat
+- connect local models to shell workflows, files, devices, and sensors
 - keep working without losing the thread when sessions get interrupted
-- manage memory and context pressure on constrained machines
+- unload and reload models around heavy work when memory is tight
+- manage context pressure on constrained machines
 - use tools with explicit approvals and predictable behavior
 - run the same backend from the TUI or Python SDK
 - avoid building your own glue layer around local inference
 
-## Contact
-
-X: https://x.com/FlouisLF
-
 ## Who It's For
 
-- local-LLM users who need shell and device interaction, not just a chat UI
+- local-LLM users who need system and device interaction, not just a chat UI
 - builders working with cameras, microphones, GPIO, or simple sensor inputs
 - constrained or edge-style setups where restart recovery and memory pressure matter
-## Who It's Not For
 
-- people who only want a polished hosted assistant or browser chat
-- teams looking for a generic SaaS copilot with no local/device needs
-- users who do not care about running on their own hardware
 
 ## Quickstart
 
@@ -44,7 +37,7 @@ cd open-jet
 ./install.sh
 ```
 
-OpenJet is positioned for local and self-hosted use first. Hosted APIs are supported, but they are the fallback path, not the main story.
+OpenJet is built for local runtimes first. Hosted APIs are supported as a fallback path, not the main story.
 
 ### Recommended start: local `llama.cpp`
 
@@ -182,7 +175,7 @@ open-jet
 
 ## What it provides
 
-- bounded-context local chat with your on-device model
+- bounded-context local runtime for your on-device model
 - self-hosted and hosted OpenAI-compatible API support through the same session layer
 - automatic context condensing under pressure
 - low-memory shell execution that can unload and reload `llama.cpp` models around heavy commands
@@ -226,6 +219,10 @@ OpenJet is built around:
 - [Deployment: CPU-only](docs/deployment/cpu-only.md)
 - [Configuration](docs/configuration.md)
 - [Licensing](docs/licensing.md)
+
+## Contact
+
+X: https://x.com/FlouisLF
 
 ## License
 

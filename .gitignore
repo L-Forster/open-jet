@@ -21,6 +21,7 @@ claude.md
 config.yaml
 
 # Local tooling/cache artifacts
+.agents/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
