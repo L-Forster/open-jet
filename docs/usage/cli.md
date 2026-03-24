@@ -41,6 +41,21 @@ open-jet device off <id>
 
 Run `open-jet device list` first. Use the current id shown on the left as `<existing_id>` if you want to rename a device for chat.
 
+Backend workflow commands:
+
+```bash
+open-jet workflow list
+open-jet workflow show <name>
+open-jet workflow run <name>
+open-jet workflow start <name>
+open-jet workflow stop <name>
+open-jet workflow status [name]
+open-jet workflow logs <name>
+open-jet workflow assign <name> <device_id>...
+```
+
+Workflow files are Markdown files under `workflows/` or `.openjet/workflows/`. See [backend-workflows.md](backend-workflows.md).
+
 ## Basic interaction
 
 - Type normally and press Enter to chat

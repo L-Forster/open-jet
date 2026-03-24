@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .observation import ObservationStore, process_audio_observation, save_frame_observation
 from .peripherals import PeripheralDevice, PeripheralKind, PeripheralTransport, capture_snapshot, discover_peripherals, record_clip
@@ -12,6 +12,14 @@ from .peripherals.system import resolve_binary, run_command
 from .peripherals.types import Observation, ObservationModality
 
 DEFAULT_DEVICES_REGISTRY_PATH = Path(".openjet/state/devices.md")
+DEVICE_TOOL_NAMES = (
+    "device_list",
+    "camera_snapshot",
+    "microphone_record",
+    "microphone_set_enabled",
+    "gpio_read",
+    "sensor_read",
+)
 
 
 @dataclass(frozen=True)
@@ -140,6 +148,55 @@ def sync_devices_registry(
     return write_devices_markdown(cfg, store=active_store, output_path=output_path)
 
 
+def ensure_devices_registry(
+    root: Path,
+    *,
+    cfg: Mapping[str, object] | None = None,
+) -> Path | None:
+    from .config import load_config
+
+    output_path = root / ".openjet" / "state" / "devices.md"
+    try:
+        resolved_cfg = cfg if isinstance(cfg, Mapping) else load_config()
+        store = ObservationStore(root / ".openjet" / "state" / "observations")
+        return sync_devices_registry(resolved_cfg, store=store, output_path=output_path)
+    except Exception:
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                "# Devices\n\n"
+                "Device discovery failed while refreshing this registry.\n",
+                encoding="utf-8",
+            )
+            return output_path.resolve()
+        except Exception:
+            return None
+
+
+def format_device_registry_prompt(
+    registry_path: str | Path,
+    *,
+    referenced_ids: Sequence[str] | None = None,
+    include_tool_names: bool = True,
+) -> str:
+    normalized_path = Path(registry_path).expanduser().resolve()
+    lines = [
+        f"IO device registry located in {normalized_path}.",
+        "Open if wanting to interact with devices.",
+    ]
+    refs = _normalize_prompt_refs(referenced_ids)
+    if refs:
+        lines.append(f"Referenced device ids for this turn: {', '.join(refs)}.")
+    lines.append("Do not assume any device logs or payload files are already loaded.")
+    if include_tool_names:
+        lines.append(
+            "Available device tools include "
+            + ", ".join(f"`{name}`" for name in DEVICE_TOOL_NAMES[:-1])
+            + f", and `{DEVICE_TOOL_NAMES[-1]}`."
+        )
+    return "\n".join(lines)
+
+
 def render_devices_markdown(
     cfg: Mapping[str, object] | None,
     *,
@@ -202,6 +259,21 @@ def _latest_payload_ref(path: Path) -> str | None:
         return None
     text = str(payload or "").strip()
     return text or None
+
+
+def _normalize_prompt_refs(referenced_ids: Sequence[str] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in referenced_ids or ():
+        text = str(raw).strip().lstrip("@")
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
 
 
 def collect_device_observation(

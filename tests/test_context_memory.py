@@ -49,7 +49,7 @@ class PersistentMemoryFileTests(unittest.IsolatedAsyncioTestCase):
             root = Path(tmp)
             await update_persistent_memory(root, scope="user", action="replace", content="- prefers concise answers")
             await update_persistent_memory(root, scope="agent", action="replace", content="- use apply_patch for edits")
-            with patch("src.persistent_memory.load_config", return_value={}):
+            with patch("src.config.load_config", return_value={}):
                 prompt = await build_system_prompt("base system", root)
             self.assertTrue((root / ".openjet" / "state" / "devices.md").is_file())
 
@@ -63,20 +63,18 @@ class PersistentMemoryFileTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_system_prompt_uses_provided_cfg_for_device_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            cfg = {"device_aliases": {"front": "camera:/dev/video0"}}
+            provided_cfg = {"device_aliases": {"front": "camera:/dev/video0"}}
 
-            def _fake_sync(passed_cfg, *, store, output_path=None):
-                self.assertIs(passed_cfg, cfg)
-                target = Path(output_path or store.root.parent / "devices.md").expanduser().resolve()
+            def _fake_registry(passed_root, *, cfg=None):
+                self.assertEqual(passed_root, root)
+                self.assertIs(cfg, provided_cfg)
+                target = (root / ".openjet" / "state" / "devices.md").resolve()
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text("# Devices\n", encoding="utf-8")
                 return target
 
-            with patch("src.persistent_memory.sync_devices_registry", side_effect=_fake_sync), patch(
-                "src.persistent_memory.load_config",
-                side_effect=AssertionError("load_config should not run when cfg is provided"),
-            ):
-                prompt = await build_system_prompt("base system", root, cfg=cfg)
+            with patch("src.persistent_memory.ensure_devices_registry", side_effect=_fake_registry):
+                prompt = await build_system_prompt("base system", root, cfg=provided_cfg)
 
         self.assertIn(str(root / ".openjet" / "state" / "devices.md"), prompt)
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.metadata
+from pathlib import Path
 
 from .airgap import airgapped_from_cfg
 from .config import load_config, save_config
@@ -14,6 +16,25 @@ from .runtime_registry import active_model_ref, runtime_spec
 from .self_update import update_from_latest_release
 from .surfaces import launch_tui
 from .surfaces.command_specs import COMMANDS
+from .workflows import (
+    WorkflowStatus,
+    discover_workflow_index,
+    load_workflow_spec,
+    run_workflow,
+    run_workflow_daemon,
+    start_workflow_daemon,
+    stop_workflow_daemon,
+    validate_workflow_device_ids,
+    write_workflow_run_report,
+)
+from .workflows.state import (
+    list_workflow_statuses,
+    load_workflow_status,
+    save_workflow_assignment,
+    save_workflow_status,
+    workflow_last_run_path,
+    workflow_runs_dir,
+)
 
 
 def _active_profile_name(cfg: dict[str, object]) -> str:
@@ -63,6 +84,119 @@ def _format_slash_commands_summary() -> str:
         aliases = f" (aliases: {', '.join(f'/{alias}' for alias in spec.aliases)})" if spec.aliases else ""
         lines.append(f"- /{spec.name}: {spec.description}{aliases}")
     return "\n".join(lines)
+
+
+def _workflow_root() -> Path:
+    return Path.cwd().resolve()
+
+
+def _format_workflow_list(root: Path) -> str:
+    specs, issues = discover_workflow_index(root)
+    if not specs:
+        if not issues:
+            return "No workflows discovered. Add Markdown files under `workflows/` or `.openjet/workflows/`."
+        lines = ["No valid workflows discovered."]
+        lines.extend(f"- skipped {issue.path}: {issue.error}" for issue in issues)
+        return "\n".join(lines)
+    status_by_name = {status.name.lower(): status for status in list_workflow_statuses(root)}
+    lines = ["Discovered workflows:"]
+    for spec in specs:
+        status = status_by_name.get(spec.name.lower())
+        state = "running" if status and status.running else "idle"
+        interval = status.interval_seconds if status and status.interval_seconds is not None else spec.interval_seconds
+        devices = ", ".join(status.bound_devices if status and status.bound_devices else spec.devices) or "none"
+        lines.append(
+            f"- {spec.name}: mode={spec.mode} | state={state} | devices={devices} | "
+            f"interval={interval if interval is not None else 'n/a'} | path={spec.path}"
+        )
+    if issues:
+        lines.append("Skipped invalid workflow files:")
+        lines.extend(f"- {issue.path}: {issue.error}" for issue in issues)
+    return "\n".join(lines)
+
+
+def _format_workflow_show(spec) -> str:
+    lines = [
+        f"Workflow: {spec.name}",
+        f"Path: {spec.path}",
+        f"Source: {spec.source}",
+        f"Mode: {spec.mode}",
+        f"Devices: {', '.join(spec.devices) if spec.devices else 'none'}",
+        f"Interval: {spec.interval_seconds if spec.interval_seconds is not None else 'n/a'}",
+        f"Allow shell: {'true' if spec.allow_shell else 'false'}",
+        f"Skills: {', '.join(spec.skills) if spec.skills else 'none'}",
+        f"Files: {', '.join(spec.files) if spec.files else 'none'}",
+        "",
+        spec.body.strip() or "(empty workflow body)",
+    ]
+    return "\n".join(lines)
+
+
+def _format_single_workflow_status(spec, status: WorkflowStatus | None) -> str:
+    if status is None:
+        return (
+            f"Workflow: {spec.name}\n"
+            f"Path: {spec.path}\n"
+            "State: idle\n"
+            "No runs recorded yet."
+        )
+    lines = [
+        f"Workflow: {spec.name}",
+        f"Path: {spec.path}",
+        f"State: {'running' if status.running else 'idle'}",
+        f"PID: {status.pid if status.pid is not None else 'n/a'}",
+        f"Interval: {status.interval_seconds if status.interval_seconds is not None else spec.interval_seconds or 'n/a'}",
+        f"Bound devices: {', '.join(status.bound_devices) if status.bound_devices else 'none'}",
+        f"Last success: {status.last_success if status.last_success is not None else 'n/a'}",
+        f"Last started: {status.last_started_at or 'n/a'}",
+        f"Last finished: {status.last_finished_at or 'n/a'}",
+        f"Last report: {status.last_report_path or 'n/a'}",
+    ]
+    if status.last_error:
+        lines.append(f"Last error: {status.last_error}")
+    return "\n".join(lines)
+
+
+def _format_workflow_status(root: Path, name: str | None = None) -> str:
+    specs, issues = discover_workflow_index(root)
+    if name:
+        spec = load_workflow_spec(root, name)
+        return _format_single_workflow_status(spec, load_workflow_status(root, spec.name))
+    if not specs:
+        if not issues:
+            return "No workflows discovered."
+        lines = ["No valid workflows discovered."]
+        lines.extend(f"- skipped {issue.path}: {issue.error}" for issue in issues)
+        return "\n".join(lines)
+    status_by_name = {status.name.lower(): status for status in list_workflow_statuses(root)}
+    lines = ["Workflow status:"]
+    for spec in specs:
+        status = status_by_name.get(spec.name.lower())
+        state = "running" if status and status.running else "idle"
+        last = "n/a" if status is None or status.last_success is None else ("success" if status.last_success else "failure")
+        lines.append(f"- {spec.name}: state={state} | last={last} | path={spec.path}")
+    if issues:
+        lines.append("Skipped invalid workflow files:")
+        lines.extend(f"- {issue.path}: {issue.error}" for issue in issues)
+    return "\n".join(lines)
+
+
+def _read_workflow_logs(root: Path, name: str, tail: int) -> str:
+    if tail <= 0:
+        raise ValueError("--tail must be greater than zero")
+    spec = load_workflow_spec(root, name)
+    run_files = sorted(workflow_runs_dir(root, spec.name).glob("*.md"))
+    selected = run_files[-tail:]
+    if not selected:
+        latest = workflow_last_run_path(root, spec.name)
+        if latest.is_file():
+            selected = [latest]
+    if not selected:
+        return f"No workflow logs recorded yet for {spec.name}."
+    chunks: list[str] = []
+    for path in selected:
+        chunks.append(f"# Log File: {path}\n\n{path.read_text(encoding='utf-8').strip()}")
+    return "\n\n".join(chunks)
 
 
 def _open_jet_version() -> str:
@@ -130,13 +264,42 @@ def _set_device_state(cfg: dict[str, object], existing_id: str, *, enabled: bool
     return f"Device {source.primary_ref} is now {state}.\nDevice registry: {registry_path}"
 
 
+async def _run_workflow_once(
+    root: Path,
+    spec_name: str,
+    *,
+    device_ids: list[str] | None = None,
+) -> tuple[object, Path]:
+    spec = load_workflow_spec(root, spec_name)
+    cfg = load_config()
+    result = await run_workflow(root, spec, cfg=cfg, cli_device_ids=device_ids)
+    report_path = write_workflow_run_report(root, spec, result)
+    save_workflow_status(
+        root,
+        WorkflowStatus(
+            name=spec.name,
+            running=False,
+            pid=None,
+            interval_seconds=spec.interval_seconds,
+            bound_devices=result.bound_devices,
+            last_started_at=result.started_at,
+            last_finished_at=result.finished_at,
+            last_success=result.success,
+            last_error=result.error,
+            last_report_path=str(report_path),
+            updated_at=result.finished_at,
+        ),
+    )
+    return result, report_path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="open-jet offline agentic terminal UI",
         epilog=(
             "Useful commands: `open-jet commands` for slash commands, `open-jet status` for runtime/config status, "
-            "and `open-jet device list` for persistent device setup. In the TUI, use `/device` and `@device_id` tags "
-            "for device inputs. See docs/usage/device-sources.md."
+            "`open-jet device list` for persistent device setup, and `open-jet workflow list` for Markdown workflows. "
+            "In the TUI, use `/device` and `@device_id` tags for device inputs. See docs/usage/device-sources.md."
         ),
     )
     parser.add_argument("--setup", action="store_true", help="start in setup wizard mode before launching the chat UI")
@@ -160,6 +323,32 @@ def build_parser() -> argparse.ArgumentParser:
     device_on_parser.add_argument("device_id", help="current device id")
     device_off_parser = device_subparsers.add_parser("off", help="disable a device")
     device_off_parser.add_argument("device_id", help="current device id")
+    workflow_parser = subparsers.add_parser("workflow", help="run Markdown-defined workflows over the shared device backend")
+    workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_action")
+    workflow_subparsers.add_parser("list", help="list discovered workflow Markdown files")
+    workflow_show_parser = workflow_subparsers.add_parser("show", help="show a workflow definition")
+    workflow_show_parser.add_argument("name", help="workflow name")
+    workflow_run_parser = workflow_subparsers.add_parser("run", help="execute a workflow once")
+    workflow_run_parser.add_argument("name", help="workflow name")
+    workflow_run_parser.add_argument("--device", dest="device_ids", action="append", default=[], help="bind a device id for this run")
+    workflow_start_parser = workflow_subparsers.add_parser("start", help="start a background workflow runner")
+    workflow_start_parser.add_argument("name", help="workflow name")
+    workflow_start_parser.add_argument("--device", dest="device_ids", action="append", default=[], help="bind a device id for this runner")
+    workflow_start_parser.add_argument("--interval", type=int, default=None, help="poll interval in seconds")
+    workflow_stop_parser = workflow_subparsers.add_parser("stop", help="stop a running workflow")
+    workflow_stop_parser.add_argument("name", help="workflow name")
+    workflow_status_parser = workflow_subparsers.add_parser("status", help="show workflow status")
+    workflow_status_parser.add_argument("name", nargs="?", help="workflow name")
+    workflow_logs_parser = workflow_subparsers.add_parser("logs", help="show workflow Markdown reports")
+    workflow_logs_parser.add_argument("name", help="workflow name")
+    workflow_logs_parser.add_argument("--tail", type=int, default=1, help="number of report files to show")
+    workflow_assign_parser = workflow_subparsers.add_parser("assign", help="persist local device bindings for a workflow")
+    workflow_assign_parser.add_argument("name", help="workflow name")
+    workflow_assign_parser.add_argument("device_ids", nargs="+", help="one or more device ids from `open-jet device list`")
+    workflow_runner_parser = subparsers.add_parser("workflow-runner", help=argparse.SUPPRESS)
+    workflow_runner_parser.add_argument("name", help=argparse.SUPPRESS)
+    workflow_runner_parser.add_argument("--device", dest="device_ids", action="append", default=[], help=argparse.SUPPRESS)
+    workflow_runner_parser.add_argument("--interval", type=int, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -200,6 +389,79 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError as exc:
             raise SystemExit(str(exc))
         raise SystemExit("Usage: open-jet device [list|add <existing_id> <new_id>|on <id>|off <id>]")
+    if args.command == "workflow":
+        root = _workflow_root()
+        action = str(getattr(args, "workflow_action", "") or "list").strip().lower()
+        try:
+            if action == "list":
+                print(_format_workflow_list(root))
+                return
+            if action == "show":
+                print(_format_workflow_show(load_workflow_spec(root, str(args.name))))
+                return
+            if action == "run":
+                if args.device_ids:
+                    validate_workflow_device_ids(load_config(), list(args.device_ids))
+                result, report_path = asyncio.run(
+                    _run_workflow_once(root, str(args.name), device_ids=list(args.device_ids) or None)
+                )
+                status = "success" if result.success else "failure"
+                print(
+                    f"Workflow {result.name} completed with status={status}.\n"
+                    f"Report: {report_path}\n"
+                    f"Bound devices: {', '.join(result.bound_devices) if result.bound_devices else 'none'}"
+                )
+                if result.error:
+                    print(f"Error: {result.error}")
+                return
+            if action == "start":
+                spec = load_workflow_spec(root, str(args.name))
+                if args.device_ids:
+                    validate_workflow_device_ids(load_config(), list(args.device_ids))
+                interval = int(args.interval) if args.interval is not None else spec.interval_seconds
+                if interval is None or interval <= 0:
+                    raise ValueError("workflow start requires --interval or interval_seconds in the workflow file")
+                pid = start_workflow_daemon(root, spec.name, device_ids=list(args.device_ids), interval_seconds=interval)
+                print(f"Started workflow {spec.name} with pid={pid}.\nRunner log: {workflow_last_run_path(root, spec.name).parent / 'runner.log'}")
+                return
+            if action == "stop":
+                spec = load_workflow_spec(root, str(args.name))
+                stopped = stop_workflow_daemon(root, spec.name)
+                if stopped:
+                    print(f"Stopped workflow {spec.name}.")
+                else:
+                    print(f"Failed to stop workflow {spec.name} or it was not running.")
+                return
+            if action == "status":
+                print(_format_workflow_status(root, str(args.name) if getattr(args, "name", None) else None))
+                return
+            if action == "logs":
+                print(_read_workflow_logs(root, str(args.name), int(args.tail)))
+                return
+            if action == "assign":
+                spec = load_workflow_spec(root, str(args.name))
+                validate_workflow_device_ids(load_config(), list(args.device_ids))
+                assignment_path = save_workflow_assignment(root, spec.name, [str(item).strip() for item in args.device_ids if str(item).strip()])
+                print(
+                    f"Saved workflow device bindings for {spec.name}.\n"
+                    f"Assignment file: {assignment_path}"
+                )
+                return
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        raise SystemExit(
+            "Usage: open-jet workflow [list|show <name>|run <name>|start <name>|stop <name>|status [name]|logs <name>|assign <name> <device_id>...]"
+        )
+    if args.command == "workflow-runner":
+        asyncio.run(
+            run_workflow_daemon(
+                _workflow_root(),
+                str(args.name),
+                device_ids=list(args.device_ids),
+                interval_seconds=args.interval,
+            )
+        )
+        return
     if args.command == "version":
         print(f"open-jet {_open_jet_version()}")
         return

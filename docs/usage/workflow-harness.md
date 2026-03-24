@@ -10,3 +10,5 @@ It provides:
 - persistent harness state under `.openjet/`
 
 This helps reduce prompt drift and keep limited-context models focused on the active task.
+
+For backend workflow files and CLI execution, see [backend-workflows.md](backend-workflows.md).

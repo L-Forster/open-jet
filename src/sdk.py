@@ -77,11 +77,13 @@ class OpenJetSession:
         *,
         cfg: dict | None = None,
         system_prompt: str | None = None,
+        root: Path | None = None,
         approval_handler: ApprovalHandler | None = None,
         allowed_tools: set[str] | None = None,
         airgapped: bool | None = None,
     ) -> OpenJetSession:
         resolved_cfg = dict(cfg or load_config())
+        resolved_root = Path(root or Path.cwd()).resolve()
         resolved_cfg["airgapped"] = airgapped_from_cfg(resolved_cfg, override=airgapped)
         set_airgapped(bool(resolved_cfg["airgapped"]))
         client = create_runtime_client(resolved_cfg)
@@ -91,7 +93,7 @@ class OpenJetSession:
             client=client,
             system_prompt=await build_system_prompt(
                 system_prompt or "",
-                Path.cwd(),
+                resolved_root,
                 cfg=resolved_cfg,
             ),
             context_window_tokens=client.context_window_tokens,
@@ -318,6 +320,7 @@ async def create_agent(
     *,
     cfg: dict | None = None,
     system_prompt: str | None = None,
+    root: Path | None = None,
     approval_handler: ApprovalHandler | None = None,
     allowed_tools: set[str] | None = None,
     airgapped: bool | None = None,
@@ -325,6 +328,7 @@ async def create_agent(
     return await OpenJetSession.create(
         cfg=cfg,
         system_prompt=system_prompt,
+        root=root,
         approval_handler=approval_handler,
         allowed_tools=allowed_tools,
         airgapped=airgapped,

@@ -88,6 +88,7 @@ The setup wizard now focuses on:
 
 - [Installation](installation.md)
 - [Configuration](configuration.md)
+- [Backend Workflows](usage/backend-workflows.md)
 - [Runtime: llama.cpp](runtimes/llama-cpp.md)
 - [Runtime: OpenAI-compatible](runtimes/openai-compatible.md)
 - [Runtime: OpenRouter](runtimes/openrouter.md)
