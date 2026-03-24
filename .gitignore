@@ -19,6 +19,7 @@ session_state.json
 AGENTS.md
 claude.md
 config.yaml
+.installed_release
 
 # Local tooling/cache artifacts
 .agents/

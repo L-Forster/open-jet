@@ -27,6 +27,16 @@ class _FakeResponse:
 
 
 class SelfUpdateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._stamp_patch = patch("src.self_update._read_installed_release_version", return_value=None)
+        self._stamp_patch.start()
+        self._write_stamp_patch = patch("src.self_update._write_installed_release_version")
+        self._write_stamp_patch.start()
+
+    def tearDown(self) -> None:
+        self._write_stamp_patch.stop()
+        self._stamp_patch.stop()
+
     def test_available_release_update_skips_unknown_installed_version(self) -> None:
         with patch("src.self_update.urlopen") as urlopen_mock:
             release = available_release_update(current_version="unknown")
@@ -98,6 +108,18 @@ class SelfUpdateTests(unittest.TestCase):
 
         self.assertEqual(message, "open-jet 0.3.0 is already up to date.")
         run_mock.assert_not_called()
+
+    def test_available_release_update_skips_when_stamp_matches(self) -> None:
+        self._stamp_patch.stop()
+        release_payload = json.dumps(
+            {"tag_name": "v0.4.0", "tarball_url": "https://example.invalid/t.tar.gz"}
+        ).encode("utf-8")
+        with patch("src.self_update._read_installed_release_version", return_value="0.4.0"), \
+             patch("src.self_update.urlopen", return_value=_FakeResponse(release_payload)):
+            release = available_release_update(current_version="0.3.0")
+        self.assertIsNone(release)
+        self._stamp_patch = patch("src.self_update._read_installed_release_version", return_value=None)
+        self._stamp_patch.start()
 
     def test_update_from_latest_release_raises_clear_error_when_install_fails(self) -> None:
         release_payload = json.dumps(

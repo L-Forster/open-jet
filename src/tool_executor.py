@@ -56,6 +56,11 @@ def set_swap_manager(manager: SwapManager | None) -> None:
     _swap_manager = manager
 
 
+def get_swap_manager() -> SwapManager | None:
+    """Return the currently registered SwapManager, if any."""
+    return _swap_manager
+
+
 async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
     if not isinstance(tool_call.arguments, dict):
         return ToolExecutionResult(

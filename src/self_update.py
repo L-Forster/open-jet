@@ -17,6 +17,21 @@ RELEASES_LATEST_URL = "https://api.github.com/repos/l-forster/open-jet/releases/
 USER_AGENT = "open-jet-updater"
 DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS = 4.0
 DEFAULT_RELEASE_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+_INSTALLED_RELEASE_STAMP = Path(__file__).resolve().parent.parent / ".installed_release"
+
+
+def _read_installed_release_version() -> str | None:
+    try:
+        return _INSTALLED_RELEASE_STAMP.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _write_installed_release_version(version: str) -> None:
+    try:
+        _INSTALLED_RELEASE_STAMP.write_text(version + "\n")
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -149,6 +164,9 @@ def available_release_update(
     release = latest_release_info(timeout_seconds=timeout_seconds)
     if installed_version == release.version:
         return None
+    stamp_version = _read_installed_release_version()
+    if stamp_version == release.version:
+        return None
     return release
 
 
@@ -157,8 +175,11 @@ def install_release(release: ReleaseInfo, *, current_version: str | None = None)
     tarball_url = release.tarball_url
 
     installed_version = str(current_version or "").strip()
+    stamp_version = _read_installed_release_version()
     if installed_version and installed_version == latest_version:
         return f"open-jet {installed_version} is already up to date."
+    if stamp_version == latest_version:
+        return f"open-jet {latest_version} is already up to date."
 
     snapshot = _active_config_snapshot()
     try:
@@ -174,6 +195,7 @@ def install_release(release: ReleaseInfo, *, current_version: str | None = None)
         raise RuntimeError(f"Failed to install open-jet {latest_version}.") from exc
 
     _preserve_user_config(snapshot, latest_version=latest_version)
+    _write_installed_release_version(latest_version)
     if installed_version:
         return f"Updated open-jet from {installed_version} to {latest_version}."
     return f"Installed open-jet {latest_version}."

@@ -114,7 +114,7 @@ from .self_update import available_release_update, install_release
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
-from .tool_executor import format_tool_args, set_swap_manager
+from .tool_executor import format_tool_args, get_swap_manager, set_swap_manager
 
 
 def _format_error(exc: Exception) -> str:
@@ -1704,35 +1704,30 @@ class OpenJetApp:
     ) -> str:
         if not self.client:
             return "Saved chat loaded into the transcript only."
-        saved_runtime = str(state.get("runtime") or "").strip()
-        current_runtime = str(self.cfg.get("runtime", "llama_cpp") or "").strip()
-        saved_model = str(state.get("model_ref") or state.get("model") or "").strip()
-        current_model = self._active_model_ref()
-        runtime_matches = not saved_runtime or saved_runtime == current_runtime
-        model_matches = not saved_model or saved_model == current_model
 
-        if kv_cache_available and runtime_matches and model_matches:
-            try:
-                restored = await self.client.restore_kv_cache(self.chat_archive.kv_cache_path(chat_id))
-            except Exception:
-                restored = False
-            if restored:
-                return "KV cache restored from the saved chat."
+        # Legacy KV cache restore for checkpoints saved before this change.
+        if kv_cache_available:
+            saved_runtime = str(state.get("runtime") or "").strip()
+            current_runtime = str(self.cfg.get("runtime", "llama_cpp") or "").strip()
+            saved_model = str(state.get("model_ref") or state.get("model") or "").strip()
+            current_model = self._active_model_ref()
+            runtime_matches = not saved_runtime or saved_runtime == current_runtime
+            model_matches = not saved_model or saved_model == current_model
+            if runtime_matches and model_matches:
+                try:
+                    restored = await self.client.restore_kv_cache(self.chat_archive.kv_cache_path(chat_id))
+                except Exception:
+                    restored = False
+                if restored:
+                    return "KV cache restored from the saved chat."
 
+        # No KV cache — reset the runtime so it rebuilds the cache on the
+        # next inference turn from the restored message history.
         try:
             await self.client.reset_kv_cache()
         except Exception:
-            if kv_cache_available and runtime_matches and model_matches:
-                return "Saved chat loaded, but KV cache restore failed and the runtime could not be reset."
-            if not runtime_matches or not model_matches:
-                return "Saved chat loaded, but the active runtime/model differs and the runtime reset failed."
-            return "Saved chat loaded, but the runtime reset failed; future turns may need /clear."
-
-        if kv_cache_available and runtime_matches and model_matches:
-            return "Saved chat loaded; KV cache restore failed, so the runtime was reset and will re-prompt next turn."
-        if not runtime_matches or not model_matches:
-            return "Saved chat loaded; the active runtime/model differs, so the runtime was reset and will re-prompt next turn."
-        return "Saved chat loaded into the transcript. The runtime was reset and will re-prompt next turn."
+            return "Saved chat loaded, but the runtime could not be reset."
+        return "Saved chat loaded. KV cache will rebuild on next turn."
 
     async def restore_saved_chat(self, selected_path: str | Path, log: LogView) -> bool:
         if not self.agent:
@@ -1856,16 +1851,11 @@ class OpenJetApp:
             self.chat_archive.save_resume_state(self._chat_session_id, payload)
         except Exception:
             return False
-        if not self.client:
-            self.chat_archive.delete_kv_cache(self._chat_session_id)
-            return False
-        try:
-            saved = await self.client.save_kv_cache(self.chat_archive.kv_cache_path(self._chat_session_id))
-        except Exception:
-            saved = False
-        if not saved:
-            self.chat_archive.delete_kv_cache(self._chat_session_id)
-        return saved
+        # KV cache is not persisted — it's rebuilt naturally on the first
+        # inference turn after resume.  This avoids storing hundreds of MB
+        # per chat on storage-constrained devices.
+        self.chat_archive.delete_kv_cache(self._chat_session_id)
+        return True
 
     def persist_harness_state(self) -> None:
         self.harness_state.updated_at = time.time()
@@ -2014,6 +2004,7 @@ class OpenJetApp:
             )
             while True:
                 self._set_generating_status()
+                await self._check_memory_pressure_before_turn(log)
                 self._prepare_turn_context()
                 tool_status_tokens: dict[str, int] = {}
                 text_buf = ""
@@ -2256,8 +2247,58 @@ class OpenJetApp:
     async def _recover_runtime(self, log: LogView, error_text: str) -> bool:
         if not self.client:
             return False
-        log.write(rich_text("LLM runtime interrupted. Restarting runtime once and retrying...", "warning"))
         self._log_trace_event("runtime_recovery_attempt", recoverable_error=error_text)
+
+        # Try swap-based recovery first: if memory pressure caused the crash,
+        # unloading the model frees RAM so the reload starts clean.
+        manager = get_swap_manager()
+        if manager is not None:
+            from .runtime_limits import read_memory_snapshot
+
+            snapshot = read_memory_snapshot()
+            available_mb = snapshot.available_mb if snapshot and snapshot.available_mb is not None else 0.0
+            model_mb = manager.plugin.model_memory_mb()
+            # If available memory is low relative to model size, a KV reset
+            # alone won't help — do a full unload/reload cycle.
+            if available_mb < model_mb * 0.3:
+                log.write(
+                    rich_text(
+                        f"Runtime crashed under memory pressure ({available_mb:.0f}MB free). "
+                        f"Saving state and unloading model to reclaim memory...",
+                        "warning",
+                    )
+                )
+                state_dir = manager._state_dir
+                try:
+                    save_ok = await manager.plugin.save_state(state_dir)
+                    self._log_trace_event(
+                        "swap_recovery_save",
+                        save_ok=save_ok,
+                        available_before_mb=available_mb,
+                        model_mb=model_mb,
+                    )
+                    await manager.plugin.unload()
+                    log.write(rich_text("Reloading model...", "status"))
+                    await manager.plugin.reload()
+                    restore_ok = False
+                    if save_ok:
+                        try:
+                            restore_ok = await manager.plugin.restore_state(state_dir)
+                        except Exception:
+                            pass
+                    if not restore_ok:
+                        log.write(rich_text("KV cache restore failed — conversation will be re-prompted.", "muted"))
+                    self._log_trace_event("swap_recovery_reloaded", restore_ok=restore_ok)
+                    log.write(rich_text("Model reloaded after swap recovery. Retrying turn.", "status"))
+                    log.write("")
+                    return True
+                except Exception as exc:
+                    self._log_trace_event("swap_recovery_failed", error=str(exc))
+                    log.write(f"{rich_text('Swap recovery failed:', 'error')} {rich_text(str(exc), 'muted')}")
+                    # Fall through to regular KV reset attempt
+
+        # Standard recovery: reset KV cache without unloading the model.
+        log.write(rich_text("LLM runtime interrupted. Restarting runtime once and retrying...", "warning"))
         try:
             await self.client.reset_kv_cache()
         except Exception as exc:
@@ -2276,6 +2317,61 @@ class OpenJetApp:
         log.write(rich_text("Runtime recovered. Retrying turn.", "status"))
         log.write("")
         return True
+
+    async def _check_memory_pressure_before_turn(self, log: LogView) -> None:
+        """Proactively swap if memory is critically low before starting inference."""
+        manager = get_swap_manager()
+        if manager is None:
+            return
+        from .runtime_limits import read_memory_snapshot
+
+        snapshot = read_memory_snapshot()
+        if not snapshot or snapshot.available_mb is None or snapshot.total_mb is None:
+            return
+        available_mb = snapshot.available_mb
+        total_mb = snapshot.total_mb
+        # Trigger proactive swap when available memory drops below 8% of total
+        # (matches the agent's min_available_mb heuristic).
+        min_available_mb = max(512, int(total_mb * 0.08))
+        if available_mb >= min_available_mb:
+            return
+        model_mb = manager.plugin.model_memory_mb()
+        # Only worth swapping if unloading the model would actually free enough.
+        if available_mb + model_mb < min_available_mb:
+            return
+        log.write(
+            rich_text(
+                f"Memory pressure detected ({available_mb:.0f}MB free, need {min_available_mb}MB). "
+                f"Cycling model to reclaim memory...",
+                "warning",
+            )
+        )
+        self._log_trace_event(
+            "proactive_swap_started",
+            available_mb=available_mb,
+            min_available_mb=min_available_mb,
+            model_mb=model_mb,
+        )
+        state_dir = manager._state_dir
+        try:
+            save_ok = await manager.plugin.save_state(state_dir)
+            await manager.plugin.unload()
+            await manager.plugin.reload()
+            restore_ok = False
+            if save_ok:
+                try:
+                    restore_ok = await manager.plugin.restore_state(state_dir)
+                except Exception:
+                    pass
+            if not restore_ok:
+                log.write(rich_text("KV cache restore failed — conversation will be re-prompted.", "muted"))
+            self._log_trace_event("proactive_swap_completed", save_ok=save_ok, restore_ok=restore_ok)
+            log.write(rich_text("Model reloaded. Continuing.", "status"))
+            log.write("")
+        except Exception as exc:
+            self._log_trace_event("proactive_swap_failed", error=str(exc))
+            log.write(f"{rich_text('Memory reclaim failed:', 'error')} {rich_text(str(exc), 'muted')}")
+            log.write("")
 
     def _start_thinking(self) -> int:
         self._thinking_token += 1
