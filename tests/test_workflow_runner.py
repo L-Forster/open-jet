@@ -19,6 +19,12 @@ class _FakeAgent:
     def estimated_context_tokens(self) -> int:
         return 256
 
+    def persistent_context_tokens(self) -> int:
+        return 256
+
+    def runtime_overhead_tokens(self, *, force_post_tool_continuation: bool = False, empty_retry_count: int = 0) -> int:
+        return 0
+
 
 class _FakeSession:
     def __init__(self, response: SDKResponse, *, context_window_tokens: int = 8192) -> None:

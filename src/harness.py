@@ -5,11 +5,12 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import yaml
 
 from .context_index import load_repo_context_index, lookup_file_summary
+from .device_sources import ensure_devices_registry, format_device_registry_prompt
 from .runtime_limits import MemorySnapshot, estimate_tokens
 from .skills_registry import available_skill_names as registry_available_skill_names
 from .skills_registry import render_skills_manifest
@@ -300,6 +301,10 @@ def build_turn_context(
     effective_window: int,
     memory_snapshot: MemorySnapshot | None,
     layered_config: dict[str, Any] | None = None,
+    cfg: Mapping[str, object] | None = None,
+    referenced_device_ids: Sequence[str] | None = None,
+    extra_system_messages: Sequence[dict[str, str]] | None = None,
+    extra_docs_loaded: Sequence[str] | None = None,
 ) -> HarnessContext:
     config = layered_context_config(layered_config)
     budget = compute_turn_budget(
@@ -436,6 +441,33 @@ def build_turn_context(
                 f"{layer_name} exceeded 40% of the context window: used={used} threshold={budget.layer_alert_tokens}"
             )
 
+    referenced_ids = _normalize_context_device_refs(referenced_device_ids)
+    if referenced_ids:
+        registry_path = ensure_devices_registry(root, cfg=cfg)
+        if registry_path is not None:
+            registry_prompt = format_device_registry_prompt(
+                registry_path,
+                referenced_ids=referenced_ids,
+            )
+            messages.append({"role": "system", "content": registry_prompt})
+            docs_tokens += estimate_tokens(registry_prompt)
+
+    for message in extra_system_messages or ():
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role", "")).strip().lower() != "system":
+            continue
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        messages.append({"role": "system", "content": content})
+        docs_tokens += estimate_tokens(content)
+
+    for label in extra_docs_loaded or ():
+        text = str(label).strip()
+        if text:
+            docs_loaded.append(text)
+
     docs_tokens += state_summary_tokens
     return HarnessContext(
         messages=messages,
@@ -449,6 +481,21 @@ def build_turn_context(
         budget_alerts=budget_alerts,
         candidate_decisions=candidate_decisions,
     )
+
+
+def _normalize_context_device_refs(referenced_device_ids: Sequence[str] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in referenced_device_ids or ():
+        text = str(raw).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
 
 
 def build_state_summary(state: HarnessState, budget: TurnBudget | None = None) -> str:

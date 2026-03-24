@@ -195,7 +195,14 @@ class DevicesMarkdownTests(unittest.TestCase):
 class AppDeviceTagTests(unittest.IsolatedAsyncioTestCase):
     async def test_submit_text_with_device_tag_points_to_registry_file(self) -> None:
         app = OpenJetApp()
-        app.agent = SimpleNamespace(messages=[])
+        app.agent = SimpleNamespace(
+            messages=[],
+            set_turn_context=Mock(),
+            persistent_context_tokens=Mock(return_value=0),
+            runtime_overhead_tokens=Mock(return_value=0),
+            _messages_for_runtime=Mock(return_value=[]),
+        )
+        app.client = SimpleNamespace(context_window_tokens=2048)
         source = DeviceSource(
             primary_ref="front",
             refs=("front", "camera0"),
@@ -229,20 +236,31 @@ class AppDeviceTagTests(unittest.IsolatedAsyncioTestCase):
                 app, "_begin_turn_trace"
             ):
                 await app.submit_text("@front what is on the desk?")
+                app._prepare_turn_context()
 
         content = app.agent.messages[-1]["content"]
         self.assertIsInstance(content, str)
-        self.assertIn("IO device registry located in", content)
-        self.assertIn(str(registry), content)
-        self.assertIn("Open if wanting to interact with devices.", content)
-        self.assertIn("Referenced device ids for this turn: front.", content)
+        self.assertEqual(content, "what is on the desk?")
         self.assertIn("what is on the desk?", content)
         self.assertNotIn("@front what is on the desk?", content)
+        self.assertEqual(app._active_turn_device_refs, ("front",))
+        turn_context = app.agent.set_turn_context.call_args.args[0]
+        joined_context = "\n\n".join(message["content"] for message in turn_context)
+        self.assertIn("IO device registry located in", joined_context)
+        self.assertIn(str(registry), joined_context)
+        self.assertIn("Referenced device ids for this turn: front.", joined_context)
 
     async def test_submit_text_with_spoofed_device_writes_real_registry_file(self) -> None:
         app = OpenJetApp()
         app.cfg = {}
-        app.agent = SimpleNamespace(messages=[])
+        app.agent = SimpleNamespace(
+            messages=[],
+            set_turn_context=Mock(),
+            persistent_context_tokens=Mock(return_value=0),
+            runtime_overhead_tokens=Mock(return_value=0),
+            _messages_for_runtime=Mock(return_value=[]),
+        )
+        app.client = SimpleNamespace(context_window_tokens=2048)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             app.observation_store = ObservationStore(root / ".openjet" / "state" / "observations")
@@ -278,15 +296,19 @@ class AppDeviceTagTests(unittest.IsolatedAsyncioTestCase):
                 "_begin_turn_trace",
             ):
                 await app.submit_text("@camera0 what is on the desk?")
+                app._prepare_turn_context()
 
             registry = root / ".openjet" / "state" / "devices.md"
             registry_exists = registry.is_file()
             registry_text = registry.read_text(encoding="utf-8") if registry_exists else ""
             content = app.agent.messages[-1]["content"]
+            turn_context = app.agent.set_turn_context.call_args.args[0]
+            joined_context = "\n\n".join(message["content"] for message in turn_context)
 
         self.assertTrue(registry_exists)
-        self.assertIn(str(registry), content)
-        self.assertIn("Referenced device ids for this turn: camera0.", content)
+        self.assertEqual(content, "what is on the desk?")
+        self.assertIn(str(registry), joined_context)
+        self.assertIn("Referenced device ids for this turn: camera0.", joined_context)
         self.assertIn("## camera0", registry_text)
 
 

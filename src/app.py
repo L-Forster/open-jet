@@ -54,7 +54,6 @@ from .config import load_config, save_config
 from .device_sources import (
     DeviceSource,
     assign_device_alias,
-    format_device_registry_prompt,
     list_device_sources,
     resolve_device_source,
     set_device_enabled,
@@ -108,13 +107,14 @@ from .skills_registry import resolve_skill_path
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
 from .runtime_registry import active_model_ref, create_runtime_client
+from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
 from .self_update import available_release_update, install_release
 from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
-from .tool_executor import ToolExecutionResult, execute_tool, format_tool_args, set_swap_manager
+from .tool_executor import format_tool_args, set_swap_manager
 
 
 def _format_error(exc: Exception) -> str:
@@ -325,6 +325,7 @@ class OpenJetApp:
         self._session_completion_tokens = 0
         self._session_runtime_requests = 0
         self._pending_image_paths: list[str] = []
+        self._active_turn_device_refs: tuple[str, ...] = ()
         self._widgets = {
             "#chat-log": LogView(self.console),
             "#assistant-status": StatusWidget(),
@@ -1210,6 +1211,7 @@ class OpenJetApp:
         log: LogView,
     ) -> str:
         if not source_refs:
+            self._active_turn_device_refs = ()
             return prompt_text
         resolved: list[DeviceSource] = []
         seen: set[str] = set()
@@ -1220,10 +1222,12 @@ class OpenJetApp:
             seen.add(source.primary_ref)
             resolved.append(source)
         if not resolved:
+            self._active_turn_device_refs = ()
             return prompt_text
         try:
             registry_path = self.write_devices_registry()
         except Exception as exc:
+            self._active_turn_device_refs = ()
             log.write(f"[yellow]devices:[/] {_format_error(exc)}")
             log.write("")
             return prompt_text
@@ -1234,15 +1238,8 @@ class OpenJetApp:
             "[/]"
         )
         log.write("")
-        cleaned_prompt = _strip_consumed_mentions(prompt_text, source_refs).strip()
-        registry_context = format_device_registry_prompt(
-            registry_path,
-            referenced_ids=[source.primary_ref for source in resolved],
-            include_tool_names=False,
-        )
-        if cleaned_prompt:
-            return f"{registry_context}\n\nUser request:\n{cleaned_prompt}"
-        return registry_context
+        self._active_turn_device_refs = tuple(source.primary_ref for source in resolved)
+        return _strip_consumed_mentions(prompt_text, source_refs).strip()
 
     async def _load_mentioned_files_into_context(self, mentioned_files: list[str], log: LogView) -> None:
         if not self.agent:
@@ -1838,11 +1835,6 @@ class OpenJetApp:
             log.write(f"  {rich_text(f'... ({len(lines) - 20} more lines)', 'dim')}")
         log.write("")
 
-    def _complete_tool_call_and_refresh(self, tc: ToolCall, result: object) -> None:
-        assert self.agent is not None
-        self.agent.complete_tool_call(tc, result)
-        self._render_token_counter()
-
     def persist_session_state(self, *, reason: str) -> None:
         if not self.agent or not self.state_store.enabled:
             return
@@ -1927,7 +1919,6 @@ class OpenJetApp:
     def _start_agent_turn(self, recovery_attempted: bool = False) -> None:
         if self._generation_worker and not self._generation_worker.done():
             self._log_trace_event("turn_replaced", replaced_by_new_turn=True)
-        self._prepare_turn_context()
         self._generation_worker = asyncio.create_task(self.run_agent_turn(recovery_attempted=recovery_attempted))
 
     def _prepare_turn_context(self) -> None:
@@ -1943,6 +1934,8 @@ class OpenJetApp:
             effective_window=window,
             memory_snapshot=read_memory_snapshot(),
             layered_config=self.cfg.get("layered_context", {}),
+            cfg=self.cfg,
+            referenced_device_ids=self._active_turn_device_refs,
         )
         self.agent.set_turn_context(context.messages)
         self._last_turn_context_snapshot = context
@@ -2013,16 +2006,22 @@ class OpenJetApp:
         self._log_trace_event("run_agent_turn_started", recovery_attempted=recovery_attempted)
         try:
             assert self.agent is not None
+            session = OpenJetSession(
+                self.agent,
+                approval_handler=lambda tc: self._approve_tool_call_via_session(tc, log),
+                allowed_tools=allowed_tools_for_mode(self.harness_state.mode),
+                airgapped=self.is_airgapped(),
+            )
             while True:
                 self._set_generating_status()
                 self._prepare_turn_context()
-                pending_tool_calls: list[ToolCall] = []
-                condense_reason: str | None = None
+                tool_status_tokens: dict[str, int] = {}
                 text_buf = ""
                 should_retry = False
+                turn_completed = False
 
-                async for event in self.agent.run_turn():
-                    if event.kind == ActionKind.TEXT:
+                async for event in session.stream_existing_turn():
+                    if event.kind == SDKEventKind.TEXT:
                         if not assistant_header_written:
                             log.write(Rule(rich_text("Assistant", "assistant"), style="assistant"))
                             assistant_header_written = True
@@ -2042,7 +2041,7 @@ class OpenJetApp:
                                 in_code_block=assistant_in_code_block,
                             )
                             log.write(rendered)
-                    elif event.kind == ActionKind.TOOL_REQUEST:
+                    elif event.kind == SDKEventKind.TOOL_REQUEST and event.tool_call:
                         if text_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
                                 text_buf,
@@ -2050,10 +2049,35 @@ class OpenJetApp:
                             )
                             log.write(rendered)
                             text_buf = ""
-                        pending_tool_calls.append(event.tool_call)
-                    elif event.kind == ActionKind.CONDENSE:
-                        condense_reason = event.text
-                    elif event.kind == ActionKind.ERROR:
+                        self._record_tool_request(event.tool_call, log, tool_status_tokens)
+                    elif event.kind == SDKEventKind.TOOL_RESULT and event.tool_result:
+                        tool_event = self._record_tool_result(event.tool_result, log, tool_status_tokens)
+                        if tool_event:
+                            tool_events.append(tool_event)
+                        self.persist_session_state(reason=f"tool_result:{event.tool_result.tool_call.name}")
+                    elif event.kind == SDKEventKind.CONDENSE:
+                        log.write(f"  {rich_text(event.text, 'status')}")
+                        log.write("")
+                        self.persist_session_state(reason="auto_condense")
+                        self.persist_harness_state()
+                        remaining_pressure = self.agent.resource_pressure_reason()
+                        if remaining_pressure:
+                            log.write(
+                                f"  {rich_text('Auto-condense stopped:', 'warning')} "
+                                f"{rich_text(f'{remaining_pressure}. Retry after memory/context pressure clears.', 'muted')}"
+                            )
+                            log.write("")
+                            self.persist_session_state(reason="auto_condense_stopped")
+                            self._finish_turn_trace(
+                                success=False,
+                                status="resource_pressure",
+                                error=remaining_pressure,
+                            )
+                            self._render_token_counter()
+                            return
+                        should_retry = True
+                        break
+                    elif event.kind == SDKEventKind.ERROR:
                         if not overflow_condense_attempted and self._is_context_overflow_error(event.text):
                             result = await self.agent.condense_context(force=True)
                             log.write(f"  {rich_text(result, 'status')}")
@@ -2073,7 +2097,7 @@ class OpenJetApp:
                         log.write(f"\n{rich_text('error:', 'error')} {rich_text(event.text, 'muted')}")
                         self._finish_turn_trace(success=False, status="agent_error", error=event.text)
                         return
-                    elif event.kind == ActionKind.DONE:
+                    elif event.kind == SDKEventKind.DONE:
                         if text_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
                                 text_buf,
@@ -2082,61 +2106,17 @@ class OpenJetApp:
                             log.write(rendered)
                             text_buf = ""
                         log.write("")
+                        turn_completed = True
 
                 if should_retry:
                     continue
-
-                if condense_reason is not None:
-                    result = await self.agent.condense_context()
-                    log.write(f"  {rich_text(result, 'status')}")
-                    self._write_condense_trace(log, condense_reason)
-                    log.write("")
-                    self.persist_session_state(reason="auto_condense")
-                    self.persist_harness_state()
-                    remaining_pressure = self.agent.resource_pressure_reason()
-                    if remaining_pressure:
-                        log.write(
-                            f"  {rich_text('Auto-condense stopped:', 'warning')} "
-                            f"{rich_text(f'{remaining_pressure}. Retry after memory/context pressure clears.', 'muted')}"
-                        )
-                        log.write("")
-                        self.persist_session_state(reason="auto_condense_stopped")
-                        self._finish_turn_trace(
-                            success=False,
-                            status="resource_pressure",
-                            error=remaining_pressure,
-                        )
-                        self._render_token_counter()
-                        return
-                    continue
-
-                if not pending_tool_calls:
+                if turn_completed:
                     break
-
-                for tc in pending_tool_calls:
-                    try:
-                        event = await self._handle_tool_call(tc, log)
-                        if event:
-                            tool_events.append(event)
-                    except Exception as exc:
-                        if self.session_logger:
-                            self.session_logger.record_exception(
-                                "tool_call_failed",
-                                exc,
-                                component="tool",
-                                turn_id=self._active_turn_id,
-                                tool_key=tc.id,
-                                extra_attributes={"openjet.tool.name": tc.name},
-                            )
-                        log.write(f"{rich_text(f'tool error ({tc.name}):', 'error')} {rich_text(str(exc), 'muted')}")
-                        log.write("")
-                        self._complete_tool_call_and_refresh(tc, f"Tool execution failed: {exc}")
-
-                self.persist_session_state(reason="assistant_turn_with_tools")
         except asyncio.CancelledError:
             return
         finally:
             self._stop_thinking(thinking_token)
+            self._active_turn_device_refs = ()
             if self._generation_worker and self._generation_worker.done():
                 self._generation_worker = None
 
@@ -2147,7 +2127,29 @@ class OpenJetApp:
         self._finish_turn_trace(success=True, status="completed")
         self._render_token_counter()
 
-    async def _handle_tool_call(self, tc: ToolCall, log: LogView) -> dict | None:
+    async def _approve_tool_call_via_session(self, tc: ToolCall, log: LogView) -> bool:
+        self._active_turn_approval_requests += 1
+        approved = await self._wait_for_tool_approval(tc)
+        decision_ms = None
+        if self._approval_started_at is not None:
+            decision_ms = round((time.monotonic() - self._approval_started_at) * 1000.0, 2)
+        self._approval_started_at = None
+        if self.session_logger:
+            self.session_logger.record_tool_approval(
+                tool_key=tc.id or "",
+                approved=approved,
+                decision_ms=decision_ms,
+            )
+        if approved:
+            log.write(f"  {rich_text('approved', 'success')}")
+            self._active_turn_approval_grants += 1
+        else:
+            log.write(f"  {rich_text('denied', 'error')}")
+            log.write("")
+            self.persist_session_state(reason=f"tool_denied:{tc.name}")
+        return approved
+
+    def _record_tool_request(self, tc: ToolCall, log: LogView, active_status_tokens: dict[str, int]) -> None:
         tool_key = tc.id or f"{tc.name}-{int(time.time() * 1000)}"
         tc.id = tool_key
         tool_attrs = self._tool_telemetry_attributes(tc)
@@ -2156,157 +2158,70 @@ class OpenJetApp:
                 self._active_turn_false_positive_commands += 1
             if bool(tool_attrs.get("openjet.tool.shell.hallucinated_command")):
                 self._active_turn_hallucinated_commands += 1
-        if tc.name not in allowed_tools_for_mode(self.harness_state.mode):
-            denied = f"Tool {tc.name} is not available for this request. Use an approved tool or ask for a different approach."
-            log.write(rich_text(denied, "warning"))
-            log.write("")
-            if self.session_logger and self._active_turn_id:
-                self.session_logger.start_tool_call(
-                    turn_id=self._active_turn_id,
-                    tool_key=tool_key,
-                    tool_name=tc.name,
-                    attributes=tool_attrs,
-                    needs_confirmation=False,
-                )
-                self.session_logger.finish_tool_call(
-                    tool_key,
-                    ok=False,
-                    approved=False,
-                    duration_ms=None,
-                    status="disallowed",
-                    attributes={"openjet.tool.denial_reason": "mode_restricted"},
-                )
-            if self.agent:
-                self._complete_tool_call_and_refresh(tc, denied)
-            return {"tool": tc.name, "ok": False, "summary": denied, "target": format_tool_args(tc)}
-        needs_confirm = self.agent.needs_confirmation(tc) if self.agent else False
         if self.session_logger and self._active_turn_id:
             self.session_logger.start_tool_call(
                 turn_id=self._active_turn_id,
                 tool_key=tool_key,
                 tool_name=tc.name,
                 attributes=tool_attrs,
-                needs_confirmation=needs_confirm,
+                needs_confirmation=self.agent.needs_confirmation(tc) if self.agent else False,
             )
+        self._active_turn_tool_attempts += 1
         log.write(Rule(rich_text(f"Tool: {tc.name}", "tool"), style="tool"))
         log.write(rich_text(f"{tc.name}:", "tool"))
         for preview_line in self._tool_preview_lines(tc):
             preview_style = "command" if tc.name == "shell" else "muted"
             log.write(f"  {rich_text(preview_line, preview_style)}")
-        if needs_confirm:
-            self._active_turn_approval_requests += 1
-            approved = await self._wait_for_tool_approval(tc)
-            decision_ms = None
-            if self._approval_started_at is not None:
-                decision_ms = round((time.monotonic() - self._approval_started_at) * 1000.0, 2)
-            self._approval_started_at = None
-            if self.session_logger:
-                self.session_logger.record_tool_approval(
-                    tool_key=tool_key,
-                    approved=approved,
-                    decision_ms=decision_ms,
-                )
-            if not approved:
-                log.write(f"  {rich_text('denied', 'error')}")
-                log.write("")
-                self._complete_tool_call_and_refresh(tc, "User denied this action.")
-                self.persist_session_state(reason=f"tool_denied:{tc.name}")
-                if self.session_logger:
-                    self.session_logger.finish_tool_call(
-                        tool_key,
-                        ok=False,
-                        approved=False,
-                        duration_ms=decision_ms,
-                        status="denied",
-                    )
-                return {"tool": tc.name, "ok": False, "summary": "User denied this action.", "target": format_tool_args(tc)}
-            log.write(f"  {rich_text('approved', 'success')}")
-            self._active_turn_approval_grants += 1
+        active_status_tokens[tool_key] = self._start_tool_status(tc)
 
-        if tc.name == "load_file":
-            self._clamp_load_file_tool_budget(tc)
-        self._active_turn_tool_attempts += 1
-        t0 = time.monotonic()
-        tool_status_token = self._start_tool_status(tc)
-        try:
-            execution = await execute_tool(tc)
-        except Exception as exc:
-            duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
-            if self.session_logger:
-                self.session_logger.record_exception(
-                    "tool_execute_exception",
-                    exc,
-                    component="tool",
-                    turn_id=self._active_turn_id,
-                    tool_key=tool_key,
-                    extra_attributes={"openjet.tool.name": tc.name},
-                )
-                self.session_logger.finish_tool_call(
-                    tool_key,
-                    ok=False,
-                    approved=True,
-                    duration_ms=duration_ms,
-                    status="exception",
-                )
-            raise
-        finally:
-            self._stop_tool_status(tool_status_token)
-        result = execution.output
-        meta = execution.meta
-
-        # Handle model swap restore failure — KV cache is stale, re-prompt.
+    def _record_tool_result(
+        self,
+        tool_result: SDKToolResult,
+        log: LogView,
+        active_status_tokens: dict[str, int],
+    ) -> dict | None:
+        tc = tool_result.tool_call
+        tool_key = tc.id or f"{tc.name}-{int(time.time() * 1000)}"
+        status_token = active_status_tokens.pop(tool_key, None)
+        self._stop_tool_status(status_token)
+        meta = dict(tool_result.meta or {})
+        status = str(meta.get("status", "completed")).strip() or "completed"
+        duration_ms = meta.get("duration_ms")
+        if tool_result.ok:
+            self._active_turn_tool_successes += 1
         if meta.get("swapped") and not meta.get("swap_restore_ok", True):
             log.write(f"  {rich_text('KV cache restore failed after swap — re-prompting context', 'warning')}")
-            if self.agent and self.client:
-                try:
-                    await self.client.reset_kv_cache()
-                except Exception:
-                    pass  # reset_kv_cache restarts the server, best effort
-            if self.session_logger:
-                self.session_logger.log_event(
-                    "swap_restore_fallback",
-                    swap_duration_s=meta.get("swap_duration_s"),
-                )
-
-        result_for_context, result_for_display, output_truncated = self._fit_tool_result_content_to_budget(execution)
-        if execution.ok:
-            self._active_turn_tool_successes += 1
-        self._write_tool_result(log, result_for_display, tool_call=tc)
-        self._complete_tool_call_and_refresh(tc, result_for_context)
-        self.persist_session_state(reason=f"tool_result:{tc.name}")
-        duration_ms = round((time.monotonic() - t0) * 1000.0, 2)
+        if status == "disallowed":
+            log.write(rich_text(tool_result.output, "warning"))
+            log.write("")
+        elif status == "denied":
+            pass
+        else:
+            self._write_tool_result(log, tool_result.output, tool_call=tc)
         if self.session_logger:
             self.session_logger.finish_tool_call(
                 tool_key,
-                ok=execution.ok,
-                approved=True,
-                duration_ms=duration_ms,
-                status="completed" if execution.ok else "failed",
+                ok=tool_result.ok,
+                approved=tool_result.approved,
+                duration_ms=duration_ms if isinstance(duration_ms, (int, float)) else None,
+                status=status,
                 attributes=self._tool_result_telemetry_attributes(
                     tc,
                     meta,
-                    duration_ms=duration_ms,
-                    output_truncated=output_truncated,
+                    duration_ms=duration_ms if isinstance(duration_ms, (int, float)) else None,
+                    output_truncated=bool(meta.get("output_truncated", False)),
                 ),
             )
+        self._render_token_counter()
         return {
             "tool": tc.name,
-            "ok": bool(meta.get("ok", True)),
-            "summary": result.splitlines()[0] if result else "",
+            "ok": bool(meta.get("ok", False)),
+            "summary": tool_result.output.splitlines()[0] if tool_result.output else "",
             "target": format_tool_args(tc),
             "verification": tc.name == "shell" and shell_command_is_verification(str(tc.arguments.get("command", ""))),
             "command": tc.arguments.get("command") if isinstance(tc.arguments, dict) else None,
             "duration_ms": duration_ms,
         }
-
-    def _clamp_load_file_tool_budget(self, tc: ToolCall) -> None:
-        if isinstance(tc.arguments, dict):
-            remaining = self._remaining_prompt_tokens(reserve_next_turn_overhead=True)
-            current = tc.arguments.get("max_tokens")
-            if isinstance(current, int):
-                tc.arguments["max_tokens"] = min(current, remaining) if remaining > 0 else 0
-            else:
-                tc.arguments["max_tokens"] = remaining if remaining > 0 else 0
 
     def _remaining_prompt_tokens(self, *, reserve_next_turn_overhead: bool = False) -> int:
         if not self.agent:
@@ -2322,81 +2237,6 @@ class OpenJetApp:
             else 0
         )
         return max(0, budget.prompt_tokens - current - runtime_overhead)
-
-    def _fit_tool_result_to_budget(self, result: str) -> tuple[str, bool]:
-        if not result:
-            return result, False
-        budget_tokens = max(0, self._remaining_prompt_tokens(reserve_next_turn_overhead=True))
-        runtime_overhead = (
-            self.agent.runtime_overhead_tokens(force_post_tool_continuation=True)
-            if self.agent
-            else 0
-        )
-        result_tokens = estimate_tokens(result)
-        if budget_tokens <= 0:
-            self._log_trace_event(
-                "tool_result_truncated",
-                result_tokens=result_tokens,
-                budget_tokens=budget_tokens,
-                runtime_overhead_tokens=runtime_overhead,
-                reason="no_prompt_budget_remaining",
-            )
-            return (
-                "...[tool output omitted: no prompt budget remaining]\n"
-                "[tool context limit reached: "
-                f"tool~{result_tokens}t, available~0t after overhead~{runtime_overhead}t; "
-                "narrow the next tool call or condense context]",
-                True,
-            )
-        if result_tokens <= budget_tokens:
-            return result, False
-        self._log_trace_event(
-            "tool_result_truncated",
-            result_tokens=result_tokens,
-            budget_tokens=budget_tokens,
-            runtime_overhead_tokens=runtime_overhead,
-            reason="exceeds_prompt_budget",
-        )
-        prefix = "...[tool output truncated]\n"
-        suffix = (
-            "\n[tool context limit reached: "
-            f"tool~{result_tokens}t, available~{budget_tokens}t after overhead~{runtime_overhead}t; "
-            "narrow the next tool call or condense context]"
-        )
-        max_chars = max(128, budget_tokens * 4)
-        clipped = result[-max_chars:]
-        candidate = prefix + clipped + suffix
-        while estimate_tokens(candidate) > budget_tokens and len(clipped) > 64:
-            clipped = clipped[max(64, int(len(clipped) * 0.85)):]
-            candidate = prefix + clipped + suffix
-        return candidate, True
-
-    def _fit_tool_result_content_to_budget(
-        self,
-        execution: ToolExecutionResult,
-    ) -> tuple[object, str, bool]:
-        if execution.context_content is None:
-            result_for_context, output_truncated = self._fit_tool_result_to_budget(execution.output)
-            return result_for_context, result_for_context, output_truncated
-
-        content = execution.context_content
-        if isinstance(content, str):
-            result_for_context, output_truncated = self._fit_tool_result_to_budget(content)
-            return result_for_context, result_for_context, output_truncated
-
-        image_paths: list[str] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if str(block.get("type", "")).strip().lower() != "input_image":
-                continue
-            path = str(block.get("path", "")).strip()
-            if path:
-                image_paths.append(path)
-
-        result_for_display, output_truncated = self._fit_tool_result_to_budget(content_to_plain_text(content))
-        result_for_context = build_user_content(result_for_display, image_paths or None)
-        return result_for_context, result_for_display, output_truncated
 
     def _is_recoverable_runtime_error(self, error_text: str) -> bool:
         lowered = error_text.lower()

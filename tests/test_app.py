@@ -32,6 +32,7 @@ from src.llama_server import (
 )
 from src.provisioning import ensure_direct_model
 from src.runtime_protocol import StreamChunk, ToolCall
+from src.sdk import ToolResult
 from src.session_state import ChatArchiveStore, SavedChatEntry, SessionStateStore
 from src.setup import _prompt_choice, _runtime_prompt_options, build_recommended_payload, run_setup_wizard
 
@@ -1293,43 +1294,20 @@ class SlashResumeCommandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AppToolHandlingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_handle_tool_call_refreshes_token_counter_immediately_after_result(self) -> None:
+    async def test_record_tool_result_refreshes_token_counter_immediately_after_result(self) -> None:
         app = OpenJetApp()
-
-        class ToolAgent:
-            def __init__(self) -> None:
-                self.messages = [{"role": "system", "content": "system"}]
-
-            def needs_confirmation(self, tool_call) -> bool:
-                return False
-
-            def complete_tool_call(self, tool_call, result) -> None:
-                self.messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
-
-            def estimated_context_tokens(self) -> int:
-                return 128
-
-            def runtime_overhead_tokens(self, *, force_post_tool_continuation: bool = False, empty_retry_count: int = 0) -> int:
-                return 0
-
-            def context_budget(self):
-                return None
-
-        app.agent = ToolAgent()
         tool_call = ToolCall(name="list_directory", arguments={"path": "."}, id="call-1")
+        tool_result = ToolResult(
+            tool_call=tool_call,
+            output="listing",
+            meta={"ok": True, "status": "completed"},
+        )
 
-        execution = SimpleNamespace(output="listing", meta={"ok": True}, ok=True)
-        with patch("src.app.execute_tool", AsyncMock(return_value=execution)), patch.object(
-            app, "_fit_tool_result_to_budget", return_value=("listing", False)
-        ), patch.object(app, "_render_token_counter") as render_counter, patch.object(
-            app, "persist_session_state"
-        ) as persist_session:
-            event = await app._handle_tool_call(tool_call, app.query_one("#chat-log"))
+        with patch.object(app, "_render_token_counter") as render_counter:
+            event = app._record_tool_result(tool_result, app.query_one("#chat-log"), {})
 
         self.assertEqual(event["tool"], "list_directory")
-        self.assertEqual(app.agent.messages[-1]["content"], "listing")
         render_counter.assert_called_once()
-        persist_session.assert_called_once_with(reason="tool_result:list_directory")
 
 
 class CliCommandTests(unittest.TestCase):

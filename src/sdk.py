@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -139,6 +140,10 @@ class OpenJetSession:
 
     async def stream(self, prompt: str, *, image_paths: list[str] | None = None):
         self.agent.add_user_message(prompt, image_paths=image_paths)
+        async for event in self.stream_existing_turn():
+            yield event
+
+    async def stream_existing_turn(self):
         while True:
             pending_tool_calls: list[ToolCall] = []
             async for event in self.agent.run_turn():
@@ -205,7 +210,7 @@ class OpenJetSession:
             return ToolResult(
                 tool_call=tool_call,
                 output=output,
-                meta={"ok": False, "denied": True},
+                meta={"ok": False, "denied": True, "status": "disallowed"},
                 approved=False,
             )
 
@@ -217,19 +222,47 @@ class OpenJetSession:
                 return ToolResult(
                     tool_call=tool_call,
                     output=output,
-                    meta={"ok": False, "denied": True},
+                    meta={"ok": False, "denied": True, "status": "denied"},
                     approved=False,
                 )
 
         if tool_call.name == "load_file":
             self._clamp_load_file_tool_budget(tool_call)
 
-        result = await execute_tool(tool_call)
-        context_output = self._fit_tool_result_content_to_budget(result)
+        t0 = time.monotonic()
+        try:
+            result = await execute_tool(tool_call)
+        except Exception as exc:
+            output = f"Tool execution failed: {exc}"
+            self.agent.complete_tool_call(tool_call, output)
+            return ToolResult(
+                tool_call=tool_call,
+                output=output,
+                meta={
+                    "ok": False,
+                    "status": "exception",
+                    "error": str(exc).strip() or type(exc).__name__,
+                    "duration_ms": round((time.monotonic() - t0) * 1000.0, 2),
+                },
+                approved=True,
+            )
+
+        if result.meta.get("swapped") and not result.meta.get("swap_restore_ok", True):
+            try:
+                await self.agent.client.reset_kv_cache()
+            except Exception:
+                pass
+
+        context_output, output_truncated = self._fit_tool_result_content_to_budget(result)
         self.agent.complete_tool_call(tool_call, context_output)
-        if bool(result.meta.get("internal_retry")):
+        result_meta = dict(result.meta)
+        result_meta.setdefault("ok", bool(result.ok))
+        result_meta.setdefault("status", "completed" if result.ok else "failed")
+        result_meta["duration_ms"] = round((time.monotonic() - t0) * 1000.0, 2)
+        result_meta["output_truncated"] = output_truncated
+        if bool(result_meta.get("internal_retry")):
             return None
-        return ToolResult(tool_call=tool_call, output=result.output, meta=result.meta, approved=True)
+        return ToolResult(tool_call=tool_call, output=result.output, meta=result_meta, approved=True)
 
     async def _approve(self, tool_call: ToolCall) -> bool:
         if self._approval_handler is None:
@@ -243,11 +276,14 @@ class OpenJetSession:
         if not isinstance(tool_call.arguments, dict):
             return
         remaining = self._remaining_prompt_tokens(reserve_next_turn_overhead=True)
+        if remaining <= 0:
+            tool_call.arguments["max_tokens"] = 0
+            return
         current = tool_call.arguments.get("max_tokens")
         if not isinstance(current, int):
             tool_call.arguments["max_tokens"] = remaining
             return
-        tool_call.arguments["max_tokens"] = max(128, min(current, remaining))
+        tool_call.arguments["max_tokens"] = min(current, remaining)
 
     def _remaining_prompt_tokens(self, *, reserve_next_turn_overhead: bool = False) -> int:
         current = self.agent.estimated_context_tokens()
@@ -295,12 +331,14 @@ class OpenJetSession:
 
         return candidate
 
-    def _fit_tool_result_content_to_budget(self, result: ToolExecutionResult) -> object:
+    def _fit_tool_result_content_to_budget(self, result: ToolExecutionResult) -> tuple[object, bool]:
         content = result.context_content
         if content is None:
-            return self._fit_tool_result_to_budget(result.output)
+            fitted = self._fit_tool_result_to_budget(result.output)
+            return fitted, fitted != result.output
         if isinstance(content, str):
-            return self._fit_tool_result_to_budget(content)
+            fitted = self._fit_tool_result_to_budget(content)
+            return fitted, fitted != content
 
         image_paths: list[str] = []
         for block in content:
@@ -313,7 +351,7 @@ class OpenJetSession:
                 image_paths.append(path)
 
         text = self._fit_tool_result_to_budget(content_to_plain_text(content))
-        return build_user_content(text, image_paths or None)
+        return build_user_content(text, image_paths or None), text != content_to_plain_text(content)
 
 
 async def create_agent(

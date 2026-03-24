@@ -6,12 +6,26 @@ from pathlib import Path
 from typing import Mapping
 
 from ..config import load_config
-from ..device_sources import ensure_devices_registry
+from ..device_sources import DEVICE_TOOL_NAMES, ensure_devices_registry
+from ..executor import load_file
+from ..harness import HarnessState, build_turn_context, set_preferred_skills, update_state_for_user_message
+from ..runtime_limits import MIN_TOKEN_BUDGET, derive_context_budget, read_memory_snapshot
 from ..sdk import OpenJetSession
 from ..tool_executor import format_tool_args
 from .bindings import WorkflowBindings, resolve_workflow_bindings
-from .context import allowed_tools_for_workflow, build_workflow_context
 from .specs import WorkflowSpec
+
+
+READ_ONLY_WORKFLOW_TOOLS = {
+    "read_file",
+    "load_file",
+    "glob",
+    "grep",
+    "list_directory",
+    "system_info",
+}
+MAX_PRELOAD_FILE_TOKENS = 1200
+PRELOAD_RESERVE_TOKENS = 384
 
 
 @dataclass(frozen=True)
@@ -31,6 +45,13 @@ class WorkflowRunResult:
     docs_loaded: tuple[str, ...] = field(default_factory=tuple)
     preloaded_files: tuple[str, ...] = field(default_factory=tuple)
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkflowTurnContext:
+    messages: list[dict[str, str]]
+    docs_loaded: tuple[str, ...]
+    preloaded_files: tuple[str, ...] = field(default_factory=tuple)
 
 
 async def run_workflow(
@@ -54,12 +75,15 @@ async def run_workflow(
             root=root,
             allowed_tools=allowed_tools_for_workflow(spec),
         )
-        context = await build_workflow_context(
+        context = await _build_workflow_turn_context(
             root,
             spec,
             bindings,
             cfg=resolved_cfg,
-            current_context_tokens=session.agent.estimated_context_tokens(),
+            current_context_tokens=(
+                session.agent.persistent_context_tokens()
+                + session.agent.runtime_overhead_tokens()
+            ),
             effective_window=session.agent.context_window_tokens or 2048,
         )
         session.add_turn_context(context.messages)
@@ -115,6 +139,13 @@ async def run_workflow(
             await session.close()
 
 
+def allowed_tools_for_workflow(spec: WorkflowSpec) -> set[str]:
+    allowed = set(READ_ONLY_WORKFLOW_TOOLS) | set(DEVICE_TOOL_NAMES)
+    if spec.allow_shell:
+        allowed.add("shell")
+    return allowed
+
+
 def _workflow_run_prompt(spec: WorkflowSpec, bindings: WorkflowBindings) -> str:
     lines = [
         f"Run workflow `{spec.name}` now.",
@@ -131,3 +162,111 @@ def _workflow_run_prompt(spec: WorkflowSpec, bindings: WorkflowBindings) -> str:
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+async def _build_workflow_turn_context(
+    root: Path,
+    spec: WorkflowSpec,
+    bindings: WorkflowBindings,
+    *,
+    cfg: Mapping[str, object] | None,
+    current_context_tokens: int,
+    effective_window: int,
+):
+    state = update_state_for_user_message(
+        HarnessState(),
+        f"Run workflow {spec.name}",
+        mode=spec.mode,
+        files=list(spec.files),
+    )
+    if spec.skills:
+        state = set_preferred_skills(state, list(spec.skills))
+    workflow_messages = [{"role": "system", "content": _render_workflow_doc(spec)}]
+    preloaded_messages, preloaded_files = await _preload_workflow_files(
+        root,
+        spec,
+        current_context_tokens=current_context_tokens,
+        effective_window=effective_window,
+    )
+    context = build_turn_context(
+        root=root,
+        state=state,
+        current_context_tokens=current_context_tokens,
+        effective_window=effective_window,
+        memory_snapshot=read_memory_snapshot(),
+        layered_config=dict(cfg.get("layered_context") or {}) if isinstance(cfg, Mapping) else None,
+        cfg=cfg,
+        referenced_device_ids=bindings.primary_refs or bindings.requested_ids,
+        extra_system_messages=[*workflow_messages, *preloaded_messages],
+        extra_docs_loaded=preloaded_files,
+    )
+    return WorkflowTurnContext(
+        messages=context.messages,
+        docs_loaded=tuple(context.docs_loaded),
+        preloaded_files=tuple(preloaded_files),
+    )
+
+
+async def _preload_workflow_files(
+    root: Path,
+    spec: WorkflowSpec,
+    *,
+    current_context_tokens: int,
+    effective_window: int,
+) -> tuple[list[dict[str, str]], list[str]]:
+    if not spec.files:
+        return [], []
+    budget = derive_context_budget(effective_window)
+    remaining_budget = max(0, budget.prompt_tokens - current_context_tokens - PRELOAD_RESERVE_TOKENS)
+    if remaining_budget < MIN_TOKEN_BUDGET * len(spec.files):
+        raise ValueError(
+            "workflow file preload budget is too small for the configured files; "
+            "reduce `files:` or increase the context window"
+        )
+    messages: list[dict[str, str]] = []
+    preloaded: list[str] = []
+    files_left = len(spec.files)
+    for raw_path in spec.files:
+        budget_for_file = min(
+            MAX_PRELOAD_FILE_TOKENS,
+            max(MIN_TOKEN_BUDGET, remaining_budget // max(1, files_left)),
+        )
+        path = Path(raw_path)
+        resolved = path if path.is_absolute() else (root / path)
+        loaded = await load_file(str(resolved), max_tokens=budget_for_file)
+        if not loaded.ok:
+            raise ValueError(f"workflow file preload failed for {raw_path}: {loaded.detail}")
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Workflow-configured file context:\n"
+                    f"path: {loaded.path}\n"
+                    f"tokens_estimated: {loaded.estimated_tokens}\n"
+                    f"tokens_loaded: {loaded.returned_tokens}\n"
+                    f"token_budget: {loaded.token_budget}\n"
+                    f"truncated: {'yes' if loaded.truncated else 'no'}\n"
+                    "content:\n"
+                    f"{loaded.content}"
+                ),
+            }
+        )
+        preloaded.append(loaded.path)
+        remaining_budget = max(0, remaining_budget - loaded.returned_tokens)
+        files_left -= 1
+    return messages, preloaded
+
+
+def _render_workflow_doc(spec: WorkflowSpec) -> str:
+    lines = [
+        f"WORKFLOW DOCUMENT: {spec.name}",
+        f"path: {spec.path}",
+        f"mode: {spec.mode}",
+        f"allow_shell: {'true' if spec.allow_shell else 'false'}",
+        f"devices: {', '.join(spec.devices) if spec.devices else 'none'}",
+        f"skills: {', '.join(spec.skills) if spec.skills else 'none'}",
+        f"files: {', '.join(spec.files) if spec.files else 'none'}",
+        "instructions:",
+        spec.body.strip() or "(empty workflow body)",
+    ]
+    return "\n".join(lines)
