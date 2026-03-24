@@ -2,20 +2,20 @@
 <img height="225" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
 
 
-`open-jet` is an offline-first local agent you can actually use for real work on the edge.
+`open-jet` is a self-hosted agent runtime for local models that need to do more than chat.
 
-It gives you a practical agent interface on top of your own local model and runtime, without making you assemble chat, tools, session recovery, and prompt management yourself.
+Most local LLM tools stop at prompts and text. OpenJet lets a local model interact with the machine and devices around it: shell workflows, files, cameras, microphones, GPIO, and simple sensor inputs.
 
-OpenJet is designed to stay useful when local AI gets messy: tight memory, short context windows, interrupted sessions, and hardware-specific runtime issues.
+It is built for the environments where local agents usually become brittle: tight memory, short context windows, interrupted sessions, and hardware-specific runtime issues.
 
-OpenJet can also interface with local input and output devices through the same chat and tool runtime.
+Use OpenJet when you want a local model that can stay useful while interfacing with real systems and device I/O on hardware you control.
 
 ## Why use OpenJet
 
-- start with a local or self-hosted runtime you control
+- connect local models to local devices and system workflows, not just chat
 - keep working without losing the thread when sessions get interrupted
+- manage memory and context pressure on constrained machines
 - use tools with explicit approvals and predictable behavior
-- work with local cameras, microphones, GPIO, and simple sensor inputs through the same chat and tool flow
 - run the same backend from the TUI or Python SDK
 - avoid building your own glue layer around local inference
 
@@ -23,6 +23,16 @@ OpenJet can also interface with local input and output devices through the same 
 
 X: https://x.com/FlouisLF
 
+## Who It's For
+
+- local-LLM users who need shell and device interaction, not just a chat UI
+- builders working with cameras, microphones, GPIO, or simple sensor inputs
+- constrained or edge-style setups where restart recovery and memory pressure matter
+## Who It's Not For
+
+- people who only want a polished hosted assistant or browser chat
+- teams looking for a generic SaaS copilot with no local/device needs
+- users who do not care about running on their own hardware
 
 ## Quickstart
 
