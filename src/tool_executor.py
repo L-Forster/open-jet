@@ -19,8 +19,8 @@ from .executor import (
     grep_files,
     list_directory,
     load_file,
-    read_system_info,
     read_file,
+    read_system_info,
     run_shell,
     write_file,
 )
@@ -46,475 +46,345 @@ class ToolExecutionResult:
         return bool(self.meta.get("ok", False))
 
 
-# Optional SwapManager — set by app.py at startup when available.
+class ToolArgumentError(ValueError):
+    pass
+
+
 _swap_manager: SwapManager | None = None
+_MISSING = object()
+_DEVICE_TOOLS = {
+    "camera_snapshot": (PeripheralKind.CAMERA, None, True, None),
+    "microphone_record": (PeripheralKind.MICROPHONE, "duration_seconds", True, None),
+    "sensor_read": (PeripheralKind.SENSOR, None, False, PeripheralTransport.GPIO),
+    "gpio_read": (PeripheralKind.SENSOR, None, False, PeripheralTransport.GPIO),
+}
 
 
 def set_swap_manager(manager: SwapManager | None) -> None:
-    """Register a SwapManager for memory-guarded shell execution."""
     global _swap_manager
     _swap_manager = manager
 
 
 def get_swap_manager() -> SwapManager | None:
-    """Return the currently registered SwapManager, if any."""
     return _swap_manager
 
 
 async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
-    if not isinstance(tool_call.arguments, dict):
-        return ToolExecutionResult(
-            output=f"Error: invalid arguments for {tool_call.name}",
-            meta={"ok": False},
-        )
-
-    if tool_call.name == "shell":
-        command = tool_call.arguments.get("command", "")
-        timeout_seconds = tool_call.arguments.get("timeout_seconds")
-        resource_mode = str(tool_call.arguments.get("resource_mode", "normal") or "normal").strip().lower()
-        estimated_ram_mb = tool_call.arguments.get("estimated_ram_mb")
-        estimated_vram_mb = tool_call.arguments.get("estimated_vram_mb")
-        reload_delay_seconds = tool_call.arguments.get("reload_delay_seconds", 0)
-        if not isinstance(command, str) or not command.strip():
-            return ToolExecutionResult(
-                output="Error: invalid arguments for shell (required: command)",
-                meta={"ok": False},
-            )
-        if timeout_seconds is not None:
-            if not isinstance(timeout_seconds, int):
-                return ToolExecutionResult(
-                    output="Error: invalid arguments for shell (timeout_seconds must be int)",
-                    meta={"ok": False},
+    args = tool_call.arguments
+    if not isinstance(args, dict):
+        return _invalid(tool_call.name)
+    try:
+        match tool_call.name:
+            case "shell":
+                return await _shell_result(args)
+            case "system_info":
+                return await _text_result_async(read_system_info, scope=_str_arg(args, "scope"), error_prefix="Error:")
+            case "device_list":
+                text, meta = _device_list_output(kind=_str_arg(args, "kind"))
+                return ToolExecutionResult(output=text, meta=meta)
+            case "camera_snapshot" | "microphone_record" | "sensor_read" | "gpio_read":
+                return _device_tool_result(tool_call.name, args)
+            case "microphone_set_enabled":
+                return _microphone_set_enabled_result(args)
+            case "read_file":
+                return await _text_result_async(
+                    read_file,
+                    _str_arg(args, "path", required=True, allow_empty=False),
+                    error_prefix="Error:",
                 )
-            if timeout_seconds <= 0:
-                return ToolExecutionResult(
-                    output="Error: invalid arguments for shell (timeout_seconds must be > 0)",
-                    meta={"ok": False},
+            case "memory":
+                return await _memory_result(args)
+            case "write_file":
+                path = args.get("path", "")
+                content = args.get("content", "")
+                if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
+                    raise ToolArgumentError("required: path, content")
+                return await _text_result_async(write_file, path, content, error_prefix="Error")
+            case "load_file":
+                return await _load_file_result(args)
+            case "edit_file":
+                return await _edit_file_result(args)
+            case "glob":
+                return await _text_result_async(
+                    glob_files,
+                    _str_arg(args, "pattern", required=True, allow_empty=False),
+                    path=args.get("path"),
+                    error_prefix="Error",
                 )
-        if resource_mode not in {"normal", "auto", "unload_first"}:
-            return ToolExecutionResult(
-                output="Error: invalid arguments for shell (resource_mode must be normal, auto, or unload_first)",
-                meta={"ok": False},
-            )
-        if estimated_ram_mb is not None and not isinstance(estimated_ram_mb, int):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for shell (estimated_ram_mb must be int)",
-                meta={"ok": False},
-            )
-        if estimated_vram_mb is not None and not isinstance(estimated_vram_mb, int):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for shell (estimated_vram_mb must be int)",
-                meta={"ok": False},
-            )
-        if not isinstance(reload_delay_seconds, int):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for shell (reload_delay_seconds must be int)",
-                meta={"ok": False},
-            )
-        if reload_delay_seconds < 0:
-            return ToolExecutionResult(
-                output="Error: invalid arguments for shell (reload_delay_seconds must be >= 0)",
-                meta={"ok": False},
-            )
-        effective_timeout = timeout_seconds or DEFAULT_SHELL_TIMEOUT_SECONDS
-        swap_meta: dict = {}
-        swap_plan = _swap_manager.plan_unload(estimated_ram_mb or 0) if _swap_manager is not None else None
-        use_swap = False
-        if resource_mode == "unload_first":
-            use_swap = _swap_manager is not None
-        elif resource_mode == "auto" and swap_plan is not None:
-            use_swap = swap_plan.unload_recommended
-
-        if use_swap and _swap_manager is not None:
-            swap_result = await _swap_manager.run_with_swap(
-                command,
-                timeout=effective_timeout,
-                reload_delay_seconds=reload_delay_seconds,
-            )
-            res = swap_result.exec_result
-            swap_meta = {
-                "swap_mode": resource_mode,
-                "swap_available": True,
-                "swap_attempted": True,
-                "swap_plan_recommended": True if swap_plan is None else swap_plan.unload_recommended,
-                "estimated_ram_mb": estimated_ram_mb,
-                "estimated_vram_mb": estimated_vram_mb,
-                "reload_delay_seconds": reload_delay_seconds,
-                "swapped": swap_result.unloaded,
-                "swap_reload_ok": swap_result.reload_ok,
-                "swap_restore_ok": swap_result.restore_ok,
-                "swap_duration_s": swap_result.swap_duration_s,
-            }
-        else:
-            res = await run_shell(command, timeout_seconds=effective_timeout)
-            swap_meta = {
-                "swap_mode": resource_mode,
-                "swap_available": _swap_manager is not None,
-                "swap_attempted": False,
-                "swap_plan_recommended": swap_plan.unload_recommended if swap_plan is not None else False,
-                "estimated_ram_mb": estimated_ram_mb,
-                "estimated_vram_mb": estimated_vram_mb,
-                "reload_delay_seconds": reload_delay_seconds,
-            }
-
-        result_output = res.summary
-        swap_note = _swap_summary_line(swap_meta)
-        if swap_note:
-            result_output = f"{result_output}\n{swap_note}"
-        resource_hint = _resource_failure_hint(res)
-        if resource_hint:
-            result_output = f"{result_output}\n{resource_hint}"
-        return ToolExecutionResult(
-            output=result_output,
-            meta={
-                "ok": res.ok,
-                "exit_code": res.exit_code,
-                "stdout": res.stdout,
-                "stderr": res.stderr,
-                "timed_out": res.timed_out,
-                "timeout_seconds": res.timeout_seconds,
-                "resource_failure_detected": bool(resource_hint),
-                **swap_meta,
-            },
-        )
-
-    if tool_call.name == "system_info":
-        scope = tool_call.arguments.get("scope")
-        if scope is not None and not isinstance(scope, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for system_info (scope must be string)",
-                meta={"ok": False},
-            )
-        text = await read_system_info(scope=scope)
-        return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error:")})
-
-    if tool_call.name == "device_list":
-        kind = tool_call.arguments.get("kind")
-        if kind is not None and not isinstance(kind, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for device_list (kind must be string)",
-                meta={"ok": False},
-            )
-        try:
-            text, meta = _device_list_output(kind=kind)
-        except ValueError as exc:
-            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
-        return ToolExecutionResult(output=text, meta=meta)
-
-    if tool_call.name == "camera_snapshot":
-        source_ref = tool_call.arguments.get("source")
-        output_path = tool_call.arguments.get("output_path")
-        if source_ref is not None and not isinstance(source_ref, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for camera_snapshot (source must be string)",
-                meta={"ok": False},
-            )
-        if output_path is not None and not isinstance(output_path, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for camera_snapshot (output_path must be string)",
-                meta={"ok": False},
-            )
-        try:
-            result = _device_observation_result(
-                source_ref=source_ref,
-                expected_kind=PeripheralKind.CAMERA,
-                output_path=output_path,
-            )
-        except (ValueError, RuntimeError) as exc:
-            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
-        return result
-
-    if tool_call.name == "microphone_record":
-        source_ref = tool_call.arguments.get("source")
-        duration_seconds = tool_call.arguments.get("duration_seconds", 5)
-        output_path = tool_call.arguments.get("output_path")
-        if source_ref is not None and not isinstance(source_ref, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for microphone_record (source must be string)",
-                meta={"ok": False},
-            )
-        if not isinstance(duration_seconds, int):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for microphone_record (duration_seconds must be int)",
-                meta={"ok": False},
-            )
-        if duration_seconds <= 0:
-            return ToolExecutionResult(
-                output="Error: invalid arguments for microphone_record (duration_seconds must be > 0)",
-                meta={"ok": False},
-            )
-        if output_path is not None and not isinstance(output_path, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for microphone_record (output_path must be string)",
-                meta={"ok": False},
-            )
-        try:
-            result = _device_observation_result(
-                source_ref=source_ref,
-                expected_kind=PeripheralKind.MICROPHONE,
-                duration_seconds=duration_seconds,
-                output_path=output_path,
-            )
-        except (ValueError, RuntimeError) as exc:
-            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
-        return result
-
-    if tool_call.name == "microphone_set_enabled":
-        source_ref = tool_call.arguments.get("source")
-        enabled = tool_call.arguments.get("enabled")
-        if source_ref is not None and not isinstance(source_ref, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for microphone_set_enabled (source must be string)",
-                meta={"ok": False},
-            )
-        if not isinstance(enabled, bool):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for microphone_set_enabled (enabled must be boolean)",
-                meta={"ok": False},
-            )
-        try:
-            cfg = _tool_config()
-            source = _select_device_source(cfg, source_ref=source_ref, expected_kind=PeripheralKind.MICROPHONE)
-            updated = set_device_enabled(cfg, reference=source.primary_ref, enabled=enabled)
-            save_config(cfg)
-            registry_path = _sync_tool_device_registry(cfg)
-        except ValueError as exc:
-            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
-        state = "enabled" if updated.enabled else "disabled"
-        return ToolExecutionResult(
-            output=f"Microphone @{updated.primary_ref} is now {state}.",
-            meta={
-                "ok": True,
-                "source_ref": updated.primary_ref,
-                "enabled": updated.enabled,
-                "registry_path": str(registry_path) if registry_path else None,
-            },
-        )
-
-    if tool_call.name in {"sensor_read", "gpio_read"}:
-        source_ref = tool_call.arguments.get("source")
-        if source_ref is not None and not isinstance(source_ref, str):
-            return ToolExecutionResult(
-                output=f"Error: invalid arguments for {tool_call.name} (source must be string)",
-                meta={"ok": False},
-            )
-        try:
-            result = _device_observation_result(
-                source_ref=source_ref,
-                expected_kind=PeripheralKind.SENSOR,
-                required_transport=PeripheralTransport.GPIO,
-            )
-        except (ValueError, RuntimeError) as exc:
-            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
-        return result
-
-    if tool_call.name == "read_file":
-        path = tool_call.arguments.get("path", "")
-        if not isinstance(path, str) or not path.strip():
-            return ToolExecutionResult(
-                output="Error: invalid arguments for read_file (required: path)",
-                meta={"ok": False},
-            )
-        text = await read_file(path)
-        return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error:")})
-
-    if tool_call.name == "memory":
-        scope = tool_call.arguments.get("scope", "")
-        action = tool_call.arguments.get("action", "")
-        content = tool_call.arguments.get("content", "")
-        if not isinstance(scope, str) or not scope.strip() or not isinstance(action, str) or not action.strip():
-            return ToolExecutionResult(
-                output="Error: invalid arguments for memory (required: scope, action)",
-                meta={"ok": False},
-            )
-        if not isinstance(content, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for memory (content must be string)",
-                meta={"ok": False},
-            )
-        try:
-            text = await update_persistent_memory(
-                Path.cwd(),
-                scope=scope,
-                action=action,
-                content=content,
-            )
-        except ValueError as exc:
-            return ToolExecutionResult(output=f"Error: {exc}", meta={"ok": False})
-        return ToolExecutionResult(output=text, meta={"ok": True, "scope": scope, "action": action})
-
-    if tool_call.name == "write_file":
-        path = tool_call.arguments.get("path", "")
-        content = tool_call.arguments.get("content", "")
-        if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for write_file (required: path, content)",
-                meta={"ok": False},
-            )
-        text = await write_file(path, content)
-        return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error")})
-
-    if tool_call.name == "load_file":
-        path = tool_call.arguments.get("path", "")
-        max_tokens = tool_call.arguments.get("max_tokens")
-        if not isinstance(path, str) or not path.strip():
-            return ToolExecutionResult(
-                output="Error: invalid arguments for load_file (required: path)",
-                meta={"ok": False},
-            )
-        if max_tokens is not None and not isinstance(max_tokens, int):
-            return ToolExecutionResult(
-                output="Error: invalid arguments for load_file (max_tokens must be int)",
-                meta={"ok": False},
-            )
-        loaded = await load_file(path, max_tokens=max_tokens)
-        if not loaded.ok:
-            return ToolExecutionResult(output=loaded.detail, meta={"ok": False})
-        payload = f"{loaded.summary}\ncontent:\n{loaded.content}"
-        return ToolExecutionResult(
-            output=payload,
-            meta={
-                "ok": True,
-                "truncated": loaded.truncated,
-                "estimated_tokens": loaded.estimated_tokens,
-                "returned_tokens": loaded.returned_tokens,
-                "token_budget": loaded.token_budget,
-                "mem_available_mb": loaded.mem_available_mb,
-            },
-        )
-
-    if tool_call.name == "edit_file":
-        path = tool_call.arguments.get("path", "")
-        patch = tool_call.arguments.get("patch")
-        old_string = tool_call.arguments.get("old_string", "")
-        new_string = tool_call.arguments.get("new_string", "")
-        replace_all_flag = tool_call.arguments.get("replace_all", False)
-        if not isinstance(path, str) or not path.strip():
-            return ToolExecutionResult(
-                output="Error: invalid arguments for edit_file (required: path)",
-                meta={"ok": False},
-            )
-        if patch is not None:
-            if not isinstance(patch, str) or not patch.strip():
-                return ToolExecutionResult(
-                    output="Error: invalid arguments for edit_file (patch must be a non-empty string)",
-                    meta={"ok": False},
+            case "grep":
+                return await _text_result_async(
+                    grep_files,
+                    _str_arg(args, "pattern", required=True, allow_empty=False),
+                    path=args.get("path"),
+                    glob_filter=args.get("glob"),
+                    ignore_case=bool(args.get("ignore_case", False)),
+                    error_prefix="Error",
                 )
-            result = await edit_file(path, patch=patch, return_result=True)
-        else:
-            if not isinstance(old_string, str) or not old_string:
-                return ToolExecutionResult(
-                    output="Error: invalid arguments for edit_file (required: patch or old_string)",
-                    meta={"ok": False},
-                )
-            if not isinstance(new_string, str):
-                return ToolExecutionResult(
-                    output="Error: invalid arguments for edit_file (required: new_string)",
-                    meta={"ok": False},
-                )
-            result = await edit_file(
-                path,
-                old_string=old_string,
-                new_string=new_string,
-                replace_all=bool(replace_all_flag),
-                return_result=True,
-            )
-        return ToolExecutionResult(
-            output=result.output,
-            meta={
-                "ok": result.ok,
-                "internal_retry": result.internal_retry,
-                "replacements": result.replacements,
-                "match_strategy": result.match_strategy,
-                "validation_error": result.validation_error,
-            },
-        )
-
-    if tool_call.name == "glob":
-        pattern = tool_call.arguments.get("pattern", "")
-        search_path = tool_call.arguments.get("path")
-        if not isinstance(pattern, str) or not pattern.strip():
-            return ToolExecutionResult(
-                output="Error: invalid arguments for glob (required: pattern)",
-                meta={"ok": False},
-            )
-        text = await glob_files(pattern, path=search_path)
-        return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error")})
-
-    if tool_call.name == "grep":
-        pattern = tool_call.arguments.get("pattern", "")
-        search_path = tool_call.arguments.get("path")
-        glob_filter = tool_call.arguments.get("glob")
-        ignore_case = tool_call.arguments.get("ignore_case", False)
-        if not isinstance(pattern, str) or not pattern.strip():
-            return ToolExecutionResult(
-                output="Error: invalid arguments for grep (required: pattern)",
-                meta={"ok": False},
-            )
-        text = await grep_files(
-            pattern,
-            path=search_path,
-            glob_filter=glob_filter,
-            ignore_case=bool(ignore_case),
-        )
-        return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error")})
-
-    if tool_call.name == "list_directory":
-        dir_path = tool_call.arguments.get("path")
-        text = await list_directory(path=dir_path)
-        return ToolExecutionResult(output=text, meta={"ok": not text.startswith("Error")})
-
-    return ToolExecutionResult(output=f"Unknown tool: {tool_call.name}", meta={"ok": False})
+            case "list_directory":
+                return await _text_result_async(list_directory, path=args.get("path"), error_prefix="Error")
+            case _:
+                return ToolExecutionResult(output=f"Unknown tool: {tool_call.name}", meta={"ok": False})
+    except ToolArgumentError as exc:
+        return _invalid(tool_call.name, str(exc))
+    except ValueError as exc:
+        return _error(str(exc))
 
 
 def format_tool_args(tool_call: ToolCall) -> str:
-    if tool_call.name == "shell":
-        command = tool_call.arguments.get("command", str(tool_call.arguments))
-        timeout_seconds = tool_call.arguments.get("timeout_seconds")
-        resource_mode = str(tool_call.arguments.get("resource_mode", "normal") or "normal").strip()
-        if isinstance(timeout_seconds, int):
-            return f"$ {command} (timeout: {timeout_seconds}s, mode: {resource_mode})"
-        return f"$ {command} (mode: {resource_mode})"
-    if tool_call.name == "system_info":
-        scope = str(tool_call.arguments.get("scope", "summary") or "summary").strip()
-        return f"scope={scope}"
-    if tool_call.name == "device_list":
-        kind = str(tool_call.arguments.get("kind", "") or "").strip()
-        return f"kind={kind}" if kind else "all devices"
-    if tool_call.name in {"camera_snapshot", "microphone_record", "sensor_read", "gpio_read"}:
-        source = str(tool_call.arguments.get("source", "") or "").strip()
-        if tool_call.name == "microphone_record":
-            duration_seconds = tool_call.arguments.get("duration_seconds")
-            if isinstance(duration_seconds, int):
-                return f"{source or '<auto>'} ({duration_seconds}s)"
-        return source or "<auto>"
-    if tool_call.name == "microphone_set_enabled":
-        source = str(tool_call.arguments.get("source", "") or "").strip() or "<auto>"
-        enabled = tool_call.arguments.get("enabled")
-        return f"{source} -> {'on' if enabled else 'off'}"
-    if tool_call.name == "memory":
-        scope = str(tool_call.arguments.get("scope", ""))
-        action = str(tool_call.arguments.get("action", ""))
-        return f"{action} {scope}".strip()
-    if tool_call.name in {"read_file", "write_file", "load_file", "edit_file"}:
-        return str(tool_call.arguments.get("path", str(tool_call.arguments)))
-    if tool_call.name in {"glob", "grep"}:
-        return str(tool_call.arguments.get("pattern", str(tool_call.arguments)))
-    if tool_call.name == "list_directory":
-        return str(tool_call.arguments.get("path", ".") or ".")
-    return str(tool_call.arguments)
+    if not isinstance(tool_call.arguments, dict):
+        return str(tool_call.arguments)
+    args = tool_call.arguments
+    match tool_call.name:
+        case "shell":
+            command = args.get("command", str(args))
+            timeout_seconds = args.get("timeout_seconds")
+            mode = str(args.get("resource_mode", "normal") or "normal").strip()
+            return f"$ {command} (timeout: {timeout_seconds}s, mode: {mode})" if isinstance(timeout_seconds, int) else f"$ {command} (mode: {mode})"
+        case "system_info":
+            return f"scope={str(args.get('scope', 'summary') or 'summary').strip()}"
+        case "device_list":
+            kind = str(args.get("kind", "") or "").strip()
+            return f"kind={kind}" if kind else "all devices"
+        case "camera_snapshot" | "microphone_record" | "sensor_read" | "gpio_read":
+            source = str(args.get("source", "") or "").strip() or "<auto>"
+            duration = args.get("duration_seconds")
+            return f"{source} ({duration}s)" if tool_call.name == "microphone_record" and isinstance(duration, int) else source
+        case "microphone_set_enabled":
+            source = str(args.get("source", "") or "").strip() or "<auto>"
+            return f"{source} -> {'on' if args.get('enabled') else 'off'}"
+        case "memory":
+            return f"{str(args.get('action', ''))} {str(args.get('scope', ''))}".strip()
+        case "read_file" | "write_file" | "load_file" | "edit_file":
+            return str(args.get("path", str(args)))
+        case "glob" | "grep":
+            return str(args.get("pattern", str(args)))
+        case "list_directory":
+            return str(args.get("path", ".") or ".")
+        case _:
+            return str(args)
 
 
-def _swap_summary_line(meta: dict) -> str:
-    if not meta:
-        return ""
+async def _shell_result(args: dict[str, Any]) -> ToolExecutionResult:
+    command = _str_arg(args, "command", required=True, allow_empty=False)
+    timeout_seconds = _int_arg(args, "timeout_seconds", allow_none=True)
+    if timeout_seconds is not None and timeout_seconds <= 0:
+        raise ToolArgumentError("timeout_seconds must be > 0")
+    resource_mode = str(args.get("resource_mode", "normal") or "normal").strip().lower()
+    if resource_mode not in {"normal", "auto", "unload_first"}:
+        raise ToolArgumentError("resource_mode must be normal, auto, or unload_first")
+    estimated_ram_mb = _int_arg(args, "estimated_ram_mb", allow_none=True)
+    estimated_vram_mb = _int_arg(args, "estimated_vram_mb", allow_none=True)
+    reload_delay_seconds = _int_arg(
+        args,
+        "reload_delay_seconds",
+        default=0,
+        minimum=0,
+        minimum_message="reload_delay_seconds must be >= 0",
+    )
+    timeout = timeout_seconds or DEFAULT_SHELL_TIMEOUT_SECONDS
+    plan = _swap_manager.plan_unload(estimated_ram_mb or 0) if _swap_manager is not None else None
+    use_swap = resource_mode == "unload_first" and _swap_manager is not None
+    if resource_mode == "auto" and plan is not None:
+        use_swap = plan.unload_recommended
+
+    if use_swap and _swap_manager is not None:
+        swap = await _swap_manager.run_with_swap(command, timeout=timeout, reload_delay_seconds=reload_delay_seconds)
+        res = swap.exec_result
+        swap_meta = {
+            "swap_mode": resource_mode,
+            "swap_available": True,
+            "swap_attempted": True,
+            "swap_plan_recommended": True if plan is None else plan.unload_recommended,
+            "estimated_ram_mb": estimated_ram_mb,
+            "estimated_vram_mb": estimated_vram_mb,
+            "reload_delay_seconds": reload_delay_seconds,
+            "swapped": swap.unloaded,
+            "swap_reload_ok": swap.reload_ok,
+            "swap_restore_ok": swap.restore_ok,
+            "swap_duration_s": swap.swap_duration_s,
+        }
+    else:
+        res = await run_shell(command, timeout_seconds=timeout)
+        swap_meta = {
+            "swap_mode": resource_mode,
+            "swap_available": _swap_manager is not None,
+            "swap_attempted": False,
+            "swap_plan_recommended": plan.unload_recommended if plan is not None else False,
+            "estimated_ram_mb": estimated_ram_mb,
+            "estimated_vram_mb": estimated_vram_mb,
+            "reload_delay_seconds": reload_delay_seconds,
+        }
+
+    resource_hint = _resource_failure_hint(res)
+    output = res.summary
+    for note in (_swap_summary_line(swap_meta), resource_hint):
+        if note:
+            output = f"{output}\n{note}"
+    return ToolExecutionResult(
+        output=output,
+        meta={
+            "ok": res.ok,
+            "exit_code": res.exit_code,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+            "timed_out": res.timed_out,
+            "timeout_seconds": res.timeout_seconds,
+            "resource_failure_detected": bool(resource_hint),
+            **swap_meta,
+        },
+    )
+
+
+def _device_tool_result(tool_name: str, args: dict[str, Any]) -> ToolExecutionResult:
+    kind, duration_field, supports_output_path, required_transport = _DEVICE_TOOLS[tool_name]
+    kwargs: dict[str, Any] = {"source_ref": _str_arg(args, "source"), "expected_kind": kind}
+    if duration_field is not None:
+        kwargs["duration_seconds"] = _int_arg(args, duration_field, default=5, minimum=1, minimum_message=f"{duration_field} must be > 0")
+    if supports_output_path:
+        kwargs["output_path"] = _str_arg(args, "output_path")
+    if required_transport is not None:
+        kwargs["required_transport"] = required_transport
+    try:
+        return _device_observation_result(**kwargs)
+    except RuntimeError as exc:
+        return _error(str(exc))
+
+
+def _microphone_set_enabled_result(args: dict[str, Any]) -> ToolExecutionResult:
+    enabled = args.get("enabled", _MISSING)
+    if not isinstance(enabled, bool):
+        raise ToolArgumentError("enabled must be boolean")
+    cfg = _tool_config()
+    source = _select_device_source(cfg, source_ref=_str_arg(args, "source"), expected_kind=PeripheralKind.MICROPHONE)
+    updated = set_device_enabled(cfg, reference=source.primary_ref, enabled=enabled)
+    save_config(cfg)
+    registry_path = _sync_tool_device_registry(cfg)
+    state = "enabled" if updated.enabled else "disabled"
+    return ToolExecutionResult(
+        output=f"Microphone @{updated.primary_ref} is now {state}.",
+        meta={"ok": True, "source_ref": updated.primary_ref, "enabled": updated.enabled, "registry_path": str(registry_path) if registry_path else None},
+    )
+
+
+async def _memory_result(args: dict[str, Any]) -> ToolExecutionResult:
+    scope = args.get("scope", "")
+    action = args.get("action", "")
+    content = args.get("content", "")
+    if not isinstance(scope, str) or not scope.strip() or not isinstance(action, str) or not action.strip():
+        raise ToolArgumentError("required: scope, action")
+    if not isinstance(content, str):
+        raise ToolArgumentError("content must be string")
+    text = await update_persistent_memory(Path.cwd(), scope=scope, action=action, content=content)
+    return ToolExecutionResult(output=text, meta={"ok": True, "scope": scope, "action": action})
+
+
+async def _load_file_result(args: dict[str, Any]) -> ToolExecutionResult:
+    loaded = await load_file(_str_arg(args, "path", required=True, allow_empty=False), max_tokens=_int_arg(args, "max_tokens", allow_none=True))
+    if not loaded.ok:
+        return ToolExecutionResult(output=loaded.detail, meta={"ok": False})
+    return ToolExecutionResult(
+        output=f"{loaded.summary}\ncontent:\n{loaded.content}",
+        meta={
+            "ok": True,
+            "truncated": loaded.truncated,
+            "estimated_tokens": loaded.estimated_tokens,
+            "returned_tokens": loaded.returned_tokens,
+            "token_budget": loaded.token_budget,
+            "mem_available_mb": loaded.mem_available_mb,
+        },
+    )
+
+
+async def _edit_file_result(args: dict[str, Any]) -> ToolExecutionResult:
+    path = _str_arg(args, "path", required=True, allow_empty=False)
+    patch = args.get("patch")
+    if patch is not None:
+        if not isinstance(patch, str) or not patch.strip():
+            raise ToolArgumentError("patch must be a non-empty string")
+        result = await edit_file(path, patch=patch, return_result=True)
+    else:
+        old_string = args.get("old_string", "")
+        new_string = args.get("new_string", "")
+        if not isinstance(old_string, str) or not old_string:
+            raise ToolArgumentError("required: patch or old_string")
+        if not isinstance(new_string, str):
+            raise ToolArgumentError("required: new_string")
+        result = await edit_file(path, old_string=old_string, new_string=new_string, replace_all=bool(args.get("replace_all", False)), return_result=True)
+    return ToolExecutionResult(
+        output=result.output,
+        meta={
+            "ok": result.ok,
+            "internal_retry": result.internal_retry,
+            "replacements": result.replacements,
+            "match_strategy": result.match_strategy,
+            "validation_error": result.validation_error,
+        },
+    )
+
+
+async def _text_result_async(func, *func_args, error_prefix: str, **func_kwargs) -> ToolExecutionResult:
+    text = await func(*func_args, **func_kwargs)
+    return ToolExecutionResult(output=text, meta={"ok": not text.startswith(error_prefix)})
+
+
+def _invalid(tool_name: str, detail: str | None = None) -> ToolExecutionResult:
+    return ToolExecutionResult(output=f"Error: invalid arguments for {tool_name}{f' ({detail})' if detail else ''}", meta={"ok": False})
+
+
+def _error(detail: str) -> ToolExecutionResult:
+    return ToolExecutionResult(output=f"Error: {detail}", meta={"ok": False})
+
+
+def _str_arg(args: dict[str, Any], name: str, *, required: bool = False, allow_empty: bool = True, default: object = _MISSING) -> str | None:
+    value = args.get(name, default)
+    if value is _MISSING:
+        if required:
+            raise ToolArgumentError(f"required: {name}")
+        return None
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ToolArgumentError(f"{name} must be string")
+    if required and not allow_empty and not value.strip():
+        raise ToolArgumentError(f"required: {name}")
+    return value
+
+
+def _int_arg(
+    args: dict[str, Any],
+    name: str,
+    *,
+    default: object = _MISSING,
+    allow_none: bool = False,
+    minimum: int | None = None,
+    minimum_message: str | None = None,
+) -> int | None:
+    value = args.get(name, default)
+    if value is _MISSING:
+        if allow_none:
+            return None
+        raise ToolArgumentError(f"required: {name}")
+    if value is None:
+        if allow_none:
+            return None
+        raise ToolArgumentError(f"{name} must be int")
+    if not isinstance(value, int):
+        raise ToolArgumentError(f"{name} must be int")
+    if minimum is not None and value < minimum:
+        raise ToolArgumentError(minimum_message or f"{name} must be >= {minimum}")
+    return value
+
+
+def _swap_summary_line(meta: dict[str, Any]) -> str:
     mode = str(meta.get("swap_mode", "normal") or "normal")
     if meta.get("swapped"):
         delay = meta.get("reload_delay_seconds", 0)
         duration = meta.get("swap_duration_s")
-        delay_part = f", reload_delay={delay}s" if isinstance(delay, int) and delay > 0 else ""
-        duration_part = f", total={duration}s" if isinstance(duration, (int, float)) else ""
-        return f"[swap path used: mode={mode}{delay_part}{duration_part}]"
+        return (
+            f"[swap path used: mode={mode}"
+            f"{f', reload_delay={delay}s' if isinstance(delay, int) and delay > 0 else ''}"
+            f"{f', total={duration}s' if isinstance(duration, (int, float)) else ''}]"
+        )
     if meta.get("swap_attempted") and meta.get("swap_available"):
         return "[swap skipped: unload was requested but the swap cycle could not complete, so the command ran directly]"
     if mode == "unload_first":
@@ -528,24 +398,24 @@ def _resource_failure_hint(result) -> str:
     if result.ok:
         return ""
     haystack = "\n".join(part for part in (result.stdout, result.stderr) if part).lower()
-    if not haystack:
-        return ""
-    patterns = (
-        "out of memory",
-        "cuda out of memory",
-        "cuda error",
-        "cublas_status_alloc_failed",
-        "cannot allocate memory",
-        "std::bad_alloc",
-        "memoryerror",
-        "killed",
-    )
-    if not any(pattern in haystack for pattern in patterns):
-        return ""
-    return (
-        "[resource failure detected: consider `system_info` and, if needed, retry the shell command "
-        "with `resource_mode` set to `unload_first`]"
-    )
+    if any(
+        pattern in haystack
+        for pattern in (
+            "out of memory",
+            "cuda out of memory",
+            "cuda error",
+            "cublas_status_alloc_failed",
+            "cannot allocate memory",
+            "std::bad_alloc",
+            "memoryerror",
+            "killed",
+        )
+    ):
+        return (
+            "[resource failure detected: consider `system_info` and, if needed, retry the shell command "
+            "with `resource_mode` set to `unload_first`]"
+        )
+    return ""
 
 
 def _device_list_output(*, kind: str | None) -> tuple[str, dict[str, object]]:
@@ -555,22 +425,13 @@ def _device_list_output(*, kind: str | None) -> tuple[str, dict[str, object]]:
     parsed_kind = _parse_device_kind(kind)
     if parsed_kind is not None:
         sources = [source for source in sources if source.device.kind is parsed_kind]
-
     if not sources:
         label = f"{parsed_kind.value} " if parsed_kind is not None else ""
         message = f"No {label}device sources detected.".strip()
         hint = device_discovery_hint()
         if hint:
             message = f"{message}\n{hint}"
-        return (
-            message,
-            {
-                "ok": True,
-                "count": 0,
-                "registry_path": str(registry_path) if registry_path else None,
-            },
-        )
-
+        return message, {"ok": True, "count": 0, "registry_path": str(registry_path) if registry_path else None}
     lines = ["Discovered device sources:"]
     for source in sources:
         refs = ", ".join(f"@{ref}" for ref in source.refs)
@@ -579,15 +440,12 @@ def _device_list_output(*, kind: str | None) -> tuple[str, dict[str, object]]:
             f"- @{source.primary_ref}: {source.device.label} | kind={source.device.kind.value} "
             f"| transport={source.device.transport.value} | state={'enabled' if source.enabled else 'disabled'} | refs={refs}{path}"
         )
-    return (
-        "\n".join(lines),
-        {
-            "ok": True,
-            "count": len(sources),
-            "kind": parsed_kind.value if parsed_kind else None,
-            "registry_path": str(registry_path) if registry_path else None,
-        },
-    )
+    return "\n".join(lines), {
+        "ok": True,
+        "count": len(sources),
+        "kind": parsed_kind.value if parsed_kind else None,
+        "registry_path": str(registry_path) if registry_path else None,
+    }
 
 
 def _device_observation_result(
@@ -605,20 +463,12 @@ def _device_observation_result(
             f"{expected_kind.value} source {source.primary_ref} uses {source.device.transport.value}; "
             f"only {required_transport.value} is supported right now"
         )
-
     store = ObservationStore()
-    observation = collect_device_observation(
-        source,
-        store=store,
-        cfg=cfg,
-        duration_seconds=duration_seconds,
-        output_path=output_path,
-    )
+    observation = collect_device_observation(source, store=store, cfg=cfg, duration_seconds=duration_seconds, output_path=output_path)
     registry_path = _sync_tool_device_registry(cfg, store=store)
     context_content = observation_to_agent_content(observation, store=store)
-    output = content_to_plain_text(context_content)
     return ToolExecutionResult(
-        output=output,
+        output=content_to_plain_text(context_content),
         context_content=context_content,
         meta={
             "ok": True,
@@ -653,7 +503,6 @@ def _select_device_source(
         if source.device.kind is not expected_kind:
             raise ValueError(f"source {source.primary_ref} is not a {expected_kind.value}")
         return source
-
     candidates = [source for source in list_device_sources(cfg) if source.device.kind is expected_kind]
     if not candidates:
         raise ValueError(f"no {expected_kind.value} sources detected")
@@ -672,11 +521,7 @@ def _parse_device_kind(kind: str | None) -> PeripheralKind | None:
         raise ValueError("kind must be one of: camera, microphone, speaker, sensor") from exc
 
 
-def _sync_tool_device_registry(
-    cfg: dict[str, object],
-    *,
-    store: ObservationStore | None = None,
-) -> Path | None:
+def _sync_tool_device_registry(cfg: dict[str, object], *, store: ObservationStore | None = None) -> Path | None:
     try:
         return sync_devices_registry(cfg, store=store)
     except Exception:
