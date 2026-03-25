@@ -1,8 +1,7 @@
-"""Tests for the dynamic model swap (unload/reload) plugin system."""
+"""Tests for the dynamic model swap lifecycle."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import tempfile
 import unittest
@@ -11,7 +10,6 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from src.agent import ActionKind
 from src.executor import ExecResult
-from src.swap_plugin import SwapPlugin
 from src.swap_manager import SwapManager, SwapResult
 
 
@@ -19,7 +17,7 @@ from src.swap_manager import SwapManager, SwapResult
 # Helpers
 # ---------------------------------------------------------------------------
 
-class FakeSwapPlugin(SwapPlugin):
+class FakeSwapPlugin:
     """In-memory plugin for testing — no llama server needed."""
 
     def __init__(
@@ -58,35 +56,6 @@ class FakeSwapPlugin(SwapPlugin):
 
     def model_memory_mb(self) -> float:
         return self._model_mb
-
-
-# ---------------------------------------------------------------------------
-# SwapPlugin interface tests
-# ---------------------------------------------------------------------------
-
-class SwapPluginInterfaceTests(unittest.TestCase):
-    """Verify the base SwapPlugin raises NotImplementedError."""
-
-    def test_base_class_methods_raise(self) -> None:
-        plugin = SwapPlugin()
-        with self.assertRaises(NotImplementedError):
-            asyncio.run(plugin.save_state(Path("/tmp")))
-        with self.assertRaises(NotImplementedError):
-            asyncio.run(plugin.unload())
-        with self.assertRaises(NotImplementedError):
-            asyncio.run(plugin.reload())
-        with self.assertRaises(NotImplementedError):
-            asyncio.run(plugin.restore_state(Path("/tmp")))
-        with self.assertRaises(NotImplementedError):
-            plugin.available_memory_mb()
-        with self.assertRaises(NotImplementedError):
-            plugin.model_memory_mb()
-
-    def test_fake_plugin_implements_interface(self) -> None:
-        plugin = FakeSwapPlugin()
-        self.assertIsInstance(plugin, SwapPlugin)
-        self.assertEqual(plugin.available_memory_mb(), 1000.0)
-        self.assertEqual(plugin.model_memory_mb(), 2500.0)
 
 
 # ---------------------------------------------------------------------------

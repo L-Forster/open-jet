@@ -8,8 +8,6 @@ Main settings live in `config.yaml`.
 - `openai_compatible`
 - `openrouter`
 
-`sglang` and `trtllm_pytorch` are disabled in this simplified build.
-
 OpenJet is positioned for local and self-hosted use first. `openrouter` is the optional hosted profile.
 
 ## Minimal local/offline config

@@ -2231,7 +2231,7 @@ class OpenJetApp:
 
     def _is_recoverable_runtime_error(self, error_text: str) -> bool:
         lowered = error_text.lower()
-        needles = ("connecterror", "connection refused", "connection reset", "remoteprotocolerror", "readtimeout", "timed out", "server disconnected", "llama-server exited", "trtllm-serve exited", "502", "503", "504")
+        needles = ("connecterror", "connection refused", "connection reset", "remoteprotocolerror", "readtimeout", "timed out", "server disconnected", "llama-server exited", "502", "503", "504")
         return any(needle in lowered for needle in needles)
 
     def _is_context_overflow_error(self, error_text: str) -> bool:

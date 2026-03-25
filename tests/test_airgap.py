@@ -61,10 +61,6 @@ class RuntimeRegistryAirgapTests(AirgapBaseTestCase):
             ],
         )
 
-    def test_create_runtime_client_rejects_disabled_backends(self) -> None:
-        with self.assertRaisesRegex(ValueError, "disabled in this simplified build"):
-            create_runtime_client({"runtime": "sglang", "sglang_model": "model"})
-
     def test_create_runtime_client_blocks_openrouter_when_airgapped(self) -> None:
         with self.assertRaises(AirgapViolationError):
             create_runtime_client(

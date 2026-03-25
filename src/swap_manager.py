@@ -1,4 +1,4 @@
-"""Orchestrates model unload/reload cycles using a registered SwapPlugin.
+"""Orchestrate model unload/reload cycles using a registered swap backend.
 
 Usage::
 
@@ -14,15 +14,42 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 from .executor import ExecResult, run_shell
-from .swap_plugin import SwapPlugin
 
 log = logging.getLogger(__name__)
 
 # Minimum free MB headroom to keep even when model is unloaded
 _MIN_HEADROOM_MB = 200.0
+
+
+class SwapBackend(Protocol):
+    """Describe the hooks that a swap-capable runtime must expose."""
+
+    async def save_state(self, state_dir: Path) -> bool:
+        """Persist any runtime state needed to resume after reload."""
+        ...
+
+    async def unload(self) -> None:
+        """Unload the model so the shell command can use the freed memory."""
+        ...
+
+    async def reload(self) -> None:
+        """Bring the runtime back after the shell command finishes."""
+        ...
+
+    async def restore_state(self, state_dir: Path) -> bool:
+        """Restore previously saved state after the runtime reloads."""
+        ...
+
+    def available_memory_mb(self) -> float:
+        """Report how much RAM is currently available."""
+        ...
+
+    def model_memory_mb(self) -> float:
+        """Estimate how much memory the loaded model is using."""
+        ...
 
 
 @dataclass
@@ -51,7 +78,7 @@ class SwapManager:
 
     def __init__(
         self,
-        plugin: SwapPlugin,
+        plugin: SwapBackend,
         *,
         state_dir: Path | None = None,
         status_hook: Callable[[str], None] | None = None,
@@ -61,7 +88,7 @@ class SwapManager:
         self._status_hook = status_hook
 
     @property
-    def plugin(self) -> SwapPlugin:
+    def plugin(self) -> SwapBackend:
         return self._plugin
 
     def plan_unload(self, estimated_need_mb: float) -> SwapPlan:

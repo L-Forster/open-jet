@@ -51,28 +51,6 @@ def discover_model_files() -> list[str]:
     return sorted(found)
 
 
-def discover_trt_model_dirs() -> list[str]:
-    roots = [
-        Path.cwd(),
-        Path.cwd() / "models",
-        Path.home() / "models",
-    ]
-    found: set[str] = set()
-    for root in roots:
-        if not root.exists() or not root.is_dir():
-            continue
-        for path in root.iterdir():
-            if not path.is_dir():
-                continue
-            if (path / "config.json").is_file() and (path / "tokenizer_config.json").is_file():
-                found.add(str(path.resolve()))
-    return sorted(found)
-
-
-def discover_sglang_model_dirs() -> list[str]:
-    return discover_trt_model_dirs()
-
-
 def estimate_model_params_b_from_text(text: str) -> float | None:
     src = text.strip().lower()
     if not src:
@@ -141,7 +119,7 @@ def _configured_runtime(current_cfg: Mapping[str, object] | None) -> str:
     if isinstance(current_cfg, Mapping):
         value = str(current_cfg.get("runtime") or "").strip()
     spec = runtime_spec(value)
-    return spec.key if spec.show_in_setup and spec.enabled else "llama_cpp"
+    return spec.key if spec.show_in_setup else "llama_cpp"
 
 
 def _discover_llama_server() -> str | None:
@@ -214,7 +192,7 @@ def _recommended_setup_runtime(current_cfg: Mapping[str, object] | None) -> str:
     raw_runtime = _current_string(current_cfg, "runtime")
     if raw_runtime:
         spec = runtime_spec(raw_runtime)
-        if spec.enabled and spec.show_in_setup:
+        if spec.show_in_setup:
             return spec.key
     return "llama_cpp"
 

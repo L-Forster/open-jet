@@ -1,4 +1,4 @@
-"""SwapPlugin implementation for llama.cpp (llama-server).
+"""Swap backend implementation for llama.cpp (llama-server).
 
 Uses:
 - KV cache save/restore via llama-server slot API
@@ -17,13 +17,12 @@ import httpx
 
 from .llama_server import LlamaServerClient
 from .runtime_limits import read_memory_snapshot
-from .swap_plugin import SwapPlugin
 
 log = logging.getLogger(__name__)
 
 
-class LlamaSwapPlugin(SwapPlugin):
-    """Concrete swap plugin backed by a running ``LlamaServerClient``."""
+class LlamaSwapPlugin:
+    """Swap backend backed by a running ``LlamaServerClient``."""
 
     def __init__(
         self,
@@ -40,11 +39,11 @@ class LlamaSwapPlugin(SwapPlugin):
         self._messages = messages
 
     def set_estimated_model_mb(self, mb: float) -> None:
+        """Override the default model-size estimate used for swap planning."""
         self._estimated_model_mb = mb
 
-    # -- SwapPlugin interface --------------------------------------------------
-
     async def save_state(self, state_dir: Path) -> bool:
+        """Persist the live message list and best-effort KV cache state."""
         state_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Persist conversation messages
@@ -71,12 +70,15 @@ class LlamaSwapPlugin(SwapPlugin):
         return True
 
     async def unload(self) -> None:
+        """Stop the llama.cpp server so its memory can be reused."""
         await self._client._stop_server()
 
     async def reload(self) -> None:
+        """Start the llama.cpp server again after the shell command finishes."""
         await self._client.start()
 
     async def restore_state(self, state_dir: Path) -> bool:
+        """Reload saved messages and restore the KV cache when possible."""
         # 1. Restore conversation messages
         msgs_path = state_dir / "messages.json"
         if msgs_path.exists():
@@ -104,12 +106,14 @@ class LlamaSwapPlugin(SwapPlugin):
         return False
 
     def available_memory_mb(self) -> float:
+        """Read the current available RAM from the system snapshot."""
         snapshot = read_memory_snapshot()
         if snapshot and snapshot.available_mb is not None:
             return float(snapshot.available_mb)
         return 0.0
 
     def model_memory_mb(self) -> float:
+        """Return the planned model-memory estimate used by ``SwapManager``."""
         if self._estimated_model_mb > 0:
             return self._estimated_model_mb
         # Rough heuristic: check memory drop after unload would give real

@@ -14,8 +14,6 @@ cd open-jet
 - `openai_compatible` for self-hosted or compatible OpenAI-style APIs
 - `openrouter` for OpenRouter
 
-`SGLang` and `TensorRT-LLM` are disabled in this simplified build.
-
 OpenJet is positioned for local and self-hosted use first.
 
 ## 2. Recommended path: local `llama.cpp`

@@ -98,8 +98,6 @@ Supported runtimes in this simplified build:
 - OpenAI-compatible APIs for self-hosted gateways and compatible services
 - OpenRouter as an optional hosted profile
 
-`SGLang` and `TensorRT-LLM` are intentionally disabled to keep setup simpler.
-
 If you want full install details for each runtime, jump to [Installation](#installation) or the [Quickstart docs](https://github.com/l-forster/open-jet/blob/main/docs/quickstart.md).
 
 ## Installation

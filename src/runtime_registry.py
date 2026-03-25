@@ -19,7 +19,6 @@ class RuntimeSpec:
     uses_gpu_layers: bool = False
     supports_ollama: bool = False
     show_in_setup: bool = True
-    enabled: bool = True
 
 
 RUNTIME_SPECS: dict[str, RuntimeSpec] = {
@@ -41,20 +40,6 @@ RUNTIME_SPECS: dict[str, RuntimeSpec] = {
         label="Hosted API: OpenRouter",
         model_config_key="openrouter_model",
     ),
-    "sglang": RuntimeSpec(
-        key="sglang",
-        label="SGLang (disabled in simplified build)",
-        model_config_key="sglang_model",
-        show_in_setup=False,
-        enabled=False,
-    ),
-    "trtllm_pytorch": RuntimeSpec(
-        key="trtllm_pytorch",
-        label="TensorRT-LLM (disabled in simplified build)",
-        model_config_key="trtllm_model",
-        show_in_setup=False,
-        enabled=False,
-    ),
 }
 
 DEFAULT_RUNTIME = "llama_cpp"
@@ -74,11 +59,7 @@ def normalize_runtime(value: str | None) -> str:
 
 
 def runtime_options() -> list[tuple[str, str]]:
-    return [
-        (spec.label, spec.key)
-        for spec in RUNTIME_SPECS.values()
-        if spec.show_in_setup and spec.enabled
-    ]
+    return [(spec.label, spec.key) for spec in RUNTIME_SPECS.values() if spec.show_in_setup]
 
 
 def runtime_spec(value: str | None) -> RuntimeSpec:
@@ -96,12 +77,6 @@ def create_runtime_client(
     diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> RuntimeClient:
     runtime = normalize_runtime(str(cfg.get("runtime", DEFAULT_RUNTIME)))
-    spec = runtime_spec(runtime)
-    if not spec.enabled:
-        raise ValueError(
-            f"{spec.label} is disabled in this simplified build. "
-            "Supported runtimes are llama.cpp, OpenAI-compatible APIs, and OpenRouter."
-        )
     context_window_tokens = int(cfg.get("context_window_tokens", 2048))
     airgapped = airgapped_from_cfg(cfg)
     if runtime == "openrouter":
