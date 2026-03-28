@@ -25,14 +25,9 @@ def _normalize_telemetry_slug(value: str | None, *, default: str = "unknown") ->
 
 def _telemetry_backend(cfg: dict[str, Any]) -> str:
     model_source = str(cfg.get("model_source", "") or "").strip().lower()
-    runtime = str(cfg.get("runtime", "llama_cpp") or "").strip().lower()
     if model_source:
         return _normalize_telemetry_slug(model_source)
-    if runtime == "openai_compatible":
-        return "openai_compatible"
-    if runtime == "openrouter":
-        return "openrouter"
-    return _normalize_telemetry_slug(runtime)
+    return "llama_cpp"
 
 
 def _telemetry_model_fields(model_ref: str) -> tuple[str, str]:

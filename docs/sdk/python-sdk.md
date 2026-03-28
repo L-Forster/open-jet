@@ -8,7 +8,7 @@ Public import:
 from open_jet import OpenJetSession, create_agent
 ```
 
-## Basic local or cloud session
+## Basic local session
 
 ```python
 import asyncio
@@ -30,7 +30,7 @@ asyncio.run(main())
 
 `OpenJetSession.create()` reads `config.yaml` by default, so the SDK and TUI can share the same runtime setup.
 
-## Explicit cloud config
+## Explicit local config
 
 ```python
 import asyncio
@@ -41,11 +41,11 @@ from open_jet import OpenJetSession
 async def main() -> None:
     session = await OpenJetSession.create(
         cfg={
-            "runtime": "openai_compatible",
-            "openai_compatible_model": "gpt-4o-mini",
-            "openai_compatible_base_url": "https://api.openai.com",
-            "openai_compatible_api_key_env": "OPENAI_API_KEY",
-            "context_window_tokens": 8192,
+            "llama_model": "/home/you/models/Qwen3.5-4B-Q4_K_M.gguf",
+            "llama_server_path": "/home/you/llama.cpp/build/bin/llama-server",
+            "device": "cuda",
+            "gpu_layers": 99,
+            "context_window_tokens": 4096,
         }
     )
     try:
@@ -125,11 +125,10 @@ OpenJet works best as the session layer beneath another agent when you want:
 - a bounded-memory chat/runtime loop
 - explicit tool approvals
 - local `llama.cpp` support
-- the option to swap between local `llama.cpp`, self-hosted gateways, and an optional hosted fallback without changing your app code
 
 If you already have your own orchestrator, prefer:
 
 1. create one `OpenJetSession` per task or worker
-2. keep the runtime choice in `cfg`
+2. keep the local model path in `cfg`
 3. use `stream()` if your outer agent needs incremental tokens or tool events
 4. use `allowed_tools` and `approval_handler` to enforce your own policy

@@ -23,15 +23,11 @@ If you want a compiled package artifact, build it separately:
 
 This produces a wheel in `dist/` and keeps the normal editable install path separate.
 
-## Supported runtimes
+## Runtime
 
-- `llama.cpp` for local/offline inference
-- `openai_compatible` for self-hosted or compatible OpenAI-style APIs
-- `openrouter` as an optional hosted profile
+OpenJet is local-only. It uses `llama-server` from `llama.cpp` with GGUF models.
 
-OpenJet is positioned for local and self-hosted use first.
-
-## Recommended path: local `llama.cpp`
+## Recommended path
 
 Start with:
 
@@ -39,17 +35,13 @@ Start with:
 open-jet --setup
 ```
 
-Choose `Local model: llama.cpp (GGUF)`.
-
 OpenJet will first try to reuse an existing local setup. If pieces are missing, setup can provision them for you.
 
-The local path can:
+Setup can:
 
 - reuse `llama-server` if it is already installed
 - clone and build `llama.cpp` to produce `llama-server`
 - use a local `.gguf`
-- resolve an installed Ollama model
-- pull an Ollama model
 - download a recommended GGUF directly
 
 Automatic provisioning still needs:
@@ -64,28 +56,6 @@ Manual build guides are still available if you want to control the runtime yours
 - [Jetson setup](deployment/jetson.md)
 - [Linux x86 + NVIDIA](deployment/linux-x86-nvidia.md)
 - [CPU-only](deployment/cpu-only.md)
-
-## Self-hosted API path
-
-OpenAI-compatible:
-
-```bash
-export OPENAI_API_KEY=your-key
-open-jet --setup
-```
-
-Choose `Self-hosted API: OpenAI-compatible`.
-
-## Optional hosted path
-
-OpenRouter:
-
-```bash
-export OPENROUTER_API_KEY=your-key
-open-jet --setup
-```
-
-Choose `Hosted API: OpenRouter`.
 
 ## Public SDK import
 

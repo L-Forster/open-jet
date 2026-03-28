@@ -57,7 +57,7 @@ class SelfUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.yaml"
-            config_path.write_text("runtime: llama_cpp\n")
+            config_path.write_text("llama_model: /models/current.gguf\n")
 
             def fake_urlopen(request, timeout=None):
                 del timeout
@@ -74,7 +74,7 @@ class SelfUpdateTests(unittest.TestCase):
             ), patch(
                 "src.self_update.subprocess.run",
                 side_effect=lambda args, check: config_path.write_text(
-                    "runtime: openai_compatible\ntelemetry:\n  enabled: true\nnew_feature:\n  enabled: true\n"
+                    "llama_model: /models/release.gguf\ntelemetry:\n  enabled: true\nnew_feature:\n  enabled: true\n"
                 ),
             ) as run_mock:
                 previous_cwd = Path.cwd()
@@ -86,7 +86,7 @@ class SelfUpdateTests(unittest.TestCase):
                     os.chdir(previous_cwd)
 
             self.assertEqual(message, "Updated open-jet from 0.3.0 to 0.4.0.")
-            self.assertIn("runtime: llama_cpp", merged_config)
+            self.assertIn("llama_model: /models/current.gguf", merged_config)
             self.assertIn("new_feature:", merged_config)
             self.assertIn("telemetry:", merged_config)
             self.assertTrue((root / "config.yaml.bak.pre-update-0.4.0").is_file())

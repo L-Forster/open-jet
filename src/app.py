@@ -99,14 +99,13 @@ from .model_profiles import (
     list_model_profiles,
     sync_active_model_profile,
 )
-from .ollama_setup import discover_installed_ollama_models, materialize_setup_model
 from .observation import ObservationStore
 from .persistent_memory import build_system_prompt
 from .provisioning import provision_setup_artifacts
 from .skills_registry import resolve_skill_path
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
-from .runtime_registry import active_model_ref, create_runtime_client
+from .runtime_registry import DEFAULT_RUNTIME, active_model_ref, create_runtime_client
 from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
@@ -508,7 +507,7 @@ class OpenJetApp:
         model_ref = self._active_model_ref()
         model_id, model_variant = _telemetry_model_fields(model_ref)
         return {
-            "runtime": self.cfg.get("runtime", "llama_cpp"),
+            "runtime": DEFAULT_RUNTIME,
             "backend": _telemetry_backend(self.cfg),
             "model": model_ref,
             "model_id": model_id,
@@ -743,14 +742,8 @@ class OpenJetApp:
             status.update("")
             status.add_class("hidden")
 
-        resolved = await materialize_setup_model(
-            setup_result,
-            log,
-            set_status=_set_status,
-            clear_status=_clear_status,
-        )
         return await provision_setup_artifacts(
-            resolved,
+            setup_result,
             hardware_info=detect_hardware_info(),
             log=log,
             set_status=_set_status,
@@ -1047,23 +1040,9 @@ class OpenJetApp:
         elif not self.cfg.get("setup_complete"):
             self.cfg["setup_complete"] = True
             self.cfg.setdefault("model_source", "local")
-            self.cfg.setdefault("runtime", "llama_cpp")
             self.cfg.setdefault("device", recommended_device())
             self.cfg.setdefault("context_window_tokens", recommended_context_window_tokens())
             self.cfg.setdefault("gpu_layers", recommended_gpu_layers(str(self.cfg.get("device", "auto"))))
-            save_config(self.cfg)
-
-        if self.cfg.get("model_source") == "ollama" and self.cfg.get("ollama_model") and (not self.cfg.get("model") or not Path(str(self.cfg.get("model"))).is_file()):
-            try:
-                resolved = await self._materialize_setup_model(dict(self.cfg), log)
-            except Exception as exc:
-                if self.session_logger:
-                    self.session_logger.record_exception("setup_resolve_model_failed", exc, component="setup")
-                log.write(f"[bold red]Failed to resolve Ollama model:[/] {_format_error(exc)}")
-                log.write("")
-                self._quit_requested = True
-                return
-            self.cfg.update(resolved)
             save_config(self.cfg)
 
         active_model = self._active_model_ref()
@@ -1613,8 +1592,7 @@ class OpenJetApp:
             "chat_id": self._chat_session_id,
             "session_id": self.session_logger.session_id if self.session_logger else None,
             "airgapped": self.is_airgapped(),
-            "runtime": str(self.cfg.get("runtime", "llama_cpp")),
-            "model": self.cfg.get("model"),
+            "runtime": DEFAULT_RUNTIME,
             "model_ref": self._active_model_ref(),
             "device": self.cfg.get("device", "auto"),
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
@@ -1742,10 +1720,9 @@ class OpenJetApp:
         mismatch_note = ""
         if kv_cache_available:
             saved_runtime = str(state.get("runtime") or "").strip()
-            current_runtime = str(self.cfg.get("runtime", "llama_cpp") or "").strip()
-            saved_model = str(state.get("model_ref") or state.get("model") or "").strip()
+            saved_model = str(state.get("model_ref") or "").strip()
             current_model = self._active_model_ref()
-            runtime_matches = not saved_runtime or saved_runtime == current_runtime
+            runtime_matches = not saved_runtime or saved_runtime == DEFAULT_RUNTIME
             model_matches = not saved_model or saved_model == current_model
             if runtime_matches and model_matches:
                 try:
@@ -1756,7 +1733,7 @@ class OpenJetApp:
                     return "KV cache restored from the saved chat."
             else:
                 mismatch_note = (
-                    " The active runtime/model differs from the saved chat, "
+                    " The active model differs from the saved chat, "
                     "so the KV cache was skipped."
                 )
 

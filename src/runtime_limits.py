@@ -61,10 +61,7 @@ def _get_encoder() -> tiktoken.Encoding:
 
 def _active_local_gguf_model_ref() -> str | None:
     cfg = load_config()
-    runtime = str(cfg.get("runtime", "llama_cpp") or "llama_cpp").strip().lower()
-    if runtime != "llama_cpp":
-        return None
-    model_ref = str(cfg.get("llama_model") or cfg.get("model") or "").strip()
+    model_ref = str(cfg.get("llama_model") or "").strip()
     return model_ref or None
 
 

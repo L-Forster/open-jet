@@ -518,7 +518,7 @@ class LlamaServerClient:
             if not parts:
                 continue
             exe_name = Path(parts[0]).name.lower()
-            if exe_name not in {"llama-server", "ollama"}:
+            if exe_name != "llama-server":
                 continue
 
             stale.append(pid)

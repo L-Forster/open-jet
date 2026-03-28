@@ -107,6 +107,11 @@ def save_config(cfg: dict) -> None:
 
 def normalize_config(cfg: dict) -> dict:
     normalized = dict(cfg or {})
+    legacy_exact_keys = {"runtime", "model", "ollama_model", "recommended_llm"}
+    legacy_prefixes = ("openai_compatible_", "openrouter_")
+    for key in list(normalized):
+        if key in legacy_exact_keys or any(key.startswith(prefix) for prefix in legacy_prefixes):
+            normalized.pop(key, None)
 
     state_cfg = dict(normalized.get("state") or {})
     state_path = str(state_cfg.get("path", "")).strip()

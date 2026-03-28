@@ -111,8 +111,6 @@ async def ensure_llama_server(
     set_status: Callable[[str], None],
     clear_status: Callable[[], None],
 ) -> dict[str, Any]:
-    if str(setup_result.get("runtime", "llama_cpp")) != "llama_cpp":
-        return setup_result
     existing = current_llama_server_path()
     if existing and not _needs_rebuild(hardware_info, existing):
         merged = dict(setup_result)
@@ -185,7 +183,6 @@ async def ensure_direct_model(
         raise RuntimeError("Direct model provisioning is missing a download URL or target path.")
     if target_path.is_file():
         merged = dict(setup_result)
-        merged["model"] = str(target_path)
         merged["llama_model"] = str(target_path)
         merged["setup_missing_model"] = False
         return merged
@@ -229,7 +226,6 @@ async def ensure_direct_model(
     log.write(f"[bold bright_white]Download complete: {_fmt_size(downloaded)}[/]")
     clear_status()
     merged = dict(setup_result)
-    merged["model"] = str(target_path)
     merged["llama_model"] = str(target_path)
     merged["setup_missing_model"] = False
     return merged

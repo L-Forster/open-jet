@@ -59,27 +59,19 @@ class RuntimeRegistryAirgapTests(AirgapBaseTestCase):
             ],
         )
 
-    def test_create_runtime_client_blocks_openrouter_when_airgapped(self) -> None:
-        with self.assertRaises(AirgapViolationError):
-            create_runtime_client(
-                {
-                    "runtime": "openrouter",
-                    "openrouter_model": "openai/gpt-4o-mini",
-                    "airgapped": True,
-                }
-            )
+    def test_create_runtime_client_requires_local_model(self) -> None:
+        with self.assertRaises(ValueError):
+            create_runtime_client({})
 
-    def test_create_runtime_client_allows_loopback_openai_compatible_when_airgapped(self) -> None:
+    def test_create_runtime_client_supports_airgapped_local_model(self) -> None:
         client = create_runtime_client(
             {
-                "runtime": "openai_compatible",
-                "openai_compatible_model": "local",
-                "openai_compatible_base_url": "http://127.0.0.1:9000",
+                "llama_model": "local.gguf",
                 "airgapped": True,
             }
         )
 
-        self.assertEqual(client.base_url, "http://127.0.0.1:9000")
+        self.assertEqual(client.model, "local.gguf")
         asyncio.run(client.close())
 
 
@@ -153,7 +145,7 @@ class SDKAirgapTests(AirgapBaseTestCase):
                 new=AsyncMock(return_value="system prompt"),
             ):
                 session = await create_agent(
-                    cfg={"runtime": "llama_cpp", "llama_model": "model.gguf"},
+                    cfg={"llama_model": "model.gguf"},
                     airgapped=True,
                 )
 

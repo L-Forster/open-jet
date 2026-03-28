@@ -3,29 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from .runtime_registry import DEFAULT_RUNTIME, active_model_ref, normalize_runtime, runtime_spec
+from .runtime_registry import RUNTIME_LABEL, active_model_ref
 
 PROFILE_KEYS: tuple[str, ...] = (
-    "runtime",
-    "model_source",
-    "model",
     "llama_model",
-    "ollama_model",
-    "recommended_llm",
-    "openai_compatible_model",
-    "openai_compatible_base_url",
-    "openai_compatible_api_key_env",
-    "openai_compatible_headers",
-    "openai_compatible_extra_body",
-    "openai_compatible_verify_connection",
-    "openrouter_model",
-    "openrouter_base_url",
-    "openrouter_api_key_env",
-    "openrouter_headers",
-    "openrouter_extra_body",
-    "openrouter_site_url",
-    "openrouter_app_name",
-    "openrouter_verify_connection",
+    "llama_server_path",
+    "model_source",
     "device",
     "context_window_tokens",
     "gpu_layers",
@@ -36,33 +19,26 @@ PROFILE_KEYS: tuple[str, ...] = (
 
 
 def profile_model_ref(profile: Mapping[str, object]) -> str:
-    model_ref = active_model_ref(dict(profile))
-    if model_ref:
-        return model_ref
-    if str(profile.get("model_source", "local")).strip().lower() == "ollama":
-        return str(profile.get("ollama_model") or "").strip()
-    return ""
+    return active_model_ref(dict(profile))
 
 
 def default_profile_name(source: Mapping[str, object]) -> str:
-    runtime = normalize_runtime(str(source.get("runtime", DEFAULT_RUNTIME)))
     model_ref = profile_model_ref(source)
     if not model_ref:
-        return runtime_spec(runtime).label
+        return RUNTIME_LABEL
     name = Path(model_ref).name or model_ref
-    if runtime == "llama_cpp" and name.lower().endswith(".gguf"):
+    if name.lower().endswith(".gguf"):
         name = name[:-5]
-    return name.strip() or runtime_spec(runtime).label
+    return name.strip() or RUNTIME_LABEL
 
 
 def build_model_profile(source: Mapping[str, object], *, name: str | None = None) -> dict[str, Any] | None:
-    runtime = normalize_runtime(str(source.get("runtime", DEFAULT_RUNTIME)))
     model_ref = profile_model_ref(source)
     if not model_ref:
         return None
 
     profile_name = (name or str(source.get("active_model_profile") or "")).strip() or default_profile_name(source)
-    profile: dict[str, Any] = {"name": profile_name, "runtime": runtime}
+    profile: dict[str, Any] = {"name": profile_name}
     for key in PROFILE_KEYS:
         value = source.get(key)
         if value is None:
@@ -72,7 +48,7 @@ def build_model_profile(source: Mapping[str, object], *, name: str | None = None
             if not value:
                 continue
         profile[key] = value
-    profile["runtime"] = runtime
+    profile["llama_model"] = model_ref
     return profile
 
 
@@ -121,7 +97,7 @@ def replace_model_profile(
 ) -> dict[str, Any]:
     built = build_model_profile(profile, name=str(profile.get("name") or "").strip() or None)
     if not built:
-        raise ValueError("Model profile requires a configured model reference.")
+        raise ValueError("Model profile requires a configured GGUF path.")
 
     previous_key = (previous_name or "").strip().lower()
     target_key = built["name"].strip().lower()
@@ -138,14 +114,13 @@ def replace_model_profile(
 def apply_model_profile(cfg: dict[str, Any], profile: Mapping[str, object]) -> dict[str, Any]:
     built = build_model_profile(profile, name=str(profile.get("name") or "").strip() or None)
     if not built:
-        raise ValueError("Model profile requires a configured model reference.")
+        raise ValueError("Model profile requires a configured GGUF path.")
 
     for key in PROFILE_KEYS:
         if key in built:
             cfg[key] = built[key]
         elif key in cfg:
             cfg.pop(key, None)
-    cfg["runtime"] = str(built.get("runtime", DEFAULT_RUNTIME))
     cfg["active_model_profile"] = built["name"]
     return built
 

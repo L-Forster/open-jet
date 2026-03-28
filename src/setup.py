@@ -229,7 +229,7 @@ def _saved_model_refs(current_cfg: Mapping[str, object] | None, runtime: str) ->
         saved = history.get(runtime)
         if isinstance(saved, list):
             refs.extend(str(item).strip() for item in saved)
-    active_ref = _current_string(current_cfg, "llama_model") or _current_string(current_cfg, "model")
+    active_ref = _current_string(current_cfg, "llama_model")
     if active_ref:
         refs.insert(0, active_ref)
     return _dedupe_refs(refs)
@@ -240,9 +240,7 @@ def _setup_model_refs(payload: Mapping[str, object] | None) -> list[str]:
         return []
     refs = [
         payload.get("llama_model"),
-        payload.get("model"),
         payload.get("model_download_path"),
-        payload.get("recommended_llm"),
     ]
     unique: list[str] = []
     seen: set[str] = set()
@@ -294,14 +292,12 @@ def _runtime_prompt_options(
     llama_ready: bool,
 ) -> list[tuple[str, str]]:
     suffix = " (recommended)" if llama_ready else " (recommended, setup can provision llama-server)"
-    if _current_string(current_cfg, "runtime") == "llama_cpp":
-        suffix = f"{suffix}, current"
     return [(f"Local model: llama.cpp (GGUF){suffix}", "llama_cpp")]
 
 
 def _recommended_summary(payload: Mapping[str, object]) -> str:
     model_source = str(payload.get("model_source") or "local")
-    model_ref = str(payload.get("llama_model") or payload.get("model") or "").strip()
+    model_ref = str(payload.get("llama_model") or "").strip()
     model_text = model_ref or "missing"
     notes: list[str] = []
     if payload.get("setup_missing_runtime"):
@@ -323,19 +319,17 @@ def _recommended_local_payload(
     saved_model_files: list[str],
     direct: Mapping[str, str],
 ) -> dict[str, object]:
-    current_model = _current_string(current_cfg, "llama_model") or _current_string(current_cfg, "model")
+    current_model = _current_string(current_cfg, "llama_model")
     if current_model and Path(current_model).expanduser().is_file():
         model_path = str(Path(current_model).expanduser())
         return {
             "model_source": "local",
-            "model": model_path,
             "llama_model": model_path,
         }
     if model_files:
         model_path = str(Path(model_files[0]).expanduser())
         return {
             "model_source": "local",
-            "model": model_path,
             "llama_model": model_path,
         }
     existing_saved = [path for path in saved_model_files if Path(path).expanduser().is_file()]
@@ -343,14 +337,12 @@ def _recommended_local_payload(
         model_path = str(Path(existing_saved[0]).expanduser())
         return {
             "model_source": "local",
-            "model": model_path,
             "llama_model": model_path,
         }
     return {
         "model_source": "direct",
         "model_download_url": str(direct["url"]),
         "model_download_path": str(direct["target_path"]),
-        "recommended_llm": str(direct["label"]),
         "setup_missing_model": True,
     }
 
@@ -361,14 +353,12 @@ def build_recommended_payload(
     recommended_ctx: int,
     current_cfg: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    runtime = "llama_cpp"
     hardware_profile = "other" if _current_string(current_cfg, "hardware_profile") == "other" else "auto"
     hardware_override = _current_string(current_cfg, "hardware_override") if hardware_profile == "other" else ""
     effective_hw = effective_hardware_info(hardware_profile, hardware_info, hardware_override)
     device = recommended_device_for_hardware(hardware_profile, hardware_info, hardware_override)
 
     payload: dict[str, object] = {
-        "runtime": runtime,
         "hardware_profile": hardware_profile,
         "hardware_override": hardware_override,
         "device": device,
@@ -380,14 +370,14 @@ def build_recommended_payload(
         _recommended_local_payload(
             current_cfg=current_cfg,
             model_files=discover_model_files(),
-            saved_model_files=_saved_model_refs(current_cfg, runtime),
+            saved_model_files=_saved_model_refs(current_cfg, "llama_cpp"),
             direct=direct,
         )
     )
 
     llama_model = str(payload.get("llama_model") or "").strip()
     if llama_model:
-        _remember_model_ref(payload, current_cfg, runtime, llama_model)
+        _remember_model_ref(payload, current_cfg, "llama_cpp", llama_model)
 
     payload["setup_missing_runtime"] = _discover_llama_server() is None
 
@@ -405,7 +395,7 @@ def build_recommended_payload(
         )
     )
     payload["context_window_tokens"] = recommend_setup_context_window(
-        runtime=runtime,
+        runtime="llama_cpp",
         device=device,
         fallback_tokens=fallback_ctx,
         model_refs=_setup_model_refs(payload),
@@ -432,7 +422,6 @@ async def run_setup_wizard(
     console.print(f"[dim]Detected hardware: {escape(hardware_info.label)} ({escape(ram_text)})[/]")
     console.print("[dim]Setup is local-only: pick or download a GGUF and compile llama.cpp when needed.[/]")
 
-    runtime = "llama_cpp"
     recommended_payload = build_recommended_payload(
         hardware_info=hardware_info,
         recommended_ctx=recommended_ctx,
@@ -492,7 +481,6 @@ async def run_setup_wizard(
         )
 
     payload: dict[str, object] = {
-        "runtime": runtime,
         "hardware_profile": hardware,
         "hardware_override": hardware_override if hardware == "other" else "",
     }
@@ -500,7 +488,7 @@ async def run_setup_wizard(
     effective_hw = effective_hardware_info(hardware, hardware_info, hardware_override)
     device = recommended_device_for_hardware(hardware, hardware_info, hardware_override)
     model_files = discover_model_files()
-    saved_model_files = _saved_model_refs(current_cfg, runtime)
+    saved_model_files = _saved_model_refs(current_cfg, "llama_cpp")
     direct = recommend_direct_model(effective_hw, cfg=current_cfg)
     model_plan_options: list[tuple[str, object]] = [
         ("Use a local .gguf model file", "__local__"),
@@ -564,14 +552,12 @@ async def run_setup_wizard(
         if model_file.suffix.lower() != ".gguf":
             raise RuntimeError("Model file must end with .gguf.")
         payload["model_source"] = "local"
-        payload["model"] = str(model_file)
         payload["llama_model"] = str(model_file)
-        _remember_model_ref(payload, current_cfg, runtime, str(model_file))
+        _remember_model_ref(payload, current_cfg, "llama_cpp", str(model_file))
     else:
         payload["model_source"] = "direct"
         payload["model_download_url"] = str(direct["url"])
         payload["model_download_path"] = str(direct["target_path"])
-        payload["recommended_llm"] = str(direct["label"])
         payload["setup_missing_model"] = True
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -588,7 +574,7 @@ async def run_setup_wizard(
         )
     )
     recommended_ctx_value = recommend_setup_context_window(
-        runtime=runtime,
+        runtime="llama_cpp",
         device=device,
         fallback_tokens=fallback_ctx,
         model_refs=_setup_model_refs(payload),

@@ -16,13 +16,11 @@ The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/b
 
 ## What setup automates
 
-When you run `open-jet --setup` for the local runtime, OpenJet can:
+When you run `open-jet --setup`, OpenJet can:
 
 - reuse an existing `llama-server` binary
 - clone and build `llama.cpp` if `llama-server` is missing
 - use a local `.gguf`
-- resolve an installed Ollama model
-- pull an Ollama model
 - download a recommended GGUF if you do not have a local model ready
 
 Automatic provisioning still depends on local prerequisites like network access, `git`, `cmake`, and a working compiler toolchain.

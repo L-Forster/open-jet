@@ -315,10 +315,9 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
         stdout = io.StringIO()
 
         try:
-            with patch("src.cli.load_config", return_value={"runtime": "llama_cpp"}), patch(
-                "src.cli.runtime_spec",
-                return_value=SimpleNamespace(label="llama.cpp (GGUF)"),
-            ), patch("src.cli.active_model_ref", return_value="model.gguf"), patch(
+            with patch("src.cli.load_config", return_value={"llama_model": "model.gguf"}), patch(
+                "src.cli.active_model_ref", return_value="model.gguf"
+            ), patch(
                 "src.cli.airgapped_from_cfg",
                 return_value=False,
             ), patch("sys.stdout", stdout):
@@ -327,7 +326,7 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
             if original_app_module is not None:
                 sys.modules["src.app"] = original_app_module
 
-        self.assertIn("Runtime: llama.cpp (GGUF) (llama_cpp)", stdout.getvalue())
+        self.assertIn("Runtime: Local model: llama.cpp (GGUF)", stdout.getvalue())
         if original_app_module is None:
             self.assertNotIn("src.app", sys.modules)
         else:
@@ -619,7 +618,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 hardware_info=hardware,
                 recommended_ctx=4096,
                 current_cfg={
-                    "runtime": "llama_cpp",
                     "llama_model": current_model,
                     "context_window_tokens": 3072,
                     "gpu_layers": 20,
@@ -647,7 +645,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 current_cfg={},
             )
 
-        self.assertEqual(payload["runtime"], "llama_cpp")
         self.assertEqual(payload["model_source"], "direct")
         self.assertTrue(payload["setup_missing_runtime"])
         self.assertIn("model_download_url", payload)
@@ -667,8 +664,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 recommended_ctx=2048,
                 current_cfg={},
             )
-
-        self.assertEqual(payload["runtime"], "llama_cpp")
 
     def test_build_recommended_payload_uses_configured_direct_model_catalog(self) -> None:
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=12.0, has_cuda=False)
@@ -708,7 +703,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 current_cfg=current_cfg,
             )
 
-        self.assertEqual(payload["recommended_llm"], "Qwen3.5 9B")
         self.assertEqual(payload["model_download_url"], "https://example.invalid/qwen-9b.gguf")
         self.assertTrue(str(payload["model_download_path"]).endswith("Qwen_Qwen3.5-9B-Q4_K_M.gguf"))
 
@@ -724,7 +718,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
             "src.setup.build_recommended_payload",
             return_value={
-                "runtime": "llama_cpp",
                 "model_source": "direct",
                 "model_download_url": "https://example.invalid/model.gguf",
                 "model_download_path": "/models/base.gguf",
@@ -776,7 +769,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNotNone(payload)
-        self.assertEqual(payload["runtime"], "llama_cpp")
         self.assertEqual(payload["model_source"], "direct")
         self.assertTrue(payload["setup_missing_model"])
         self.assertIn("model_download_url", payload)
@@ -828,7 +820,6 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "model.gguf"
             payload = {
-                "runtime": "llama_cpp",
                 "model_source": "direct",
                 "model_download_url": "https://example.invalid/model.gguf",
                 "model_download_path": str(target),
@@ -845,7 +836,6 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             written = target.read_bytes()
 
         self.assertEqual(written, b"test-gguf")
-        self.assertEqual(resolved["model"], str(target))
         self.assertEqual(resolved["llama_model"], str(target))
         self.assertFalse(resolved["setup_missing_model"])
         self.assertTrue(any(text.startswith("downloading model.gguf") for text in updates))
@@ -857,12 +847,12 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
         app.cfg["logging"] = {"enabled": False}
         events: list[str] = []
 
-        with patch.object(app, "_run_setup_wizard", AsyncMock(return_value={"model": "/models/base.gguf"})), patch(
+        with patch.object(app, "_run_setup_wizard", AsyncMock(return_value={"llama_model": "/models/base.gguf"})), patch(
             "src.app.save_config", side_effect=lambda _cfg: events.append("save")
         ), patch.object(
             app,
             "_materialize_setup_model",
-            AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "model": "/models/resolved.gguf"}),
+            AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "llama_model": "/models/resolved.gguf"}),
         ), patch.object(app, "_init_client", AsyncMock(side_effect=lambda: events.append("init"))), patch.object(
             app, "_render_token_counter"
         ), patch.object(
@@ -879,12 +869,12 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
         app.cfg["logging"] = {"enabled": False}
         events: list[str] = []
 
-        with patch.object(app, "_run_setup_wizard", AsyncMock(return_value={"model": "/models/base.gguf"})), patch(
+        with patch.object(app, "_run_setup_wizard", AsyncMock(return_value={"llama_model": "/models/base.gguf"})), patch(
             "src.app.save_config", side_effect=lambda _cfg: events.append("save")
         ), patch.object(
             app,
             "_materialize_setup_model",
-            AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "model": "/models/resolved.gguf"}),
+            AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "llama_model": "/models/resolved.gguf"}),
         ), patch.object(app, "_init_client", AsyncMock(side_effect=lambda: events.append("init"))), patch.object(
             app, "_maybe_prompt_for_startup_update", AsyncMock()
         ), patch.object(
@@ -903,9 +893,7 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
         app.cfg["model_profiles"] = [
             {
                 "name": "Base",
-                "runtime": "llama_cpp",
                 "model_source": "local",
-                "model": "/models/base.gguf",
                 "llama_model": "/models/base.gguf",
                 "context_window_tokens": 4096,
                 "gpu_layers": 99,
@@ -915,9 +903,7 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.app.save_config"):
             app._persist_setup_result(
                 {
-                    "runtime": "llama_cpp",
                     "model_source": "local",
-                    "model": "/models/alt.gguf",
                     "llama_model": "/models/alt.gguf",
                     "context_window_tokens": 8192,
                     "gpu_layers": 70,
@@ -938,7 +924,6 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.app.save_config"):
             app._persist_setup_result(
                 {
-                    "runtime": "llama_cpp",
                     "system_prompt": "should not persist",
                 }
             )
@@ -952,9 +937,7 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         app.cfg["model_profiles"] = [
             {
                 "name": "alt",
-                "runtime": "llama_cpp",
                 "model_source": "local",
-                "model": "/models/alt.gguf",
                 "llama_model": "/models/alt.gguf",
                 "context_window_tokens": 4096,
                 "gpu_layers": 99,
@@ -973,18 +956,14 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         app.cfg["model_profiles"] = [
             {
                 "name": "base",
-                "runtime": "llama_cpp",
                 "model_source": "local",
-                "model": "/models/base.gguf",
                 "llama_model": "/models/base.gguf",
                 "context_window_tokens": 4096,
                 "gpu_layers": 99,
             },
             {
                 "name": "alt",
-                "runtime": "llama_cpp",
                 "model_source": "local",
-                "model": "/models/alt.gguf",
                 "llama_model": "/models/alt.gguf",
                 "context_window_tokens": 4096,
                 "gpu_layers": 99,
@@ -1008,9 +987,7 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         app.cfg["model_profiles"] = [
             {
                 "name": "alt",
-                "runtime": "llama_cpp",
                 "model_source": "local",
-                "model": "/models/alt.gguf",
                 "llama_model": "/models/alt.gguf",
                 "context_window_tokens": 4096,
                 "gpu_layers": 99,
@@ -1188,8 +1165,6 @@ class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
             app = OpenJetApp()
             app.state_store = SessionStateStore(path=state_path, enabled=True)
             app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
-            app.cfg["runtime"] = "llama_cpp"
-            app.cfg["model"] = "/models/demo.gguf"
             app.cfg["llama_model"] = "/models/demo.gguf"
             app.agent = SimpleNamespace(
                 system_prompt="system",
@@ -1242,8 +1217,6 @@ class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
             app = OpenJetApp()
             app.state_store = SessionStateStore(path=state_path, enabled=True)
             app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
-            app.cfg["runtime"] = "llama_cpp"
-            app.cfg["model"] = "/models/current.gguf"
             app.cfg["llama_model"] = "/models/current.gguf"
             app.agent = SimpleNamespace(
                 system_prompt="system",
@@ -1282,7 +1255,7 @@ class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
             app.client.restore_kv_cache.assert_not_awaited()
             app.client.reset_kv_cache.assert_awaited_once()
             self.assertTrue(
-                any("active runtime/model differs" in str(entry) for entry in app.query_one("#chat-log")._entries)
+                any("active model differs" in str(entry) for entry in app.query_one("#chat-log")._entries)
             )
 
 
@@ -1341,9 +1314,7 @@ class CliCommandTests(unittest.TestCase):
                 "model_profiles": [
                     {
                         "name": "base",
-                        "runtime": "llama_cpp",
                         "model_source": "local",
-                        "model": "/models/base.gguf",
                         "llama_model": "/models/base.gguf",
                         "context_window_tokens": 4096,
                         "gpu_layers": 99,
@@ -1353,12 +1324,11 @@ class CliCommandTests(unittest.TestCase):
         )
 
         self.assertIn("Active model preset: base", text)
-        self.assertIn("- base (active): runtime=llama_cpp", text)
+        self.assertIn("- base (active): context=4096", text)
 
     def test_format_cli_status_reports_runtime_and_airgap(self) -> None:
         text = _format_cli_status(
             {
-                "runtime": "llama_cpp",
                 "active_model_profile": "base",
                 "llama_model": "/models/base.gguf",
                 "context_window_tokens": 4096,
@@ -1367,7 +1337,7 @@ class CliCommandTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("Runtime: Local model: llama.cpp (GGUF) (llama_cpp)", text)
+        self.assertIn("Runtime: Local model: llama.cpp (GGUF)", text)
         self.assertIn("Active model preset: base", text)
         self.assertIn("Air-gapped: true", text)
 
@@ -1381,15 +1351,13 @@ class CliCommandTests(unittest.TestCase):
         cfg = {
             "active_model_profile": "base",
             "context_window_tokens": 4096,
-            "model_profiles": [
-                {
-                    "name": "base",
-                    "runtime": "llama_cpp",
-                    "model_source": "local",
-                    "model": "/models/base.gguf",
-                    "llama_model": "/models/base.gguf",
-                    "context_window_tokens": 4096,
-                    "gpu_layers": 99,
+                "model_profiles": [
+                    {
+                        "name": "base",
+                        "model_source": "local",
+                        "llama_model": "/models/base.gguf",
+                        "context_window_tokens": 4096,
+                        "gpu_layers": 99,
                 }
             ],
         }
@@ -1419,9 +1387,7 @@ class CliCommandTests(unittest.TestCase):
             "model_profiles": [
                 {
                     "name": "base",
-                    "runtime": "llama_cpp",
                     "model_source": "local",
-                    "model": "/models/base.gguf",
                     "llama_model": "/models/base.gguf",
                     "context_window_tokens": 4096,
                     "gpu_layers": 99,

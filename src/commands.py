@@ -12,7 +12,6 @@ from .config import save_config
 from .model_profiles import get_model_profile, list_model_profiles, replace_model_profile
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
-from .runtime_registry import runtime_spec
 from .setup import _prompt_text
 from .skills_registry import skills_manifest_path, sync_skills_manifest
 from .surfaces.command_specs import COMMANDS, CommandSpec
@@ -484,7 +483,6 @@ class SlashCommandHandler:
                         profile["name"],
                         f"{profile['name']}"
                         f"{' (active)' if profile['name'] == active else ''}"
-                        f" | runtime={profile.get('runtime', 'llama_cpp')}"
                         f" | ctx={profile.get('context_window_tokens', 'n/a')}"
                         f" | gpu={profile.get('gpu_layers', 'n/a')}",
                     )
@@ -512,10 +510,10 @@ class SlashCommandHandler:
             log.write(f"[bold bright_white]Active model preset: {active or 'none'}[/]")
             for profile in profiles:
                 marker = " (active)" if profile["name"] == active else ""
-                model_ref = str(profile.get("ollama_model") or profile.get("model") or profile.get("llama_model") or "")
+                model_ref = str(profile.get("llama_model") or "")
                 log.write(
                     "[bold bright_white]"
-                    f"- {profile['name']}{marker}: runtime={profile.get('runtime', 'llama_cpp')} "
+                    f"- {profile['name']}{marker}: "
                     f"context={profile.get('context_window_tokens', 'n/a')} gpu={profile.get('gpu_layers', 'n/a')} "
                     f"model={model_ref or 'n/a'}"
                     "[/]"
@@ -561,21 +559,22 @@ class SlashCommandHandler:
             log.write("")
             return
 
-        runtime = str(profile.get("runtime", "llama_cpp"))
-        model_source = str(profile.get("model_source", "local"))
-        model_key = "ollama_model" if model_source == "ollama" else runtime_spec(runtime).model_config_key
-        model_prompt = "ollama model> " if model_source == "ollama" else "model ref> "
-
         name_value = await _prompt_text(self.app._session, "model name> ", default=str(profile["name"]))
-        model_value = await _prompt_text(self.app._session, model_prompt, default=str(profile.get(model_key) or profile.get("model") or ""))
+        model_value = await _prompt_text(
+            self.app._session,
+            "model ref> ",
+            default=str(profile.get("llama_model") or ""),
+        )
         context_value = await _prompt_text(
             self.app._session,
             "context window> ",
             default=str(profile.get("context_window_tokens", 4096)),
         )
-        gpu_value = str(profile.get("gpu_layers", 0))
-        if runtime == "llama_cpp":
-            gpu_value = await _prompt_text(self.app._session, "gpu layers> ", default=gpu_value)
+        gpu_value = await _prompt_text(
+            self.app._session,
+            "gpu layers> ",
+            default=str(profile.get("gpu_layers", 0)),
+        )
 
         try:
             context_tokens = int(context_value.strip())
@@ -588,13 +587,8 @@ class SlashCommandHandler:
         updated = dict(profile)
         updated["name"] = name_value.strip() or profile["name"]
         updated["context_window_tokens"] = context_tokens
-        updated["gpu_layers"] = gpu_layers if runtime == "llama_cpp" else 0
-        updated[model_key] = model_value.strip()
-        if model_source != "ollama":
-            updated["model"] = model_value.strip()
-        else:
-            updated["recommended_llm"] = model_value.strip()
-            updated["model"] = str(profile.get("model") or "").strip()
+        updated["gpu_layers"] = gpu_layers
+        updated["llama_model"] = model_value.strip()
 
         try:
             stored = replace_model_profile(self.app.cfg, updated, previous_name=profile["name"])

@@ -96,7 +96,7 @@ class SessionLoggerTests(unittest.TestCase):
             attrs = logger._sanitize_runtime_context(
                 {
                     "runtime": "llama_cpp",
-                    "backend": "ollama",
+                    "backend": "llama_cpp",
                     "model": "/models/Qwen3.5-4B-Q4_K_M.gguf",
                     "model_id": "qwen3.5-4b",
                     "model_variant": "q4_k_m",
@@ -113,7 +113,7 @@ class SessionLoggerTests(unittest.TestCase):
                 }
             )
 
-            self.assertEqual(attrs["openjet.backend"], "ollama")
+            self.assertEqual(attrs["openjet.backend"], "llama_cpp")
             self.assertEqual(attrs["openjet.model.name"], "Qwen3.5-4B-Q4_K_M.gguf")
             self.assertEqual(attrs["openjet.model.id"], "qwen3_5_4b")
             self.assertEqual(attrs["openjet.model.variant"], "q4_k_m")
