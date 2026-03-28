@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Mapping
 
 import yaml
 
@@ -57,6 +58,27 @@ RECOMMENDED_LLM_BANDS: tuple[tuple[float, tuple[tuple[str, float, str], ...]], .
     ),
 )
 
+DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
+    {
+        "max_ram_gb": 6.0,
+        "label": "Qwen3.5 4B",
+        "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf?download=true",
+    },
+    {
+        "max_ram_gb": 12.0,
+        "label": "Qwen3.5 9B",
+        "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true",
+    },
+    {
+        "max_ram_gb": 24.0,
+        "label": "Qwen3.5 27B",
+        "filename": "Qwen3.5-27B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf?download=true",
+    },
+)
+
 HARDWARE_OVERRIDE_OPTIONS: tuple[tuple[str, str, float, bool], ...] = (
     ("desktop_8", "Desktop / Laptop (8GB RAM)", 8.0, False),
     ("desktop_16", "Desktop / Laptop (16GB RAM)", 16.0, False),
@@ -101,3 +123,43 @@ def normalize_config(cfg: dict) -> dict:
         normalized["logging"] = log_cfg
 
     return normalized
+
+
+def setup_direct_model_catalog(cfg: Mapping[str, object] | None = None) -> tuple[dict[str, object], ...]:
+    if not isinstance(cfg, Mapping):
+        return DEFAULT_DIRECT_MODEL_CATALOG
+
+    setup_cfg = cfg.get("setup_recommendations")
+    if not isinstance(setup_cfg, Mapping):
+        return DEFAULT_DIRECT_MODEL_CATALOG
+
+    raw_models = setup_cfg.get("direct_models")
+    if not isinstance(raw_models, list):
+        return DEFAULT_DIRECT_MODEL_CATALOG
+
+    parsed: list[dict[str, Any]] = []
+    for item in raw_models:
+        if not isinstance(item, Mapping):
+            continue
+        label = str(item.get("label") or "").strip()
+        filename = str(item.get("filename") or "").strip()
+        url = str(item.get("url") or "").strip()
+        try:
+            max_ram_gb = float(item.get("max_ram_gb"))
+        except (TypeError, ValueError):
+            continue
+        if max_ram_gb <= 0 or not label or not filename or not url:
+            continue
+        parsed.append(
+            {
+                "max_ram_gb": max_ram_gb,
+                "label": label,
+                "filename": filename,
+                "url": url,
+            }
+        )
+
+    if not parsed:
+        return DEFAULT_DIRECT_MODEL_CATALOG
+    parsed.sort(key=lambda row: float(row["max_ram_gb"]))
+    return tuple(parsed)

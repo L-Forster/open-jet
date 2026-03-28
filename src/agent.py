@@ -13,6 +13,7 @@ from .multimodal import content_to_plain_text, estimate_message_content_tokens, 
 from .runtime_protocol import ToolCall, tool_schema_token_estimate
 from .runtime_client import RuntimeClient
 from .runtime_limits import ContextBudget, derive_context_budget, estimate_tokens, read_memory_snapshot
+from .tools.registry import confirmation_required_tool_names
 
 
 class ActionKind(Enum):
@@ -46,7 +47,7 @@ class CondenseReport:
 
 
 # Tools that require user confirmation before execution
-CONFIRM_TOOLS = {"shell", "write_file", "edit_file", "memory"}
+CONFIRM_TOOLS = set(confirmation_required_tool_names())
 POST_TOOL_CONTINUATION_NOTE = (
     "Tool results are available in the conversation. Analyze them before deciding the next action. "
     "If they answer the user's request, answer directly. Otherwise request the next precise tool. "

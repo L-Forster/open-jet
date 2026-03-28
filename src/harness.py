@@ -15,6 +15,7 @@ from .runtime_limits import MemorySnapshot, estimate_tokens
 from .skills_registry import available_skill_names as registry_available_skill_names
 from .skills_registry import render_skills_manifest
 from .skills_registry import skill_summaries, sync_skills_manifest
+from .tools.registry import TOOL_MODES, confirmation_required_tool_names, tool_bundle_names_for_mode, tool_names_with_tag
 
 
 ROLE_BY_MODE = {
@@ -24,22 +25,9 @@ ROLE_BY_MODE = {
     "debug": "debugger",
 }
 
-CONFIRMATION_GATED_TOOLS = {"shell", "write_file", "edit_file", "memory"}
-DEVICE_TOOLS = {
-    "device_list",
-    "camera_snapshot",
-    "microphone_record",
-    "microphone_set_enabled",
-    "gpio_read",
-    "sensor_read",
-}
-
-TOOL_BUNDLES = {
-    "chat": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
-    "code": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
-    "review": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
-    "debug": {"read_file", "load_file", "glob", "grep", "list_directory", "system_info"} | DEVICE_TOOLS,
-}
+CONFIRMATION_GATED_TOOLS = set(confirmation_required_tool_names())
+DEVICE_TOOLS = set(tool_names_with_tag("device"))
+TOOL_BUNDLES = {mode: set(tool_bundle_names_for_mode(mode)) for mode in TOOL_MODES}
 
 @dataclass
 class PlanStep:
@@ -303,6 +291,7 @@ def build_turn_context(
     layered_config: dict[str, Any] | None = None,
     cfg: Mapping[str, object] | None = None,
     referenced_device_ids: Sequence[str] | None = None,
+    device_registry_path: str | Path | None = None,
     extra_system_messages: Sequence[dict[str, str]] | None = None,
     extra_docs_loaded: Sequence[str] | None = None,
 ) -> HarnessContext:
@@ -443,7 +432,11 @@ def build_turn_context(
 
     referenced_ids = _normalize_context_device_refs(referenced_device_ids)
     if referenced_ids:
-        registry_path = ensure_devices_registry(root, cfg=cfg)
+        registry_path = (
+            Path(device_registry_path).expanduser().resolve()
+            if device_registry_path is not None
+            else ensure_devices_registry(root, cfg=cfg)
+        )
         if registry_path is not None:
             registry_prompt = format_device_registry_prompt(
                 registry_path,
@@ -648,7 +641,9 @@ def normalize_skill_name(name: str) -> str:
 
 
 def allowed_tools_for_mode(mode: str | None) -> set[str]:
-    allowed: set[str] = set(CONFIRMATION_GATED_TOOLS)
+    allowed = set(CONFIRMATION_GATED_TOOLS)
+    if mode:
+        return allowed | set(TOOL_BUNDLES.get(str(mode).strip().lower(), set()))
     for bundle in TOOL_BUNDLES.values():
         allowed |= set(bundle)
     return allowed

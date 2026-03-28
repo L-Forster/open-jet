@@ -34,11 +34,13 @@ RUNTIME_SPECS: dict[str, RuntimeSpec] = {
         key="openai_compatible",
         label="Self-hosted API: OpenAI-compatible",
         model_config_key="openai_compatible_model",
+        show_in_setup=False,
     ),
     "openrouter": RuntimeSpec(
         key="openrouter",
         label="Hosted API: OpenRouter",
         model_config_key="openrouter_model",
+        show_in_setup=False,
     ),
 }
 

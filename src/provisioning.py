@@ -7,10 +7,11 @@ import shutil
 import stat
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import httpx
 
+from .config import setup_direct_model_catalog
 from .hardware import HardwareInfo, is_jetson_label
 
 def _fmt_size(nbytes: int) -> str:
@@ -27,37 +28,14 @@ BIN_DIR = OPENJET_HOME / "bin"
 LLAMA_CPP_DIR = Path.home() / "llama.cpp"
 LLAMA_SERVER_BIN = BIN_DIR / "llama-server"
 
-_MODEL_CATALOG: tuple[dict[str, object], ...] = (
-    {
-        "max_ram_gb": 6.0,
-        "label": "Qwen3.5 2B",
-        "filename": "Qwen_Qwen3.5-2B-Q4_K_M.gguf",
-        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/Qwen_Qwen3.5-2B-Q4_K_M.gguf?download=true",
-    },
-    {
-        "max_ram_gb": 12.0,
-        "label": "Qwen3.5 4B",
-        "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
-        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/Qwen_Qwen3.5-4B-Q4_K_M.gguf?download=true",
-    },
-    {
-        "max_ram_gb": 24.0,
-        "label": "Qwen3.5 9B",
-        "filename": "Qwen_Qwen3.5-9B-Q4_K_M.gguf",
-        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF/resolve/main/Qwen_Qwen3.5-9B-Q4_K_M.gguf?download=true",
-    },
-    {
-        "max_ram_gb": 10_000.0,
-        "label": "Qwen3.5 27B",
-        "filename": "Qwen_Qwen3.5-27B-Q4_K_M.gguf",
-        "url": "https://huggingface.co/bartowski/Qwen_Qwen3.5-27B-GGUF/resolve/main/Qwen_Qwen3.5-27B-Q4_K_M.gguf?download=true",
-    },
-)
-
-
-def recommend_direct_model(hardware_info: HardwareInfo) -> dict[str, str]:
+def recommend_direct_model(
+    hardware_info: HardwareInfo,
+    *,
+    cfg: Mapping[str, object] | None = None,
+) -> dict[str, str]:
     total_ram_gb = max(hardware_info.total_ram_gb, 0.0)
-    for row in _MODEL_CATALOG:
+    model_catalog = setup_direct_model_catalog(cfg)
+    for row in model_catalog:
         if total_ram_gb <= float(row["max_ram_gb"]):
             filename = str(row["filename"])
             return {
@@ -66,7 +44,7 @@ def recommend_direct_model(hardware_info: HardwareInfo) -> dict[str, str]:
                 "url": str(row["url"]),
                 "target_path": str(MODELS_DIR / filename),
             }
-    row = _MODEL_CATALOG[-1]
+    row = model_catalog[-1]
     filename = str(row["filename"])
     return {
         "label": str(row["label"]),

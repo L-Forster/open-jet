@@ -10,16 +10,10 @@ from .observation import ObservationStore, process_audio_observation, save_frame
 from .peripherals import PeripheralDevice, PeripheralKind, PeripheralTransport, capture_snapshot, discover_peripherals, record_clip
 from .peripherals.system import resolve_binary, run_command
 from .peripherals.types import Observation, ObservationModality
+from .tools.registry import tool_names_with_tag
 
 DEFAULT_DEVICES_REGISTRY_PATH = Path(".openjet/state/devices.md")
-DEVICE_TOOL_NAMES = (
-    "device_list",
-    "camera_snapshot",
-    "microphone_record",
-    "microphone_set_enabled",
-    "gpio_read",
-    "sensor_read",
-)
+DEVICE_TOOL_NAMES = tool_names_with_tag("device")
 
 
 @dataclass(frozen=True)

@@ -6,24 +6,19 @@ from pathlib import Path
 from typing import Mapping
 
 from ..config import load_config
-from ..device_sources import DEVICE_TOOL_NAMES, ensure_devices_registry
+from ..device_sources import ensure_devices_registry
 from ..executor import load_file
 from ..harness import HarnessState, build_turn_context, set_preferred_skills, update_state_for_user_message
 from ..runtime_limits import MIN_TOKEN_BUDGET, derive_context_budget, read_memory_snapshot
 from ..sdk import OpenJetSession
 from ..tool_executor import format_tool_args
+from ..tools.registry import workflow_default_tool_names, workflow_optional_tool_names
 from .bindings import WorkflowBindings, resolve_workflow_bindings
 from .specs import WorkflowSpec
 
 
-READ_ONLY_WORKFLOW_TOOLS = {
-    "read_file",
-    "load_file",
-    "glob",
-    "grep",
-    "list_directory",
-    "system_info",
-}
+WORKFLOW_BASE_TOOLS = set(workflow_default_tool_names())
+WORKFLOW_OPTIONAL_TOOLS = set(workflow_optional_tool_names())
 MAX_PRELOAD_FILE_TOKENS = 1200
 PRELOAD_RESERVE_TOKENS = 384
 
@@ -140,9 +135,9 @@ async def run_workflow(
 
 
 def allowed_tools_for_workflow(spec: WorkflowSpec) -> set[str]:
-    allowed = set(READ_ONLY_WORKFLOW_TOOLS) | set(DEVICE_TOOL_NAMES)
+    allowed = set(WORKFLOW_BASE_TOOLS)
     if spec.allow_shell:
-        allowed.add("shell")
+        allowed |= set(WORKFLOW_OPTIONAL_TOOLS)
     return allowed
 
 

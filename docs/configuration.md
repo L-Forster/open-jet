@@ -38,6 +38,27 @@ gpu_layers: 99
 
 If setup starts from a direct GGUF download, it will download into the OpenJet models directory and then persist the resolved `llama_model` path for future runs.
 
+You can override the setup wizard's direct-download recommendations in `config.yaml`:
+
+```yaml
+setup_recommendations:
+  direct_models:
+    - max_ram_gb: 6
+      label: Qwen3.5 4B
+      filename: Qwen3.5-4B-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf?download=true
+    - max_ram_gb: 12
+      label: Qwen3.5 9B
+      filename: Qwen3.5-9B-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true
+    - max_ram_gb: 24
+      label: Qwen3.5 27B
+      filename: Qwen3.5-27B-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf?download=true
+```
+
+Rows are matched by `max_ram_gb`, and the last row is used as the fallback above the highest configured RAM band.
+
 ## Minimal self-hosted OpenAI-compatible config
 
 ```yaml

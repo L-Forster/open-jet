@@ -56,8 +56,6 @@ class RuntimeRegistryAirgapTests(AirgapBaseTestCase):
             options,
             [
                 ("Local model: llama.cpp (GGUF)", "llama_cpp"),
-                ("Self-hosted API: OpenAI-compatible", "openai_compatible"),
-                ("Hosted API: OpenRouter", "openrouter"),
             ],
         )
 

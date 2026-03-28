@@ -30,7 +30,7 @@ from src.llama_server import (
     _JETSON_VMM_CHUNK_MB,
     _JETSON_VMM_RESERVE_MB,
 )
-from src.provisioning import ensure_direct_model
+from src.provisioning import ensure_direct_model, recommend_direct_model
 from src.runtime_protocol import StreamChunk, ToolCall
 from src.sdk import ToolResult
 from src.session_state import ChatArchiveStore, SavedChatEntry, SessionStateStore
@@ -311,20 +311,27 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
         await wait_task
 
     def test_status_cli_does_not_import_tui_surface(self) -> None:
-        sys.modules.pop("src.app", None)
+        original_app_module = sys.modules.pop("src.app", None)
         stdout = io.StringIO()
 
-        with patch("src.cli.load_config", return_value={"runtime": "llama_cpp"}), patch(
-            "src.cli.runtime_spec",
-            return_value=SimpleNamespace(label="llama.cpp (GGUF)"),
-        ), patch("src.cli.active_model_ref", return_value="model.gguf"), patch(
-            "src.cli.airgapped_from_cfg",
-            return_value=False,
-        ), patch("sys.stdout", stdout):
-            cli_main(["status"])
+        try:
+            with patch("src.cli.load_config", return_value={"runtime": "llama_cpp"}), patch(
+                "src.cli.runtime_spec",
+                return_value=SimpleNamespace(label="llama.cpp (GGUF)"),
+            ), patch("src.cli.active_model_ref", return_value="model.gguf"), patch(
+                "src.cli.airgapped_from_cfg",
+                return_value=False,
+            ), patch("sys.stdout", stdout):
+                cli_main(["status"])
+        finally:
+            if original_app_module is not None:
+                sys.modules["src.app"] = original_app_module
 
         self.assertIn("Runtime: llama.cpp (GGUF) (llama_cpp)", stdout.getvalue())
-        self.assertNotIn("src.app", sys.modules)
+        if original_app_module is None:
+            self.assertNotIn("src.app", sys.modules)
+        else:
+            self.assertIs(sys.modules["src.app"], original_app_module)
 
     def test_format_command_status_label_compacts_and_truncates(self) -> None:
         label = OpenJetApp._format_command_status_label(
@@ -439,6 +446,7 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
 class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
     def test_runtime_prompt_options_note_setup_can_provision_llama_server(self) -> None:
         options = _runtime_prompt_options({}, llama_ready=False)
+        self.assertEqual(len(options), 1)
         llama_label = next(label for label, key in options if key == "llama_cpp")
         self.assertIn("setup can provision llama-server", llama_label)
 
@@ -502,7 +510,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         manual_model = "/models/custom.gguf"
         profile_name = "Custom Model"
 
-        choices = iter(["manual", "auto", "llama_cpp", "__local__", "__manual__", 4096, 99])
+        choices = iter(["manual", "auto", "__local__", "__manual__", 4096, 99])
         texts = iter([manual_model, profile_name])
 
         async def fake_choice(*_args, **_kwargs):
@@ -514,8 +522,8 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
             "src.setup._prompt_text", side_effect=fake_text
         ), patch("src.setup.discover_model_files", return_value=[]), patch(
-            "src.setup.find_ollama_cli", return_value=None
-        ), patch("src.setup.recommended_context_window_tokens", return_value=4096), patch(
+            "src.setup.recommended_context_window_tokens", return_value=4096
+        ), patch(
             "src.setup.recommended_context_window_tokens_from_total", return_value=4096
         ), patch("src.setup.recommended_gpu_layers", return_value=99), patch(
             "pathlib.Path.is_file", return_value=True
@@ -544,8 +552,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 return "manual"
             if title == "Hardware profile":
                 return "auto"
-            if title == "Runtime":
-                return "llama_cpp"
             if title == "Model source":
                 return "__local__"
             if title == "Local model":
@@ -555,7 +561,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
             "src.setup.discover_model_files", return_value=[]
-        ), patch("src.setup.find_ollama_cli", return_value=None):
+        ):
             with self.assertRaises(StopSetupWizard):
                 await run_setup_wizard(
                     session=None,
@@ -581,8 +587,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 return "guided"
             if title == "Hardware profile":
                 return "auto"
-            if title == "Runtime":
-                return options[kwargs["default_index"]][1]
             if title == "Model source":
                 return "__local__"
             if title == "Local model":
@@ -603,8 +607,8 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
             "src.setup._prompt_text", side_effect=fake_text
         ), patch("src.setup.discover_model_files", return_value=[]), patch(
-            "src.setup.find_ollama_cli", return_value=None
-        ), patch("src.setup.recommended_context_window_tokens", return_value=4096), patch(
+            "src.setup.recommended_context_window_tokens", return_value=4096
+        ), patch(
             "src.setup.recommended_context_window_tokens_from_total", return_value=4096
         ), patch("src.setup.recommended_gpu_layers", return_value=99), patch(
             "pathlib.Path.is_file", return_value=True
@@ -624,18 +628,15 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(payload)
         self.assertEqual(payload["llama_model"], current_model)
-        self.assertEqual(payload["context_window_tokens"], 3072)
+        self.assertEqual(payload["context_window_tokens"], 4096)
         self.assertEqual(payload["gpu_layers"], 20)
         self.assertEqual(text_defaults[0], current_model)
-        self.assertIsInstance(captured_defaults["Runtime"], int)
         self.assertIsInstance(captured_defaults["Context window"], int)
         self.assertIsInstance(captured_defaults["GPU layers"], int)
 
     def test_build_recommended_payload_marks_missing_runtime_and_prefers_direct_model(self) -> None:
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
         with patch("src.setup.discover_model_files", return_value=[]), patch(
-            "src.setup.find_ollama_cli", return_value=None
-        ), patch("src.setup.discover_installed_ollama_models", return_value=[]), patch(
             "src.setup._discover_llama_server", return_value=None
         ), patch("src.setup.recommended_context_window_tokens", return_value=2048), patch(
             "src.setup.recommended_context_window_tokens_from_total", return_value=2048
@@ -656,8 +657,6 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key", "OPENROUTER_API_KEY": "router-key"}, clear=False), patch(
             "src.setup.discover_model_files", return_value=[]
-        ), patch("src.setup.find_ollama_cli", return_value=None), patch(
-            "src.setup.discover_installed_ollama_models", return_value=[]
         ), patch("src.setup._discover_llama_server", return_value=None), patch(
             "src.setup.recommended_context_window_tokens", return_value=2048
         ), patch(
@@ -670,6 +669,48 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(payload["runtime"], "llama_cpp")
+
+    def test_build_recommended_payload_uses_configured_direct_model_catalog(self) -> None:
+        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=12.0, has_cuda=False)
+        current_cfg = {
+            "setup_recommendations": {
+                "direct_models": [
+                    {
+                        "max_ram_gb": 6,
+                        "label": "Qwen3.5 4B",
+                        "filename": "Qwen_Qwen3.5-4B-Q4_K_M.gguf",
+                        "url": "https://example.invalid/qwen-4b.gguf",
+                    },
+                    {
+                        "max_ram_gb": 12,
+                        "label": "Qwen3.5 9B",
+                        "filename": "Qwen_Qwen3.5-9B-Q4_K_M.gguf",
+                        "url": "https://example.invalid/qwen-9b.gguf",
+                    },
+                    {
+                        "max_ram_gb": 24,
+                        "label": "Qwen3.5 27B",
+                        "filename": "Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+                        "url": "https://example.invalid/qwen-27b.gguf",
+                    },
+                ]
+            }
+        }
+
+        with patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup._discover_llama_server", return_value=None
+        ), patch("src.setup.recommended_context_window_tokens", return_value=4096), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=4096
+        ):
+            payload = build_recommended_payload(
+                hardware_info=hardware,
+                recommended_ctx=4096,
+                current_cfg=current_cfg,
+            )
+
+        self.assertEqual(payload["recommended_llm"], "Qwen3.5 9B")
+        self.assertEqual(payload["model_download_url"], "https://example.invalid/qwen-9b.gguf")
+        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen_Qwen3.5-9B-Q4_K_M.gguf"))
 
     async def test_run_setup_wizard_returns_recommended_payload_immediately(self) -> None:
         console = Mock()
@@ -684,8 +725,9 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             "src.setup.build_recommended_payload",
             return_value={
                 "runtime": "llama_cpp",
-                "model_source": "ollama",
-                "ollama_model": "qwen3:4b",
+                "model_source": "direct",
+                "model_download_url": "https://example.invalid/model.gguf",
+                "model_download_path": "/models/base.gguf",
                 "device": "cpu",
                 "context_window_tokens": 2048,
                 "gpu_layers": 0,
@@ -701,50 +743,15 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 current_cfg={},
             )
 
-        self.assertEqual(payload["ollama_model"], "qwen3:4b")
-
-    async def test_run_setup_wizard_supports_openai_compatible_runtime(self) -> None:
-        console = Mock()
-        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
-        profile_name = "Cloud Preset"
-
-        choices = iter(["manual", "auto", "openai_compatible", 4096])
-        texts = iter(["gpt-4o-mini", "https://api.openai.com", "OPENAI_API_KEY", profile_name])
-
-        async def fake_choice(*_args, **_kwargs):
-            return next(choices)
-
-        async def fake_text(*_args, **_kwargs):
-            return next(texts)
-
-        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
-            "src.setup._prompt_text", side_effect=fake_text
-        ), patch("src.setup.recommended_context_window_tokens", return_value=4096), patch(
-            "src.setup.recommended_context_window_tokens_from_total", return_value=4096
-        ):
-            payload = await run_setup_wizard(
-                session=None,
-                console=console,
-                hardware_info=hardware,
-                recommended_ctx=4096,
-                current_cfg={},
-            )
-
-        self.assertIsNotNone(payload)
-        self.assertEqual(payload["runtime"], "openai_compatible")
-        self.assertEqual(payload["model_source"], "remote")
-        self.assertEqual(payload["openai_compatible_model"], "gpt-4o-mini")
-        self.assertEqual(payload["openai_compatible_base_url"], "https://api.openai.com")
-        self.assertEqual(payload["openai_compatible_api_key_env"], "OPENAI_API_KEY")
-        self.assertEqual(payload["gpu_layers"], 0)
-        self.assertEqual(payload["model_profile_name"], profile_name)
+        self.assertEqual(payload["model_source"], "direct")
+        self.assertEqual(payload["model_download_path"], "/models/base.gguf")
 
     async def test_run_setup_wizard_supports_direct_download_local_runtime(self) -> None:
         console = Mock()
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
         profile_name = "Downloaded Local Model"
 
-        choices = iter(["manual", "auto", "llama_cpp", "__direct__", 2048, 0])
+        choices = iter(["manual", "auto", "__direct__", 2048, 0])
         texts = iter([profile_name])
 
         async def fake_choice(*_args, **_kwargs):
@@ -756,8 +763,8 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
             "src.setup._prompt_text", side_effect=fake_text
         ), patch("src.setup.discover_model_files", return_value=[]), patch(
-            "src.setup.find_ollama_cli", return_value=None
-        ), patch("src.setup.recommended_context_window_tokens", return_value=2048), patch(
+            "src.setup.recommended_context_window_tokens", return_value=2048
+        ), patch(
             "src.setup.recommended_context_window_tokens_from_total", return_value=2048
         ), patch("src.setup.recommended_gpu_layers", return_value=0):
             payload = await run_setup_wizard(
@@ -778,6 +785,20 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
+    def test_recommend_direct_model_uses_requested_default_q4_bands(self) -> None:
+        self.assertEqual(
+            recommend_direct_model(HardwareInfo(label="6GB", total_ram_gb=6.0, has_cuda=False))["label"],
+            "Qwen3.5 4B",
+        )
+        self.assertEqual(
+            recommend_direct_model(HardwareInfo(label="12GB", total_ram_gb=12.0, has_cuda=False))["label"],
+            "Qwen3.5 9B",
+        )
+        self.assertEqual(
+            recommend_direct_model(HardwareInfo(label="24GB", total_ram_gb=24.0, has_cuda=False))["label"],
+            "Qwen3.5 27B",
+        )
+
     async def test_ensure_direct_model_downloads_target_file(self) -> None:
         class FakeResponse:
             status_code = 200
@@ -865,6 +886,8 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
             "_materialize_setup_model",
             AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "model": "/models/resolved.gguf"}),
         ), patch.object(app, "_init_client", AsyncMock(side_effect=lambda: events.append("init"))), patch.object(
+            app, "_maybe_prompt_for_startup_update", AsyncMock()
+        ), patch.object(
             app, "_render_token_counter"
         ), patch.object(
             app, "_restore_harness_state"

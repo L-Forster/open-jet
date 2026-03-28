@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.command.build_py import build_py as _build_py
 
 
@@ -40,6 +41,18 @@ class build_py(_build_py):
         ]
 
 
+class build_ext(_build_ext):
+    """Keep generated extension artifacts out of the source tree."""
+
+    def finalize_options(self) -> None:
+        super().finalize_options()
+        if self.inplace:
+            raise RuntimeError(
+                "In-place extension builds are disabled for open-jet. "
+                "Build into the setuptools build directory instead so src/ stays source-only."
+            )
+
+
 def build_extensions() -> list[Extension]:
     if not BUILD_EXTENSIONS:
         return []
@@ -59,6 +72,6 @@ def build_extensions() -> list[Extension]:
 
 setup(
     ext_modules=build_extensions(),
-    cmdclass={"build_py": build_py},
+    cmdclass={"build_py": build_py, "build_ext": build_ext},
     zip_safe=False,
 )

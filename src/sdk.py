@@ -214,7 +214,8 @@ class OpenJetSession:
                 approved=False,
             )
 
-        if self.agent.needs_confirmation(tool_call):
+        needs_confirmation = getattr(self.agent, "needs_confirmation", None)
+        if callable(needs_confirmation) and needs_confirmation(tool_call):
             approved = await self._approve(tool_call)
             if not approved:
                 output = "User denied this action."
@@ -286,16 +287,25 @@ class OpenJetSession:
         tool_call.arguments["max_tokens"] = min(current, remaining)
 
     def _remaining_prompt_tokens(self, *, reserve_next_turn_overhead: bool = False) -> int:
-        current = self.agent.estimated_context_tokens()
-        budget = self.agent.context_budget()
+        estimate_context = getattr(self.agent, "estimated_context_tokens", None)
+        if callable(estimate_context):
+            current = int(estimate_context())
+        else:
+            persistent_context = getattr(self.agent, "persistent_context_tokens", None)
+            current = int(persistent_context()) if callable(persistent_context) else 0
+        context_budget = getattr(self.agent, "context_budget", None)
+        budget = context_budget() if callable(context_budget) else None
         if not budget:
-            window = self.agent.context_window_tokens or 2048
+            window = int(getattr(self.agent, "context_window_tokens", 2048) or 2048)
             budget = derive_context_budget(window)
-        runtime_overhead = (
-            self.agent.runtime_overhead_tokens(force_post_tool_continuation=True)
-            if reserve_next_turn_overhead
-            else 0
-        )
+        runtime_overhead = 0
+        if reserve_next_turn_overhead:
+            overhead_fn = getattr(self.agent, "runtime_overhead_tokens", None)
+            if callable(overhead_fn):
+                try:
+                    runtime_overhead = int(overhead_fn(force_post_tool_continuation=True))
+                except TypeError:
+                    runtime_overhead = int(overhead_fn())
         return max(0, budget.prompt_tokens - current - runtime_overhead)
 
     def _fit_tool_result_to_budget(self, result: str) -> str:

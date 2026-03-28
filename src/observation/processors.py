@@ -353,6 +353,7 @@ def _transcribe_with_faster_whisper(
     )
     if model is None:
         return None
+    cache_key = (model_name, device, compute_type)
 
     kwargs: dict[str, object] = {
         "beam_size": max(1, int(settings["beam_size"])),
@@ -365,13 +366,29 @@ def _transcribe_with_faster_whisper(
     if bool(settings["translate"]):
         kwargs["task"] = "translate"
 
-    try:
-        segments, _info = model.transcribe(str(observation.payload_ref), **kwargs)
-    except Exception:
-        return None
+    def _transcribe_once(active_model) -> str | None:
+        try:
+            segments, _info = active_model.transcribe(str(observation.payload_ref), **kwargs)
+        except Exception:
+            return None
+        text_parts = [str(getattr(segment, "text", "") or "").strip() for segment in segments]
+        return _normalize_transcript_text("\n".join(part for part in text_parts if part))
 
-    text_parts = [str(getattr(segment, "text", "") or "").strip() for segment in segments]
-    return _normalize_transcript_text("\n".join(part for part in text_parts if part))
+    transcript = _transcribe_once(model)
+    if transcript:
+        return transcript
+
+    # Clear stale cache entries and retry once with the currently imported class.
+    _FASTER_WHISPER_MODELS.pop(cache_key, None)
+    retry_model = _load_faster_whisper_model(
+        model_cls,
+        model_name=model_name,
+        device=device,
+        compute_type=compute_type,
+    )
+    if retry_model is None:
+        return None
+    return _transcribe_once(retry_model)
 
 
 def _load_faster_whisper_model(

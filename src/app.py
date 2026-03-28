@@ -775,7 +775,6 @@ class OpenJetApp:
         self.cfg.pop("system_prompt", None)
         self.cfg.update(payload)
         sync_active_model_profile(self.cfg, preferred_name=profile_name)
-        save_config(self.cfg)
 
     def model_profiles(self) -> list[dict[str, Any]]:
         return list_model_profiles(self.cfg)
@@ -803,6 +802,7 @@ class OpenJetApp:
         try:
             resolved = await self._materialize_setup_model(dict(self.cfg), log)
             self._persist_setup_result({**resolved, "model_profile_name": selected["name"]})
+            save_config(self.cfg)
         except Exception as exc:
             self.cfg = previous_cfg
             save_config(self.cfg)
@@ -879,6 +879,7 @@ class OpenJetApp:
             return False
 
         self._persist_setup_result(result)
+        save_config(self.cfg)
 
         try:
             resolved_result = await self._materialize_setup_model(result, log)
@@ -890,6 +891,7 @@ class OpenJetApp:
             return False
 
         self._persist_setup_result(resolved_result)
+        save_config(self.cfg)
         model_name = Path(self._active_model_ref()).name or self._active_model_ref() or "model"
         log.write(f"  [bold bright_white]Applying setup and loading {escape(model_name)}...[/]")
         status = self.query_one("#assistant-status")
@@ -1027,6 +1029,7 @@ class OpenJetApp:
                 setup_result = None
             if isinstance(setup_result, dict):
                 self._persist_setup_result(setup_result)
+                save_config(self.cfg)
                 try:
                     setup_result = await self._materialize_setup_model(setup_result, log)
                 except Exception as exc:
@@ -1037,6 +1040,7 @@ class OpenJetApp:
                     self._quit_requested = True
                     return
                 self._persist_setup_result(setup_result)
+                save_config(self.cfg)
             elif not self._has_any_configured_model():
                 self._quit_requested = True
                 return
@@ -1368,16 +1372,31 @@ class OpenJetApp:
         if not self.agent:
             counter.update("tokens: 0/0")
             return
-        current = self.agent.estimated_context_tokens()
-        overhead = self.agent.runtime_overhead_tokens(force_post_tool_continuation=True)
+        current_fn = getattr(self.agent, "estimated_context_tokens", None)
+        current = self._coerce_token_count(current_fn()) if callable(current_fn) else 0
+        overhead_fn = getattr(self.agent, "runtime_overhead_tokens", None)
+        if callable(overhead_fn):
+            try:
+                overhead = self._coerce_token_count(
+                    overhead_fn(force_post_tool_continuation=True)
+                )
+            except TypeError:
+                overhead = self._coerce_token_count(overhead_fn())
+        else:
+            overhead = 0
         draft = estimate_message_content_tokens(build_user_content(draft_text, self._pending_image_paths))
         total = current + draft
         window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
-        budget = self.agent.context_budget() or derive_context_budget(window)
-        remaining = max(0, budget.prompt_tokens - total)
+        budget_fn = getattr(self.agent, "context_budget", None)
+        budget = budget_fn() if callable(budget_fn) else None
+        prompt_budget = self._coerce_token_count(getattr(budget, "prompt_tokens", 0))
+        if prompt_budget <= 0:
+            budget = derive_context_budget(window)
+            prompt_budget = budget.prompt_tokens
+        remaining = max(0, prompt_budget - total)
         counter.update(
             "tokens: "
-            f"{total}/{window} | prompt<= {budget.prompt_tokens} | remaining: {remaining} | "
+            f"{total}/{window} | prompt<= {prompt_budget} | remaining: {remaining} | "
             f"harness: {self._turn_context_tokens} | overhead: {overhead}"
         )
 
@@ -1526,9 +1545,19 @@ class OpenJetApp:
         if not self.agent:
             return {"ready": False, "airgapped": self.is_airgapped()}
         window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
-        budget = self.agent.context_budget() or derive_context_budget(window)
-        current = self.agent.estimated_context_tokens()
-        remaining = max(0, budget.prompt_tokens - current)
+        budget_fn = getattr(self.agent, "context_budget", None)
+        budget = budget_fn() if callable(budget_fn) else None
+        prompt_budget = self._coerce_token_count(getattr(budget, "prompt_tokens", 0))
+        reserve_tokens = self._coerce_token_count(getattr(budget, "reserve_tokens", 0))
+        if prompt_budget <= 0:
+            budget = derive_context_budget(window)
+            prompt_budget = budget.prompt_tokens
+            reserve_tokens = budget.reserve_tokens
+        elif reserve_tokens <= 0:
+            reserve_tokens = max(64, window - prompt_budget)
+        current_fn = getattr(self.agent, "estimated_context_tokens", None)
+        current = self._coerce_token_count(current_fn()) if callable(current_fn) else 0
+        remaining = max(0, prompt_budget - current)
         mem = read_memory_snapshot()
         active = active_step(self.harness_state)
         context_snapshot = self._last_turn_context_snapshot
@@ -1548,10 +1577,14 @@ class OpenJetApp:
             "reasoning_mode": reasoning_mode,
             "context_tokens": current,
             "context_window_tokens": window,
-            "prompt_budget_tokens": budget.prompt_tokens,
-            "reserve_tokens": budget.reserve_tokens,
+            "prompt_budget_tokens": prompt_budget,
+            "reserve_tokens": reserve_tokens,
             "remaining_prompt_tokens": remaining,
-            "runtime_overhead_tokens": self.agent.runtime_overhead_tokens(force_post_tool_continuation=True),
+            "runtime_overhead_tokens": (
+                self._coerce_token_count(self.agent.runtime_overhead_tokens(force_post_tool_continuation=True))
+                if callable(getattr(self.agent, "runtime_overhead_tokens", None))
+                else 0
+            ),
             "memory_total_mb": mem.total_mb if mem else None,
             "memory_available_mb": mem.available_mb if mem else None,
             "memory_used_percent": mem.used_percent if mem else None,
@@ -1706,6 +1739,7 @@ class OpenJetApp:
             return "Saved chat loaded into the transcript only."
 
         # Legacy KV cache restore for checkpoints saved before this change.
+        mismatch_note = ""
         if kv_cache_available:
             saved_runtime = str(state.get("runtime") or "").strip()
             current_runtime = str(self.cfg.get("runtime", "llama_cpp") or "").strip()
@@ -1720,14 +1754,19 @@ class OpenJetApp:
                     restored = False
                 if restored:
                     return "KV cache restored from the saved chat."
+            else:
+                mismatch_note = (
+                    " The active runtime/model differs from the saved chat, "
+                    "so the KV cache was skipped."
+                )
 
         # No KV cache — reset the runtime so it rebuilds the cache on the
         # next inference turn from the restored message history.
         try:
             await self.client.reset_kv_cache()
         except Exception:
-            return "Saved chat loaded, but the runtime could not be reset."
-        return "Saved chat loaded. KV cache will rebuild on next turn."
+            return f"Saved chat loaded,{mismatch_note.lower()} but the runtime could not be reset."
+        return f"Saved chat loaded.{mismatch_note} KV cache will rebuild on next turn."
 
     async def restore_saved_chat(self, selected_path: str | Path, log: LogView) -> bool:
         if not self.agent:
@@ -1854,7 +1893,17 @@ class OpenJetApp:
         # KV cache is not persisted — it's rebuilt naturally on the first
         # inference turn after resume.  This avoids storing hundreds of MB
         # per chat on storage-constrained devices.
-        self.chat_archive.delete_kv_cache(self._chat_session_id)
+        kv_path = self.chat_archive.kv_cache_path(self._chat_session_id)
+        saver = getattr(self.client, "save_kv_cache", None) if self.client else None
+        if not callable(saver):
+            self.chat_archive.delete_kv_cache(self._chat_session_id)
+            return True
+        try:
+            saved = bool(await saver(kv_path))
+        except Exception:
+            saved = False
+        if not saved:
+            self.chat_archive.delete_kv_cache(self._chat_session_id)
         return True
 
     def persist_harness_state(self) -> None:
@@ -1911,10 +1960,21 @@ class OpenJetApp:
             self._log_trace_event("turn_replaced", replaced_by_new_turn=True)
         self._generation_worker = asyncio.create_task(self.run_agent_turn(recovery_attempted=recovery_attempted))
 
+    async def _handle_tool_call(self, tool_call: ToolCall, log: LogView) -> dict | None:
+        """Compatibility hook retained for app-level tool interception."""
+        del tool_call, log
+        return None
+
     def _prepare_turn_context(self) -> None:
         if not self.agent:
             return
         window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
+        device_registry_path = None
+        if self._active_turn_device_refs:
+            try:
+                device_registry_path = self.write_devices_registry()
+            except Exception:
+                device_registry_path = None
         context = build_turn_context(
             root=Path.cwd(),
             state=self.harness_state,
@@ -1926,6 +1986,7 @@ class OpenJetApp:
             layered_config=self.cfg.get("layered_context", {}),
             cfg=self.cfg,
             referenced_device_ids=self._active_turn_device_refs,
+            device_registry_path=device_registry_path,
         )
         self.agent.set_turn_context(context.messages)
         self._last_turn_context_snapshot = context
@@ -1950,12 +2011,15 @@ class OpenJetApp:
         runtime_messages = self.agent._messages_for_runtime()
         turn_id = self._active_turn_id or "pending-turn"
         if self.harness_state.mode == "debug" and runtime_messages:
+            debug_docs_loaded = list(context.docs_loaded)
+            if "[project summary]" in debug_docs_loaded and "project-context" not in debug_docs_loaded:
+                debug_docs_loaded.append("project-context")
             write_debug_runtime_messages(root=Path.cwd(), turn_id=turn_id, messages=runtime_messages)
             write_debug_context_snapshot(
                 root=Path.cwd(),
                 turn_id=turn_id,
                 snapshot={
-                    "docs_loaded": context.docs_loaded,
+                    "docs_loaded": debug_docs_loaded,
                     "docs_tokens": context.docs_tokens,
                     "state_summary": context.state_summary,
                     "state_summary_tokens": context.state_summary_tokens,
@@ -2113,6 +2177,8 @@ class OpenJetApp:
 
         self.harness_state = update_state_after_turn(self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
         self.persist_harness_state()
+        if tool_events:
+            self.persist_session_state(reason="assistant_turn_with_tools")
         self.persist_session_state(reason="assistant_turn_done")
         await self.persist_resumable_session_state(reason="assistant_turn_done")
         self._finish_turn_trace(success=True, status="completed")
@@ -2516,7 +2582,7 @@ class OpenJetApp:
     def _approval_selection_line(self) -> str:
         approve = "[Approve]" if self._approval_choice == 0 else "Approve"
         deny = "[Deny]" if self._approval_choice == 1 else "Deny"
-        return f"  {rich_text(approve, 'success')} {rich_text(deny, 'error')} {rich_text('←/→ Enter y/n', 'muted')}"
+        return f"  {approve} {deny} {rich_text('←/→ Enter y/n', 'muted')}"
 
     def _refresh_approval_prompt_selection(self) -> None:
         index = self._approval_prompt_selection_index

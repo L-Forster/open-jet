@@ -4,10 +4,8 @@ import os
 import shutil
 from html import escape as html_escape
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.markup import escape
 
@@ -15,18 +13,13 @@ from .config import HARDWARE_OVERRIDE_OPTIONS
 from .hardware import (
     HardwareInfo,
     effective_hardware_info,
-    is_jetson_label,
     recommended_context_window_tokens,
     recommended_context_window_tokens_from_total,
     recommended_device_for_hardware,
     recommended_gpu_layers,
-    recommended_llm_models,
-    recommended_param_budget_b,
 )
 from .model_profiles import default_profile_name
-from .ollama_setup import discover_installed_ollama_models, find_ollama_cli
 from .provisioning import recommend_direct_model
-from .runtime_registry import runtime_options, runtime_spec
 from .setup_memory import recommend_setup_context_window
 
 if TYPE_CHECKING:
@@ -51,84 +44,6 @@ def discover_model_files() -> list[str]:
     return sorted(found)
 
 
-def _setup_model_refs(payload: Mapping[str, object] | None) -> list[str]:
-    if not isinstance(payload, Mapping):
-        return []
-    refs = [
-        payload.get("llama_model"),
-        payload.get("model"),
-        payload.get("model_download_path"),
-        payload.get("recommended_llm"),
-        payload.get("ollama_model"),
-    ]
-    unique: list[str] = []
-    seen: set[str] = set()
-    for ref in refs:
-        value = str(ref or "").strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        unique.append(value)
-    return unique
-
-
-def context_window_options(recommended: int) -> list[int]:
-    options = [1024, 2048, 4096, 8192, 16384, 32768]
-    if recommended not in options:
-        options.append(recommended)
-    return sorted(set(options))
-
-
-def gpu_layer_options(device: str, recommended: int) -> list[int]:
-    base = [0] if device == "cpu" else [0, 10, 20, 28, 35]
-    if recommended not in base:
-        base.append(recommended)
-    return sorted(set(base))
-
-
-def _dedupe_refs(refs: list[str]) -> list[str]:
-    seen: set[str] = set()
-    unique: list[str] = []
-    for ref in refs:
-        value = str(ref).strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        unique.append(value)
-    return unique
-
-
-def _saved_model_refs(current_cfg: Mapping[str, object] | None, runtime: str) -> list[str]:
-    if not isinstance(current_cfg, Mapping):
-        return []
-    refs: list[str] = []
-    history = current_cfg.get("setup_model_history")
-    if isinstance(history, dict):
-        saved = history.get(runtime)
-        if isinstance(saved, list):
-            refs.extend(str(item).strip() for item in saved)
-    model_key = runtime_spec(runtime).model_config_key
-    active_ref = str(current_cfg.get(model_key) or "").strip()
-    if active_ref:
-        refs.insert(0, active_ref)
-    return _dedupe_refs(refs)
-
-
-def _default_option_index(options: list[tuple[str, object]], value: object, *, fallback: int = 0) -> int:
-    for idx, (_label, option_value) in enumerate(options):
-        if option_value == value:
-            return idx
-    return fallback
-
-
-def _configured_runtime(current_cfg: Mapping[str, object] | None) -> str:
-    value = ""
-    if isinstance(current_cfg, Mapping):
-        value = str(current_cfg.get("runtime") or "").strip()
-    spec = runtime_spec(value)
-    return spec.key if spec.show_in_setup else "llama_cpp"
-
-
 def _discover_llama_server() -> str | None:
     found = shutil.which("llama-server")
     if found:
@@ -137,298 +52,6 @@ def _discover_llama_server() -> str | None:
     if candidate.is_file():
         return str(candidate)
     return None
-
-
-def _runtime_prompt_options(
-    current_cfg: Mapping[str, object] | None,
-    *,
-    llama_ready: bool,
-) -> list[tuple[str, str]]:
-    configured_runtime = _configured_runtime(current_cfg)
-    options: list[tuple[str, str]] = []
-    for label, key in runtime_options():
-        suffix = ""
-        if key == "llama_cpp":
-            suffix = " (recommended)" if llama_ready else " (recommended, setup can provision llama-server)"
-        elif key == "openai_compatible":
-            suffix = " (self-hosted gateway or compatible API)"
-        elif key == "openrouter":
-            suffix = " (optional hosted fallback)"
-        if key == configured_runtime:
-            suffix = f"{suffix}, current" if suffix else " (current)"
-        options.append((f"{label}{suffix}", key))
-    return options
-
-
-def _current_string(current_cfg: Mapping[str, object] | None, key: str) -> str:
-    if not isinstance(current_cfg, Mapping):
-        return ""
-    return str(current_cfg.get(key) or "").strip()
-
-
-def _current_int(current_cfg: Mapping[str, object] | None, key: str) -> int | None:
-    if not isinstance(current_cfg, Mapping):
-        return None
-    value = current_cfg.get(key)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _current_bool(current_cfg: Mapping[str, object] | None, key: str) -> bool | None:
-    if not isinstance(current_cfg, Mapping):
-        return None
-    value = current_cfg.get(key)
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "1", "yes", "on"}:
-            return True
-        if lowered in {"false", "0", "no", "off"}:
-            return False
-    return None
-
-
-def _recommended_setup_runtime(current_cfg: Mapping[str, object] | None) -> str:
-    raw_runtime = _current_string(current_cfg, "runtime")
-    if raw_runtime:
-        spec = runtime_spec(raw_runtime)
-        if spec.show_in_setup:
-            return spec.key
-    return "llama_cpp"
-
-
-def _default_remote_model(runtime: str) -> str:
-    if runtime == "openrouter":
-        return "openai/gpt-4o-mini"
-    return "gpt-4o-mini"
-
-
-def _recommended_model_choice(
-    *,
-    hardware_info: HardwareInfo,
-    current_cfg: Mapping[str, object] | None,
-    runtime: str,
-    model_files: list[str],
-    saved_model_files: list[str],
-    installed_ollama: list[str],
-    ollama_cli: str | None,
-    max_b: float,
-) -> tuple[str, dict[str, object]]:
-    current_model_source = _current_string(current_cfg, "model_source").lower()
-    current_ollama_model = _current_string(current_cfg, "ollama_model")
-    current_local_model = _current_string(current_cfg, runtime_spec(runtime).model_config_key)
-    if current_model_source == "ollama" and current_ollama_model:
-        return "ollama", {
-            "model_source": "ollama",
-            "recommended_llm": current_ollama_model,
-            "ollama_model": current_ollama_model,
-        }
-    if current_local_model and Path(current_local_model).is_file():
-        return "local", {
-            "model_source": "local",
-            "model": current_local_model,
-            "llama_model": current_local_model,
-        }
-    if model_files:
-        model_path = model_files[0]
-        return "local", {
-            "model_source": "local",
-            "model": model_path,
-            "llama_model": model_path,
-        }
-    existing_saved = [p for p in saved_model_files if Path(p).is_file()]
-    if existing_saved:
-        model_path = existing_saved[0]
-        return "local", {
-            "model_source": "local",
-            "model": model_path,
-            "llama_model": model_path,
-        }
-    if installed_ollama:
-        tag = installed_ollama[0]
-        return "ollama", {
-            "model_source": "ollama",
-            "recommended_llm": tag,
-            "ollama_model": tag,
-        }
-    recommended = recommended_llm_models(max_b)
-    if ollama_cli and recommended:
-        tag = recommended[0][1]
-        return "ollama", {
-            "model_source": "ollama",
-            "recommended_llm": tag,
-            "ollama_model": tag,
-        }
-    direct = recommend_direct_model(hardware_info)
-    return "direct", {
-        "model_source": "direct",
-        "model_download_url": direct["url"],
-        "model_download_path": direct["target_path"],
-        "recommended_llm": direct["label"],
-        "setup_missing_model": True,
-    }
-
-
-def build_recommended_payload(
-    *,
-    hardware_info: HardwareInfo,
-    recommended_ctx: int,
-    current_cfg: Mapping[str, object] | None = None,
-) -> dict[str, object]:
-    hardware_profile = _current_string(current_cfg, "hardware_profile") or "auto"
-    if hardware_profile != "other":
-        hardware_profile = "auto"
-    hardware_override = _current_string(current_cfg, "hardware_override") if hardware_profile == "other" else ""
-    effective_hw = effective_hardware_info(hardware_profile, hardware_info, hardware_override)
-    runtime = _recommended_setup_runtime(current_cfg)
-    device = recommended_device_for_hardware(hardware_profile, hardware_info, hardware_override)
-
-    payload: dict[str, object] = {
-        "runtime": runtime,
-        "hardware_profile": hardware_profile,
-        "hardware_override": hardware_override,
-    }
-
-    if runtime == "llama_cpp":
-        model_files = discover_model_files()
-        saved_model_files = _saved_model_refs(current_cfg, runtime)
-        ollama_cli = find_ollama_cli()
-        installed_ollama = discover_installed_ollama_models() if ollama_cli else []
-        max_b = recommended_param_budget_b(hardware_profile, hardware_info, hardware_override)
-        _source, model_payload = _recommended_model_choice(
-            hardware_info=hardware_info,
-            current_cfg=current_cfg,
-            runtime=runtime,
-            model_files=model_files,
-            saved_model_files=saved_model_files,
-            installed_ollama=installed_ollama,
-            ollama_cli=ollama_cli,
-            max_b=max_b,
-        )
-        payload.update(model_payload)
-        payload["setup_missing_runtime"] = _discover_llama_server() is None
-        if "llama_model" in payload:
-            _remember_model_ref(payload, current_cfg, runtime, str(payload["llama_model"]))
-    elif runtime == "openai_compatible":
-        model_ref = _current_string(current_cfg, "openai_compatible_model") or _default_remote_model(runtime)
-        base_url = _current_string(current_cfg, "openai_compatible_base_url") or os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com"
-        api_key_env = _current_string(current_cfg, "openai_compatible_api_key_env") or "OPENAI_API_KEY"
-        payload.update(
-            {
-                "model_source": "remote",
-                "model": model_ref,
-                "openai_compatible_model": model_ref,
-                "openai_compatible_base_url": base_url,
-                "openai_compatible_api_key_env": api_key_env,
-                "openai_compatible_verify_connection": _current_bool(current_cfg, "openai_compatible_verify_connection") or False,
-                "setup_missing_api_key": not bool(os.environ.get(api_key_env, "").strip()),
-            }
-        )
-    else:
-        model_ref = _current_string(current_cfg, "openrouter_model") or _default_remote_model(runtime)
-        api_key_env = _current_string(current_cfg, "openrouter_api_key_env") or "OPENROUTER_API_KEY"
-        payload.update(
-            {
-                "model_source": "remote",
-                "model": model_ref,
-                "openrouter_model": model_ref,
-                "openrouter_base_url": _current_string(current_cfg, "openrouter_base_url") or "https://openrouter.ai/api/v1",
-                "openrouter_api_key_env": api_key_env,
-                "openrouter_verify_connection": _current_bool(current_cfg, "openrouter_verify_connection") or False,
-                "setup_missing_api_key": not bool(os.environ.get(api_key_env, "").strip()),
-            }
-        )
-
-    headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    fallback_ctx = (
-        int(recommended_ctx)
-        if recommended_ctx > 0
-        else (
-            recommended_context_window_tokens()
-            if hardware_profile == "auto"
-            else recommended_context_window_tokens_from_total(
-                effective_hw.total_ram_gb,
-                headless=headless,
-            )
-        )
-    )
-    detected_recommended_ctx = recommend_setup_context_window(
-        runtime=runtime,
-        device=device,
-        fallback_tokens=fallback_ctx,
-        model_refs=_setup_model_refs(payload),
-    )
-    context_value = _current_int(current_cfg, "context_window_tokens") or detected_recommended_ctx
-    gpu_value = 0
-    if runtime == "llama_cpp":
-        gpu_value = _current_int(current_cfg, "gpu_layers")
-        if gpu_value is None:
-            gpu_value = recommended_gpu_layers(device, effective_hw.total_ram_gb)
-
-    payload.update(
-        {
-            "device": device,
-            "context_window_tokens": context_value,
-            "gpu_layers": gpu_value if runtime == "llama_cpp" else 0,
-            "setup_complete": True,
-            "model_profile_name": default_profile_name(payload),
-        }
-    )
-    return payload
-
-
-def _recommended_summary(payload: Mapping[str, object]) -> str:
-    runtime = str(payload.get("runtime") or "llama_cpp")
-    model_source = str(payload.get("model_source") or "local")
-    model_ref = str(
-        payload.get("ollama_model")
-        or payload.get(runtime_spec(runtime).model_config_key)
-        or payload.get("model")
-        or ""
-    ).strip()
-    model_text = model_ref or "missing"
-    notes: list[str] = []
-    if payload.get("setup_missing_runtime"):
-        notes.append("llama-server will be provisioned")
-    if payload.get("setup_missing_model"):
-        if model_source == "direct":
-            notes.append("recommended GGUF will be downloaded")
-        else:
-            notes.append("model missing")
-    if payload.get("setup_missing_api_key"):
-        notes.append("API key env missing")
-    note_suffix = f" [{', '.join(notes)}]" if notes else ""
-    return (
-        f"runtime={runtime}, model_source={model_source}, model={model_text}, "
-        f"device={payload.get('device', 'auto')}, ctx={payload.get('context_window_tokens', '?')}, "
-        f"gpu_layers={payload.get('gpu_layers', 0)}{note_suffix}"
-    )
-
-
-def _remember_model_ref(
-    payload: dict[str, object],
-    current_cfg: Mapping[str, object] | None,
-    runtime: str,
-    model_ref: str,
-) -> None:
-    ref = str(model_ref).strip()
-    if not ref:
-        return
-    history_payload: dict[str, list[str]] = {}
-    existing = current_cfg.get("setup_model_history") if isinstance(current_cfg, Mapping) else None
-    if isinstance(existing, dict):
-        for key, value in existing.items():
-            if isinstance(value, list):
-                history_payload[str(key)] = _dedupe_refs([str(item) for item in value])
-    history_payload[runtime] = _dedupe_refs([ref, *history_payload.get(runtime, [])])
-    payload["setup_model_history"] = history_payload
 
 
 async def _prompt_text(
@@ -449,16 +72,17 @@ def _choice_prompt_html(
     *,
     selected_index: int,
     detail: str | None = None,
-) -> HTML:
-    lines = [f"<style fg='{ACCENT_GREEN}' bold='true'>{html_escape(title)}</style>"]
+    accent_color: str = ACCENT_GREEN,
+) -> Any:
+    from prompt_toolkit.formatted_text import HTML
+
+    lines = [f"<style fg='{accent_color}' bold='true'>{html_escape(title)}</style>"]
     if detail:
         lines.append(f"<style fg='ansibrightblack'>{html_escape(detail)}</style>")
     for idx, (label, _value) in enumerate(options):
         marker = "›" if idx == selected_index else " "
-        style = f" fg='{ACCENT_GREEN}' bold='true'" if idx == selected_index else ""
-        lines.append(
-            f"{marker} <style{style}>{idx + 1}. {html_escape(str(label))}</style>"
-        )
+        style = f" fg='{accent_color}' bold='true'" if idx == selected_index else ""
+        lines.append(f"{marker} <style{style}>{idx + 1}. {html_escape(str(label))}</style>")
     return HTML("\n".join(lines) + "\n\nchoice> ")
 
 
@@ -470,7 +94,10 @@ async def _prompt_choice(
     *,
     default_index: int = 0,
     detail: str | None = None,
+    accent_color: str = ACCENT_GREEN,
 ) -> object:
+    from prompt_toolkit.key_binding import KeyBindings
+
     default_index = max(0, min(default_index, len(options) - 1))
     if session is not None:
         selected_index = default_index
@@ -516,6 +143,7 @@ async def _prompt_choice(
                 options,
                 selected_index=selected_index,
                 detail=detail,
+                accent_color=accent_color,
             ),
             default="",
             key_bindings=bindings,
@@ -533,7 +161,7 @@ async def _prompt_choice(
             return options[picked][1]
         return options[selected_index][1]
 
-    console.print(f"[bold {ACCENT_GREEN}]{escape(title)}[/]")
+    console.print(f"[bold {accent_color}]{escape(title)}[/]")
     if detail:
         console.print(f"[dim]{escape(detail)}[/]")
     for idx, (label, _value) in enumerate(options, start=1):
@@ -553,6 +181,244 @@ async def _prompt_choice(
         console.print("[yellow]Choice out of range.[/]")
 
 
+def _current_string(current_cfg: Mapping[str, object] | None, key: str) -> str:
+    if not isinstance(current_cfg, Mapping):
+        return ""
+    return str(current_cfg.get(key) or "").strip()
+
+
+def _current_int(current_cfg: Mapping[str, object] | None, key: str) -> int | None:
+    if not isinstance(current_cfg, Mapping):
+        return None
+    value = current_cfg.get(key)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _default_option_index(options: list[tuple[str, object]], value: object, *, fallback: int = 0) -> int:
+    for idx, (_label, option_value) in enumerate(options):
+        if option_value == value:
+            return idx
+    return fallback
+
+
+def _dedupe_refs(refs: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for ref in refs:
+        value = str(ref).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _saved_model_refs(current_cfg: Mapping[str, object] | None, runtime: str) -> list[str]:
+    if not isinstance(current_cfg, Mapping):
+        return []
+    refs: list[str] = []
+    history = current_cfg.get("setup_model_history")
+    if isinstance(history, dict):
+        saved = history.get(runtime)
+        if isinstance(saved, list):
+            refs.extend(str(item).strip() for item in saved)
+    active_ref = _current_string(current_cfg, "llama_model") or _current_string(current_cfg, "model")
+    if active_ref:
+        refs.insert(0, active_ref)
+    return _dedupe_refs(refs)
+
+
+def _setup_model_refs(payload: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return []
+    refs = [
+        payload.get("llama_model"),
+        payload.get("model"),
+        payload.get("model_download_path"),
+        payload.get("recommended_llm"),
+    ]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        value = str(ref or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _remember_model_ref(
+    payload: dict[str, object],
+    current_cfg: Mapping[str, object] | None,
+    runtime: str,
+    model_ref: str,
+) -> None:
+    ref = str(model_ref).strip()
+    if not ref:
+        return
+    history_payload: dict[str, list[str]] = {}
+    existing = current_cfg.get("setup_model_history") if isinstance(current_cfg, Mapping) else None
+    if isinstance(existing, dict):
+        for key, value in existing.items():
+            if isinstance(value, list):
+                history_payload[str(key)] = _dedupe_refs([str(item) for item in value])
+    history_payload[runtime] = _dedupe_refs([ref, *history_payload.get(runtime, [])])
+    payload["setup_model_history"] = history_payload
+
+
+def context_window_options(recommended: int) -> list[int]:
+    options = [1024, 2048, 4096, 8192, 16384, 32768]
+    if recommended not in options:
+        options.append(recommended)
+    return sorted(set(options))
+
+
+def gpu_layer_options(device: str, recommended: int) -> list[int]:
+    base = [0] if device == "cpu" else [0, 10, 20, 28, 35]
+    if recommended not in base:
+        base.append(recommended)
+    return sorted(set(base))
+
+
+def _runtime_prompt_options(
+    current_cfg: Mapping[str, object] | None,
+    *,
+    llama_ready: bool,
+) -> list[tuple[str, str]]:
+    suffix = " (recommended)" if llama_ready else " (recommended, setup can provision llama-server)"
+    if _current_string(current_cfg, "runtime") == "llama_cpp":
+        suffix = f"{suffix}, current"
+    return [(f"Local model: llama.cpp (GGUF){suffix}", "llama_cpp")]
+
+
+def _recommended_summary(payload: Mapping[str, object]) -> str:
+    model_source = str(payload.get("model_source") or "local")
+    model_ref = str(payload.get("llama_model") or payload.get("model") or "").strip()
+    model_text = model_ref or "missing"
+    notes: list[str] = []
+    if payload.get("setup_missing_runtime"):
+        notes.append("llama-server will be provisioned")
+    if payload.get("setup_missing_model"):
+        notes.append("recommended GGUF will be downloaded")
+    note_suffix = f" [{', '.join(notes)}]" if notes else ""
+    return (
+        f"runtime=llama_cpp, model_source={model_source}, model={model_text}, "
+        f"device={payload.get('device', 'auto')}, ctx={payload.get('context_window_tokens', '?')}, "
+        f"gpu_layers={payload.get('gpu_layers', 0)}{note_suffix}"
+    )
+
+
+def _recommended_local_payload(
+    *,
+    current_cfg: Mapping[str, object] | None,
+    model_files: list[str],
+    saved_model_files: list[str],
+    direct: Mapping[str, str],
+) -> dict[str, object]:
+    current_model = _current_string(current_cfg, "llama_model") or _current_string(current_cfg, "model")
+    if current_model and Path(current_model).expanduser().is_file():
+        model_path = str(Path(current_model).expanduser())
+        return {
+            "model_source": "local",
+            "model": model_path,
+            "llama_model": model_path,
+        }
+    if model_files:
+        model_path = str(Path(model_files[0]).expanduser())
+        return {
+            "model_source": "local",
+            "model": model_path,
+            "llama_model": model_path,
+        }
+    existing_saved = [path for path in saved_model_files if Path(path).expanduser().is_file()]
+    if existing_saved:
+        model_path = str(Path(existing_saved[0]).expanduser())
+        return {
+            "model_source": "local",
+            "model": model_path,
+            "llama_model": model_path,
+        }
+    return {
+        "model_source": "direct",
+        "model_download_url": str(direct["url"]),
+        "model_download_path": str(direct["target_path"]),
+        "recommended_llm": str(direct["label"]),
+        "setup_missing_model": True,
+    }
+
+
+def build_recommended_payload(
+    *,
+    hardware_info: HardwareInfo,
+    recommended_ctx: int,
+    current_cfg: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    runtime = "llama_cpp"
+    hardware_profile = "other" if _current_string(current_cfg, "hardware_profile") == "other" else "auto"
+    hardware_override = _current_string(current_cfg, "hardware_override") if hardware_profile == "other" else ""
+    effective_hw = effective_hardware_info(hardware_profile, hardware_info, hardware_override)
+    device = recommended_device_for_hardware(hardware_profile, hardware_info, hardware_override)
+
+    payload: dict[str, object] = {
+        "runtime": runtime,
+        "hardware_profile": hardware_profile,
+        "hardware_override": hardware_override,
+        "device": device,
+        "setup_complete": True,
+    }
+
+    direct = recommend_direct_model(effective_hw, cfg=current_cfg)
+    payload.update(
+        _recommended_local_payload(
+            current_cfg=current_cfg,
+            model_files=discover_model_files(),
+            saved_model_files=_saved_model_refs(current_cfg, runtime),
+            direct=direct,
+        )
+    )
+
+    llama_model = str(payload.get("llama_model") or "").strip()
+    if llama_model:
+        _remember_model_ref(payload, current_cfg, runtime, llama_model)
+
+    payload["setup_missing_runtime"] = _discover_llama_server() is None
+
+    headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    fallback_ctx = (
+        int(recommended_ctx)
+        if recommended_ctx > 0
+        else (
+            recommended_context_window_tokens()
+            if hardware_profile == "auto"
+            else recommended_context_window_tokens_from_total(
+                effective_hw.total_ram_gb,
+                headless=headless,
+            )
+        )
+    )
+    payload["context_window_tokens"] = recommend_setup_context_window(
+        runtime=runtime,
+        device=device,
+        fallback_tokens=fallback_ctx,
+        model_refs=_setup_model_refs(payload),
+    )
+    payload["gpu_layers"] = (
+        _current_int(current_cfg, "gpu_layers")
+        if _current_int(current_cfg, "gpu_layers") is not None
+        else recommended_gpu_layers(device, effective_hw.total_ram_gb)
+    )
+    payload["model_profile_name"] = default_profile_name(payload)
+    return payload
+
+
 async def run_setup_wizard(
     *,
     session: PromptSession[object] | None,
@@ -564,11 +430,9 @@ async def run_setup_wizard(
     ram_text = f"{hardware_info.total_ram_gb:.1f} GB RAM" if hardware_info.total_ram_gb > 0 else "RAM unknown"
     console.print(f"[bold {ACCENT_GREEN}]open-jet setup[/]")
     console.print(f"[dim]Detected hardware: {escape(hardware_info.label)} ({escape(ram_text)})[/]")
-    console.print(
-        "[dim]Local setup can reuse an existing llama.cpp or Ollama install, "
-        "or provision llama-server and a recommended model when the required tools and network access are available.[/]"
-    )
+    console.print("[dim]Setup is local-only: pick or download a GGUF and compile llama.cpp when needed.[/]")
 
+    runtime = "llama_cpp"
     recommended_payload = build_recommended_payload(
         hardware_info=hardware_info,
         recommended_ctx=recommended_ctx,
@@ -596,16 +460,19 @@ async def run_setup_wizard(
         (f"Use detected hardware ({hardware_info.label}, {ram_text})", "auto"),
         ("Pick hardware profile manually", "other"),
     ]
-    default_hardware = "other" if setup_mode == "manual" and _current_string(current_cfg, "hardware_profile") == "other" else str(recommended_payload.get("hardware_profile", "auto"))
-    hardware = await _prompt_choice(
-        session,
-        console,
-        "Hardware profile",
-        hardware_options,
-        default_index=_default_option_index(
+    default_hardware = (
+        "other"
+        if setup_mode == "manual" and _current_string(current_cfg, "hardware_profile") == "other"
+        else str(recommended_payload.get("hardware_profile", "auto"))
+    )
+    hardware = str(
+        await _prompt_choice(
+            session,
+            console,
+            "Hardware profile",
             hardware_options,
-            default_hardware,
-        ),
+            default_index=_default_option_index(hardware_options, default_hardware),
+        )
     )
 
     hardware_override = ""
@@ -624,202 +491,88 @@ async def run_setup_wizard(
             )
         )
 
-    runtime_prompt_options = _runtime_prompt_options(
-        current_cfg,
-        llama_ready=_discover_llama_server() is not None,
-    )
-    runtime_default = _configured_runtime(current_cfg) if setup_mode == "manual" else str(recommended_payload.get("runtime", _configured_runtime(current_cfg)))
-    runtime = str(
-        await _prompt_choice(
-            session,
-            console,
-            "Runtime",
-            runtime_prompt_options,
-            default_index=_default_option_index(
-                runtime_prompt_options,
-                runtime_default,
-            ),
-        )
-    )
-
     payload: dict[str, object] = {
         "runtime": runtime,
         "hardware_profile": hardware,
         "hardware_override": hardware_override if hardware == "other" else "",
     }
 
-    effective_hw = effective_hardware_info(str(hardware), hardware_info, hardware_override)
-    jetson_target = (hardware == "other" and hardware_override.startswith("jetson_")) or is_jetson_label(effective_hw.label)
-    device = recommended_device_for_hardware(str(hardware), hardware_info, hardware_override)
+    effective_hw = effective_hardware_info(hardware, hardware_info, hardware_override)
+    device = recommended_device_for_hardware(hardware, hardware_info, hardware_override)
+    model_files = discover_model_files()
+    saved_model_files = _saved_model_refs(current_cfg, runtime)
+    direct = recommend_direct_model(effective_hw, cfg=current_cfg)
+    model_plan_options: list[tuple[str, object]] = [
+        ("Use a local .gguf model file", "__local__"),
+        (f"Download recommended GGUF: {direct['label']}", "__direct__"),
+    ]
+    detail = "Choose a local GGUF or let setup download the recommended GGUF."
+    current_llama_model = _current_string(current_cfg, "llama_model")
+    default_model_plan = "__local__"
+    if setup_mode != "manual":
+        default_model_plan = "__direct__" if recommended_payload.get("model_source") == "direct" else "__local__"
+    elif not (current_llama_model or model_files or saved_model_files):
+        default_model_plan = "__direct__"
 
-    if runtime == "llama_cpp":
-        model_files = discover_model_files()
-        saved_model_files = _saved_model_refs(current_cfg, runtime)
-        ollama_cli = find_ollama_cli()
-        installed_ollama = discover_installed_ollama_models() if ollama_cli else []
-        max_b = recommended_param_budget_b(str(hardware), hardware_info, hardware_override)
-        direct = recommend_direct_model(effective_hw)
-        direct_plan = "__direct__"
-        download_rows = [
-            (f"Download with Ollama: {label}", tag)
-            for label, tag in recommended_llm_models(max_b)[:3]
-        ]
-        installed_rows = [
-            (f"Use installed Ollama model: {tag}", tag)
-            for tag in installed_ollama
-        ]
-        installed_tags = {tag for _label, tag in installed_rows}
-        download_rows = [row for row in download_rows if row[1] not in installed_tags]
-        model_plan_options: list[tuple[str, object]] = [("Use a local .gguf model file", "__local__")]
-        model_plan_options.extend(installed_rows)
-        model_plan_options.extend(download_rows)
-        model_plan_options.append((f"Download recommended GGUF: {direct['label']}", direct_plan))
-        detail = (
-            "Choose a local GGUF, an installed Ollama model, or let setup pull or download a recommended local model."
-            if ollama_cli
-            else "Choose a local GGUF or let setup download a recommended local GGUF."
+    model_plan = str(
+        await _prompt_choice(
+            session,
+            console,
+            "Model source",
+            model_plan_options,
+            default_index=_default_option_index(model_plan_options, default_model_plan),
+            detail=detail,
         )
-        current_model_source = _current_string(current_cfg, "model_source").lower()
-        current_ollama_model = _current_string(current_cfg, "ollama_model")
-        current_llama_model = _current_string(current_cfg, "llama_model")
-        default_model_plan = "__local__"
+    )
+
+    if model_plan == "__local__":
+        local_rows = [(Path(model).name, model) for model in model_files]
+        local_rows.extend(
+            (f"{Path(model).name} (saved)", model)
+            for model in saved_model_files
+            if model not in model_files
+        )
+        local_rows.append(("Manual path", "__manual__"))
+        preferred_local_model = current_llama_model or None
         if setup_mode != "manual":
-            recommended_source = str(recommended_payload.get("model_source") or "local")
-            if recommended_source == "ollama":
-                default_model_plan = str(recommended_payload.get("ollama_model") or current_ollama_model or "__local__")
-            elif recommended_source == "direct":
-                default_model_plan = direct_plan
-        elif current_model_source == "ollama" and current_ollama_model:
-            default_model_plan = current_ollama_model
-        elif current_llama_model or model_files or saved_model_files:
-            default_model_plan = "__local__"
-        elif installed_ollama:
-            default_model_plan = installed_ollama[0]
-        elif download_rows:
-            default_model_plan = str(download_rows[0][1])
-        else:
-            default_model_plan = direct_plan
-        model_plan = "__local__"
-        if len(model_plan_options) > 1:
-            model_plan = str(
-                await _prompt_choice(
-                    session,
-                    console,
-                    "Model source",
-                    model_plan_options,
-                    default_index=_default_option_index(model_plan_options, default_model_plan),
-                    detail=detail,
-                )
+            preferred_local_model = str(recommended_payload.get("llama_model") or preferred_local_model or "")
+            preferred_local_model = preferred_local_model or None
+        option_values = [value for _label, value in local_rows]
+        if preferred_local_model and preferred_local_model not in option_values:
+            local_rows.insert(
+                0,
+                (f"{Path(preferred_local_model).name or preferred_local_model} (current)", preferred_local_model),
             )
-        if model_plan == "__local__":
-            local_rows = [(Path(model).name, model) for model in model_files]
-            local_rows.extend(
-                (f"{Path(model).name} (saved)", model)
-                for model in saved_model_files
-                if model not in model_files
-            )
-            local_rows.append(("Manual path", "__manual__"))
-            preferred_local_model = current_llama_model if current_llama_model else None
-            if setup_mode != "manual":
-                preferred_local_model = str(recommended_payload.get("llama_model") or preferred_local_model or "")
-                preferred_local_model = preferred_local_model or None
-            if preferred_local_model and preferred_local_model not in [value for _label, value in local_rows]:
-                local_rows.insert(0, (f"{Path(preferred_local_model).name or preferred_local_model} (current)", preferred_local_model))
-            local_choice = await _prompt_choice(
-                session,
-                console,
-                "Local model",
+        local_choice = await _prompt_choice(
+            session,
+            console,
+            "Local model",
+            local_rows,
+            default_index=_default_option_index(
                 local_rows,
-                default_index=_default_option_index(
-                    local_rows,
-                    preferred_local_model or (local_rows[0][1] if local_rows else "__manual__"),
-                ),
-                detail="Select a detected GGUF file or choose Manual path.",
-            )
-            if local_choice == "__manual__":
-                model_path = await _prompt_text(session, "model path> ", default=current_llama_model)
-            else:
-                model_path = str(local_choice)
-            model_file = Path(model_path).expanduser()
-            if not model_file.is_file():
-                raise RuntimeError("Model file does not exist.")
-            if model_file.suffix.lower() != ".gguf":
-                raise RuntimeError("Model file must end with .gguf.")
-            payload["model_source"] = "local"
-            payload["model"] = str(model_file)
-            payload["llama_model"] = str(model_file)
-            _remember_model_ref(payload, current_cfg, runtime, str(model_file))
-        elif model_plan == direct_plan:
-            payload["model_source"] = "direct"
-            payload["model_download_url"] = str(direct["url"])
-            payload["model_download_path"] = str(direct["target_path"])
-            payload["recommended_llm"] = str(direct["label"])
-            payload["setup_missing_model"] = True
+                preferred_local_model or (local_rows[0][1] if local_rows else "__manual__"),
+            ),
+            detail="Select a detected GGUF file or choose Manual path.",
+        )
+        if local_choice == "__manual__":
+            model_path = await _prompt_text(session, "model path> ", default=current_llama_model)
         else:
-            if not ollama_cli:
-                raise RuntimeError("Ollama CLI not found.")
-            if jetson_target:
-                console.print("[dim]Jetson targets require quantized GGUF-backed Ollama models.[/]")
-            payload["model_source"] = "ollama"
-            payload["recommended_llm"] = model_plan
-            payload["ollama_model"] = model_plan
-    elif runtime == "openai_compatible":
-        current_model_ref = _current_string(current_cfg, "openai_compatible_model")
-        current_base_url = _current_string(current_cfg, "openai_compatible_base_url") or "https://api.openai.com"
-        current_api_env = _current_string(current_cfg, "openai_compatible_api_key_env") or "OPENAI_API_KEY"
-        if setup_mode != "manual":
-            current_model_ref = str(recommended_payload.get("openai_compatible_model") or current_model_ref or "")
-            current_base_url = str(recommended_payload.get("openai_compatible_base_url") or current_base_url)
-            current_api_env = str(recommended_payload.get("openai_compatible_api_key_env") or current_api_env)
-        model_ref = await _prompt_text(
-            session,
-            "model id> ",
-            default=current_model_ref or _default_remote_model(runtime),
-        )
-        if not model_ref:
-            raise RuntimeError("OpenAI-compatible runtime requires a model id.")
-        base_url = await _prompt_text(
-            session,
-            "base url> ",
-            default=current_base_url,
-        )
-        if not base_url:
-            raise RuntimeError("OpenAI-compatible runtime requires a base URL.")
-        api_key_env = await _prompt_text(
-            session,
-            "api key env> ",
-            default=current_api_env,
-        )
-        payload["model_source"] = "remote"
-        payload["model"] = model_ref
-        payload["openai_compatible_model"] = model_ref
-        payload["openai_compatible_base_url"] = base_url
-        payload["openai_compatible_api_key_env"] = api_key_env or "OPENAI_API_KEY"
-        payload["openai_compatible_verify_connection"] = False
+            model_path = str(local_choice)
+        model_file = Path(model_path).expanduser()
+        if not model_file.is_file():
+            raise RuntimeError("Model file does not exist.")
+        if model_file.suffix.lower() != ".gguf":
+            raise RuntimeError("Model file must end with .gguf.")
+        payload["model_source"] = "local"
+        payload["model"] = str(model_file)
+        payload["llama_model"] = str(model_file)
+        _remember_model_ref(payload, current_cfg, runtime, str(model_file))
     else:
-        current_model_ref = _current_string(current_cfg, "openrouter_model")
-        current_api_env = _current_string(current_cfg, "openrouter_api_key_env") or "OPENROUTER_API_KEY"
-        if setup_mode != "manual":
-            current_model_ref = str(recommended_payload.get("openrouter_model") or current_model_ref or "")
-            current_api_env = str(recommended_payload.get("openrouter_api_key_env") or current_api_env)
-        model_ref = await _prompt_text(
-            session,
-            "model id> ",
-            default=current_model_ref or _default_remote_model(runtime),
-        )
-        if not model_ref:
-            raise RuntimeError("OpenRouter runtime requires a model id.")
-        api_key_env = await _prompt_text(
-            session,
-            "api key env> ",
-            default=current_api_env,
-        )
-        payload["model_source"] = "remote"
-        payload["model"] = model_ref
-        payload["openrouter_model"] = model_ref
-        payload["openrouter_base_url"] = "https://openrouter.ai/api/v1"
-        payload["openrouter_api_key_env"] = api_key_env or "OPENROUTER_API_KEY"
-        payload["openrouter_verify_connection"] = False
+        payload["model_source"] = "direct"
+        payload["model_download_url"] = str(direct["url"])
+        payload["model_download_path"] = str(direct["target_path"])
+        payload["recommended_llm"] = str(direct["label"])
+        payload["setup_missing_model"] = True
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     fallback_ctx = (
@@ -840,56 +593,55 @@ async def run_setup_wizard(
         fallback_tokens=fallback_ctx,
         model_refs=_setup_model_refs(payload),
     )
-    context_options = [
-        (f"{value} (recommended)" if value == recommended_ctx_value else str(value), value)
-        for value in context_window_options(recommended_ctx_value)
-    ]
     context_default = _current_int(current_cfg, "context_window_tokens") or recommended_ctx_value
     if setup_mode != "manual":
         context_default = int(recommended_payload.get("context_window_tokens", context_default))
+    context_values = context_window_options(recommended_ctx_value)
+    if context_default not in context_values:
+        context_values = sorted(set([*context_values, context_default]))
+    context_options = [
+        (f"{value} (recommended)" if value == recommended_ctx_value else str(value), value)
+        for value in context_values
+    ]
     context_value = int(
         await _prompt_choice(
             session,
             console,
             "Context window",
             context_options,
-            default_index=_default_option_index(
-                context_options,
-                context_default,
-            ),
+            default_index=_default_option_index(context_options, context_default),
         )
     )
 
-    gpu_value = 0
-    if runtime == "llama_cpp":
-        recommended_gpu = recommended_gpu_layers(device, effective_hw.total_ram_gb)
-        gpu_options = [
-            (f"{value} (recommended)" if value == recommended_gpu else str(value), value)
-            for value in gpu_layer_options(device, recommended_gpu)
-        ]
-        gpu_default = _current_int(current_cfg, "gpu_layers") if _current_int(current_cfg, "gpu_layers") is not None else recommended_gpu
-        if setup_mode != "manual":
-            gpu_default = int(recommended_payload.get("gpu_layers", gpu_default))
-        gpu_value = int(
-            await _prompt_choice(
-                session,
-                console,
-                "GPU layers",
-                gpu_options,
-                default_index=_default_option_index(
-                    gpu_options,
-                    gpu_default,
-                ),
-                detail="Higher offload can be faster but uses more memory.",
-            )
+    recommended_gpu = recommended_gpu_layers(device, effective_hw.total_ram_gb)
+    gpu_default = _current_int(current_cfg, "gpu_layers") if _current_int(current_cfg, "gpu_layers") is not None else recommended_gpu
+    if setup_mode != "manual":
+        gpu_default = int(recommended_payload.get("gpu_layers", gpu_default))
+    gpu_values = gpu_layer_options(device, recommended_gpu)
+    if gpu_default not in gpu_values:
+        gpu_values = sorted(set([*gpu_values, gpu_default]))
+    gpu_options = [
+        (f"{value} (recommended)" if value == recommended_gpu else str(value), value)
+        for value in gpu_values
+    ]
+    gpu_value = int(
+        await _prompt_choice(
+            session,
+            console,
+            "GPU layers",
+            gpu_options,
+            default_index=_default_option_index(gpu_options, gpu_default),
+            detail="Higher offload can be faster but uses more memory.",
         )
+    )
 
     payload.update(
         {
             "device": device,
             "context_window_tokens": context_value,
-            "gpu_layers": gpu_value if runtime == "llama_cpp" else 0,
+            "gpu_layers": gpu_value,
             "setup_complete": True,
+            "setup_missing_runtime": _discover_llama_server() is None,
         }
     )
     payload["model_profile_name"] = await _prompt_text(

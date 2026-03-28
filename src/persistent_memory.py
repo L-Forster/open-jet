@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .config import load_config
 from .device_sources import ensure_devices_registry, format_device_registry_prompt
 from .runtime_limits import MIN_TOKEN_BUDGET, derive_file_token_budget, estimate_tokens, read_memory_snapshot
 
@@ -84,9 +85,10 @@ async def build_system_prompt(
     *,
     cfg: Mapping[str, object] | None = None,
 ) -> str:
+    resolved_cfg = cfg if isinstance(cfg, Mapping) else load_config()
     snapshot = await load_persistent_memory(root)
     memory_prompt = snapshot.as_system_prompt()
-    devices_prompt = _device_registry_prompt(root, cfg=cfg)
+    devices_prompt = _device_registry_prompt(root, cfg=resolved_cfg)
     sections = [base_prompt.strip(), memory_prompt, devices_prompt]
     return "\n\n".join(section for section in sections if section).strip()
 

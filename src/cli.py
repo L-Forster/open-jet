@@ -90,8 +90,17 @@ def _workflow_root() -> Path:
     return Path.cwd().resolve()
 
 
+def discover_workflow_specs(root: Path):
+    return discover_workflow_index(root)[0]
+
+
+def discover_workflow_issues(root: Path):
+    return discover_workflow_index(root)[1]
+
+
 def _format_workflow_list(root: Path) -> str:
-    specs, issues = discover_workflow_index(root)
+    specs = discover_workflow_specs(root)
+    issues = discover_workflow_issues(root)
     if not specs:
         if not issues:
             return "No workflows discovered. Add Markdown files under `workflows/` or `.openjet/workflows/`."
@@ -158,7 +167,8 @@ def _format_single_workflow_status(spec, status: WorkflowStatus | None) -> str:
 
 
 def _format_workflow_status(root: Path, name: str | None = None) -> str:
-    specs, issues = discover_workflow_index(root)
+    specs = discover_workflow_specs(root)
+    issues = discover_workflow_issues(root)
     if name:
         spec = load_workflow_spec(root, name)
         return _format_single_workflow_status(spec, load_workflow_status(root, spec.name))
@@ -211,6 +221,21 @@ def _update_context_window(cfg: dict[str, object], context_tokens: int) -> str:
         raise ValueError("Context window must be at least 512 tokens.")
     updated_cfg = dict(cfg)
     updated_cfg["context_window_tokens"] = context_tokens
+    active_name = str(updated_cfg.get("active_model_profile") or "").strip().lower()
+    raw_profiles = updated_cfg.get("model_profiles")
+    if active_name and isinstance(raw_profiles, list):
+        updated_profiles: list[object] = []
+        matched_active = False
+        for item in raw_profiles:
+            if isinstance(item, dict) and str(item.get("name") or "").strip().lower() == active_name:
+                revised = dict(item)
+                revised["context_window_tokens"] = context_tokens
+                updated_profiles.append(revised)
+                matched_active = True
+                continue
+            updated_profiles.append(item)
+        if matched_active:
+            updated_cfg["model_profiles"] = updated_profiles
     sync_active_model_profile(updated_cfg)
     save_config(updated_cfg)
     return (

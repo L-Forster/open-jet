@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import src.setup as setup_source
 
 from src.setup_memory import (
     _detect_amd_free_vram_mb_from_sysfs,
@@ -14,20 +14,6 @@ from src.setup_memory import (
     recommend_context_window_from_remaining_vram_mb,
     recommend_setup_context_window,
 )
-
-
-def _load_setup_source_module():
-    root = Path(__file__).resolve().parents[1]
-    module_name = "src._setup_source_test"
-    sys.modules.pop(module_name, None)
-    spec = importlib.util.spec_from_file_location(module_name, root / "src" / "setup.py")
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Failed to load src/setup.py from source.")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
 
 class SetupMemoryTests(unittest.TestCase):
     def test_detect_free_accelerator_memory_mb_uses_max_free_gpu(self) -> None:
@@ -100,18 +86,9 @@ class SetupMemoryTests(unittest.TestCase):
 
 class SetupSourceIntegrationTests(unittest.TestCase):
     def test_build_recommended_payload_uses_setup_memory_recommendation(self) -> None:
-        setup_source = _load_setup_source_module()
         hardware = setup_source.HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
 
         with patch.object(setup_source, "discover_model_files", return_value=["/models/demo.gguf"]), patch.object(
-            setup_source,
-            "find_ollama_cli",
-            return_value=None,
-        ), patch.object(
-            setup_source,
-            "discover_installed_ollama_models",
-            return_value=[],
-        ), patch.object(
             setup_source,
             "_discover_llama_server",
             return_value="/usr/bin/llama-server",

@@ -13,8 +13,8 @@ from .model_profiles import get_model_profile, list_model_profiles, replace_mode
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
 from .runtime_registry import runtime_spec
-from .skills_registry import skills_manifest_path, sync_skills_manifest
 from .setup import _prompt_text
+from .skills_registry import skills_manifest_path, sync_skills_manifest
 from .surfaces.command_specs import COMMANDS, CommandSpec
 from .theme import rich_text
 

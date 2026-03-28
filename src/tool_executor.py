@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ from .peripherals import PeripheralKind, PeripheralTransport
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import update_persistent_memory
 from .runtime_protocol import ToolCall
+from .tools.registry import bind_tool_executor, get_tool_spec
 
 if TYPE_CHECKING:
     from .swap_manager import SwapManager
@@ -79,56 +81,15 @@ async def execute_tool(tool_call: ToolCall) -> ToolExecutionResult:
     if not isinstance(args, dict):
         return _invalid(tool_call.name)
     try:
-        match tool_call.name:
-            case "shell":
-                return await _shell_result(args)
-            case "system_info":
-                return await _text_result_async(read_system_info, scope=_str_arg(args, "scope"), error_prefix="Error:")
-            case "device_list":
-                text, meta = _device_list_output(kind=_str_arg(args, "kind"))
-                return ToolExecutionResult(output=text, meta=meta)
-            case "camera_snapshot" | "microphone_record" | "sensor_read" | "gpio_read":
-                return _device_tool_result(tool_call.name, args)
-            case "microphone_set_enabled":
-                return _microphone_set_enabled_result(args)
-            case "read_file":
-                return await _text_result_async(
-                    read_file,
-                    _str_arg(args, "path", required=True, allow_empty=False),
-                    error_prefix="Error:",
-                )
-            case "memory":
-                return await _memory_result(args)
-            case "write_file":
-                path = args.get("path", "")
-                content = args.get("content", "")
-                if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
-                    raise ToolArgumentError("required: path, content")
-                return await _text_result_async(write_file, path, content, error_prefix="Error")
-            case "load_file":
-                return await _load_file_result(args)
-            case "edit_file":
-                return await _edit_file_result(args)
-            case "glob":
-                return await _text_result_async(
-                    glob_files,
-                    _str_arg(args, "pattern", required=True, allow_empty=False),
-                    path=args.get("path"),
-                    error_prefix="Error",
-                )
-            case "grep":
-                return await _text_result_async(
-                    grep_files,
-                    _str_arg(args, "pattern", required=True, allow_empty=False),
-                    path=args.get("path"),
-                    glob_filter=args.get("glob"),
-                    ignore_case=bool(args.get("ignore_case", False)),
-                    error_prefix="Error",
-                )
-            case "list_directory":
-                return await _text_result_async(list_directory, path=args.get("path"), error_prefix="Error")
-            case _:
-                return ToolExecutionResult(output=f"Unknown tool: {tool_call.name}", meta={"ok": False})
+        spec = get_tool_spec(tool_call.name)
+        if spec is None or spec.executor is None:
+            return ToolExecutionResult(output=f"Unknown tool: {tool_call.name}", meta={"ok": False})
+        result = spec.executor(args)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, ToolExecutionResult):
+            raise TypeError(f"tool {tool_call.name} returned invalid result type: {type(result).__name__}")
+        return result
     except ToolArgumentError as exc:
         return _invalid(tool_call.name, str(exc))
     except ValueError as exc:
@@ -652,3 +613,74 @@ def _sync_tool_device_registry(cfg: dict[str, object], *, store: ObservationStor
         return sync_devices_registry(cfg, store=store)
     except Exception:
         return None
+
+
+async def _system_info_result(args: dict[str, Any]) -> ToolExecutionResult:
+    return await _text_result_async(read_system_info, scope=_str_arg(args, "scope"), error_prefix="Error:")
+
+
+async def _read_file_result(args: dict[str, Any]) -> ToolExecutionResult:
+    return await _text_result_async(
+        read_file,
+        _str_arg(args, "path", required=True, allow_empty=False),
+        error_prefix="Error:",
+    )
+
+
+async def _write_file_result(args: dict[str, Any]) -> ToolExecutionResult:
+    path = args.get("path", "")
+    content = args.get("content", "")
+    if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
+        raise ToolArgumentError("required: path, content")
+    return await _text_result_async(write_file, path, content, error_prefix="Error")
+
+
+async def _glob_result(args: dict[str, Any]) -> ToolExecutionResult:
+    return await _text_result_async(
+        glob_files,
+        _str_arg(args, "pattern", required=True, allow_empty=False),
+        path=args.get("path"),
+        error_prefix="Error",
+    )
+
+
+async def _grep_result(args: dict[str, Any]) -> ToolExecutionResult:
+    return await _text_result_async(
+        grep_files,
+        _str_arg(args, "pattern", required=True, allow_empty=False),
+        path=args.get("path"),
+        glob_filter=args.get("glob"),
+        ignore_case=bool(args.get("ignore_case", False)),
+        error_prefix="Error",
+    )
+
+
+async def _list_directory_result(args: dict[str, Any]) -> ToolExecutionResult:
+    return await _text_result_async(list_directory, path=args.get("path"), error_prefix="Error")
+
+
+def _device_list_result(args: dict[str, Any]) -> ToolExecutionResult:
+    text, meta = _device_list_output(kind=_str_arg(args, "kind"))
+    return ToolExecutionResult(output=text, meta=meta)
+
+
+def _bind_tool_executors() -> None:
+    bind_tool_executor("shell", _shell_result)
+    bind_tool_executor("system_info", _system_info_result)
+    bind_tool_executor("device_list", _device_list_result)
+    bind_tool_executor("camera_snapshot", lambda args: _device_tool_result("camera_snapshot", args))
+    bind_tool_executor("microphone_record", lambda args: _device_tool_result("microphone_record", args))
+    bind_tool_executor("sensor_read", lambda args: _device_tool_result("sensor_read", args))
+    bind_tool_executor("gpio_read", lambda args: _device_tool_result("gpio_read", args))
+    bind_tool_executor("microphone_set_enabled", _microphone_set_enabled_result)
+    bind_tool_executor("read_file", _read_file_result)
+    bind_tool_executor("memory", _memory_result)
+    bind_tool_executor("write_file", _write_file_result)
+    bind_tool_executor("load_file", _load_file_result)
+    bind_tool_executor("edit_file", _edit_file_result)
+    bind_tool_executor("glob", _glob_result)
+    bind_tool_executor("grep", _grep_result)
+    bind_tool_executor("list_directory", _list_directory_result)
+
+
+_bind_tool_executors()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -878,7 +879,10 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_results[0].output, "User denied this action.")
 
     async def test_stream_approves_confirmed_tool_with_handler(self) -> None:
-        tool_call = ToolCall(name="shell", arguments={"command": 'python -c "print(\'sdk\')"'} )
+        tool_call = ToolCall(
+            name="shell",
+            arguments={"command": f'"{sys.executable}" -c "print(\'sdk\')"'},
+        )
         client = SequencedRuntimeClient([[StreamChunk(tool_calls=[tool_call])], [StreamChunk(text="done")]])
         agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
         session = OpenJetSession(agent, approval_handler=lambda tc: tc.name == "shell")

@@ -12,6 +12,7 @@ from pathlib import Path
 import tiktoken
 from typing import Any
 
+from .airgap import is_airgapped
 from .config import load_config
 
 
@@ -41,6 +42,11 @@ class ContextBudget:
 def estimate_tokens(text: str) -> int:
     if not text:
         return 0
+    if is_airgapped():
+        counter = _get_airgapped_token_counter()
+        if counter is not None:
+            return counter(text)
+        return max(1, len(text) // 4)
     counter = _get_local_gguf_token_counter(_active_local_gguf_model_ref())
     if counter is not None:
         return counter(text)
@@ -60,6 +66,11 @@ def _active_local_gguf_model_ref() -> str | None:
         return None
     model_ref = str(cfg.get("llama_model") or cfg.get("model") or "").strip()
     return model_ref or None
+
+
+@lru_cache(maxsize=1)
+def _get_airgapped_token_counter() -> Any | None:
+    return _get_local_gguf_token_counter(_active_local_gguf_model_ref())
 
 
 @lru_cache(maxsize=4)
