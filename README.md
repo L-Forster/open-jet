@@ -1,66 +1,44 @@
 # OpenJet
+
 <img height="225" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
 
-**OpenJet is a local `llama.cpp` agent runtime with real system and device I/O.**
+**An AI coding agent that runs entirely on your machine.**
 
-`open-jet` is for running local GGUF models that need to interact with shell workflows, files, cameras, microphones, GPIO, and simple sensors without turning into a brittle demo.
+This is Claude Code for local LLMs. OpenJet handles the model, the runtime, and the setup without having to manually wrangle complex confirgurations. You get a coding agent in your terminal that reads your files, edits your code, runs commands, and stays out of the cloud.
 
-## Why use OpenJet
-
-- local GGUF models with real tool access
-- explicit approvals for risky actions
-- session resume and KV-cache recovery
-- low-memory model unload/reload around heavy shell work
-- hardware-aware setup for local Linux and Jetson-style systems
-- the same local runtime from the TUI and Python SDK
-
-## Quickstart
+## Get started
 
 ```bash
 git clone https://github.com/l-forster/open-jet.git
 cd open-jet
 ./install.sh
 open-jet --setup
+```
+
+That's it. Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
+
+Then just:
+
+```bash
 open-jet
 ```
 
-Setup is local-only and sequential. It will:
+## What you get
 
-1. detect hardware
-2. let you pick an existing `.gguf` or download a recommended one
-3. reuse or build `llama-server`
-4. save the final flat config in `config.yaml`
+An agent in your terminal that can actually do things:
 
-Automatic provisioning still needs normal local prerequisites:
+- **Read and edit your code** — search files, apply edits, write new ones
+- **Run shell commands** — with explicit approval before anything executes
+- **Resume sessions** — close the terminal, come back later, pick up where you left off
+- **Work on constrained hardware** — automatic context condensing, model unload/reload around heavy tasks
+- **Device access** — cameras, microphones, GPIO for edge and embedded work
+- **Python SDK** — automate the same agent from scripts
 
-- network access for model download and `llama.cpp` clone/build
-- `git`
-- `cmake`
-- a working compiler toolchain
+## Why this exists
 
-## Config
+Cloud coding agents need API keys, send your code to someone else's server, and cost money per token. Local alternatives like Ollama give you a chat window but not an agent — no file access, no shell, no session recovery.
 
-The canonical local config fields are:
-
-- `llama_model`
-- `llama_server_path`
-- `device`
-- `gpu_layers`
-- `context_window_tokens`
-- `setup_recommendations.direct_models`
-- `active_model_profile`
-- `model_profiles`
-
-See [Configuration](docs/configuration.md) for examples.
-
-## What it provides
-
-- bounded local inference through `llama-server`
-- controlled tool use and slash commands
-- automatic context condensing under pressure
-- resumable chat/session state
-- OpenTelemetry instrumentation with optional collector export
-- device registry and workflow support for local machines
+OpenJet closes that gap. It's built for local models on real hardware, where memory is tight, context windows are short, and sessions get interrupted. Everything runs on your machine, nothing leaves it.
 
 ## Docs
 
@@ -70,12 +48,11 @@ See [Configuration](docs/configuration.md) for examples.
 - [Runtime: llama.cpp](docs/runtimes/llama-cpp.md)
 - [Python SDK](docs/sdk/python-sdk.md)
 - [Usage: CLI](docs/usage/cli.md)
-- [Usage: Device sources](docs/usage/device-sources.md)
 - [Usage: Slash commands](docs/usage/slash-commands.md)
+- [Usage: Device sources](docs/usage/device-sources.md)
 - [Usage: Workflow harness](docs/usage/workflow-harness.md)
 - [Usage: Session state and logging](docs/usage/session-state-and-logging.md)
 - [Examples](docs/examples/README.md)
-- [Telemetry](docs/telemetry.md)
 - [Deployment: Jetson](docs/deployment/jetson.md)
 - [Deployment: Linux x86 + NVIDIA](docs/deployment/linux-x86-nvidia.md)
 - [Deployment: CPU-only](docs/deployment/cpu-only.md)
@@ -83,6 +60,4 @@ See [Configuration](docs/configuration.md) for examples.
 ## License
 
 `AGPL-3.0-only`, with commercial licensing available under separate terms.
-
-
 
