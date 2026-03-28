@@ -278,8 +278,8 @@ TOOLS = [
         "function": {
             "name": "edit_file",
             "description": (
-                "Edit a file using one or more strict SEARCH/REPLACE blocks. "
-                "Prefer patch over full rewrites. Use this exact format: "
+                "Edit an existing file using one or more strict SEARCH/REPLACE blocks. "
+                "Use this exact format for every patch: "
                 "<<<<<<< SEARCH\\n...existing text...\\n=======\\n...replacement text...\\n>>>>>>> REPLACE"
             ),
             "parameters": {
@@ -292,8 +292,7 @@ TOOLS = [
                     "patch": {
                         "type": "string",
                         "description": (
-                            "One or more SEARCH/REPLACE blocks. "
-                            "This is the preferred edit format."
+                            "Required patch text. Send one or more SEARCH/REPLACE blocks using the exact existing text."
                         ),
                     },
                     "old_string": {

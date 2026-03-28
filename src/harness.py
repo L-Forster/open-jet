@@ -63,7 +63,7 @@ class HarnessState:
     last_action: dict[str, Any] = field(default_factory=dict)
     last_verification: dict[str, Any] = field(default_factory=dict)
     open_questions: list[str] = field(default_factory=list)
-    constraints: list[str] = field(default_factory=lambda: ["edge device", "bounded context"])
+    constraints: list[str] = field(default_factory=lambda: ["local-first", "small focused turns"])
     next_action: str = ""
     failure_count_for_active_step: int = 0
     updated_at: float = 0.0
@@ -107,7 +107,7 @@ class HarnessState:
             last_action=dict(payload.get("last_action", {})) if isinstance(payload.get("last_action"), dict) else {},
             last_verification=dict(payload.get("last_verification", {})) if isinstance(payload.get("last_verification"), dict) else {},
             open_questions=[str(item) for item in payload.get("open_questions", []) if str(item)],
-            constraints=[str(item) for item in payload.get("constraints", []) if str(item)] or ["edge device", "bounded context"],
+            constraints=[str(item) for item in payload.get("constraints", []) if str(item)] or ["local-first", "small focused turns"],
             next_action=str(payload.get("next_action", "")),
             failure_count_for_active_step=int(payload.get("failure_count_for_active_step", 0) or 0),
             updated_at=float(payload.get("updated_at", 0.0) or 0.0),
@@ -863,7 +863,28 @@ def _split_frontmatter(body: str) -> tuple[dict[str, Any], str]:
 
 
 def _format_doc(label: str, body: str) -> str:
-    return f"USER-EDITABLE HARNESS DOC: {label}\n{body.strip()}"
+    title = _doc_title(label)
+    return f"{title}\nSource: {label}\n\n{body.strip()}"
+
+
+def _doc_title(label: str) -> str:
+    if label == ".openjet/agents/base.md":
+        return "BASE AGENT GUIDANCE"
+    if label.startswith(".openjet/agents/"):
+        return "ROLE-SPECIFIC AGENT GUIDANCE"
+    if label == ".openjet/projects/default.md":
+        return "PROJECT GUIDANCE"
+    if label == "skills.md":
+        return "AVAILABLE SKILLS"
+    if label.startswith("skills/"):
+        return "LOADED SKILL GUIDANCE"
+    if label.startswith("file-context:"):
+        return "FILE CONTEXT"
+    if label == "recent-context":
+        return "RECENT TURN CONTEXT"
+    if label == "[project summary]":
+        return "PROJECT SUMMARY"
+    return "HARNESS CONTEXT"
 
 
 def _compact_json(payload: dict[str, Any]) -> str:

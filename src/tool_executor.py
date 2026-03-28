@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -14,6 +15,9 @@ from .device_sources import (
 )
 from .executor import (
     DEFAULT_SHELL_TIMEOUT_SECONDS,
+    EditFileResult,
+    _normalize_tool_path,
+    _validate_edited_content,
     edit_file,
     glob_files,
     grep_files,
@@ -58,6 +62,7 @@ _DEVICE_TOOLS = {
     "sensor_read": (PeripheralKind.SENSOR, None, False, PeripheralTransport.GPIO),
     "gpio_read": (PeripheralKind.SENSOR, None, False, PeripheralTransport.GPIO),
 }
+_UNIFIED_DIFF_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def set_swap_manager(manager: SwapManager | None) -> None:
@@ -301,7 +306,10 @@ async def _edit_file_result(args: dict[str, Any]) -> ToolExecutionResult:
     if patch is not None:
         if not isinstance(patch, str) or not patch.strip():
             raise ToolArgumentError("patch must be a non-empty string")
-        result = await edit_file(path, patch=patch, return_result=True)
+        if _looks_like_unified_diff_patch(patch):
+            result = _apply_unified_diff_patch(path, patch)
+        else:
+            result = await edit_file(path, patch=patch, return_result=True)
     else:
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
@@ -320,6 +328,124 @@ async def _edit_file_result(args: dict[str, Any]) -> ToolExecutionResult:
             "validation_error": result.validation_error,
         },
     )
+
+
+def _looks_like_unified_diff_patch(patch: str) -> bool:
+    return any(
+        line.startswith("@@ ") or line.startswith("--- ") or line.startswith("+++ ")
+        for line in patch.splitlines()
+    )
+
+
+def _apply_unified_diff_patch(path: str, patch: str) -> EditFileResult:
+    raw_path = path.strip()
+    if not raw_path:
+        return EditFileResult(ok=False, output="Error: path is empty.")
+
+    p = _normalize_tool_path(raw_path)
+    if not p.exists():
+        return EditFileResult(ok=False, output=f"Error: file not found: {path}")
+    if p.is_dir():
+        return EditFileResult(ok=False, output=f"Error: path is a directory: {path}")
+
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+        hunks = _parse_unified_diff_patch(patch)
+        new_content = _apply_unified_diff_hunks(content, hunks, path=path)
+    except ValueError as exc:
+        return EditFileResult(ok=False, output=f"Error: {exc}")
+    except Exception as exc:
+        return EditFileResult(ok=False, output=f"Error reading {path}: {exc}")
+
+    validation_error = _validate_edited_content(p, new_content)
+    if validation_error:
+        return EditFileResult(
+            ok=False,
+            output=validation_error,
+            internal_retry=True,
+            replacements=len(hunks),
+            match_strategy="line-numbered-diff",
+            validation_error=validation_error,
+        )
+
+    try:
+        p.write_text(new_content, encoding="utf-8")
+    except Exception as exc:
+        return EditFileResult(ok=False, output=f"Error writing {path}: {exc}")
+
+    return EditFileResult(
+        ok=True,
+        output=f"Edited {path}: {len(hunks)} replacement(s) made via line-numbered-diff.",
+        replacements=len(hunks),
+        match_strategy="line-numbered-diff",
+    )
+
+
+def _parse_unified_diff_patch(patch: str) -> list[tuple[int, int, str, str]]:
+    lines = patch.splitlines(keepends=True)
+    idx = 0
+    hunks: list[tuple[int, int, str, str]] = []
+
+    while idx < len(lines):
+        line = lines[idx]
+        if line.startswith(("diff ", "index ", "--- ", "+++ ")) or not line.strip():
+            idx += 1
+            continue
+        match = _UNIFIED_DIFF_HUNK_RE.match(line.rstrip("\r\n"))
+        if not match:
+            raise ValueError("patch must contain unified diff hunks with @@ -old,+new @@ headers.")
+        old_start = int(match.group(1))
+        old_count = int(match.group(2) or "1")
+        idx += 1
+        hunk_lines: list[str] = []
+        while idx < len(lines):
+            candidate = lines[idx]
+            if candidate.startswith("@@ "):
+                break
+            if candidate.startswith(("diff ", "index ", "--- ", "+++ ")):
+                break
+            hunk_lines.append(candidate)
+            idx += 1
+        old_parts: list[str] = []
+        new_parts: list[str] = []
+        for hunk_line in hunk_lines:
+            if hunk_line.startswith("\\ No newline at end of file"):
+                continue
+            if not hunk_line:
+                raise ValueError("invalid unified diff hunk line.")
+            prefix = hunk_line[0]
+            body = hunk_line[1:]
+            if prefix in {" ", "-"}:
+                old_parts.append(body)
+            if prefix in {" ", "+"}:
+                new_parts.append(body)
+            if prefix not in {" ", "-", "+"}:
+                raise ValueError("invalid unified diff hunk line prefix.")
+        hunks.append((old_start, old_count, "".join(old_parts), "".join(new_parts)))
+
+    if not hunks:
+        raise ValueError("patch did not contain any unified diff hunks.")
+    return hunks
+
+
+def _apply_unified_diff_hunks(
+    content: str,
+    hunks: list[tuple[int, int, str, str]],
+    *,
+    path: str,
+) -> str:
+    lines = content.splitlines(keepends=True)
+    for old_start, old_count, old_text, new_text in reversed(hunks):
+        start_idx = max(0, old_start - 1)
+        end_idx = start_idx + old_count
+        if end_idx > len(lines):
+            raise ValueError(f"hunk range is out of bounds for {path}")
+        existing = "".join(lines[start_idx:end_idx])
+        if existing != old_text:
+            raise ValueError(f"hunk old text did not match {path} at line {old_start}")
+        replacement = new_text.splitlines(keepends=True)
+        lines[start_idx:end_idx] = replacement
+    return "".join(lines)
 
 
 async def _text_result_async(func, *func_args, error_prefix: str, **func_kwargs) -> ToolExecutionResult:

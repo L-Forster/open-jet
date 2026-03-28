@@ -8,6 +8,8 @@ cd open-jet
 ./install.sh
 ```
 
+This is the normal editable-source install path.
+
 `open-jet` now supports a deliberately smaller runtime set:
 
 - `llama.cpp` for local/offline use

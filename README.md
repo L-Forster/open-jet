@@ -122,6 +122,19 @@ cd open-jet
 ```
 
 This creates a local virtualenv, installs the repo, and links `open-jet` / `openjet` into `~/.local/bin`.
+It is an editable source install for normal development and local use.
+
+If stale in-place compiled extension artifacts exist under `src/`, the installer removes them so imports continue to use the Python sources.
+
+### Optional: build a compiled wheel
+
+If you explicitly want a compiled package artifact, build a wheel separately:
+
+```bash
+./scripts/build-compiled.sh
+```
+
+This is an optional packaging path, not the normal install flow.
 
 ### 2. Choose a runtime path
 

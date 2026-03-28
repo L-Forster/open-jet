@@ -6,6 +6,19 @@ PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="${ROOT_DIR}/.venv"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
 
+clean_inplace_extensions() {
+  mapfile -t built_exts < <(find "${ROOT_DIR}/src" -maxdepth 1 \( -name '*.so' -o -name '*.pyd' \) -type f | sort)
+  if ((${#built_exts[@]} == 0)); then
+    return 0
+  fi
+
+  echo "Removing stale in-place extension artifacts so the editable Python sources stay active:"
+  for artifact in "${built_exts[@]}"; do
+    echo "  - ${artifact#${ROOT_DIR}/}"
+    rm -f "${artifact}"
+  done
+}
+
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "error: ${PYTHON_BIN} not found" >&2
   exit 1
@@ -24,10 +37,11 @@ create_virtualenv() {
   "${PYTHON_BIN}" -m virtualenv "${VENV_DIR}"
 }
 
+clean_inplace_extensions
 create_virtualenv
 "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
-"${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
+OPENJET_BUILD_EXTENSIONS=0 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
 
 if "${VENV_DIR}/bin/python" - <<'PY'
 from src.observation.processors import provision_default_faster_whisper_model
@@ -44,6 +58,7 @@ ln -sf "${VENV_DIR}/bin/open-jet" "${LOCAL_BIN_DIR}/open-jet"
 ln -sf "${VENV_DIR}/bin/openjet" "${LOCAL_BIN_DIR}/openjet"
 
 echo "Installed open-jet from ${ROOT_DIR}"
+echo "Install mode: editable Python source"
 echo "Launch with: open-jet --setup"
 
 case ":${PATH}:" in

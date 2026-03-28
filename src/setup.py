@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 from html import escape as html_escape
 from pathlib import Path
@@ -28,6 +27,7 @@ from .model_profiles import default_profile_name
 from .ollama_setup import discover_installed_ollama_models, find_ollama_cli
 from .provisioning import recommend_direct_model
 from .runtime_registry import runtime_options, runtime_spec
+from .setup_memory import recommend_setup_context_window
 
 if TYPE_CHECKING:
     from prompt_toolkit import PromptSession
@@ -51,18 +51,25 @@ def discover_model_files() -> list[str]:
     return sorted(found)
 
 
-def estimate_model_params_b_from_text(text: str) -> float | None:
-    src = text.strip().lower()
-    if not src:
-        return None
-    match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*([bm])(?!\w)", src)
-    if not match:
-        return None
-    try:
-        value = float(match.group(1))
-    except ValueError:
-        return None
-    return value if match.group(2) == "b" else value / 1000.0
+def _setup_model_refs(payload: Mapping[str, object] | None) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return []
+    refs = [
+        payload.get("llama_model"),
+        payload.get("model"),
+        payload.get("model_download_path"),
+        payload.get("recommended_llm"),
+        payload.get("ollama_model"),
+    ]
+    unique: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        value = str(ref or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def context_window_options(recommended: int) -> list[int]:
@@ -340,15 +347,25 @@ def build_recommended_payload(
         )
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    detected_recommended_ctx = (
-        recommended_context_window_tokens()
-        if hardware_profile == "auto"
-        else recommended_context_window_tokens_from_total(
-            effective_hw.total_ram_gb,
-            headless=headless,
+    fallback_ctx = (
+        int(recommended_ctx)
+        if recommended_ctx > 0
+        else (
+            recommended_context_window_tokens()
+            if hardware_profile == "auto"
+            else recommended_context_window_tokens_from_total(
+                effective_hw.total_ram_gb,
+                headless=headless,
+            )
         )
     )
-    context_value = _current_int(current_cfg, "context_window_tokens") or max(recommended_ctx, detected_recommended_ctx)
+    detected_recommended_ctx = recommend_setup_context_window(
+        runtime=runtime,
+        device=device,
+        fallback_tokens=fallback_ctx,
+        model_refs=_setup_model_refs(payload),
+    )
+    context_value = _current_int(current_cfg, "context_window_tokens") or detected_recommended_ctx
     gpu_value = 0
     if runtime == "llama_cpp":
         gpu_value = _current_int(current_cfg, "gpu_layers")
@@ -805,14 +822,24 @@ async def run_setup_wizard(
         payload["openrouter_verify_connection"] = False
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    if hardware == "auto":
-        recommended_ctx_value = recommended_context_window_tokens()
-    else:
-        recommended_ctx_value = recommended_context_window_tokens_from_total(
-            effective_hw.total_ram_gb,
-            headless=headless,
+    fallback_ctx = (
+        int(recommended_ctx)
+        if recommended_ctx > 0 and hardware == "auto"
+        else (
+            recommended_context_window_tokens()
+            if hardware == "auto"
+            else recommended_context_window_tokens_from_total(
+                effective_hw.total_ram_gb,
+                headless=headless,
+            )
         )
-    recommended_ctx_value = max(recommended_ctx, recommended_ctx_value)
+    )
+    recommended_ctx_value = recommend_setup_context_window(
+        runtime=runtime,
+        device=device,
+        fallback_tokens=fallback_ctx,
+        model_refs=_setup_model_refs(payload),
+    )
     context_options = [
         (f"{value} (recommended)" if value == recommended_ctx_value else str(value), value)
         for value in context_window_options(recommended_ctx_value)

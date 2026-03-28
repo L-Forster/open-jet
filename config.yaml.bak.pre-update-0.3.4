@@ -1,0 +1,102 @@
+active_model_profile: '99'
+airgapped: false
+context_window_tokens: 16384
+device: vulkan
+gpu_layers: 99
+hardware_profile: auto
+layered_context:
+  alert_ratio: 0.4
+  enabled: true
+  layer1_enabled: true
+  layer1_ratio: 0.15
+  layer2_enabled: true
+  layer2_ratio: 0.2
+  layer3_enabled: true
+  layer3_ratio: 0.1
+llama_model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+llama_server_path: /home/louis/llama.cpp/build/bin/llama-server
+logging:
+  directory: .openjet/state/sessions
+  enabled: false
+memory_guard:
+  check_interval_chunks: 16
+  condense_target_tokens: 900
+  keep_last_messages: 6
+  max_used_percent: null
+  min_available_mb: null
+model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+model_download_path: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+model_download_url: https://huggingface.co/bartowski/Qwen_Qwen3.5-9B-GGUF/resolve/main/Qwen_Qwen3.5-9B-Q4_K_M.gguf?download=true
+model_profiles:
+- context_window_tokens: 16384
+  device: vulkan
+  gpu_layers: 99
+  hardware_profile: auto
+  llama_model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model_source: local
+  name: '99'
+  recommended_llm: Qwen3.5 9B
+  runtime: llama_cpp
+  setup_complete: true
+- context_window_tokens: 8192
+  device: vulkan
+  gpu_layers: 70
+  hardware_profile: auto
+  llama_model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model: /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  model_source: local
+  name: Qwen_Qwen3.5-9B-Q4_K_M
+  recommended_llm: Qwen3.5 9B
+  runtime: llama_cpp
+  setup_complete: true
+- context_window_tokens: 8192
+  device: vulkan
+  gpu_layers: 70
+  hardware_profile: auto
+  llama_model: /models/alt.gguf
+  model: /models/resolved.gguf
+  model_source: local
+  name: Alt
+  recommended_llm: Qwen3.5 9B
+  runtime: llama_cpp
+  setup_complete: true
+- context_window_tokens: 4096
+  gpu_layers: 99
+  llama_model: /models/base.gguf
+  model: /models/base.gguf
+  model_source: local
+  name: Base
+  runtime: llama_cpp
+model_source: local
+recommended_llm: Qwen3.5 9B
+runtime: llama_cpp
+setup_complete: true
+setup_missing_model: false
+setup_missing_runtime: false
+setup_model_history:
+  llama_cpp:
+  - /home/louis/.openjet/models/Qwen_Qwen3.5-9B-Q4_K_M.gguf
+  - /home/louis/open-jet/Qwen3.5-4B-Q4_K_M.gguf
+  - /home/louis/Downloads/Qwen3-4B-Instruct-2507.Q4_K_M.gguf
+sglang_launch_mode: jetson_container
+sglang_model: null
+sglang_served_model_name: local
+state:
+  auto_resume: false
+  enabled: true
+  path: .openjet/state/session_state.json
+telemetry:
+  broadcast:
+    enabled: false
+    endpoint: ''
+    export_logs: true
+    export_metrics: true
+    export_traces: true
+    headers: {}
+    timeout_seconds: 3.0
+  install_id_path: .openjet/state/telemetry_identity.json
+  use_case_tag: ''
+trtllm_backend: pytorch
+trtllm_model: null
+trtllm_trust_remote_code: true

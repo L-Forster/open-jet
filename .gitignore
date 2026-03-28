@@ -5,6 +5,8 @@ __pycache__/
 dist/
 build/
 src/*.c
+src/*.so
+src/*.pyd
 benchmark_results/
 
 # Runtime/session state

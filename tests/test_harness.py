@@ -31,6 +31,7 @@ from src.persistent_memory import build_system_prompt, update_persistent_memory
 from src.runtime_limits import MemorySnapshot, estimate_tokens
 from src.runtime_protocol import StreamChunk, ToolCall
 from src.sdk import OpenJetSession, SDKEventKind
+from src.tool_executor import execute_tool
 
 
 class FakeRuntimeClient:
@@ -347,7 +348,7 @@ class HarnessContextTests(unittest.TestCase):
             joined = "\n".join(message["content"] for message in context.messages)
             self.assertIn("python-refactor.md", ",".join(context.docs_loaded))
             self.assertIn("preferred refactor skill", joined)
-            self.assertNotIn("USER-EDITABLE HARNESS DOC: skills/irrelevant.md", joined)
+            self.assertNotIn("Source: skills/irrelevant.md", joined)
             self.assertLessEqual(context.docs_tokens, context.budget.docs_budget + 64)
 
     def test_clear_preferred_skills_removes_manual_skill_selection(self) -> None:
@@ -395,6 +396,118 @@ class HarnessContextTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertTrue(result.internal_retry)
             self.assertIn("Python AST validation failed", result.output)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_edit_file_patch_requires_unique_search_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            original = (
+                "def greet():\n"
+                "    return 'hi'\n\n"
+                "def wave():\n"
+                "    return 'hi'\n"
+            )
+            path.write_text(original, encoding="utf-8")
+
+            patch = (
+                "<<<<<<< SEARCH\n"
+                "    return 'hi'\n"
+                "=======\n"
+                "    return 'hello'\n"
+                ">>>>>>> REPLACE\n"
+            )
+
+            result = asyncio.run(edit_file(str(path), patch=patch, return_result=True))
+
+            self.assertFalse(result.ok)
+            self.assertIn("SEARCH block matched multiple locations exactly", result.output)
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_edit_file_patch_updates_only_the_unique_search_block(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            original = (
+                "def greet():\n"
+                "    return 'hi'\n\n"
+                "def wave():\n"
+                "    return 'hi'\n"
+            )
+            path.write_text(original, encoding="utf-8")
+            patch = (
+                "<<<<<<< SEARCH\n"
+                "def greet():\n"
+                "    return 'hi'\n"
+                "=======\n"
+                "def greet():\n"
+                "    return 'hello'\n"
+                ">>>>>>> REPLACE\n"
+            )
+
+            result = asyncio.run(edit_file(str(path), patch=patch, return_result=True))
+
+            self.assertTrue(result.ok)
+            self.assertIn("replacement(s) made", result.output)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "def greet():\n"
+                "    return 'hello'\n\n"
+                "def wave():\n"
+                "    return 'hi'\n",
+            )
+
+    def test_edit_file_tool_applies_line_numbered_diff_hunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            path.write_text(
+                "def greet():\n"
+                "    return 'hi'\n\n"
+                "def wave():\n"
+                "    return 'hi'\n",
+                encoding="utf-8",
+            )
+            patch = (
+                "@@ -1,2 +1,2 @@\n"
+                " def greet():\n"
+                "-    return 'hi'\n"
+                "+    return 'hello'\n"
+            )
+
+            result = asyncio.run(
+                execute_tool(ToolCall(name="edit_file", arguments={"path": str(path), "patch": patch}))
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "def greet():\n"
+                "    return 'hello'\n\n"
+                "def wave():\n"
+                "    return 'hi'\n",
+            )
+
+    def test_edit_file_tool_rejects_mismatched_line_numbered_diff_hunk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            original = (
+                "def greet():\n"
+                "    return 'hi'\n\n"
+                "def wave():\n"
+                "    return 'hi'\n"
+            )
+            path.write_text(original, encoding="utf-8")
+            patch = (
+                "@@ -4,2 +4,2 @@\n"
+                " def greet():\n"
+                "-    return 'hi'\n"
+                "+    return 'hello'\n"
+            )
+
+            result = asyncio.run(
+                execute_tool(ToolCall(name="edit_file", arguments={"path": str(path), "patch": patch}))
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("hunk old text did not match", result.output)
             self.assertEqual(path.read_text(encoding="utf-8"), original)
 
     def _write_repo_context_docs(self, root: Path, *, architecture_lines: list[str]) -> None:
