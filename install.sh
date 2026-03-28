@@ -25,8 +25,6 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
 fi
 
 create_virtualenv() {
-  rm -rf "${VENV_DIR}"
-
   if "${PYTHON_BIN}" -c "import ensurepip" >/dev/null 2>&1; then
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"
     return 0
@@ -38,9 +36,11 @@ create_virtualenv() {
 }
 
 clean_inplace_extensions
-create_virtualenv
-"${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
-"${VENV_DIR}/bin/python" -m pip install --upgrade pip
+if [ ! -f "${VENV_DIR}/bin/python" ]; then
+  create_virtualenv
+  "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  "${VENV_DIR}/bin/python" -m pip install --upgrade pip
+fi
 OPENJET_BUILD_EXTENSIONS=0 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
 
 if "${VENV_DIR}/bin/python" - <<'PY'
