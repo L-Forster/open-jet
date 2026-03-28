@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import platform
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +18,30 @@ class HardwareInfo:
     total_ram_gb: float
     has_cuda: bool
     has_vulkan: bool = False
+    has_rocm: bool = False
+    has_metal: bool = False
+    vram_mb: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# GPU detection
+# ---------------------------------------------------------------------------
+
+def _detect_cuda() -> bool:
+    if sys.platform == "linux":
+        if Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists():
+            return True
+    if shutil.which("nvidia-smi"):
+        return True
+    return False
+
+
+def _detect_rocm() -> bool:
+    if shutil.which("rocm-smi"):
+        return True
+    if Path("/opt/rocm").is_dir():
+        return True
+    return False
 
 
 def _detect_vulkan() -> bool:
@@ -27,15 +54,114 @@ def _detect_vulkan() -> bool:
     return False
 
 
+def _detect_metal() -> bool:
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+# ---------------------------------------------------------------------------
+# VRAM detection
+# ---------------------------------------------------------------------------
+
+def _read_nvidia_vram_mb() -> float:
+    """Total VRAM across all NVIDIA GPUs via nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    total = 0.0
+    for line in out.strip().splitlines():
+        try:
+            total += float(line.strip())
+        except ValueError:
+            pass
+    return total
+
+
+def _read_rocm_vram_mb() -> float:
+    """Total VRAM across all AMD GPUs via sysfs or rocm-smi."""
+    total = 0.0
+    # Try sysfs first (no dependency on rocm-smi output format)
+    drm = Path("/sys/class/drm")
+    if drm.is_dir():
+        for card in drm.glob("card[0-9]*/device/mem_info_vram_total"):
+            try:
+                total += float(card.read_text().strip()) / (1024.0 * 1024.0)
+            except (OSError, ValueError):
+                pass
+    if total > 0:
+        return total
+    # Fall back to rocm-smi
+    try:
+        out = subprocess.check_output(
+            ["rocm-smi", "--showmeminfo", "vram"], text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    for line in out.splitlines():
+        if "Total" in line and "Memory" in line:
+            for part in line.split():
+                try:
+                    total += float(part) / (1024.0 * 1024.0)
+                    break
+                except ValueError:
+                    continue
+    return total
+
+
+def _read_metal_vram_mb() -> float:
+    """Apple Silicon uses unified memory — VRAM = system RAM."""
+    mem = read_memory_snapshot()
+    return mem.total_mb if mem else 0.0
+
+
+def _detect_vram_mb(has_cuda: bool, has_rocm: bool, has_metal: bool) -> float:
+    if has_cuda:
+        vram = _read_nvidia_vram_mb()
+        if vram > 0:
+            return vram
+    if has_rocm:
+        vram = _read_rocm_vram_mb()
+        if vram > 0:
+            return vram
+    if has_metal:
+        return _read_metal_vram_mb()
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Device recommendation
+# ---------------------------------------------------------------------------
+
 def recommended_device() -> str:
-    if Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists():
+    if _detect_cuda():
         return "cuda"
+    if _detect_rocm():
+        return "rocm"
+    if _detect_metal():
+        return "metal"
     if _detect_vulkan():
         return "vulkan"
     return "cpu"
 
 
+# ---------------------------------------------------------------------------
+# Board / platform label
+# ---------------------------------------------------------------------------
+
 def read_device_model() -> str | None:
+    if sys.platform == "darwin":
+        try:
+            chip = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, timeout=5,
+            ).strip()
+            if chip:
+                return chip
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return f"Apple {platform.machine()}"
     try:
         raw = Path("/proc/device-tree/model").read_bytes()
     except OSError:
@@ -44,21 +170,40 @@ def read_device_model() -> str | None:
     return text or None
 
 
+# ---------------------------------------------------------------------------
+# Main detection
+# ---------------------------------------------------------------------------
+
 def detect_hardware_info() -> HardwareInfo:
     mem = read_memory_snapshot()
     total_ram_gb = (mem.total_mb / 1024.0) if mem else 0.0
-    has_cuda = bool(Path("/usr/local/cuda").exists() or Path("/dev/nvhost-gpu").exists())
+    has_cuda = _detect_cuda()
+    has_rocm = _detect_rocm()
     has_vulkan = _detect_vulkan()
+    has_metal = _detect_metal()
+    vram_mb = _detect_vram_mb(has_cuda, has_rocm, has_metal)
     board = read_device_model()
     if board:
         label = board
+    elif has_metal:
+        label = f"Apple Silicon ({total_ram_gb:.0f} GB unified)"
     elif has_cuda:
         label = "CUDA-capable device"
+    elif has_rocm:
+        label = "ROCm-capable device"
     elif has_vulkan:
         label = "Vulkan-capable device"
     else:
         label = "CPU-only device"
-    return HardwareInfo(label=label, total_ram_gb=total_ram_gb, has_cuda=has_cuda, has_vulkan=has_vulkan)
+    return HardwareInfo(
+        label=label,
+        total_ram_gb=total_ram_gb,
+        has_cuda=has_cuda,
+        has_vulkan=has_vulkan,
+        has_rocm=has_rocm,
+        has_metal=has_metal,
+        vram_mb=vram_mb,
+    )
 
 
 def effective_hardware_info(profile: str, detected: HardwareInfo, override_key: str | None = None) -> HardwareInfo:
@@ -75,6 +220,10 @@ def recommended_device_for_hardware(profile: str, detected: HardwareInfo, overri
     hw = effective_hardware_info(profile, detected, override_key)
     if hw.has_cuda:
         return "cuda"
+    if hw.has_rocm:
+        return "rocm"
+    if hw.has_metal:
+        return "metal"
     if hw.has_vulkan:
         return "vulkan"
     return "cpu"
@@ -82,7 +231,11 @@ def recommended_device_for_hardware(profile: str, detected: HardwareInfo, overri
 
 def recommended_param_budget_b(profile: str, detected: HardwareInfo, override_key: str | None = None) -> float:
     hw = effective_hardware_info(profile, detected, override_key)
-    total_gb = hw.total_ram_gb
+    # On unified memory (Metal) or when VRAM is known, use the larger of RAM and VRAM
+    effective_gb = hw.total_ram_gb
+    if hw.vram_mb > 0 and not hw.has_metal:
+        effective_gb = max(effective_gb, hw.vram_mb / 1024.0)
+    total_gb = effective_gb
     if total_gb < 6:
         cap = 2.0
     elif total_gb < 12:
@@ -93,7 +246,8 @@ def recommended_param_budget_b(profile: str, detected: HardwareInfo, override_ke
         cap = 14.0
     else:
         cap = 32.0
-    if not hw.has_cuda and not hw.has_vulkan:
+    has_gpu = hw.has_cuda or hw.has_vulkan or hw.has_rocm or hw.has_metal
+    if not has_gpu:
         cap = min(cap, 8.0)
     return cap
 
@@ -144,7 +298,7 @@ def recommended_context_window_tokens_from_total(
 
 
 def recommended_gpu_layers(device: str, total_ram_gb: float | None = None) -> int:
-    if device in ("cuda", "vulkan"):
+    if device in ("cuda", "vulkan", "rocm", "metal"):
         return 99
     return 0
 

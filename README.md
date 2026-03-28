@@ -36,7 +36,7 @@ An agent in your terminal that can actually do things:
 
 ## Why this exists
 
-Cloud coding agents need API keys, send your code to someone else's server, and cost money per token. Local alternatives like Ollama give you a chat window but not an agent — no file access, no shell, no session recovery.
+Cloud coding agents need API keys, send your code to someone else's server, and cost money per token. Local chat tools give you a chat window but not an agent — no file access, no shell, no session recovery.
 
 OpenJet closes that gap. It's built for local models on real hardware, where memory is tight, context windows are short, and sessions get interrupted. Everything runs on your machine, nothing leaves it.
 

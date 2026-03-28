@@ -253,7 +253,7 @@ class LlamaServerClient:
             env.setdefault("GGML_CUDA_VMM_CHUNK_MB", _JETSON_VMM_CHUNK_MB)
             env.setdefault("GGML_CUDA_VMM_RESERVE_MB", _JETSON_VMM_RESERVE_MB)
         lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
-        requested_ngl = self.gpu_layers if resolved_device in ("cuda", "vulkan") else 0
+        requested_ngl = self.gpu_layers if resolved_device in ("cuda", "vulkan", "rocm", "metal") else 0
         requested_ctx = self.context_window_tokens
         batch, ubatch, fit_off, no_warmup = self._startup_profile_for_lfb(lfb_mb)
         startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
@@ -547,14 +547,10 @@ class LlamaServerClient:
         self._proc = None
 
     def _resolve_device(self) -> str:
-        if self.device in {"cuda", "cpu", "vulkan"}:
+        if self.device in {"cuda", "cpu", "vulkan", "rocm", "metal"}:
             return self.device
-        if os.path.exists("/usr/local/cuda") or os.path.exists("/dev/nvhost-gpu"):
-            return "cuda"
-        from .hardware import _detect_vulkan
-        if _detect_vulkan():
-            return "vulkan"
-        return "cpu"
+        from .hardware import recommended_device
+        return recommended_device()
 
     async def save_kv_cache(self, path: Path) -> bool:
         """Save KV cache for slot 0 to *path* via llama-server slot API.

@@ -123,7 +123,7 @@ def _materialize_qwen_tokenizer_files(
     return cache_dir
 
 
-def read_memory_snapshot() -> MemorySnapshot | None:
+def _read_memory_linux() -> MemorySnapshot | None:
     mem_total_kb: int | None = None
     mem_available_kb: int | None = None
     try:
@@ -135,14 +135,79 @@ def read_memory_snapshot() -> MemorySnapshot | None:
                     mem_available_kb = int(line.split()[1])
     except OSError:
         return None
-
     if not mem_total_kb or mem_available_kb is None:
         return None
-
     total_mb = mem_total_kb / 1024.0
     available_mb = mem_available_kb / 1024.0
     used_percent = ((mem_total_kb - mem_available_kb) / mem_total_kb) * 100.0
     return MemorySnapshot(total_mb=total_mb, available_mb=available_mb, used_percent=used_percent)
+
+
+def _read_memory_darwin() -> MemorySnapshot | None:
+    import subprocess
+    try:
+        total_bytes = int(subprocess.check_output(
+            ["sysctl", "-n", "hw.memsize"], text=True,
+        ).strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    total_mb = total_bytes / (1024.0 * 1024.0)
+    # vm_stat reports pages; page size is typically 16384 on Apple Silicon, 4096 on Intel
+    try:
+        page_size = int(subprocess.check_output(
+            ["sysctl", "-n", "hw.pagesize"], text=True,
+        ).strip())
+        vm_out = subprocess.check_output(["vm_stat"], text=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return MemorySnapshot(total_mb=total_mb, available_mb=total_mb * 0.5, used_percent=50.0)
+    free_pages = 0
+    inactive_pages = 0
+    for line in vm_out.splitlines():
+        if "Pages free" in line:
+            free_pages = int(line.split(":")[1].strip().rstrip("."))
+        elif "Pages inactive" in line:
+            inactive_pages = int(line.split(":")[1].strip().rstrip("."))
+    available_mb = (free_pages + inactive_pages) * page_size / (1024.0 * 1024.0)
+    used_percent = ((total_mb - available_mb) / total_mb) * 100.0 if total_mb > 0 else 0.0
+    return MemorySnapshot(total_mb=total_mb, available_mb=available_mb, used_percent=used_percent)
+
+
+def _read_memory_windows() -> MemorySnapshot | None:
+    import ctypes
+    import ctypes.wintypes
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.wintypes.DWORD),
+            ("dwMemoryLoad", ctypes.wintypes.DWORD),
+            ("ullTotalPhys", ctypes.c_uint64),
+            ("ullAvailPhys", ctypes.c_uint64),
+            ("ullTotalPageFile", ctypes.c_uint64),
+            ("ullAvailPageFile", ctypes.c_uint64),
+            ("ullTotalVirtual", ctypes.c_uint64),
+            ("ullAvailVirtual", ctypes.c_uint64),
+            ("ullAvailExtendedVirtual", ctypes.c_uint64),
+        ]
+    try:
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+    except (OSError, AttributeError):
+        return None
+    total_mb = stat.ullTotalPhys / (1024.0 * 1024.0)
+    available_mb = stat.ullAvailPhys / (1024.0 * 1024.0)
+    used_percent = ((total_mb - available_mb) / total_mb) * 100.0 if total_mb > 0 else 0.0
+    return MemorySnapshot(total_mb=total_mb, available_mb=available_mb, used_percent=used_percent)
+
+
+def read_memory_snapshot() -> MemorySnapshot | None:
+    import sys
+    if sys.platform == "linux":
+        return _read_memory_linux()
+    if sys.platform == "darwin":
+        return _read_memory_darwin()
+    if sys.platform == "win32":
+        return _read_memory_windows()
+    return None
 
 
 def read_memory_info() -> dict[str, Any]:
