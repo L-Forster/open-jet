@@ -21,6 +21,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markup import escape
@@ -110,7 +111,7 @@ from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
 from .self_update import RepoUpdateInfo, available_update, install_update
-from .setup import ACCENT_GREEN, _prompt_choice, discover_model_files, run_setup_wizard
+from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
 from .tool_executor import format_tool_args, get_swap_manager, set_swap_manager
@@ -942,16 +943,14 @@ class OpenJetApp:
             return
         if update is None:
             return
-        selected = await _prompt_choice(
-            self._session,
-            self.console,
-            "Update open-jet repo",
-            [
-                (f"Pull {update.remote}/{update.branch} and restart open-jet", "install"),
-                ("Skip for now", "skip"),
+        selected = await radiolist_dialog(
+            title="Update open-jet repo",
+            text=f"Newer commit available: {update.local_short} -> {update.remote_short}",
+            values=[
+                ("install", f"Pull {update.remote}/{update.branch} and restart open-jet"),
+                ("skip", "Skip for now"),
             ],
-            detail=f"Newer commit available: {update.local_short} -> {update.remote_short}",
-        )
+        ).run_async()
         if selected != "install":
             if self.session_logger:
                 self.session_logger.log_event(

@@ -4,10 +4,21 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from src.self_update import RepoUpdateInfo, available_update, update_from_latest_release
+from src.self_update import RepoUpdateInfo, _has_tracked_changes, available_update, update_from_latest_release
 
 
 class SelfUpdateTests(unittest.TestCase):
+    def test_has_tracked_changes_ignores_untracked_files(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["git", "status", "--porcelain", "--untracked-files=no"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with patch("src.self_update.subprocess.run", return_value=completed):
+            self.assertFalse(_has_tracked_changes(update_from_latest_release.__globals__["_REPO_ROOT"]))
+
     def test_available_update_prefers_current_upstream_branch_over_origin_head(self) -> None:
         def fake_git_output(*args: str) -> str | None:
             if args == ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"):
@@ -94,14 +105,11 @@ class SelfUpdateTests(unittest.TestCase):
             remote_commit="aaaaaaa222222333333444444555556666666777",
         )
         with patch("src.self_update.available_update", return_value=update), patch(
+            "src.self_update._has_tracked_changes",
+            return_value=False,
+        ), patch(
             "src.self_update._git_output",
-            side_effect=lambda *args: (
-                ""
-                if args == ("status", "--porcelain")
-                else "src/app.py\n"
-                if args == ("diff", "--name-only", update.local_commit, update.remote_commit)
-                else None
-            ),
+            side_effect=lambda *args: "src/app.py\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
         ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
             "src.self_update.subprocess.run",
         ) as run_mock:
@@ -122,14 +130,11 @@ class SelfUpdateTests(unittest.TestCase):
             remote_commit="aaaaaaa222222333333444444555556666666777",
         )
         with patch("src.self_update.available_update", return_value=update), patch(
+            "src.self_update._has_tracked_changes",
+            return_value=False,
+        ), patch(
             "src.self_update._git_output",
-            side_effect=lambda *args: (
-                ""
-                if args == ("status", "--porcelain")
-                else "pyproject.toml\n"
-                if args == ("diff", "--name-only", update.local_commit, update.remote_commit)
-                else None
-            ),
+            side_effect=lambda *args: "pyproject.toml\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
         ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
             "src.self_update.subprocess.run",
         ) as run_mock:
@@ -146,8 +151,8 @@ class SelfUpdateTests(unittest.TestCase):
             remote_commit="aaaaaaa222222333333444444555556666666777",
         )
         with patch("src.self_update.available_update", return_value=update), patch(
-            "src.self_update._git_output",
-            side_effect=lambda *args: " M src/app.py" if args == ("status", "--porcelain") else None,
+            "src.self_update._has_tracked_changes",
+            return_value=True,
         ):
             with self.assertRaisesRegex(
                 RuntimeError,
@@ -163,8 +168,8 @@ class SelfUpdateTests(unittest.TestCase):
             remote_commit="aaaaaaa222222333333444444555556666666777",
         )
         with patch("src.self_update.available_update", return_value=update), patch(
-            "src.self_update._git_output",
-            return_value="",
+            "src.self_update._has_tracked_changes",
+            return_value=False,
         ), patch(
             "src.self_update._sync_managed_llama_cpp_after_update",
             return_value=None,
@@ -186,14 +191,11 @@ class SelfUpdateTests(unittest.TestCase):
             remote_commit="aaaaaaa222222333333444444555556666666777",
         )
         with patch("src.self_update.available_update", return_value=update), patch(
+            "src.self_update._has_tracked_changes",
+            return_value=False,
+        ), patch(
             "src.self_update._git_output",
-            side_effect=lambda *args: (
-                ""
-                if args == ("status", "--porcelain")
-                else "src/app.py\n"
-                if args == ("diff", "--name-only", update.local_commit, update.remote_commit)
-                else None
-            ),
+            side_effect=lambda *args: "src/app.py\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
         ), patch(
             "src.self_update._sync_managed_llama_cpp_after_update",
             return_value="cad2d38",

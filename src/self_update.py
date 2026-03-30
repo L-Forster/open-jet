@@ -71,6 +71,20 @@ def _git_capture(*args: str) -> str | None:
     return result.stdout.strip()
 
 
+def _has_tracked_changes(cwd: Path) -> bool | None:
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return bool(result.stdout.strip())
+
+
 def _llama_git_output(cwd: Path, *args: str) -> str | None:
     try:
         result = subprocess.run(
@@ -93,10 +107,10 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     if not git_dir.is_dir():
         return None
 
-    status = _llama_git_output(LLAMA_CPP_DIR, "status", "--porcelain")
+    status = _has_tracked_changes(LLAMA_CPP_DIR)
     if status is None:
         raise RuntimeError("Failed to inspect managed llama.cpp checkout before update.")
-    if status.strip():
+    if status:
         raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
 
     target_ref = managed_llama_cpp_ref()
@@ -199,10 +213,10 @@ def available_update(*, current_version: str | None = None, timeout_seconds: flo
 
 def install_update(update: RepoUpdateInfo, *, current_version: str | None = None) -> str:
     del current_version
-    status = _git_output("status", "--porcelain")
+    status = _has_tracked_changes(_REPO_ROOT)
     if status is None:
         raise RuntimeError("Failed to inspect repo status before update.")
-    if status.strip():
+    if status:
         raise RuntimeError("Cannot update repo checkout with local changes. Commit or stash them first.")
     reinstall_required = _update_requires_install(update)
     try:
