@@ -8,30 +8,69 @@ from src.self_update import RepoUpdateInfo, available_update, update_from_latest
 
 
 class SelfUpdateTests(unittest.TestCase):
+    def test_available_update_prefers_current_upstream_branch_over_origin_head(self) -> None:
+        def fake_git_output(*args: str) -> str | None:
+            if args == ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"):
+                return "origin/main"
+            if args == ("rev-parse", "HEAD"):
+                return "1111111222222333333444444555555666666777"
+            if args == ("rev-parse", "FETCH_HEAD"):
+                return "aaaaaaa222222333333444444555556666666777"
+            raise AssertionError(args)
+
+        with patch("src.self_update._git_output", side_effect=fake_git_output), patch(
+            "src.self_update._git_capture",
+            return_value="",
+        ), patch(
+            "src.self_update._git_ok",
+            return_value=True,
+        ):
+            update = available_update()
+
+        self.assertEqual(
+            update,
+            RepoUpdateInfo(
+                remote="origin",
+                branch="main",
+                local_commit="1111111222222333333444444555555666666777",
+                remote_commit="aaaaaaa222222333333444444555556666666777",
+            ),
+        )
+
     def test_available_update_skips_when_remote_matches_head(self) -> None:
         def fake_git_output(*args: str) -> str | None:
+            if args == ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"):
+                return None
             if args == ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"):
                 return "refs/remotes/origin/master"
             if args == ("rev-parse", "HEAD"):
                 return "1111111222222333333444444555555666666777"
-            if args == ("ls-remote", "--heads", "origin", "master"):
-                return "1111111222222333333444444555555666666777\trefs/heads/master"
+            if args == ("rev-parse", "FETCH_HEAD"):
+                return "1111111222222333333444444555555666666777"
             raise AssertionError(args)
 
-        with patch("src.self_update._git_output", side_effect=fake_git_output):
+        with patch("src.self_update._git_output", side_effect=fake_git_output), patch(
+            "src.self_update._git_capture",
+            return_value="",
+        ):
             self.assertIsNone(available_update())
 
     def test_available_update_returns_remote_commit_when_head_is_behind(self) -> None:
         def fake_git_output(*args: str) -> str | None:
+            if args == ("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"):
+                return None
             if args == ("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"):
                 return "refs/remotes/origin/master"
             if args == ("rev-parse", "HEAD"):
                 return "1111111222222333333444444555555666666777"
-            if args == ("ls-remote", "--heads", "origin", "master"):
-                return "aaaaaaa222222333333444444555556666666777\trefs/heads/master"
+            if args == ("rev-parse", "FETCH_HEAD"):
+                return "aaaaaaa222222333333444444555556666666777"
             raise AssertionError(args)
 
         with patch("src.self_update._git_output", side_effect=fake_git_output), patch(
+            "src.self_update._git_capture",
+            return_value="",
+        ), patch(
             "src.self_update._git_ok",
             return_value=True,
         ):

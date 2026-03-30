@@ -58,6 +58,20 @@ def _git_ok(*args: str) -> bool:
     return result.returncode == 0
 
 
+def _git_capture(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=_REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
+
+
 def _changed_files(base: str, head: str) -> list[str] | None:
     output = _git_output("diff", "--name-only", base, head)
     if output is None:
@@ -73,6 +87,11 @@ def _update_requires_install(update: RepoUpdateInfo) -> bool:
 
 
 def _repo_tracking_target() -> tuple[str, str] | None:
+    upstream = _git_output("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if upstream:
+        remote, _, branch = upstream.partition("/")
+        if remote and branch:
+            return remote, branch
     ref = _git_output("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
     if not ref:
         return None
@@ -92,8 +111,10 @@ def available_update(*, current_version: str | None = None, timeout_seconds: flo
     if target is None:
         return None
     remote, branch = target
+    if _git_capture("fetch", "--quiet", remote, branch) is None:
+        return None
     local_commit = _git_output("rev-parse", "HEAD")
-    remote_commit = _git_output("ls-remote", "--heads", remote, branch)
+    remote_commit = _git_output("rev-parse", "FETCH_HEAD")
     if not local_commit or not remote_commit:
         return None
     remote_sha = remote_commit.split()[0].strip()
