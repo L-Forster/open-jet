@@ -1600,7 +1600,12 @@ class LlamaServerStartupTests(unittest.TestCase):
     def test_startup_profile_uses_fit_off_and_no_warmup_when_fragmented(self) -> None:
         profile = LlamaServerClient._startup_profile_for_lfb(4.0)
 
-        self.assertEqual(profile, (128, 32, True, True))
+        self.assertEqual(profile, (128, 32, True, True, True))
+
+    def test_startup_profile_uses_llama_defaults_when_memory_is_not_fragmented(self) -> None:
+        profile = LlamaServerClient._startup_profile_for_lfb(None)
+
+        self.assertEqual(profile, (2048, 512, False, False, False))
 
 
 class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
@@ -1714,6 +1719,7 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
                     ubatch=32,
                     fit_off=True,
                     no_warmup=False,
+                    no_mmap=True,
                 )
 
         self.assertTrue(any(name == "runtime_llama_start_failed" for name, _ in events))

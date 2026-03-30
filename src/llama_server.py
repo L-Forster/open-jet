@@ -215,10 +215,12 @@ class LlamaServerClient:
         return snapshot
 
     @staticmethod
-    def _startup_profile_for_lfb(lfb_mb: float | None) -> tuple[int, int, bool, bool]:
+    def _startup_profile_for_lfb(lfb_mb: float | None) -> tuple[int, int, bool, bool, bool]:
         if lfb_mb is not None and lfb_mb < _FRAGMENTED_LFB_MB:
-            return (128, 32, True, True)
-        return (128, 32, True, False)
+            return (128, 32, True, True, True)
+        # Match llama.cpp's normal defaults unless we detect fragmentation severe
+        # enough to warrant the small-footprint startup path.
+        return (2048, 512, False, False, False)
 
     async def _prepare_memory_for_launch(self) -> float | None:
         lfb_mb = self._largest_free_block_mb()
@@ -259,7 +261,7 @@ class LlamaServerClient:
             lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
             requested_ngl = self.gpu_layers if resolved_device in ("cuda", "vulkan", "rocm", "metal") else 0
             requested_ctx = self.context_window_tokens
-            batch, ubatch, fit_off, no_warmup = self._startup_profile_for_lfb(lfb_mb)
+            batch, ubatch, fit_off, no_warmup, no_mmap = self._startup_profile_for_lfb(lfb_mb)
             startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
             self._emit_diagnostic(
                 "runtime_llama_starting",
@@ -271,6 +273,7 @@ class LlamaServerClient:
                 ubatch=ubatch,
                 fit_off=fit_off,
                 no_warmup=no_warmup,
+                no_mmap=no_mmap,
                 jetson_platform=self._is_jetson_platform(),
                 airgapped=self.airgapped,
                 **startup_snapshot,
@@ -284,6 +287,7 @@ class LlamaServerClient:
                 ubatch=ubatch,
                 fit_off=fit_off,
                 no_warmup=no_warmup,
+                no_mmap=no_mmap,
             )
             self.gpu_layers = requested_ngl
             self.context_window_tokens = requested_ctx
@@ -299,6 +303,7 @@ class LlamaServerClient:
         ubatch: int,
         fit_off: bool,
         no_warmup: bool,
+        no_mmap: bool,
     ) -> None:
         # Ensure swap state directory exists for KV cache save/restore.
         slot_save_dir = Path(".openjet/state/swap")
@@ -313,10 +318,11 @@ class LlamaServerClient:
             str(self.port),
             "--parallel",
             "1",
-            "--no-mmap",
             "--slot-save-path",
             str(slot_save_dir.resolve()),
         ]
+        if no_mmap:
+            cmd.append("--no-mmap")
         if fit_off:
             cmd.extend(["--fit", "off"])
         if no_warmup:
@@ -343,6 +349,7 @@ class LlamaServerClient:
             ubatch=ubatch,
             fit_off=fit_off,
             no_warmup=no_warmup,
+            no_mmap=no_mmap,
             cuda_module_loading=env.get("CUDA_MODULE_LOADING", ""),
             ggml_cuda_enable_unified_memory=env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY", ""),
             ggml_cuda_vmm_chunk_mb=env.get("GGML_CUDA_VMM_CHUNK_MB", ""),
