@@ -51,8 +51,8 @@ clean_inplace_extensions
 if [ ! -f "${VENV_DIR}/bin/python" ]; then
   create_virtualenv
   "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
-  "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 fi
+"${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
 
 RUN_PIP_INSTALL=1
 INSTALL_REASON="fresh install mode"
