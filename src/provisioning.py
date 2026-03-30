@@ -28,7 +28,7 @@ BIN_DIR = OPENJET_HOME / "bin"
 LLAMA_CPP_DIR = Path.home() / "llama.cpp"
 LLAMA_SERVER_BIN = BIN_DIR / "llama-server"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
-LLAMA_CPP_PINNED_REF = "cad2d38"
+LLAMA_CPP_PINNED_REF = "64ac9ab6"
 
 
 def managed_llama_cpp_ref() -> str:
