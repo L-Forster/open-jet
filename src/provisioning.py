@@ -27,6 +27,13 @@ MODELS_DIR = OPENJET_HOME / "models"
 BIN_DIR = OPENJET_HOME / "bin"
 LLAMA_CPP_DIR = Path.home() / "llama.cpp"
 LLAMA_SERVER_BIN = BIN_DIR / "llama-server"
+LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
+LLAMA_CPP_PINNED_REF = "cad2d38"
+
+
+def managed_llama_cpp_ref() -> str:
+    ref = os.environ.get("OPENJET_LLAMA_CPP_REF", "").strip()
+    return ref or LLAMA_CPP_PINNED_REF
 
 def recommend_direct_model(
     hardware_info: HardwareInfo,
@@ -103,6 +110,53 @@ def _needs_rebuild(hardware_info: HardwareInfo, existing_binary: str) -> bool:
     return False
 
 
+async def _sync_managed_llama_cpp_checkout(
+    *,
+    log: Any,
+    set_status: Callable[[str], None],
+    clear_status: Callable[[], None],
+) -> str:
+    target_ref = managed_llama_cpp_ref()
+    repo_exists = (LLAMA_CPP_DIR / ".git").is_dir()
+
+    if not repo_exists and LLAMA_CPP_DIR.exists():
+        raise RuntimeError(f"{LLAMA_CPP_DIR} exists but is not a git checkout.")
+
+    if not repo_exists:
+        set_status("cloning llama.cpp")
+        log.write("  [dim]Cloning llama.cpp...[/]")
+        rc, out, err = await _run_exec(
+            "git",
+            "clone",
+            LLAMA_CPP_REPO_URL,
+            str(LLAMA_CPP_DIR),
+        )
+        if rc != 0:
+            clear_status()
+            raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
+    else:
+        rc, out, err = await _run_exec("git", "status", "--porcelain", cwd=LLAMA_CPP_DIR)
+        if rc != 0:
+            clear_status()
+            raise RuntimeError((err or out).strip() or "Failed to inspect llama.cpp checkout.")
+        if out.strip():
+            clear_status()
+            raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
+
+    set_status("fetching llama.cpp")
+    log.write("  [dim]Fetching llama.cpp refs...[/]")
+    rc, out, err = await _run_exec("git", "fetch", "--tags", "--prune", "origin", cwd=LLAMA_CPP_DIR)
+    if rc != 0:
+        clear_status()
+        raise RuntimeError((err or out).strip() or "Failed to fetch llama.cpp")
+
+    rc, out, err = await _run_exec("git", "checkout", "--detach", target_ref, cwd=LLAMA_CPP_DIR)
+    if rc != 0:
+        clear_status()
+        raise RuntimeError((err or out).strip() or f"Failed to checkout llama.cpp ref {target_ref}.")
+    return target_ref
+
+
 async def ensure_llama_server(
     setup_result: dict[str, Any],
     *,
@@ -112,7 +166,19 @@ async def ensure_llama_server(
     clear_status: Callable[[], None],
 ) -> dict[str, Any]:
     existing = current_llama_server_path()
-    if existing and not _needs_rebuild(hardware_info, existing):
+    managed_binary = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
+    existing_is_managed = existing is not None and Path(existing).resolve() == managed_binary.resolve()
+
+    target_ref = managed_llama_cpp_ref()
+    current_managed_ref = None
+    if (LLAMA_CPP_DIR / ".git").is_dir():
+        rc, out, _err = await _run_exec("git", "rev-parse", "HEAD", cwd=LLAMA_CPP_DIR)
+        if rc == 0:
+            current_managed_ref = out.strip()
+
+    managed_ref_mismatch = existing_is_managed and current_managed_ref not in {None, target_ref}
+
+    if existing and not _needs_rebuild(hardware_info, existing) and not managed_ref_mismatch:
         merged = dict(setup_result)
         merged["llama_server_path"] = existing
         merged["setup_missing_runtime"] = False
@@ -125,20 +191,11 @@ async def ensure_llama_server(
     else:
         set_status("provisioning llama-server")
         log.write("[bold bright_white]Provisioning llama-server...[/]")
-    if not LLAMA_CPP_DIR.exists():
-        set_status("cloning llama.cpp")
-        log.write("  [dim]Cloning llama.cpp...[/]")
-        rc, out, err = await _run_exec(
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "https://github.com/ggerganov/llama.cpp.git",
-            str(LLAMA_CPP_DIR),
-        )
-        if rc != 0:
-            clear_status()
-            raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
+    synced_ref = await _sync_managed_llama_cpp_checkout(
+        log=log,
+        set_status=set_status,
+        clear_status=clear_status,
+    )
 
     build_dir = LLAMA_CPP_DIR / "build"
     if rebuilding and build_dir.exists():
@@ -164,6 +221,7 @@ async def ensure_llama_server(
     merged = dict(setup_result)
     merged["llama_server_path"] = str(built)
     merged["setup_missing_runtime"] = False
+    merged["llama_cpp_ref"] = synced_ref
     return merged
 
 

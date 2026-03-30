@@ -5,7 +5,6 @@ import os
 import subprocess
 from pathlib import Path
 
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INSTALL_SCRIPT = _REPO_ROOT / "install.sh"
 _INSTALL_RELEVANT_FILES = {
@@ -70,6 +69,75 @@ def _git_capture(*args: str) -> str | None:
     except (OSError, subprocess.CalledProcessError):
         return None
     return result.stdout.strip()
+
+
+def _llama_git_output(cwd: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
+
+
+def _sync_managed_llama_cpp_after_update() -> str | None:
+    from .hardware import detect_hardware_info
+    from .provisioning import LLAMA_CPP_DIR, _llama_cmake_args, _needs_rebuild, managed_llama_cpp_ref
+
+    git_dir = LLAMA_CPP_DIR / ".git"
+    if not git_dir.is_dir():
+        return None
+
+    status = _llama_git_output(LLAMA_CPP_DIR, "status", "--porcelain")
+    if status is None:
+        raise RuntimeError("Failed to inspect managed llama.cpp checkout before update.")
+    if status.strip():
+        raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
+
+    target_ref = managed_llama_cpp_ref()
+    current_ref = _llama_git_output(LLAMA_CPP_DIR, "rev-parse", "HEAD")
+    if current_ref is None:
+        raise RuntimeError("Failed to read managed llama.cpp revision before update.")
+
+    binary = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
+    hardware_info = detect_hardware_info()
+    needs_rebuild = not binary.is_file() or _needs_rebuild(hardware_info, str(binary))
+    if current_ref == target_ref and not needs_rebuild:
+        return None
+
+    try:
+        subprocess.run(
+            ["git", "fetch", "--tags", "--prune", "origin"],
+            cwd=LLAMA_CPP_DIR,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--detach", target_ref],
+            cwd=LLAMA_CPP_DIR,
+            check=True,
+        )
+        build_dir = LLAMA_CPP_DIR / "build"
+        build_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            _llama_cmake_args(hardware_info),
+            cwd=build_dir,
+            check=True,
+        )
+        subprocess.run(
+            ["cmake", "--build", ".", "--target", "llama-server", "-j4"],
+            cwd=build_dir,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Failed to sync managed llama.cpp checkout to {target_ref[:7]}."
+        ) from exc
+    return target_ref[:7]
 
 
 def _changed_files(base: str, head: str) -> list[str] | None:
@@ -153,11 +221,15 @@ def install_update(update: RepoUpdateInfo, *, current_version: str | None = None
             },
             check=True,
         )
+        llama_ref = _sync_managed_llama_cpp_after_update()
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"Failed to update repo checkout from {update.local_short} to {update.remote_short}."
         ) from exc
-    return f"Updated open-jet repo from {update.local_short} to {update.remote_short}."
+    message = f"Updated open-jet repo from {update.local_short} to {update.remote_short}."
+    if llama_ref:
+        message += f" Synced managed llama.cpp to {llama_ref}."
+    return message
 
 
 def update_from_latest_release(*, current_version: str | None = None) -> str:

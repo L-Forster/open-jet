@@ -102,7 +102,9 @@ class SelfUpdateTests(unittest.TestCase):
                 if args == ("diff", "--name-only", update.local_commit, update.remote_commit)
                 else None
             ),
-        ), patch("src.self_update.subprocess.run") as run_mock:
+        ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
+            "src.self_update.subprocess.run",
+        ) as run_mock:
             message = update_from_latest_release(current_version="0.3.0")
 
         self.assertEqual(message, "Updated open-jet repo from 1111111 to aaaaaaa.")
@@ -128,7 +130,9 @@ class SelfUpdateTests(unittest.TestCase):
                 if args == ("diff", "--name-only", update.local_commit, update.remote_commit)
                 else None
             ),
-        ), patch("src.self_update.subprocess.run") as run_mock:
+        ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
+            "src.self_update.subprocess.run",
+        ) as run_mock:
             message = update_from_latest_release(current_version="0.3.0")
 
         self.assertEqual(message, "Updated open-jet repo from 1111111 to aaaaaaa.")
@@ -162,6 +166,9 @@ class SelfUpdateTests(unittest.TestCase):
             "src.self_update._git_output",
             return_value="",
         ), patch(
+            "src.self_update._sync_managed_llama_cpp_after_update",
+            return_value=None,
+        ), patch(
             "src.self_update.subprocess.run",
             side_effect=subprocess.CalledProcessError(1, ["git"]),
         ):
@@ -170,3 +177,32 @@ class SelfUpdateTests(unittest.TestCase):
                 "Failed to update repo checkout from 1111111 to aaaaaaa.",
             ):
                 update_from_latest_release(current_version="0.3.0")
+
+    def test_update_from_latest_release_syncs_managed_llama_cpp_when_present(self) -> None:
+        update = RepoUpdateInfo(
+            remote="origin",
+            branch="master",
+            local_commit="1111111222222333333444444555555666666777",
+            remote_commit="aaaaaaa222222333333444444555556666666777",
+        )
+        with patch("src.self_update.available_update", return_value=update), patch(
+            "src.self_update._git_output",
+            side_effect=lambda *args: (
+                ""
+                if args == ("status", "--porcelain")
+                else "src/app.py\n"
+                if args == ("diff", "--name-only", update.local_commit, update.remote_commit)
+                else None
+            ),
+        ), patch(
+            "src.self_update._sync_managed_llama_cpp_after_update",
+            return_value="cad2d38",
+        ) as sync_llama, patch("src.self_update.subprocess.run") as run_mock:
+            message = update_from_latest_release(current_version="0.3.0")
+
+        self.assertEqual(
+            message,
+            "Updated open-jet repo from 1111111 to aaaaaaa. Synced managed llama.cpp to cad2d38.",
+        )
+        sync_llama.assert_called_once_with()
+        self.assertEqual(run_mock.call_count, 2)
