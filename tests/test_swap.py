@@ -340,6 +340,7 @@ class LlamaServerKvCacheTests(unittest.IsolatedAsyncioTestCase):
         client = LlamaServerClient.__new__(LlamaServerClient)
         client.base_url = "http://127.0.0.1:8080"
         client._diagnostics_hook = None
+        client._proc = Mock(returncode=None)
 
         mock_http = AsyncMock()
         mock_response = Mock()
@@ -361,6 +362,7 @@ class LlamaServerKvCacheTests(unittest.IsolatedAsyncioTestCase):
         client = LlamaServerClient.__new__(LlamaServerClient)
         client.base_url = "http://127.0.0.1:8080"
         client._diagnostics_hook = None
+        client._proc = Mock(returncode=None)
 
         mock_http = AsyncMock()
         mock_response = Mock()
@@ -380,6 +382,7 @@ class LlamaServerKvCacheTests(unittest.IsolatedAsyncioTestCase):
         client = LlamaServerClient.__new__(LlamaServerClient)
         client.base_url = "http://127.0.0.1:8080"
         client._diagnostics_hook = None
+        client._proc = Mock(returncode=None)
 
         mock_http = AsyncMock()
         mock_http.post.side_effect = Exception("connection refused")
@@ -394,6 +397,7 @@ class LlamaServerKvCacheTests(unittest.IsolatedAsyncioTestCase):
         client = LlamaServerClient.__new__(LlamaServerClient)
         client.base_url = "http://127.0.0.1:8080"
         client._diagnostics_hook = None
+        client._proc = Mock(returncode=None)
 
         mock_http = AsyncMock()
         mock_response = Mock()
@@ -403,6 +407,59 @@ class LlamaServerKvCacheTests(unittest.IsolatedAsyncioTestCase):
 
         ok = await client.save_kv_cache(Path("/tmp/kv.bin"))
         self.assertFalse(ok)
+
+    async def test_chat_stream_starts_runtime_on_first_use(self) -> None:
+        from src.llama_server import LlamaServerClient
+
+        client = LlamaServerClient(model="model.gguf")
+        client._http = AsyncMock()
+        client._http.aclose = AsyncMock()
+        client._proc = None
+
+        async def _fake_stream_openai_chat(*args, **kwargs):
+            yield Mock(text="hello", tool_calls=[], done=False)
+            yield Mock(text="", tool_calls=[], done=True)
+
+        with patch.object(client, "start", AsyncMock()) as start, patch(
+            "src.llama_server.stream_openai_chat",
+            side_effect=_fake_stream_openai_chat,
+        ):
+            chunks = [chunk async for chunk in client.chat_stream([{"role": "user", "content": "hi"}])]
+
+        self.assertEqual(len(chunks), 2)
+        start.assert_awaited_once()
+        await client.close()
+
+    async def test_reset_kv_cache_does_not_start_unloaded_runtime(self) -> None:
+        from src.llama_server import LlamaServerClient
+
+        client = LlamaServerClient(model="model.gguf")
+        client._http = AsyncMock()
+        client._http.aclose = AsyncMock()
+        client._proc = None
+
+        with patch.object(client, "start", AsyncMock()) as start, patch.object(
+            client, "_stop_server", AsyncMock()
+        ) as stop_server:
+            await client.reset_kv_cache()
+
+        start.assert_not_awaited()
+        stop_server.assert_not_awaited()
+        await client.close()
+
+    async def test_save_kv_cache_returns_false_when_runtime_unloaded(self) -> None:
+        from src.llama_server import LlamaServerClient
+
+        client = LlamaServerClient(model="model.gguf")
+        client._http = AsyncMock()
+        client._http.aclose = AsyncMock()
+        client._proc = None
+
+        ok = await client.save_kv_cache(Path("/tmp/kv.bin"))
+
+        self.assertFalse(ok)
+        client._http.post.assert_not_called()
+        await client.close()
 
 
 # ---------------------------------------------------------------------------

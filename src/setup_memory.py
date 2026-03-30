@@ -197,17 +197,22 @@ def recommend_setup_context_window(
     device: str,
     fallback_tokens: int,
     model_refs: Iterable[object],
+    total_vram_mb: float | None = None,
 ) -> int:
     fallback = max(_CTX_OPTIONS[0], int(fallback_tokens))
     if str(runtime or "").strip().lower() != "llama_cpp":
         return fallback
 
-    free_vram_mb = detect_free_accelerator_memory_mb(device)
-    if free_vram_mb is None:
-        return fallback
-
     model_mb = estimate_model_memory_mb(*list(model_refs))
     if model_mb is None:
+        return fallback
+
+    normalized = str(device or "").strip().lower()
+    if normalized in {"cuda", "vulkan", "rocm"} and total_vram_mb is not None and total_vram_mb > 0:
+        return recommend_context_window_from_remaining_vram_mb(float(total_vram_mb) - model_mb)
+
+    free_vram_mb = detect_free_accelerator_memory_mb(device)
+    if free_vram_mb is None:
         return fallback
 
     return recommend_context_window_from_remaining_vram_mb(free_vram_mb - model_mb)

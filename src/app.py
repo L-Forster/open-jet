@@ -678,7 +678,6 @@ class OpenJetApp:
         self.client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
         if self.client.gpu_layers == 0:
             configured_gpu_layers = 0
-        await self.client.start()
         if self.client.context_window_tokens != configured_ctx or self.client.gpu_layers != configured_gpu_layers:
             self.cfg["context_window_tokens"] = self.client.context_window_tokens
             self.cfg["gpu_layers"] = self.client.gpu_layers

@@ -89,7 +89,6 @@ class OpenJetSession:
         set_airgapped(bool(resolved_cfg["airgapped"]))
         client = create_runtime_client(resolved_cfg)
         mem_cfg = resolved_cfg.get("memory_guard", {})
-        await client.start()
         agent = Agent(
             client=client,
             system_prompt=await build_system_prompt(

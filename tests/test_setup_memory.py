@@ -53,19 +53,32 @@ class SetupMemoryTests(unittest.TestCase):
 
         self.assertEqual(free_mb, 5120.0)
 
-    def test_recommend_setup_context_window_uses_remaining_vram_after_model(self) -> None:
+    def test_recommend_setup_context_window_subtracts_model_from_total_vram_for_discrete_gpu(self) -> None:
         with patch("src.setup_memory.detect_free_accelerator_memory_mb", return_value=8192.0), patch(
             "src.setup_memory.estimate_model_memory_mb",
-            return_value=5120.0,
+            return_value=15360.0,
         ):
             recommended = recommend_setup_context_window(
                 runtime="llama_cpp",
                 device="cuda",
                 fallback_tokens=8192,
                 model_refs=["/models/Qwen3.5-9B-Q4_K_M.gguf"],
+                total_vram_mb=24576.0,
             )
 
-        self.assertEqual(recommended, 4096)
+        self.assertEqual(recommended, 12288)
+
+    def test_recommend_setup_context_window_handles_user_reported_remaining_vram_case(self) -> None:
+        with patch("src.setup_memory.estimate_model_memory_mb", return_value=15360.0):
+            recommended = recommend_setup_context_window(
+                runtime="llama_cpp",
+                device="cuda",
+                fallback_tokens=6144,
+                model_refs=["/root/.openjet/models/Qwen_Qwen3.5-27B-Q4_K_M.gguf"],
+                total_vram_mb=24576.0,
+            )
+
+        self.assertEqual(recommended, 12288)
 
     def test_recommend_context_window_from_remaining_vram_mb_has_small_floor(self) -> None:
         self.assertEqual(recommend_context_window_from_remaining_vram_mb(-1), 1024)
@@ -113,3 +126,34 @@ class SetupSourceIntegrationTests(unittest.TestCase):
         self.assertEqual(call.kwargs["runtime"], "llama_cpp")
         self.assertEqual(call.kwargs["device"], "cuda")
         self.assertIn("/models/demo.gguf", call.kwargs["model_refs"])
+        self.assertEqual(call.kwargs["total_vram_mb"], hardware.vram_mb)
+
+    def test_build_recommended_payload_passes_detected_total_vram_to_setup_memory(self) -> None:
+        hardware = setup_source.HardwareInfo(
+            label="CUDA-capable device",
+            total_ram_gb=32.0,
+            has_cuda=True,
+            vram_mb=24576.0,
+        )
+
+        with patch.object(setup_source, "discover_model_files", return_value=[]), patch.object(
+            setup_source,
+            "_discover_llama_server",
+            return_value="/usr/bin/llama-server",
+        ), patch.object(
+            setup_source,
+            "recommended_gpu_layers",
+            return_value=99,
+        ), patch.object(
+            setup_source,
+            "recommend_setup_context_window",
+            return_value=12288,
+        ) as recommend_ctx:
+            payload = setup_source.build_recommended_payload(
+                hardware_info=hardware,
+                recommended_ctx=6144,
+                current_cfg={},
+            )
+
+        self.assertEqual(payload["context_window_tokens"], 12288)
+        self.assertEqual(recommend_ctx.call_args.kwargs["total_vram_mb"], 24576.0)

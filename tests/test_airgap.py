@@ -151,7 +151,7 @@ class SDKAirgapTests(AirgapBaseTestCase):
 
             self.assertTrue(session.airgapped)
             self.assertTrue(create_client.call_args.args[0]["airgapped"])
-            fake_client.start.assert_awaited_once()
+            fake_client.start.assert_not_awaited()
 
         asyncio.run(_run())
 

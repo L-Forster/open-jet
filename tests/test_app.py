@@ -96,6 +96,27 @@ class FakeRuntimeClient:
         yield StreamChunk(done=True)
 
 
+class FakeInitClient:
+    model = "fake.gguf"
+    context_window_tokens = 4096
+    gpu_layers = 99
+
+    def __init__(self) -> None:
+        self.start = AsyncMock()
+        self.close = AsyncMock()
+        self.reset_kv_cache = AsyncMock()
+
+    async def chat_stream(self, messages, *, use_tools=True):
+        if False:
+            yield messages, use_tools
+
+    async def save_kv_cache(self, path):
+        return False
+
+    async def restore_kv_cache(self, path):
+        return False
+
+
 class StopSetupWizard(Exception):
     pass
 
@@ -183,6 +204,22 @@ class AppStatusTests(unittest.TestCase):
         self.assertIn("Generating...", prompt.value)
         self.assertIn("prompt-splash-block-", prompt.value)
         self.assertIn("open-jet", prompt.value)
+
+    def test_init_client_does_not_eagerly_start_runtime(self) -> None:
+        app = OpenJetApp()
+        fake_client = FakeInitClient()
+
+        async def _run() -> None:
+            with patch("src.app.create_runtime_client", return_value=fake_client), patch(
+                "src.app.build_system_prompt",
+                new=AsyncMock(return_value="system"),
+            ):
+                await app._init_client()
+
+        asyncio.run(_run())
+
+        fake_client.start.assert_not_awaited()
+        self.assertIsNotNone(app.agent)
 
     def test_tool_output_line_highlights_shell_commands(self) -> None:
         app = OpenJetApp()

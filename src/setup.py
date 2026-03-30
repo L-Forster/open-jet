@@ -399,6 +399,7 @@ def build_recommended_payload(
         device=device,
         fallback_tokens=fallback_ctx,
         model_refs=_setup_model_refs(payload),
+        total_vram_mb=effective_hw.vram_mb,
     )
     payload["gpu_layers"] = (
         _current_int(current_cfg, "gpu_layers")
@@ -578,6 +579,7 @@ async def run_setup_wizard(
         device=device,
         fallback_tokens=fallback_ctx,
         model_refs=_setup_model_refs(payload),
+        total_vram_mb=effective_hw.vram_mb,
     )
     context_default = _current_int(current_cfg, "context_window_tokens") or recommended_ctx_value
     if setup_mode != "manual":

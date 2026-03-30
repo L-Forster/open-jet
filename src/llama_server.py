@@ -56,6 +56,7 @@ class LlamaServerClient:
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=120.0)
         self._proc: asyncio.subprocess.Process | None = None
+        self._start_lock = asyncio.Lock()
         self.reasoning_mode = "default"
         self._diagnostics_hook = diagnostics_hook
 
@@ -230,59 +231,62 @@ class LlamaServerClient:
         return lfb_mb
 
     async def start(self) -> None:
-        assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
-        await self._stop_server()
-        await self._cleanup_stale_inference_processes()
-        self._ensure_jetson_clocks_sudoers()
-        self._maximize_gpu_clocks()
-        binary = _find_llama_server()
-        env = os.environ.copy()
-        apply_airgap_env(env, enabled=self.airgapped)
-        bin_dir = os.path.dirname(binary)
-        env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
-        # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
-        # need physically contiguous pages for large allocations.
-        env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
-        env.setdefault("CUDA_MODULE_LOADING", "LAZY")
+        async with self._start_lock:
+            if self._proc and self._proc.returncode is None:
+                return
+            assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
+            await self._stop_server()
+            await self._cleanup_stale_inference_processes()
+            self._ensure_jetson_clocks_sudoers()
+            self._maximize_gpu_clocks()
+            binary = _find_llama_server()
+            env = os.environ.copy()
+            apply_airgap_env(env, enabled=self.airgapped)
+            bin_dir = os.path.dirname(binary)
+            env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
+            # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
+            # need physically contiguous pages for large allocations.
+            env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
+            env.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
-        resolved_device = self._resolve_device()
-        if resolved_device == "cuda" and self._is_jetson_platform():
-            # Jetson can fail large unified-memory allocations even when total
-            # RAM is available. A patched llama.cpp build uses these knobs to
-            # back CUDA/VMM buffers with 1 MiB chunks and smaller VA reserves.
-            env.setdefault("GGML_CUDA_VMM_CHUNK_MB", _JETSON_VMM_CHUNK_MB)
-            env.setdefault("GGML_CUDA_VMM_RESERVE_MB", _JETSON_VMM_RESERVE_MB)
-        lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
-        requested_ngl = self.gpu_layers if resolved_device in ("cuda", "vulkan", "rocm", "metal") else 0
-        requested_ctx = self.context_window_tokens
-        batch, ubatch, fit_off, no_warmup = self._startup_profile_for_lfb(lfb_mb)
-        startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
-        self._emit_diagnostic(
-            "runtime_llama_starting",
-            model=Path(self.model).name,
-            resolved_device=resolved_device,
-            requested_ctx=requested_ctx,
-            requested_ngl=requested_ngl,
-            batch=batch,
-            ubatch=ubatch,
-            fit_off=fit_off,
-            no_warmup=no_warmup,
-            jetson_platform=self._is_jetson_platform(),
-            airgapped=self.airgapped,
-            **startup_snapshot,
-        )
-        await self._start_once(
-            binary=binary,
-            env=env,
-            ngl=requested_ngl,
-            ctx=requested_ctx,
-            batch=batch,
-            ubatch=ubatch,
-            fit_off=fit_off,
-            no_warmup=no_warmup,
-        )
-        self.gpu_layers = requested_ngl
-        self.context_window_tokens = requested_ctx
+            resolved_device = self._resolve_device()
+            if resolved_device == "cuda" and self._is_jetson_platform():
+                # Jetson can fail large unified-memory allocations even when total
+                # RAM is available. A patched llama.cpp build uses these knobs to
+                # back CUDA/VMM buffers with 1 MiB chunks and smaller VA reserves.
+                env.setdefault("GGML_CUDA_VMM_CHUNK_MB", _JETSON_VMM_CHUNK_MB)
+                env.setdefault("GGML_CUDA_VMM_RESERVE_MB", _JETSON_VMM_RESERVE_MB)
+            lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
+            requested_ngl = self.gpu_layers if resolved_device in ("cuda", "vulkan", "rocm", "metal") else 0
+            requested_ctx = self.context_window_tokens
+            batch, ubatch, fit_off, no_warmup = self._startup_profile_for_lfb(lfb_mb)
+            startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
+            self._emit_diagnostic(
+                "runtime_llama_starting",
+                model=Path(self.model).name,
+                resolved_device=resolved_device,
+                requested_ctx=requested_ctx,
+                requested_ngl=requested_ngl,
+                batch=batch,
+                ubatch=ubatch,
+                fit_off=fit_off,
+                no_warmup=no_warmup,
+                jetson_platform=self._is_jetson_platform(),
+                airgapped=self.airgapped,
+                **startup_snapshot,
+            )
+            await self._start_once(
+                binary=binary,
+                env=env,
+                ngl=requested_ngl,
+                ctx=requested_ctx,
+                batch=batch,
+                ubatch=ubatch,
+                fit_off=fit_off,
+                no_warmup=no_warmup,
+            )
+            self.gpu_layers = requested_ngl
+            self.context_window_tokens = requested_ctx
 
     async def _start_once(
         self,
@@ -532,6 +536,9 @@ class LlamaServerClient:
 
     async def reset_kv_cache(self) -> None:
         # llama.cpp clears KV state on server restart.
+        proc = getattr(self, "_proc", None)
+        if not proc or proc.returncode is not None:
+            return
         await self._stop_server()
         await self.start()
 
@@ -556,6 +563,11 @@ class LlamaServerClient:
         The server resolves *filename* relative to ``--slot-save-path``,
         so we pass just the stem (filename without directory).
         """
+        proc = getattr(self, "_proc", None)
+        if proc is None:
+            return False
+        if proc.returncode is not None:
+            return False
         try:
             r = await self._http.post(
                 f"{self.base_url}/slots/0?action=save",
@@ -569,6 +581,11 @@ class LlamaServerClient:
 
     async def restore_kv_cache(self, path: Path) -> bool:
         """Restore KV cache for slot 0 from *path* via llama-server slot API."""
+        proc = getattr(self, "_proc", None)
+        if proc is None:
+            return False
+        if proc.returncode is not None:
+            return False
         try:
             r = await self._http.post(
                 f"{self.base_url}/slots/0?action=restore",
@@ -584,6 +601,7 @@ class LlamaServerClient:
         self, messages: list[dict], *, use_tools: bool = True
     ) -> AsyncIterator[StreamChunk]:
         assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
+        await self.start()
         extra_body: dict[str, object] | None = None
         if self.reasoning_mode == "on":
             extra_body = {
