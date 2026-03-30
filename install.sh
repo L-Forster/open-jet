@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="${ROOT_DIR}/.venv"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
+INSTALL_MODE="${OPENJET_INSTALL_MODE:-install}"
+UPDATE_REINSTALL="${OPENJET_UPDATE_REINSTALL:-0}"
 
 clean_inplace_extensions() {
   mapfile -t built_exts < <(find "${ROOT_DIR}/src" -maxdepth 1 \( -name '*.so' -o -name '*.pyd' \) -type f | sort)
@@ -41,14 +43,37 @@ if [ ! -f "${VENV_DIR}/bin/python" ]; then
   "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
   "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 fi
-OPENJET_BUILD_EXTENSIONS=0 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
 
-if "${VENV_DIR}/bin/python" - <<'PY'
+RUN_PIP_INSTALL=1
+INSTALL_REASON="fresh install mode"
+
+if [ "${INSTALL_MODE}" = "update" ]; then
+  INSTALL_REASON="editable package missing from virtualenv"
+  if [ -x "${VENV_DIR}/bin/openjet" ]; then
+    RUN_PIP_INSTALL=0
+    INSTALL_REASON="reusing existing editable install"
+  fi
+  if [ "${UPDATE_REINSTALL}" = "1" ]; then
+    RUN_PIP_INSTALL=1
+    INSTALL_REASON="update changed install requirements"
+  fi
+fi
+
+if [ "${RUN_PIP_INSTALL}" -eq 1 ]; then
+  echo "Refreshing editable install: ${INSTALL_REASON}"
+  OPENJET_BUILD_EXTENSIONS=0 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
+else
+  echo "Skipping pip install: ${INSTALL_REASON}"
+fi
+
+if [ "${INSTALL_MODE}" != "update" ] && "${VENV_DIR}/bin/python" - <<'PY'
 from src.observation.processors import provision_default_faster_whisper_model
 raise SystemExit(0 if provision_default_faster_whisper_model() else 1)
 PY
 then
   echo "Provisioned bundled local transcription assets"
+elif [ "${INSTALL_MODE}" = "update" ]; then
+  echo "Skipping transcription asset provisioning during update"
 else
   echo "warning: could not pre-provision local transcription assets; OpenJet will retry on first microphone use"
 fi
@@ -59,12 +84,12 @@ ln -sf "${VENV_DIR}/bin/openjet" "${LOCAL_BIN_DIR}/openjet"
 
 echo "Installed open-jet from ${ROOT_DIR}"
 echo "Install mode: editable Python source"
-echo "Launch with: open-jet --setup"
+echo "Launch with: openjet --setup"
 
 case ":${PATH}:" in
   *":${LOCAL_BIN_DIR}:"*) ;;
   *)
     echo "warning: ${LOCAL_BIN_DIR} is not on PATH"
-    echo "run with: ${LOCAL_BIN_DIR}/open-jet --setup"
+    echo "run with: ${LOCAL_BIN_DIR}/openjet --setup"
     ;;
 esac

@@ -30,6 +30,8 @@ open-jet version
 open-jet update
 ```
 
+`open-jet update` pulls the latest remote repo commit from the tracked branch.
+
 Persistent device setup:
 
 ```bash

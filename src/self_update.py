@@ -1,206 +1,146 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
+import os
 import subprocess
-import sys
-import tempfile
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
-
-import yaml
-
-from .config import CONFIG_PATH, normalize_config
-
-RELEASES_LATEST_URL = "https://api.github.com/repos/l-forster/open-jet/releases/latest"
-USER_AGENT = "open-jet-updater"
-DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS = 4.0
-DEFAULT_RELEASE_DOWNLOAD_TIMEOUT_SECONDS = 30.0
-_INSTALLED_RELEASE_STAMP = Path(__file__).resolve().parent.parent / ".installed_release"
 
 
-def _read_installed_release_version() -> str | None:
-    try:
-        return _INSTALLED_RELEASE_STAMP.read_text().strip() or None
-    except OSError:
-        return None
-
-
-def _write_installed_release_version(version: str) -> None:
-    try:
-        _INSTALLED_RELEASE_STAMP.write_text(version + "\n")
-    except OSError:
-        pass
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_INSTALL_SCRIPT = _REPO_ROOT / "install.sh"
+_INSTALL_RELEVANT_FILES = {
+    "pyproject.toml",
+    "setup.py",
+}
 
 
 @dataclass(frozen=True)
-class ReleaseInfo:
-    tag_name: str
-    version: str
-    tarball_url: str
+class RepoUpdateInfo:
+    remote: str
+    branch: str
+    local_commit: str
+    remote_commit: str
+
+    @property
+    def local_short(self) -> str:
+        return self.local_commit[:7]
+
+    @property
+    def remote_short(self) -> str:
+        return self.remote_commit[:7]
 
 
-def _active_config_snapshot() -> tuple[Path, str] | None:
-    for candidate in (Path("config.yaml"), CONFIG_PATH):
-        if candidate.exists():
-            return candidate, candidate.read_text()
-    return None
+def _git_output(*args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=_REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
 
 
-def _restore_config(snapshot: tuple[Path, str] | None) -> None:
-    if snapshot is None:
-        return
-    path, content = snapshot
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+def _git_ok(*args: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=_REPO_ROOT,
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
 
 
-def _load_yaml_dict(raw: str) -> dict[str, object]:
-    data = yaml.safe_load(raw) or {}
-    if not isinstance(data, dict):
-        raise RuntimeError("Config file must contain a YAML mapping at the top level.")
-    return data
+def _changed_files(base: str, head: str) -> list[str] | None:
+    output = _git_output("diff", "--name-only", base, head)
+    if output is None:
+        return None
+    return [line.strip() for line in output.splitlines() if line.strip()]
 
 
-def _deep_merge(base: dict[str, object], overlay: dict[str, object]) -> dict[str, object]:
-    merged = dict(base)
-    for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(
-                dict(merged[key]),
-                value,
-            )
-            continue
-        merged[key] = value
-    return merged
+def _update_requires_install(update: RepoUpdateInfo) -> bool:
+    changed_files = _changed_files(update.local_commit, update.remote_commit)
+    if changed_files is None:
+        return True
+    return any(path in _INSTALL_RELEVANT_FILES for path in changed_files)
 
 
-def _backup_path(path: Path, version: str) -> Path:
-    safe_version = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in version)
-    return path.with_name(f"{path.name}.bak.pre-update-{safe_version}")
+def _repo_tracking_target() -> tuple[str, str] | None:
+    ref = _git_output("symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+    if not ref:
+        return None
+    prefix = "refs/remotes/"
+    if not ref.startswith(prefix):
+        return None
+    tail = ref[len(prefix):]
+    remote, _, branch = tail.partition("/")
+    if not remote or not branch:
+        return None
+    return remote, branch
 
 
-def _preserve_user_config(snapshot: tuple[Path, str] | None, *, latest_version: str) -> None:
-    if snapshot is None:
-        return
-    path, previous_raw = snapshot
-    previous_cfg = _load_yaml_dict(previous_raw)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    backup = _backup_path(path, latest_version)
-    backup.write_text(previous_raw)
-
-    if path.exists():
-        current_raw = path.read_text()
-        current_cfg = _load_yaml_dict(current_raw)
-        merged_cfg = _deep_merge(current_cfg, previous_cfg)
-    else:
-        merged_cfg = previous_cfg
-
-    path.write_text(yaml.safe_dump(normalize_config(merged_cfg), sort_keys=False))
-
-
-def _latest_release(*, timeout_seconds: float = DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS) -> dict[str, object]:
-    request = Request(
-        RELEASES_LATEST_URL,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": USER_AGENT,
-        },
+def available_update(*, current_version: str | None = None, timeout_seconds: float = 0.0) -> RepoUpdateInfo | None:
+    del current_version, timeout_seconds
+    target = _repo_tracking_target()
+    if target is None:
+        return None
+    remote, branch = target
+    local_commit = _git_output("rev-parse", "HEAD")
+    remote_commit = _git_output("ls-remote", "--heads", remote, branch)
+    if not local_commit or not remote_commit:
+        return None
+    remote_sha = remote_commit.split()[0].strip()
+    if not remote_sha or local_commit == remote_sha:
+        return None
+    if not _git_ok("merge-base", "--is-ancestor", local_commit, remote_sha):
+        return None
+    return RepoUpdateInfo(
+        remote=remote,
+        branch=branch,
+        local_commit=local_commit,
+        remote_commit=remote_sha,
     )
+
+def install_update(update: RepoUpdateInfo, *, current_version: str | None = None) -> str:
+    del current_version
+    status = _git_output("status", "--porcelain")
+    if status is None:
+        raise RuntimeError("Failed to inspect repo status before update.")
+    if status.strip():
+        raise RuntimeError("Cannot update repo checkout with local changes. Commit or stash them first.")
+    reinstall_required = _update_requires_install(update)
     try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            payload = response.read().decode("utf-8")
-    except HTTPError as exc:
-        raise RuntimeError(f"Failed to fetch latest release metadata: HTTP {exc.code}.") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Failed to fetch latest release metadata: {exc.reason}.") from exc
-
-    try:
-        release = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Failed to parse latest release metadata.") from exc
-
-    if not isinstance(release, dict):
-        raise RuntimeError("Latest release metadata was not a JSON object.")
-    return release
-
-
-def _download_release_archive(
-    url: str,
-    destination: Path,
-    *,
-    timeout_seconds: float = DEFAULT_RELEASE_DOWNLOAD_TIMEOUT_SECONDS,
-) -> Path:
-    request = Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urlopen(request, timeout=timeout_seconds) as response:
-            destination.write_bytes(response.read())
-    except HTTPError as exc:
-        raise RuntimeError(f"Failed to download release archive: HTTP {exc.code}.") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Failed to download release archive: {exc.reason}.") from exc
-    return destination
-
-
-def latest_release_info(*, timeout_seconds: float = DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS) -> ReleaseInfo:
-    release = _latest_release(timeout_seconds=timeout_seconds)
-    tag_name = str(release.get("tag_name") or "").strip()
-    tarball_url = str(release.get("tarball_url") or "").strip()
-    if not tag_name or not tarball_url:
-        raise RuntimeError("Latest release metadata is missing tag_name or tarball_url.")
-    version = tag_name[1:] if tag_name.startswith("v") else tag_name
-    return ReleaseInfo(tag_name=tag_name, version=version, tarball_url=tarball_url)
-
-
-def available_release_update(
-    *,
-    current_version: str | None = None,
-    timeout_seconds: float = DEFAULT_RELEASE_METADATA_TIMEOUT_SECONDS,
-) -> ReleaseInfo | None:
-    installed_version = str(current_version or "").strip()
-    if not installed_version or installed_version.lower() == "unknown":
-        return None
-    release = latest_release_info(timeout_seconds=timeout_seconds)
-    if installed_version == release.version:
-        return None
-    stamp_version = _read_installed_release_version()
-    if stamp_version == release.version:
-        return None
-    return release
-
-
-def install_release(release: ReleaseInfo, *, current_version: str | None = None) -> str:
-    latest_version = release.version
-    tarball_url = release.tarball_url
-
-    installed_version = str(current_version or "").strip()
-    stamp_version = _read_installed_release_version()
-    if installed_version and installed_version == latest_version:
-        return f"open-jet {installed_version} is already up to date."
-    if stamp_version == latest_version:
-        return f"open-jet {latest_version} is already up to date."
-
-    snapshot = _active_config_snapshot()
-    try:
-        with tempfile.TemporaryDirectory(prefix="openjet-update-") as tmpdir:
-            archive_path = Path(tmpdir) / f"open-jet-{latest_version}.tar.gz"
-            _download_release_archive(tarball_url, archive_path)
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--upgrade", str(archive_path)],
-                check=True,
-            )
+        subprocess.run(
+            ["git", "pull", "--ff-only", update.remote, update.branch],
+            cwd=_REPO_ROOT,
+            check=True,
+        )
+        subprocess.run(
+            ["bash", str(_INSTALL_SCRIPT)],
+            cwd=_REPO_ROOT,
+            env={
+                **os.environ,
+                "OPENJET_INSTALL_MODE": "update",
+                "OPENJET_UPDATE_REINSTALL": "1" if reinstall_required else "0",
+            },
+            check=True,
+        )
     except subprocess.CalledProcessError as exc:
-        _restore_config(snapshot)
-        raise RuntimeError(f"Failed to install open-jet {latest_version}.") from exc
-
-    _preserve_user_config(snapshot, latest_version=latest_version)
-    _write_installed_release_version(latest_version)
-    if installed_version:
-        return f"Updated open-jet from {installed_version} to {latest_version}."
-    return f"Installed open-jet {latest_version}."
+        raise RuntimeError(
+            f"Failed to update repo checkout from {update.local_short} to {update.remote_short}."
+        ) from exc
+    return f"Updated open-jet repo from {update.local_short} to {update.remote_short}."
 
 
 def update_from_latest_release(*, current_version: str | None = None) -> str:
-    release = latest_release_info()
-    return install_release(release, current_version=current_version)
+    update = available_update(current_version=current_version)
+    if update is None:
+        return "open-jet repo is already up to date."
+    return install_update(update, current_version=current_version)

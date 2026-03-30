@@ -39,7 +39,7 @@ class LlamaServerClient:
         self,
         model: str,
         host: str = "127.0.0.1",
-        port: int = 8080,
+        port: int = 18080,
         context_window_tokens: int = 2048,
         device: str = "auto",
         gpu_layers: int = 99,
@@ -406,8 +406,6 @@ class LlamaServerClient:
                 httpx.RemoteProtocolError,
                 httpx.TimeoutException,
             ):
-                # During startup, the socket may accept then drop before readiness.
-                # Treat transient transport errors the same as "not ready yet".
                 pass
             await asyncio.sleep(1.0)
         stderr_task.cancel()

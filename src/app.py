@@ -8,6 +8,7 @@ import importlib.metadata
 import os
 import re
 import signal
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,6 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markup import escape
@@ -109,8 +109,8 @@ from .runtime_registry import DEFAULT_RUNTIME, active_model_ref, create_runtime_
 from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
-from .self_update import available_release_update, install_release
-from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
+from .self_update import RepoUpdateInfo, available_update, install_update
+from .setup import ACCENT_GREEN, _prompt_choice, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
 from .tool_executor import format_tool_args, get_swap_manager, set_swap_manager
@@ -128,8 +128,8 @@ def _open_jet_version() -> str:
         return "unknown"
 
 
-def _plain_markup(text: str) -> str:
-    return re.sub(r"\[[^\]]*\]", "", text)
+    def _plain_markup(text: str) -> str:
+        return re.sub(r"\[[^\]]*\]", "", text)
 
 
 BANNER = """[#14532d] ██████╗ ██████╗ ███████╗███╗   ██╗      ██╗███████╗████████╗[/]
@@ -349,6 +349,9 @@ class OpenJetApp:
 
     def exit(self) -> None:
         self._quit_requested = True
+
+    def _restart_process(self) -> None:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
     @staticmethod
     def _coerce_token_count(value: object) -> int:
@@ -929,8 +932,8 @@ class OpenJetApp:
         if current_version == "unknown":
             return
         try:
-            release = await asyncio.to_thread(
-                available_release_update,
+            update = await asyncio.to_thread(
+                available_update,
                 current_version=current_version,
                 timeout_seconds=self._STARTUP_UPDATE_CHECK_TIMEOUT_SECONDS,
             )
@@ -938,35 +941,34 @@ class OpenJetApp:
             if self.session_logger:
                 self.session_logger.record_exception("update_check_failed", exc, component="update")
             return
-        if release is None:
+        if update is None:
             return
-
-        selected = await radiolist_dialog(
-            title="Update open-jet",
-            text=(
-                f"A newer release is available ({current_version} -> {release.version}). "
-                "Use arrow keys to choose what to do."
-            ),
-            values=[
-                ("install", f"Install {release.version} now and restart open-jet"),
-                ("skip", "Skip for now"),
+        selected = await _prompt_choice(
+            self._session,
+            self.console,
+            "Update open-jet repo",
+            [
+                (f"Pull {update.remote}/{update.branch} and restart open-jet", "install"),
+                ("Skip for now", "skip"),
             ],
-        ).run_async()
+            detail=f"Newer commit available: {update.local_short} -> {update.remote_short}",
+        )
         if selected != "install":
             if self.session_logger:
                 self.session_logger.log_event(
                     "startup_update_skipped",
                     current_version=current_version,
-                    latest_version=release.version,
+                    latest_version=update.remote_short,
                 )
             return
 
         status = self.query_one("#assistant-status")
-        log.write(f"  [bold bright_white]Installing open-jet {escape(release.version)}...[/]")
-        status.update(f"[bold {ACCENT_GREEN}]installing open-jet {escape(release.version)}...[/]")
+        installing_label = f"{update.remote}/{update.branch} {update.remote_short}"
+        log.write(f"  [bold bright_white]Installing open-jet {escape(installing_label)}...[/]")
+        status.update(f"[bold {ACCENT_GREEN}]installing open-jet {escape(installing_label)}...[/]")
         status.remove_class("hidden")
         try:
-            message = await asyncio.to_thread(install_release, release, current_version=current_version)
+            message = await asyncio.to_thread(install_update, update, current_version=current_version)
         except Exception as exc:
             status.update("")
             status.add_class("hidden")
@@ -979,19 +981,19 @@ class OpenJetApp:
         status.update("")
         status.add_class("hidden")
         log.write(f"  [bold bright_white]{escape(message)}[/]")
-        log.write("  [bold bright_white]Restart open-jet to use the new release.[/]")
+        log.write("  [bold bright_white]Relaunching open-jet...[/]")
         log.write("")
         if self.session_logger:
             self.session_logger.log_event(
                 "startup_update_installed",
                 current_version=current_version,
-                latest_version=release.version,
+                latest_version=update.remote_short,
             )
             try:
                 await self.session_logger.stop()
             except Exception:
                 pass
-        self._quit_requested = True
+        self._restart_process()
 
     async def _startup_sequence(self) -> None:
         log = self.query_one("#chat-log")

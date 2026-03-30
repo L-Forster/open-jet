@@ -113,7 +113,7 @@ if "src.session_logging" not in sys.modules:
 
 import src.app as app_module
 from src.app import OpenJetApp
-from src.self_update import ReleaseInfo
+from src.self_update import RepoUpdateInfo
 
 
 class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -161,13 +161,12 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
         app = OpenJetApp()
         app.cfg["airgapped"] = False
         app.cfg["logging"] = {"enabled": False}
-        release = ReleaseInfo(
-            tag_name="v0.4.0",
-            version="0.4.0",
-            tarball_url="https://example.invalid/open-jet-v0.4.0.tar.gz",
+        update = RepoUpdateInfo(
+            remote="origin",
+            branch="master",
+            local_commit="1111111222222333333444444555555666666777",
+            remote_commit="aaaaaaa222222333333444444555556666666777",
         )
-        picker = AsyncMock(return_value="skip")
-        dialog = Mock(run_async=picker)
 
         async def immediate_to_thread(func, /, *args, **kwargs):
             return func(*args, **kwargs)
@@ -178,15 +177,15 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
             side_effect=immediate_to_thread,
         ), patch.object(
             app_module,
-            "available_release_update",
-            return_value=release,
+            "available_update",
+            return_value=update,
         ) as available_update, patch.object(
             app_module,
-            "radiolist_dialog",
-            return_value=dialog,
-        ) as picker_dialog, patch.object(
+            "_prompt_choice",
+            AsyncMock(return_value="skip"),
+        ) as prompt_choice, patch.object(
             app_module,
-            "install_release",
+            "install_update",
         ) as install_release:
             await app._maybe_prompt_for_startup_update(app.query_one("#chat-log"))
 
@@ -194,7 +193,16 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
             current_version="0.3.0",
             timeout_seconds=app._STARTUP_UPDATE_CHECK_TIMEOUT_SECONDS,
         )
-        picker_dialog.assert_called_once()
+        prompt_choice.assert_awaited_once_with(
+            app._session,
+            app.console,
+            "Update open-jet repo",
+            [
+                ("Pull origin/master and restart open-jet", "install"),
+                ("Skip for now", "skip"),
+            ],
+            detail="Newer commit available: 1111111 -> aaaaaaa",
+        )
         install_release.assert_not_called()
         self.assertFalse(app._quit_requested)
 
@@ -202,13 +210,12 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
         app = OpenJetApp()
         app.cfg["airgapped"] = False
         app.cfg["logging"] = {"enabled": False}
-        release = ReleaseInfo(
-            tag_name="v0.4.0",
-            version="0.4.0",
-            tarball_url="https://example.invalid/open-jet-v0.4.0.tar.gz",
+        update = RepoUpdateInfo(
+            remote="origin",
+            branch="master",
+            local_commit="1111111222222333333444444555555666666777",
+            remote_commit="aaaaaaa222222333333444444555556666666777",
         )
-        picker = AsyncMock(return_value="install")
-        dialog = Mock(run_async=picker)
 
         async def immediate_to_thread(func, /, *args, **kwargs):
             return func(*args, **kwargs)
@@ -219,26 +226,27 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
             side_effect=immediate_to_thread,
         ), patch.object(
             app_module,
-            "available_release_update",
-            return_value=release,
+            "available_update",
+            return_value=update,
         ), patch.object(
             app_module,
-            "radiolist_dialog",
-            return_value=dialog,
+            "_prompt_choice",
+            AsyncMock(return_value="install"),
         ), patch.object(
             app_module,
-            "install_release",
-            return_value="Updated open-jet from 0.3.0 to 0.4.0.",
+            "install_update",
+            return_value="Updated open-jet repo from 1111111 to aaaaaaa.",
         ) as install_release, patch.object(
+            app,
+            "_restart_process",
+        ) as restart_process, patch.object(
             app,
             "_init_client",
             AsyncMock(),
         ) as init_client:
             await app._maybe_prompt_for_startup_update(app.query_one("#chat-log"))
 
-        install_release.assert_called_once_with(release, current_version="0.3.0")
+        install_release.assert_called_once_with(update, current_version="0.3.0")
+        restart_process.assert_called_once_with()
         init_client.assert_not_awaited()
-        self.assertTrue(app._quit_requested)
-        self.assertTrue(
-            any("Restart open-jet to use the new release." in str(entry) for entry in app.query_one("#chat-log")._entries)
-        )
+        self.assertFalse(app._quit_requested)

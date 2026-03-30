@@ -332,7 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("commands", help="list available slash commands")
     subparsers.add_parser("status", help="show runtime and configuration status")
     subparsers.add_parser("version", help="show version information")
-    subparsers.add_parser("update", help="install the latest GitHub release into the current environment")
+    subparsers.add_parser("update", help="pull the latest repo commit from the tracked remote branch")
     context_parser = subparsers.add_parser("context", help="set the configured context window token count")
     context_parser.add_argument("tokens", type=int, help="new context window token count")
     device_parser = subparsers.add_parser("device", aliases=("devices",), help="list and configure persistent device ids")

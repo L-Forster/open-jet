@@ -1650,7 +1650,6 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CUDA error: out of memory", failure["error"])
         self.assertIn("NvMapMemAllocInternalTagged: 1075072515 error 12", failure["stderr_tail"])
 
-
 class DebugPromptLoggingTests(unittest.TestCase):
     def test_prepare_turn_context_saves_full_runtime_messages_in_debug_mode(self) -> None:
         previous_cwd = Path.cwd()
