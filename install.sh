@@ -8,6 +8,7 @@ LOCAL_BIN_DIR="${HOME}/.local/bin"
 SYSTEM_BIN_DIR="/usr/local/bin"
 INSTALL_MODE="${OPENJET_INSTALL_MODE:-install}"
 UPDATE_REINSTALL="${OPENJET_UPDATE_REINSTALL:-0}"
+INSTALL_STATE_FILE="${VENV_DIR}/.openjet-install-hash"
 
 link_launchers() {
   local target_dir="$1"
@@ -16,6 +17,32 @@ link_launchers() {
   fi
   ln -sf "${VENV_DIR}/bin/open-jet" "${target_dir}/open-jet"
   ln -sf "${VENV_DIR}/bin/openjet" "${target_dir}/openjet"
+}
+
+install_fingerprint() {
+  "${VENV_DIR}/bin/python" - <<'PY'
+import hashlib
+from pathlib import Path
+
+root = Path.cwd()
+digest = hashlib.sha256()
+for relative_path in ("pyproject.toml", "setup.py"):
+    path = root / relative_path
+    digest.update(relative_path.encode("utf-8"))
+    digest.update(b"\0")
+    if path.is_file():
+        digest.update(path.read_bytes())
+    digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
+path_has_dir() {
+  local target_dir="$1"
+  case ":${PATH}:" in
+    *":${target_dir}:"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 clean_inplace_extensions() {
@@ -51,45 +78,75 @@ clean_inplace_extensions
 if [ ! -f "${VENV_DIR}/bin/python" ]; then
   create_virtualenv
   "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  "${VENV_DIR}/bin/python" -m pip install setuptools
+elif ! "${VENV_DIR}/bin/python" - <<'PY' >/dev/null 2>&1
+import importlib.util
+import sys
+
+sys.exit(0 if importlib.util.find_spec("setuptools") is not None else 1)
+PY
+then
+  "${VENV_DIR}/bin/python" -m pip install setuptools
 fi
-"${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
+
+CURRENT_INSTALL_HASH="$(install_fingerprint)"
 
 RUN_PIP_INSTALL=1
 INSTALL_REASON="fresh install mode"
+RUN_PROVISION=1
+
+if [ -x "${VENV_DIR}/bin/openjet" ]; then
+  RUN_PIP_INSTALL=0
+  INSTALL_REASON="reusing existing editable install"
+  if [ -f "${INSTALL_STATE_FILE}" ]; then
+    if [ "$(tr -d '\n' < "${INSTALL_STATE_FILE}")" != "${CURRENT_INSTALL_HASH}" ]; then
+      RUN_PIP_INSTALL=1
+      INSTALL_REASON="install metadata changed"
+    fi
+  else
+    RUN_PIP_INSTALL=1
+    INSTALL_REASON="install state missing"
+  fi
+fi
 
 if [ "${INSTALL_MODE}" = "update" ]; then
-  INSTALL_REASON="editable package missing from virtualenv"
-  if [ -x "${VENV_DIR}/bin/openjet" ]; then
-    RUN_PIP_INSTALL=0
-    INSTALL_REASON="reusing existing editable install"
-  fi
   if [ "${UPDATE_REINSTALL}" = "1" ]; then
     RUN_PIP_INSTALL=1
     INSTALL_REASON="update changed install requirements"
   fi
+  RUN_PROVISION=0
+fi
+
+if [ "${RUN_PIP_INSTALL}" -eq 0 ]; then
+  RUN_PROVISION=0
 fi
 
 if [ "${RUN_PIP_INSTALL}" -eq 1 ]; then
   echo "Refreshing editable install: ${INSTALL_REASON}"
   OPENJET_BUILD_EXTENSIONS=0 "${VENV_DIR}/bin/python" -m pip install --no-build-isolation -e "${ROOT_DIR}"
+  printf '%s\n' "${CURRENT_INSTALL_HASH}" > "${INSTALL_STATE_FILE}"
 else
   echo "Skipping pip install: ${INSTALL_REASON}"
 fi
 
-if [ "${INSTALL_MODE}" != "update" ] && "${VENV_DIR}/bin/python" - <<'PY'
+if [ "${RUN_PROVISION}" -eq 1 ] && "${VENV_DIR}/bin/python" - <<'PY'
 from src.observation.processors import provision_default_faster_whisper_model
 raise SystemExit(0 if provision_default_faster_whisper_model() else 1)
 PY
 then
   echo "Provisioned bundled local transcription assets"
-elif [ "${INSTALL_MODE}" = "update" ]; then
-  echo "Skipping transcription asset provisioning during update"
+elif [ "${RUN_PROVISION}" -eq 0 ]; then
+  echo "Skipping transcription asset provisioning"
 else
   echo "warning: could not pre-provision local transcription assets; OpenJet will retry on first microphone use"
 fi
 
 INSTALLED_LAUNCHER_DIR=""
-if mkdir -p "${LOCAL_BIN_DIR}" 2>/dev/null && link_launchers "${LOCAL_BIN_DIR}"; then
+if [ -d "${SYSTEM_BIN_DIR}" ] && [ -w "${SYSTEM_BIN_DIR}" ] && path_has_dir "${SYSTEM_BIN_DIR}" && link_launchers "${SYSTEM_BIN_DIR}"; then
+  INSTALLED_LAUNCHER_DIR="${SYSTEM_BIN_DIR}"
+elif mkdir -p "${LOCAL_BIN_DIR}" 2>/dev/null && path_has_dir "${LOCAL_BIN_DIR}" && link_launchers "${LOCAL_BIN_DIR}"; then
+  INSTALLED_LAUNCHER_DIR="${LOCAL_BIN_DIR}"
+elif mkdir -p "${LOCAL_BIN_DIR}" 2>/dev/null && link_launchers "${LOCAL_BIN_DIR}"; then
   INSTALLED_LAUNCHER_DIR="${LOCAL_BIN_DIR}"
 elif link_launchers "${SYSTEM_BIN_DIR}"; then
   INSTALLED_LAUNCHER_DIR="${SYSTEM_BIN_DIR}"
