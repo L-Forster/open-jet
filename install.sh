@@ -5,8 +5,18 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="${ROOT_DIR}/.venv"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
+SYSTEM_BIN_DIR="/usr/local/bin"
 INSTALL_MODE="${OPENJET_INSTALL_MODE:-install}"
 UPDATE_REINSTALL="${OPENJET_UPDATE_REINSTALL:-0}"
+
+link_launchers() {
+  local target_dir="$1"
+  if [ ! -d "${target_dir}" ] || [ ! -w "${target_dir}" ]; then
+    return 1
+  fi
+  ln -sf "${VENV_DIR}/bin/open-jet" "${target_dir}/open-jet"
+  ln -sf "${VENV_DIR}/bin/openjet" "${target_dir}/openjet"
+}
 
 clean_inplace_extensions() {
   mapfile -t built_exts < <(find "${ROOT_DIR}/src" -maxdepth 1 \( -name '*.so' -o -name '*.pyd' \) -type f | sort)
@@ -61,7 +71,7 @@ fi
 
 if [ "${RUN_PIP_INSTALL}" -eq 1 ]; then
   echo "Refreshing editable install: ${INSTALL_REASON}"
-  OPENJET_BUILD_EXTENSIONS=0 "${VENV_DIR}/bin/python" -m pip install -e "${ROOT_DIR}"
+  OPENJET_BUILD_EXTENSIONS=0 "${VENV_DIR}/bin/python" -m pip install --no-build-isolation -e "${ROOT_DIR}"
 else
   echo "Skipping pip install: ${INSTALL_REASON}"
 fi
@@ -78,18 +88,28 @@ else
   echo "warning: could not pre-provision local transcription assets; OpenJet will retry on first microphone use"
 fi
 
-mkdir -p "${LOCAL_BIN_DIR}"
-ln -sf "${VENV_DIR}/bin/open-jet" "${LOCAL_BIN_DIR}/open-jet"
-ln -sf "${VENV_DIR}/bin/openjet" "${LOCAL_BIN_DIR}/openjet"
+INSTALLED_LAUNCHER_DIR=""
+if mkdir -p "${LOCAL_BIN_DIR}" 2>/dev/null && link_launchers "${LOCAL_BIN_DIR}"; then
+  INSTALLED_LAUNCHER_DIR="${LOCAL_BIN_DIR}"
+elif link_launchers "${SYSTEM_BIN_DIR}"; then
+  INSTALLED_LAUNCHER_DIR="${SYSTEM_BIN_DIR}"
+fi
 
 echo "Installed open-jet from ${ROOT_DIR}"
 echo "Install mode: editable Python source"
-echo "Launch with: openjet --setup"
+if [ -n "${INSTALLED_LAUNCHER_DIR}" ]; then
+  echo "Launch with: openjet --setup"
+else
+  echo "warning: could not install launchers into ${LOCAL_BIN_DIR} or ${SYSTEM_BIN_DIR}"
+  echo "run with: ${VENV_DIR}/bin/openjet --setup"
+fi
 
-case ":${PATH}:" in
-  *":${LOCAL_BIN_DIR}:"*) ;;
-  *)
-    echo "warning: ${LOCAL_BIN_DIR} is not on PATH"
-    echo "run with: ${LOCAL_BIN_DIR}/openjet --setup"
-    ;;
-esac
+if [ -n "${INSTALLED_LAUNCHER_DIR}" ]; then
+  case ":${PATH}:" in
+    *":${INSTALLED_LAUNCHER_DIR}:"*) ;;
+    *)
+      echo "warning: ${INSTALLED_LAUNCHER_DIR} is not on PATH"
+      echo "run with: ${INSTALLED_LAUNCHER_DIR}/openjet --setup"
+      ;;
+  esac
+fi
