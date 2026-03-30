@@ -2547,8 +2547,6 @@ class OpenJetApp:
         if not self._awaiting_approval or not self._approval_tool_call:
             return
         self._refresh_approval_prompt_selection()
-        if self._session and self._session.app:
-            self._session.app.invalidate()
 
     def _write_approval_prompt(self, log: LogView, tc: ToolCall) -> None:
         log.write(Rule(rich_text("Approval Needed", "warning"), style="warning"))
@@ -2558,9 +2556,18 @@ class OpenJetApp:
         log.write("")
 
     def _approval_selection_line(self) -> str:
-        approve = "[Approve]" if self._approval_choice == 0 else "Approve"
-        deny = "[Deny]" if self._approval_choice == 1 else "Deny"
+        approve_style = "approve_selected" if self._approval_choice == 0 else "approve_idle"
+        deny_style = "deny_selected" if self._approval_choice == 1 else "deny_idle"
+        approve = rich_text(" Approve ", approve_style)
+        deny = rich_text(" Deny ", deny_style)
         return f"  {approve} {deny} {rich_text('←/→ Enter y/n', 'muted')}"
+
+    def _set_approval_choice(self, choice: int) -> None:
+        normalized = 0 if int(choice) <= 0 else 1
+        if self._approval_choice == normalized:
+            return
+        self._approval_choice = normalized
+        self._refresh_approval_prompt_selection()
 
     def _refresh_approval_prompt_selection(self) -> None:
         index = self._approval_prompt_selection_index
@@ -2636,14 +2643,12 @@ class OpenJetApp:
 
         @bindings.add("left", filter=awaiting_approval, eager=True)
         def _left(event) -> None:
-            self._approval_choice = 0
-            self._render_approval_bar()
+            self._set_approval_choice(0)
             event.current_buffer.reset()
 
         @bindings.add("right", filter=awaiting_approval, eager=True)
         def _right(event) -> None:
-            self._approval_choice = 1
-            self._render_approval_bar()
+            self._set_approval_choice(1)
             event.current_buffer.reset()
 
         @bindings.add("y", filter=awaiting_approval, eager=True)

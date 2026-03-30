@@ -21,6 +21,10 @@ RICH_THEME = Theme(
         "warning": "bold #fef3c7",
         "error": "bold #fca5a5",
         "success": "bold #b7efc5",
+        "approve_selected": "bold black on #86efac",
+        "approve_idle": "bold #86efac",
+        "deny_selected": "bold white on #ef4444",
+        "deny_idle": "bold #fca5a5",
     }
 )
 
