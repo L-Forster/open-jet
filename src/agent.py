@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import uuid
@@ -408,12 +409,69 @@ class Agent:
     def clear_turn_context(self) -> None:
         self.turn_context_messages = []
 
+    def runtime_request_snapshot(self, *, empty_retry_count: int = 0, use_tools: bool = True) -> dict[str, object]:
+        extra_system_note = self._continuation_note_for_runtime(empty_retry_count)
+        system_parts: list[dict[str, object]] = []
+        runtime_messages: list[dict] = []
+
+        for source, batch in (("persistent", self.messages), ("turn_context", self.turn_context_messages)):
+            for index, msg in enumerate(batch):
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role", ""))
+                if role == "system":
+                    content = content_to_plain_text(msg.get("content", "")).strip()
+                    if content:
+                        system_parts.append(
+                            {
+                                "source": source,
+                                "index": index,
+                                "content": content,
+                            }
+                        )
+                    continue
+                runtime_msg = copy.deepcopy(msg)
+                runtime_msg["content"] = runtime_content(msg.get("content", ""))
+                runtime_messages.append(runtime_msg)
+
+        continuation_note = extra_system_note.strip()
+        if continuation_note:
+            system_parts.append(
+                {
+                    "source": "continuation_note",
+                    "index": 0,
+                    "content": continuation_note,
+                }
+            )
+
+        merged_system_message = None
+        final_messages = list(runtime_messages)
+        if system_parts:
+            merged_system_message = {
+                "role": "system",
+                "content": "\n\n".join(str(part["content"]) for part in system_parts),
+            }
+            final_messages = [merged_system_message, *runtime_messages]
+
+        return {
+            "empty_retry_count": empty_retry_count,
+            "use_tools": use_tools,
+            "persistent_messages": copy.deepcopy(self.messages),
+            "turn_context_messages": copy.deepcopy(self.turn_context_messages),
+            "system_parts": system_parts,
+            "continuation_note": continuation_note,
+            "merged_system_message": merged_system_message,
+            "non_system_messages": runtime_messages,
+            "final_messages": final_messages,
+            "prompt_tokens_estimate": self._estimate_runtime_request_tokens(final_messages, use_tools=use_tools),
+        }
+
     def _messages_for_runtime(self, extra_system_note: str | None = None) -> list[dict]:
-        combined = self.messages + self.turn_context_messages
+        continuation_note = (extra_system_note or "").strip()
         system_parts: list[str] = []
         runtime_messages: list[dict] = []
 
-        for msg in combined:
+        for msg in self.messages + self.turn_context_messages:
             if not isinstance(msg, dict):
                 continue
             role = str(msg.get("role", ""))
@@ -422,19 +480,16 @@ class Agent:
                 if content:
                     system_parts.append(content)
                 continue
-            runtime_msg = dict(msg)
+            runtime_msg = copy.deepcopy(msg)
             runtime_msg["content"] = runtime_content(msg.get("content", ""))
             runtime_messages.append(runtime_msg)
 
-        extra_system_note = (extra_system_note or "").strip()
-        if extra_system_note:
-            system_parts.append(extra_system_note)
+        if continuation_note:
+            system_parts.append(continuation_note)
 
         if not system_parts:
             return runtime_messages
-
-        merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
-        return [merged_system, *runtime_messages]
+        return [{"role": "system", "content": "\n\n".join(system_parts)}, *runtime_messages]
 
     def runtime_overhead_tokens(
         self,

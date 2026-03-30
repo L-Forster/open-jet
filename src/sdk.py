@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import inspect
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .airgap import airgapped_from_cfg, set_airgapped
 from .agent import ActionKind, Agent
@@ -16,6 +17,9 @@ from .runtime_limits import derive_context_budget, estimate_tokens
 from .runtime_protocol import ToolCall
 from .runtime_registry import create_runtime_client
 from .tool_executor import ToolExecutionResult, execute_tool
+
+if TYPE_CHECKING:
+    from .session_logging import SessionLogger
 
 
 ApprovalHandler = Callable[[ToolCall], bool | Awaitable[bool]]
@@ -36,6 +40,8 @@ class ToolResult:
     output: str
     meta: dict = field(default_factory=dict)
     approved: bool = True
+    context_output: object = ""
+    context_output_text: str = ""
 
     @property
     def ok(self) -> bool:
@@ -57,6 +63,228 @@ class SDKResponse:
     condense_messages: list[str] = field(default_factory=list)
 
 
+@dataclass
+class _TurnArtifactState:
+    turn_index: int
+    prompt_index: int
+    user_prompt: str
+    mode: str
+    active_step: str | None
+    runtime_request: dict[str, Any]
+    extra: dict[str, Any] = field(default_factory=dict)
+    assistant_chunks: list[str] = field(default_factory=list)
+    assistant_text: str = ""
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
+    condense_reason: str | None = None
+    condense_result: str | None = None
+    condense_report: dict[str, Any] | None = None
+    error: str | None = None
+    status: str = "in_progress"
+
+
+class _SessionArtifactRecorder:
+    def __init__(self, session_dir: Path) -> None:
+        self.session_dir = session_dir
+        self.chat_log_path = self.session_dir / "chat_log.md"
+        self.turns_dir = self.session_dir / "turns"
+        self.turn_state_paths: list[str] = []
+        self._turns: dict[int, _TurnArtifactState] = {}
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.turns_dir.mkdir(parents=True, exist_ok=True)
+
+    def record_user_prompt(self, *, prompt_index: int, text: str) -> None:
+        self._append_markdown(
+            [
+                f"## Prompt {prompt_index} User",
+                "",
+                text,
+                "",
+            ]
+        )
+
+    def start_turn(
+        self,
+        *,
+        turn_index: int,
+        prompt_index: int,
+        user_prompt: str,
+        mode: str | None,
+        active_step: str | None,
+        runtime_request: dict[str, Any],
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        self._turns[turn_index] = _TurnArtifactState(
+            turn_index=turn_index,
+            prompt_index=prompt_index,
+            user_prompt=user_prompt,
+            mode=str(mode or "chat"),
+            active_step=active_step,
+            runtime_request=runtime_request,
+            extra=dict(extra or {}),
+        )
+
+    def record_text_chunk(self, *, turn_index: int, text: str) -> None:
+        if not text:
+            return
+        state = self._turns.get(turn_index)
+        if state is None:
+            return
+        state.assistant_chunks.append(text)
+        state.assistant_text += text
+
+    def record_tool_request(self, *, turn_index: int, tool_call: ToolCall) -> None:
+        state = self._turns.get(turn_index)
+        if state is None:
+            return
+        payload = {
+            "tool": tool_call.name,
+            "arguments": dict(tool_call.arguments),
+            "id": tool_call.id,
+        }
+        state.tool_calls.append(payload)
+        self._append_markdown(
+            [
+                f"## Prompt {state.prompt_index} / Turn {turn_index} Tool Request",
+                "",
+                f"- tool: `{tool_call.name}`",
+                f"- arguments: `{json.dumps(tool_call.arguments, ensure_ascii=False)}`",
+                "",
+            ]
+        )
+
+    def record_tool_result(
+        self,
+        *,
+        turn_index: int,
+        tool_call: ToolCall,
+        tool_result: ToolResult,
+    ) -> None:
+        state = self._turns.get(turn_index)
+        if state is None:
+            return
+        payload = {
+            "tool": tool_call.name,
+            "arguments": dict(tool_call.arguments),
+            "id": tool_call.id,
+            "approved": tool_result.approved,
+            "status": str(tool_result.meta.get("status", "")),
+            "ok": bool(tool_result.ok),
+            "meta": dict(tool_result.meta),
+            "raw_output": tool_result.output,
+            "context_output": tool_result.context_output,
+            "context_output_text": tool_result.context_output_text,
+        }
+        state.tool_results.append(payload)
+        self._append_markdown(
+            [
+                f"## Prompt {state.prompt_index} / Turn {turn_index} Tool Result",
+                "",
+                f"- tool: `{tool_call.name}`",
+                f"- ok: `{'true' if tool_result.ok else 'false'}`",
+                f"- approved: `{'true' if tool_result.approved else 'false'}`",
+                f"- status: `{tool_result.meta.get('status', '')}`",
+                "- raw_output:",
+                "```text",
+                tool_result.output,
+                "```",
+                "- context_output:",
+                "```text",
+                tool_result.context_output_text,
+                "```",
+                "",
+            ]
+        )
+
+    def record_condense(self, *, turn_index: int, reason: str, result: str, report: dict[str, Any] | None) -> None:
+        state = self._turns.get(turn_index)
+        if state is None:
+            return
+        state.condense_reason = reason
+        state.condense_result = result
+        state.condense_report = report
+        self._append_markdown(
+            [
+                f"## Prompt {state.prompt_index} / Turn {turn_index} Condense",
+                "",
+                f"- reason: `{reason}`",
+                "```text",
+                result,
+                "```",
+                "",
+            ]
+        )
+
+    def record_error(self, *, turn_index: int, error: str) -> None:
+        state = self._turns.get(turn_index)
+        if state is None:
+            return
+        state.error = error
+
+    def finish_turn(
+        self,
+        *,
+        turn_index: int,
+        status: str,
+        conversation_messages_after_turn: list[dict[str, Any]],
+        extra: dict[str, Any] | None = None,
+    ) -> str:
+        state = self._turns.get(turn_index)
+        if state is None:
+            raise KeyError(f"Unknown turn {turn_index}")
+        state.status = status
+        if extra:
+            state.extra.update(extra)
+        if state.assistant_text.strip():
+            self._append_markdown(
+                [
+                    f"## Prompt {state.prompt_index} / Turn {turn_index} Assistant",
+                    "",
+                    state.assistant_text,
+                    "",
+                ]
+            )
+        if state.error:
+            self._append_markdown(
+                [
+                    f"## Prompt {state.prompt_index} / Turn {turn_index} Error",
+                    "",
+                    state.error,
+                    "",
+                ]
+            )
+        payload = {
+            "schema_version": 1,
+            "turn_index": state.turn_index,
+            "prompt_index": state.prompt_index,
+            "user_prompt": state.user_prompt,
+            "mode": state.mode,
+            "active_step": state.active_step,
+            "status": state.status,
+            "assistant_text": state.assistant_text,
+            "assistant_chunks": list(state.assistant_chunks),
+            "tool_calls": list(state.tool_calls),
+            "tool_results": list(state.tool_results),
+            "condense_reason": state.condense_reason,
+            "condense_result": state.condense_result,
+            "condense_report": state.condense_report,
+            "runtime_request": state.runtime_request,
+            "conversation_messages_after_turn": conversation_messages_after_turn,
+            "error": state.error,
+            "extra": state.extra,
+        }
+        target = self.turns_dir / f"turn_{turn_index:03d}.json"
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        path_text = str(target)
+        if path_text not in self.turn_state_paths:
+            self.turn_state_paths.append(path_text)
+        return path_text
+
+    def _append_markdown(self, lines: list[str]) -> None:
+        with self.chat_log_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines).rstrip() + "\n")
+
+
 class OpenJetSession:
     def __init__(
         self,
@@ -65,11 +293,14 @@ class OpenJetSession:
         approval_handler: ApprovalHandler | None = None,
         allowed_tools: set[str] | None = None,
         airgapped: bool = False,
+        session_logger: "SessionLogger | None" = None,
     ) -> None:
         self.agent = agent
         self._approval_handler = approval_handler
         self._allowed_tools = allowed_tools
         self.airgapped = bool(airgapped)
+        self.session_logger = session_logger
+        self._artifacts = _SessionArtifactRecorder(session_logger.session_dir) if session_logger else None
         set_airgapped(self.airgapped)
 
     @classmethod
@@ -141,6 +372,91 @@ class OpenJetSession:
         self.agent.add_user_message(prompt, image_paths=image_paths)
         async for event in self.stream_existing_turn():
             yield event
+
+    @property
+    def chat_log_path(self) -> str:
+        return str(self._artifacts.chat_log_path) if self._artifacts else ""
+
+    @property
+    def turn_state_paths(self) -> list[str]:
+        return list(self._artifacts.turn_state_paths) if self._artifacts else []
+
+    @property
+    def session_dir(self) -> str:
+        return str(self.session_logger.session_dir) if self.session_logger else ""
+
+    @property
+    def session_manifest_path(self) -> str:
+        return str(self.session_logger.manifest_path) if self.session_logger else ""
+
+    def record_user_prompt(self, *, prompt_index: int, text: str, mode: str | None = None) -> None:
+        if self._artifacts:
+            self._artifacts.record_user_prompt(prompt_index=prompt_index, text=text)
+
+    def begin_turn_trace(
+        self,
+        *,
+        turn_index: int,
+        prompt_index: int,
+        prompt_text: str,
+        mode: str | None,
+        active_step: str | None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if not self._artifacts:
+            return
+        self._artifacts.start_turn(
+            turn_index=turn_index,
+            prompt_index=prompt_index,
+            user_prompt=prompt_text,
+            mode=mode,
+            active_step=active_step,
+            runtime_request=self.agent.runtime_request_snapshot(),
+            extra=extra,
+        )
+
+    def record_text_chunk(self, *, turn_index: int, text: str) -> None:
+        if self._artifacts:
+            self._artifacts.record_text_chunk(turn_index=turn_index, text=text)
+
+    def record_tool_request(self, *, turn_index: int, tool_call: ToolCall) -> None:
+        if self._artifacts:
+            self._artifacts.record_tool_request(turn_index=turn_index, tool_call=tool_call)
+
+    def record_turn_error(self, *, turn_index: int, error: str) -> None:
+        if self._artifacts:
+            self._artifacts.record_error(turn_index=turn_index, error=error)
+
+    def finish_turn_trace(self, *, turn_index: int, status: str, extra: dict[str, Any] | None = None) -> str:
+        if not self._artifacts:
+            return ""
+        return self._artifacts.finish_turn(
+            turn_index=turn_index,
+            status=status,
+            conversation_messages_after_turn=[dict(message) for message in self.agent.messages],
+            extra=extra,
+        )
+
+    def record_condense_result(self, *, turn_index: int, reason: str, result: str) -> None:
+        if not self._artifacts:
+            return
+        report = self.agent.last_condense_report()
+        self._artifacts.record_condense(
+            turn_index=turn_index,
+            reason=reason,
+            result=result,
+            report=None if report is None else {
+                "original_messages": report.original_messages,
+                "final_messages": report.final_messages,
+                "total_before_tokens": report.total_before_tokens,
+                "total_after_tokens": report.total_after_tokens,
+                "target_tokens": report.target_tokens,
+                "summary_tokens": report.summary_tokens,
+                "tighter_summary_used": report.tighter_summary_used,
+                "kept_latest_user": report.kept_latest_user,
+                "forced": report.forced,
+            },
+        )
 
     async def stream_existing_turn(self):
         while True:
@@ -255,6 +571,7 @@ class OpenJetSession:
 
         context_output, output_truncated = self._fit_tool_result_content_to_budget(result)
         self.agent.complete_tool_call(tool_call, context_output)
+        context_output_text = content_to_plain_text(context_output).strip() if context_output else ""
         result_meta = dict(result.meta)
         result_meta.setdefault("ok", bool(result.ok))
         result_meta.setdefault("status", "completed" if result.ok else "failed")
@@ -262,7 +579,24 @@ class OpenJetSession:
         result_meta["output_truncated"] = output_truncated
         if bool(result_meta.get("internal_retry")):
             return None
-        return ToolResult(tool_call=tool_call, output=result.output, meta=result_meta, approved=True)
+        return ToolResult(
+            tool_call=tool_call,
+            output=result.output,
+            meta=result_meta,
+            approved=True,
+            context_output=context_output,
+            context_output_text=context_output_text,
+        )
+
+    async def handle_tool_call(self, tool_call: ToolCall, *, turn_index: int | None = None) -> ToolResult | None:
+        tool_result = await self._handle_tool_call(tool_call)
+        if tool_result is not None and self._artifacts and turn_index is not None:
+            self._artifacts.record_tool_result(
+                turn_index=turn_index,
+                tool_call=tool_call,
+                tool_result=tool_result,
+            )
+        return tool_result
 
     async def _approve(self, tool_call: ToolCall) -> bool:
         if self._approval_handler is None:
