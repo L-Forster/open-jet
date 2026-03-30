@@ -308,7 +308,7 @@ class AppStatusTests(unittest.TestCase):
         self.assertIn("Deny", str(entries[2]))
         self.assertIn("deny_selected", str(entries[2]))
         self.assertIn("approve_idle", str(entries[2]))
-        self.assertIn("←/→ Enter y/n", str(entries[2]))
+        self.assertIn("Tab/←/→ Enter y/n", str(entries[2]))
 
     def test_write_approval_prompt_writes_visible_chat_block(self) -> None:
         app = OpenJetApp()
@@ -321,7 +321,7 @@ class AppStatusTests(unittest.TestCase):
         self.assertIn("edit_file -> src/app.py", str(entries[1]))
         self.assertIn("approve_selected", str(entries[2]))
         self.assertIn("deny_idle", str(entries[2]))
-        self.assertIn("←/→ Enter y/n", str(entries[2]))
+        self.assertIn("Tab/←/→ Enter y/n", str(entries[2]))
 
     def test_set_approval_choice_updates_only_selection_line(self) -> None:
         app = OpenJetApp()
@@ -337,6 +337,24 @@ class AppStatusTests(unittest.TestCase):
 
         log.refresh_recent_line.assert_called_once()
         app._session.app.invalidate.assert_not_called()
+
+    def test_cycle_approval_choice_toggles_between_options(self) -> None:
+        app = OpenJetApp()
+        app._awaiting_approval = True
+        app._approval_choice = 0
+        app._approval_tool_call = ToolCall(name="shell", arguments={"command": "nvidia-smi"})
+        log = app.query_one("#chat-log")
+        log.refresh_recent_line = Mock()
+
+        app._write_approval_prompt(log, app._approval_tool_call)
+        app._cycle_approval_choice(1)
+        self.assertEqual(app._approval_choice, 1)
+
+        app._cycle_approval_choice(1)
+        self.assertEqual(app._approval_choice, 0)
+
+        app._cycle_approval_choice(-1)
+        self.assertEqual(app._approval_choice, 1)
 
 
 class AppInputTests(unittest.IsolatedAsyncioTestCase):

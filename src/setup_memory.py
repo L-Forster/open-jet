@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -10,185 +12,290 @@ from typing import Iterable
 
 from .runtime_limits import read_memory_snapshot
 
+_MIN_CTX = 1024
 
-_CTX_OPTIONS = (1024, 2048, 4096, 6144, 8192, 12288, 16384, 32768)
-_MODEL_MB_PER_B_PARAM = 720.0
-_MODEL_BASE_OVERHEAD_MB = 256.0
-_CTX_KV_MB_PER_TOKEN = 0.55
-_CTX_RUNTIME_RESERVE_MB = 512.0
+# GGUF metadata value type codes.
+_GGUF_TYPES: dict[int, str] = {
+    0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i",
+    6: "<f", 7: "<?", 8: "str", 9: "arr",
+    10: "<Q", 11: "<q", 12: "<d",
+}
 
 
-def estimate_model_params_b_from_text(text: str) -> float | None:
-    src = str(text or "").strip().lower()
-    if not src:
+def _read_gguf_metadata(path: Path) -> dict[str, object]:
+    """Read metadata key-value pairs from a GGUF file header."""
+    meta: dict[str, object] = {}
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic != b"GGUF":
+            return meta
+        version = struct.unpack("<I", f.read(4))[0]
+        if version < 2:
+            return meta
+        _tensor_count = struct.unpack("<Q", f.read(8))[0]
+        kv_count = struct.unpack("<Q", f.read(8))[0]
+
+        def read_str() -> str:
+            length = struct.unpack("<Q", f.read(8))[0]
+            return f.read(length).decode("utf-8")
+
+        def read_value(type_code: int) -> object:
+            fmt = _GGUF_TYPES.get(type_code)
+            if fmt == "str":
+                return read_str()
+            if fmt == "arr":
+                elem_type = struct.unpack("<I", f.read(4))[0]
+                count = struct.unpack("<Q", f.read(8))[0]
+                return [read_value(elem_type) for _ in range(count)]
+            if fmt is None:
+                return None
+            return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+        for _ in range(kv_count):
+            key = read_str()
+            vtype = struct.unpack("<I", f.read(4))[0]
+            meta[key] = read_value(vtype)
+    return meta
+
+
+def _kv_bytes_per_token_from_gguf(path: Path) -> float | None:
+    """Compute KV cache bytes per token from GGUF model metadata.
+
+    Formula depends on the model family:
+    - standard/GQA models: n_layer * n_head_kv * (key_length + value_length) * bytes_per_element
+    - MLA models: llama.cpp stores only the compressed K cache, so use
+      n_layer * n_head_kv * key_length_mla * bytes_per_element
+
+    Runtime uses q8_0 for both K and V caches (~1 byte per element).
+    """
+    meta = _read_gguf_metadata(path)
+    if not meta:
         return None
-    match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*([bm])(?!\w)", src)
-    if not match:
+    arch = meta.get("general.architecture")
+    if not isinstance(arch, str):
         return None
-    try:
-        value = float(match.group(1))
-    except ValueError:
+    n_embd = meta.get(f"{arch}.embedding_length")
+    n_head = meta.get(f"{arch}.attention.head_count")
+    n_head_kv = meta.get(f"{arch}.attention.head_count_kv", n_head)
+    n_layer = meta.get(f"{arch}.block_count")
+    if not all(isinstance(v, int) and v > 0 for v in (n_head_kv, n_layer)):
         return None
-    return value if match.group(2) == "b" else value / 1000.0
+
+    # q8_0: 32 values stored in 34 bytes (32 quantized + 2-byte scale).
+    bytes_per_element = 34 / 32
+
+    key_length_mla = meta.get(f"{arch}.attention.key_length_mla")
+    if isinstance(key_length_mla, int) and key_length_mla > 0:
+        return n_layer * n_head_kv * key_length_mla * bytes_per_element
+
+    key_length = meta.get(f"{arch}.attention.key_length")
+    value_length = meta.get(f"{arch}.attention.value_length")
+    if (
+        isinstance(key_length, int) and key_length > 0
+        and isinstance(value_length, int) and value_length > 0
+    ):
+        return n_layer * n_head_kv * (key_length + value_length) * bytes_per_element
+
+    if not all(isinstance(v, int) and v > 0 for v in (n_embd, n_head)):
+        return None
+    head_dim = n_embd // n_head
+    return 2 * n_layer * n_head_kv * head_dim * bytes_per_element
 
 
-def estimate_model_memory_mb(*refs: object) -> float | None:
-    candidates = [str(ref).strip() for ref in refs if str(ref).strip()]
-    for ref in candidates:
-        path = Path(ref).expanduser()
-        if not path.is_file():
-            continue
-        try:
+def _model_file_size_mb(refs: Iterable[object]) -> float | None:
+    for ref in refs:
+        path = Path(str(ref).strip()).expanduser()
+        if path.is_file():
             return round(path.stat().st_size / (1024 * 1024), 2)
-        except OSError:
-            continue
-    for ref in candidates:
-        params_b = estimate_model_params_b_from_text(ref)
-        if params_b is None:
-            continue
-        return round((params_b * _MODEL_MB_PER_B_PARAM) + _MODEL_BASE_OVERHEAD_MB, 2)
     return None
 
 
-def detect_free_accelerator_memory_mb(device: str) -> float | None:
-    normalized = str(device or "").strip().lower()
-    if normalized == "cpu" and sys.platform == "darwin":
-        mem = read_memory_snapshot()
-        if mem is not None:
-            return float(mem.available_mb)
-        return None
-
-    if normalized not in {"cuda", "vulkan"}:
-        return None
-
-    if normalized == "cuda":
-        nvidia_free_mb = _detect_nvidia_free_vram_mb()
-        if nvidia_free_mb is not None:
-            return nvidia_free_mb
-        # Jetson uses unified memory, so available system memory is the best proxy.
-        if Path("/dev/nvhost-gpu").exists():
-            mem = read_memory_snapshot()
-            if mem is not None:
-                return float(mem.available_mb)
-        return None
-
-    amd_free_mb = _detect_amd_free_vram_mb()
-    if amd_free_mb is not None:
-        return amd_free_mb
+def _model_gguf_path(refs: Iterable[object]) -> Path | None:
+    for ref in refs:
+        path = Path(str(ref).strip()).expanduser()
+        if path.is_file() and path.suffix == ".gguf":
+            return path
     return None
 
 
-def _detect_nvidia_free_vram_mb() -> float | None:
-    tool = shutil.which("nvidia-smi")
+def _run_tool(name: str, args: list[str]) -> subprocess.CompletedProcess | None:
+    tool = shutil.which(name)
     if not tool:
         return None
     try:
-        proc = subprocess.run(
-            [
-                tool,
-                "--query-gpu=name,memory.total,memory.used,memory.free",
-                "--format=csv,noheader,nounits",
-            ],
+        proc = subprocess.run([tool, *args], capture_output=True, text=True, timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    return proc if proc.returncode == 0 else None
+
+
+def _run_tool_via_login_shell(name: str, args: list[str]) -> subprocess.CompletedProcess | None:
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    command = " ".join([shutil.which(name) or name, *args])
+    try:
+        return subprocess.run(
+            [shell, "-lc", command],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=5,
             check=False,
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
         return None
-    if proc.returncode != 0:
+
+
+def _nvidia_free_vram_mb() -> float | None:
+    proc = _run_tool("nvidia-smi", [
+        "--query-gpu=name,memory.total,memory.used,memory.free",
+        "--format=csv,noheader,nounits",
+    ])
+    if not proc:
         return None
-    free_values: list[float] = []
-    for raw_line in proc.stdout.splitlines():
-        parts = [part.strip() for part in raw_line.split(",")]
-        if len(parts) != 4:
-            continue
-        try:
-            free_values.append(float(parts[3]))
-        except ValueError:
-            continue
-    return max(free_values) if free_values else None
+    free = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(",")
+        if len(parts) == 4:
+            try:
+                free.append(float(parts[3]))
+            except ValueError:
+                pass
+    return max(free) if free else None
 
 
-def _detect_amd_free_vram_mb() -> float | None:
-    sysfs_free = _detect_amd_free_vram_mb_from_sysfs()
-    if sysfs_free is not None:
-        return sysfs_free
-    return _detect_amd_free_vram_mb_from_rocm_smi()
-
-
-def _detect_amd_free_vram_mb_from_sysfs() -> float | None:
-    free_values: list[float] = []
+def _amd_free_vram_mb() -> float | None:
+    free = []
     for total_path in Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"):
         used_path = total_path.with_name("mem_info_vram_used")
         if not used_path.is_file():
             continue
         try:
-            total_bytes = int(total_path.read_text(encoding="utf-8").strip())
-            used_bytes = int(used_path.read_text(encoding="utf-8").strip())
+            total = int(total_path.read_text(encoding="utf-8").strip())
+            used = int(used_path.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             continue
-        if total_bytes <= 0 or used_bytes < 0:
-            continue
-        free_values.append(max(0.0, (total_bytes - used_bytes) / (1024 * 1024)))
-    return max(free_values) if free_values else None
+        if total > 0 and used >= 0:
+            free.append(max(0.0, (total - used) / (1024 * 1024)))
+    if free:
+        return max(free)
 
-
-def _detect_amd_free_vram_mb_from_rocm_smi() -> float | None:
-    tool = shutil.which("rocm-smi")
-    if not tool:
-        return None
-    try:
-        proc = subprocess.run(
-            [tool, "--showmeminfo", "vram", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError, TimeoutError):
-        return None
-    if proc.returncode != 0:
+    proc = _run_tool("rocm-smi", ["--showmeminfo", "vram", "--json"])
+    if not proc:
         return None
     try:
         payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return None
+    if not isinstance(payload, dict):
+        return None
+    for v in payload.values():
+        if not isinstance(v, dict):
+            continue
+        total_raw = v.get("VRAM Total Memory (B)") or v.get("vram_total") or v.get("total")
+        used_raw = v.get("VRAM Total Used Memory (B)") or v.get("vram_used") or v.get("used")
+        try:
+            total = float(str(total_raw).strip().replace(",", ""))
+            used = float(str(used_raw).strip().replace(",", ""))
+        except ValueError:
+            continue
+        free.append(max(0.0, (total - used) / (1024 * 1024)))
+    return max(free) if free else None
+
+
+def _parse_vulkaninfo_free_vram_mb(text: str) -> float | None:
     free_values: list[float] = []
-    if isinstance(payload, dict):
-        for value in payload.values():
-            if not isinstance(value, dict):
-                continue
-            total_raw = (
-                value.get("VRAM Total Memory (B)")
-                or value.get("vram_total")
-                or value.get("total")
-            )
-            used_raw = (
-                value.get("VRAM Total Used Memory (B)")
-                or value.get("vram_used")
-                or value.get("used")
-            )
-            try:
-                total_bytes = float(str(total_raw).strip().replace(",", ""))
-                used_bytes = float(str(used_raw).strip().replace(",", ""))
-            except ValueError:
-                continue
-            free_values.append(max(0.0, (total_bytes - used_bytes) / (1024 * 1024)))
+    current_size: int | None = None
+    current_budget: int | None = None
+    current_usage: int | None = None
+    current_device_local = False
+
+    def flush() -> None:
+        nonlocal current_size, current_budget, current_usage, current_device_local
+        if current_device_local:
+            if current_budget is not None and current_usage is not None:
+                free_values.append(max(0.0, (current_budget - current_usage) / (1024 * 1024)))
+            elif current_size is not None:
+                free_values.append(max(0.0, current_size / (1024 * 1024)))
+        current_size = None
+        current_budget = None
+        current_usage = None
+        current_device_local = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"memoryHeaps\[\d+\]:", line):
+            flush()
+            continue
+        if "MEMORY_HEAP_DEVICE_LOCAL_BIT" in line:
+            current_device_local = True
+            continue
+        if line.startswith("size"):
+            match = re.search(r"=\s*(\d+)", line)
+            if match:
+                current_size = int(match.group(1))
+            continue
+        if line.startswith("budget"):
+            match = re.search(r"=\s*(\d+)", line)
+            if match:
+                current_budget = int(match.group(1))
+            continue
+        if line.startswith("usage"):
+            match = re.search(r"=\s*(\d+)", line)
+            if match:
+                current_usage = int(match.group(1))
+            continue
+
+    flush()
     return max(free_values) if free_values else None
 
 
-def recommend_context_window_from_remaining_vram_mb(remaining_vram_mb: float | None) -> int:
-    if remaining_vram_mb is None:
-        return _CTX_OPTIONS[0]
-    usable_mb = max(0.0, float(remaining_vram_mb) - _CTX_RUNTIME_RESERVE_MB)
-    token_budget = int(usable_mb / _CTX_KV_MB_PER_TOKEN) if usable_mb > 0 else 0
-    recommended = _CTX_OPTIONS[0]
-    for option in _CTX_OPTIONS:
-        if token_budget < option:
-            break
-        recommended = option
-    return recommended
+def _vulkan_free_vram_mb() -> float | None:
+    if not shutil.which("vulkaninfo"):
+        return None
+    for args in (["--summary"], []):
+        proc = _run_tool_via_login_shell("vulkaninfo", args)
+        if proc is None:
+            continue
+        output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+        free = _parse_vulkaninfo_free_vram_mb(output)
+        if free is not None:
+            return free
+    return None
+
+
+def _detect_free_memory_mb(device: str) -> float | None:
+    dev = (device or "").strip().lower()
+
+    if dev in {"cpu", "metal"} and sys.platform == "darwin":
+        mem = read_memory_snapshot()
+        return float(mem.available_mb) if mem else None
+
+    if dev == "cuda":
+        free = _nvidia_free_vram_mb()
+        if free is not None:
+            return free
+        if Path("/dev/nvhost-gpu").exists():
+            mem = read_memory_snapshot()
+            return float(mem.available_mb) if mem else None
+        return None
+
+    if dev == "vulkan":
+        free = _amd_free_vram_mb()
+        if free is not None:
+            return free
+        return _vulkan_free_vram_mb()
+
+    if dev == "rocm":
+        return _amd_free_vram_mb()
+
+    return None
+
+
+def _max_tokens_for_memory(available_mb: float, kv_bytes_per_token: float) -> int:
+    if available_mb <= 0 or kv_bytes_per_token <= 0:
+        return _MIN_CTX
+    return max(_MIN_CTX, int(available_mb * 1024 * 1024 / kv_bytes_per_token))
 
 
 def recommend_setup_context_window(
@@ -199,20 +306,24 @@ def recommend_setup_context_window(
     model_refs: Iterable[object],
     total_vram_mb: float | None = None,
 ) -> int:
-    fallback = max(_CTX_OPTIONS[0], int(fallback_tokens))
-    if str(runtime or "").strip().lower() != "llama_cpp":
-        return fallback
+    fallback = max(_MIN_CTX, int(fallback_tokens))
+    refs = list(model_refs)
 
-    model_mb = estimate_model_memory_mb(*list(model_refs))
+    model_mb = _model_file_size_mb(refs)
     if model_mb is None:
         return fallback
 
-    normalized = str(device or "").strip().lower()
-    if normalized in {"cuda", "vulkan", "rocm"} and total_vram_mb is not None and total_vram_mb > 0:
-        return recommend_context_window_from_remaining_vram_mb(float(total_vram_mb) - model_mb)
-
-    free_vram_mb = detect_free_accelerator_memory_mb(device)
-    if free_vram_mb is None:
+    gguf_path = _model_gguf_path(refs)
+    kv_bpt = _kv_bytes_per_token_from_gguf(gguf_path) if gguf_path else None
+    if kv_bpt is None:
         return fallback
 
-    return recommend_context_window_from_remaining_vram_mb(free_vram_mb - model_mb)
+    free = _detect_free_memory_mb(device)
+    if free is not None:
+        return _max_tokens_for_memory(free - model_mb, kv_bpt)
+
+    dev = (device or "").strip().lower()
+    if dev in {"cuda", "vulkan", "rocm", "metal"} and total_vram_mb is not None and total_vram_mb > 0:
+        return _max_tokens_for_memory(total_vram_mb - model_mb, kv_bpt)
+
+    return fallback

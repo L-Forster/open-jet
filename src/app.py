@@ -2560,7 +2560,7 @@ class OpenJetApp:
         deny_style = "deny_selected" if self._approval_choice == 1 else "deny_idle"
         approve = rich_text(" Approve ", approve_style)
         deny = rich_text(" Deny ", deny_style)
-        return f"  {approve} {deny} {rich_text('←/→ Enter y/n', 'muted')}"
+        return f"  {approve} {deny} {rich_text('Tab/←/→ Enter y/n', 'muted')}"
 
     def _set_approval_choice(self, choice: int) -> None:
         normalized = 0 if int(choice) <= 0 else 1
@@ -2568,6 +2568,9 @@ class OpenJetApp:
             return
         self._approval_choice = normalized
         self._refresh_approval_prompt_selection()
+
+    def _cycle_approval_choice(self, step: int = 1) -> None:
+        self._set_approval_choice((self._approval_choice + step) % 2)
 
     def _refresh_approval_prompt_selection(self) -> None:
         index = self._approval_prompt_selection_index
@@ -2649,6 +2652,11 @@ class OpenJetApp:
         @bindings.add("right", filter=awaiting_approval, eager=True)
         def _right(event) -> None:
             self._set_approval_choice(1)
+            event.current_buffer.reset()
+
+        @bindings.add("tab", filter=awaiting_approval, eager=True)
+        def _tab_approval(event) -> None:
+            self._cycle_approval_choice(1)
             event.current_buffer.reset()
 
         @bindings.add("y", filter=awaiting_approval, eager=True)

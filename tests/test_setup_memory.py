@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,38 +9,91 @@ from unittest.mock import Mock, patch
 import src.setup as setup_source
 
 from src.setup_memory import (
-    _detect_amd_free_vram_mb_from_sysfs,
-    detect_free_accelerator_memory_mb,
-    estimate_model_memory_mb,
-    recommend_context_window_from_remaining_vram_mb,
+    _amd_free_vram_mb,
+    _detect_free_memory_mb,
+    _kv_bytes_per_token_from_gguf,
+    _max_tokens_for_memory,
+    _model_file_size_mb,
     recommend_setup_context_window,
 )
 
+
+def _build_test_gguf(n_embd: int, n_head: int, n_head_kv: int, n_layer: int) -> bytes:
+    """Build a minimal valid GGUF file with the given model architecture params."""
+    buf = bytearray()
+    buf += b"GGUF"
+    buf += struct.pack("<I", 3)  # version
+    buf += struct.pack("<Q", 0)  # tensor count
+    kvs: list[tuple[str, str | int]] = [
+        ("general.architecture", "llama"),
+        ("llama.embedding_length", n_embd),
+        ("llama.attention.head_count", n_head),
+        ("llama.attention.head_count_kv", n_head_kv),
+        ("llama.block_count", n_layer),
+    ]
+    buf += struct.pack("<Q", len(kvs))
+    for key, value in kvs:
+        key_bytes = key.encode("utf-8")
+        buf += struct.pack("<Q", len(key_bytes))
+        buf += key_bytes
+        if isinstance(value, str):
+            buf += struct.pack("<I", 8)  # STRING
+            val_bytes = value.encode("utf-8")
+            buf += struct.pack("<Q", len(val_bytes))
+            buf += val_bytes
+        else:
+            buf += struct.pack("<I", 4)  # UINT32
+            buf += struct.pack("<I", value)
+    return bytes(buf)
+
+
 class SetupMemoryTests(unittest.TestCase):
-    def test_detect_free_accelerator_memory_mb_uses_max_free_gpu(self) -> None:
+    def test_kv_bytes_per_token_from_gguf_llama_8b(self) -> None:
+        # 32 layers, 32 heads, 8 KV heads, 4096 embd -> head_dim=128
+        # q8_0: 34/32 bytes per element
+        # 2 * 32 * 8 * 128 * (34/32) = 69632 bytes/token
+        data = _build_test_gguf(n_embd=4096, n_head=32, n_head_kv=8, n_layer=32)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.gguf"
+            path.write_bytes(data)
+            self.assertEqual(_kv_bytes_per_token_from_gguf(path), 69632.0)
+
+    def test_kv_bytes_per_token_from_gguf_llama_70b(self) -> None:
+        # 80 layers, 64 heads, 8 KV heads, 8192 embd -> head_dim=128
+        # 2 * 80 * 8 * 128 * (34/32) = 174080 bytes/token
+        data = _build_test_gguf(n_embd=8192, n_head=64, n_head_kv=8, n_layer=80)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.gguf"
+            path.write_bytes(data)
+            self.assertEqual(_kv_bytes_per_token_from_gguf(path), 174080.0)
+
+    def test_max_tokens_for_memory(self) -> None:
+        # 8 GB with Llama 8B KV (69632 B/tok) -> 8192*1024*1024/69632 = 123361
+        self.assertEqual(_max_tokens_for_memory(8192.0, 69632), 123361)
+        # 1 GB -> 1024*1024*1024/69632 = 15420
+        self.assertEqual(_max_tokens_for_memory(1024.0, 69632), 15420)
+
+    def test_max_tokens_for_memory_no_room(self) -> None:
+        self.assertEqual(_max_tokens_for_memory(0.0, 69632), 1024)
+        self.assertEqual(_max_tokens_for_memory(-500.0, 69632), 1024)
+
+    def test_detect_free_memory_uses_max_free_gpu(self) -> None:
         proc = Mock(
             returncode=0,
             stdout="RTX 4090, 24564, 8123, 16441\nRTX 3080, 10240, 4096, 6144\n",
         )
-
         with patch("src.setup_memory.shutil.which", return_value="/usr/bin/nvidia-smi"), patch(
-            "src.setup_memory.subprocess.run",
-            return_value=proc,
+            "src.setup_memory.subprocess.run", return_value=proc,
         ):
-            free_mb = detect_free_accelerator_memory_mb("cuda")
+            self.assertEqual(_detect_free_memory_mb("cuda"), 16441.0)
 
-        self.assertEqual(free_mb, 16441.0)
-
-    def test_estimate_model_memory_mb_prefers_real_file_size(self) -> None:
+    def test_model_file_size_mb_reads_real_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model = Path(tmp) / "demo.gguf"
             model.write_bytes(b"x" * (3 * 1024 * 1024))
+            self.assertEqual(_model_file_size_mb([str(model)]), 3.0)
 
-            estimated = estimate_model_memory_mb(str(model), "Qwen3.5 27B")
-
-        self.assertEqual(estimated, 3.0)
-
-    def test_detect_amd_free_vram_mb_from_sysfs(self) -> None:
+    def test_amd_free_vram_mb_from_sysfs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             device_dir = Path(tmp) / "card0" / "device"
             device_dir.mkdir(parents=True)
@@ -47,17 +101,16 @@ class SetupMemoryTests(unittest.TestCase):
             used_path = device_dir / "mem_info_vram_used"
             total_path.write_text(str(8 * 1024 * 1024 * 1024), encoding="utf-8")
             used_path.write_text(str(3 * 1024 * 1024 * 1024), encoding="utf-8")
-
             with patch("src.setup_memory.Path.glob", return_value=[total_path]):
-                free_mb = _detect_amd_free_vram_mb_from_sysfs()
+                self.assertEqual(_amd_free_vram_mb(), 5120.0)
 
-        self.assertEqual(free_mb, 5120.0)
-
-    def test_recommend_setup_context_window_subtracts_model_from_total_vram_for_discrete_gpu(self) -> None:
-        with patch("src.setup_memory.detect_free_accelerator_memory_mb", return_value=8192.0), patch(
-            "src.setup_memory.estimate_model_memory_mb",
-            return_value=15360.0,
-        ):
+    def test_recommend_uses_gguf_kv_cost(self) -> None:
+        # 24576 total - 15360 model = 9216 MB remaining
+        # Llama 8B KV (q8_0): 69632 B/tok
+        # 9216 * 1024 * 1024 / 69632 = 138862
+        with patch("src.setup_memory._model_file_size_mb", return_value=15360.0), \
+             patch("src.setup_memory._model_gguf_path", return_value=Path("/fake.gguf")), \
+             patch("src.setup_memory._kv_bytes_per_token_from_gguf", return_value=69632):
             recommended = recommend_setup_context_window(
                 runtime="llama_cpp",
                 device="cuda",
@@ -65,36 +118,40 @@ class SetupMemoryTests(unittest.TestCase):
                 model_refs=["/models/Qwen3.5-9B-Q4_K_M.gguf"],
                 total_vram_mb=24576.0,
             )
+        self.assertEqual(recommended, 138782)
 
-        self.assertEqual(recommended, 12288)
-
-    def test_recommend_setup_context_window_handles_user_reported_remaining_vram_case(self) -> None:
-        with patch("src.setup_memory.estimate_model_memory_mb", return_value=15360.0):
+    def test_recommend_returns_fallback_without_gguf(self) -> None:
+        with patch("src.setup_memory._model_file_size_mb", return_value=15360.0), \
+             patch("src.setup_memory._model_gguf_path", return_value=None):
             recommended = recommend_setup_context_window(
                 runtime="llama_cpp",
                 device="cuda",
                 fallback_tokens=6144,
-                model_refs=["/root/.openjet/models/Qwen_Qwen3.5-27B-Q4_K_M.gguf"],
+                model_refs=["/models/model.bin"],
                 total_vram_mb=24576.0,
             )
+        self.assertEqual(recommended, 6144)
 
-        self.assertEqual(recommended, 12288)
+    def test_recommend_returns_fallback_without_model_file(self) -> None:
+        recommended = recommend_setup_context_window(
+            runtime="llama_cpp",
+            device="cuda",
+            fallback_tokens=6144,
+            model_refs=["/nonexistent/model.gguf"],
+            total_vram_mb=24576.0,
+        )
+        self.assertEqual(recommended, 6144)
 
-    def test_recommend_context_window_from_remaining_vram_mb_has_small_floor(self) -> None:
-        self.assertEqual(recommend_context_window_from_remaining_vram_mb(-1), 1024)
-        self.assertEqual(recommend_context_window_from_remaining_vram_mb(1200), 1024)
+    def test_detect_free_memory_uses_amd_for_vulkan(self) -> None:
+        with patch("src.setup_memory._amd_free_vram_mb", return_value=6144.0):
+            self.assertEqual(_detect_free_memory_mb("vulkan"), 6144.0)
 
-    def test_detect_free_accelerator_memory_mb_uses_amd_paths_for_vulkan(self) -> None:
-        with patch("src.setup_memory._detect_amd_free_vram_mb", return_value=6144.0):
-            self.assertEqual(detect_free_accelerator_memory_mb("vulkan"), 6144.0)
-
-    def test_detect_free_accelerator_memory_mb_uses_unified_memory_on_darwin(self) -> None:
+    def test_detect_free_memory_uses_unified_on_darwin(self) -> None:
         snapshot = Mock(available_mb=6144.0)
         with patch("src.setup_memory.sys.platform", "darwin"), patch(
-            "src.setup_memory.read_memory_snapshot",
-            return_value=snapshot,
+            "src.setup_memory.read_memory_snapshot", return_value=snapshot,
         ):
-            self.assertEqual(detect_free_accelerator_memory_mb("cpu"), 6144.0)
+            self.assertEqual(_detect_free_memory_mb("cpu"), 6144.0)
 
 
 class SetupSourceIntegrationTests(unittest.TestCase):
@@ -102,17 +159,11 @@ class SetupSourceIntegrationTests(unittest.TestCase):
         hardware = setup_source.HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
 
         with patch.object(setup_source, "discover_model_files", return_value=["/models/demo.gguf"]), patch.object(
-            setup_source,
-            "_discover_llama_server",
-            return_value="/usr/bin/llama-server",
+            setup_source, "_discover_llama_server", return_value="/usr/bin/llama-server",
         ), patch.object(
-            setup_source,
-            "recommended_gpu_layers",
-            return_value=99,
+            setup_source, "recommended_gpu_layers", return_value=99,
         ), patch.object(
-            setup_source,
-            "recommend_setup_context_window",
-            return_value=6144,
+            setup_source, "recommend_setup_context_window", return_value=6144,
         ) as recommend_ctx:
             payload = setup_source.build_recommended_payload(
                 hardware_info=hardware,
@@ -128,7 +179,7 @@ class SetupSourceIntegrationTests(unittest.TestCase):
         self.assertIn("/models/demo.gguf", call.kwargs["model_refs"])
         self.assertEqual(call.kwargs["total_vram_mb"], hardware.vram_mb)
 
-    def test_build_recommended_payload_passes_detected_total_vram_to_setup_memory(self) -> None:
+    def test_build_recommended_payload_passes_detected_total_vram(self) -> None:
         hardware = setup_source.HardwareInfo(
             label="CUDA-capable device",
             total_ram_gb=32.0,
@@ -137,17 +188,11 @@ class SetupSourceIntegrationTests(unittest.TestCase):
         )
 
         with patch.object(setup_source, "discover_model_files", return_value=[]), patch.object(
-            setup_source,
-            "_discover_llama_server",
-            return_value="/usr/bin/llama-server",
+            setup_source, "_discover_llama_server", return_value="/usr/bin/llama-server",
         ), patch.object(
-            setup_source,
-            "recommended_gpu_layers",
-            return_value=99,
+            setup_source, "recommended_gpu_layers", return_value=99,
         ), patch.object(
-            setup_source,
-            "recommend_setup_context_window",
-            return_value=12288,
+            setup_source, "recommend_setup_context_window", return_value=12288,
         ) as recommend_ctx:
             payload = setup_source.build_recommended_payload(
                 hardware_info=hardware,

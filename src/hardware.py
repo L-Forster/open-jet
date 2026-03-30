@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -111,19 +113,145 @@ def _read_rocm_vram_mb() -> float:
     return total
 
 
+def _parse_vulkan_heap_size_mb(value: object) -> float:
+    if isinstance(value, (int, float)):
+        return float(value) / (1024.0 * 1024.0)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    lowered = text.lower()
+    if lowered.startswith("0x"):
+        try:
+            return int(lowered, 16) / (1024.0 * 1024.0)
+        except ValueError:
+            return 0.0
+    cleaned = lowered.replace(",", "").replace("_", "")
+    for suffix, scale in (
+        ("gib", 1024.0),
+        ("gb", 1000.0),
+        ("mib", 1.0),
+        ("mb", 1000.0 / 1024.0),
+        ("kib", 1.0 / 1024.0),
+        ("kb", 1000.0 / (1024.0 * 1024.0)),
+        ("b", 1.0 / (1024.0 * 1024.0)),
+    ):
+        if cleaned.endswith(suffix):
+            try:
+                return float(cleaned.removesuffix(suffix).strip()) * scale
+            except ValueError:
+                return 0.0
+    try:
+        return float(cleaned) / (1024.0 * 1024.0)
+    except ValueError:
+        return 0.0
+
+
+def _collect_vulkan_device_local_heap_mb(payload: object) -> float:
+    total = 0.0
+    if isinstance(payload, dict):
+        heaps = payload.get("memoryHeaps")
+        if isinstance(heaps, list):
+            for heap in heaps:
+                if not isinstance(heap, dict):
+                    continue
+                flags = str(heap.get("flags") or heap.get("Flags") or "")
+                if "DEVICE_LOCAL" not in flags.upper():
+                    continue
+                size = (
+                    heap.get("size")
+                    or heap.get("Size")
+                    or heap.get("sizeBytes")
+                    or heap.get("heapSize")
+                )
+                total += _parse_vulkan_heap_size_mb(size)
+        for value in payload.values():
+            total += _collect_vulkan_device_local_heap_mb(value)
+    elif isinstance(payload, list):
+        for item in payload:
+            total += _collect_vulkan_device_local_heap_mb(item)
+    return total
+
+
+def _parse_vulkaninfo_text_total_vram_mb(text: str) -> float:
+    total = 0.0
+    current_size = 0.0
+    current_device_local = False
+
+    def flush() -> None:
+        nonlocal total, current_size, current_device_local
+        if current_device_local and current_size > 0:
+            total += current_size
+        current_size = 0.0
+        current_device_local = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"memoryHeaps\[\d+\]:", line):
+            flush()
+            continue
+        if "MEMORY_HEAP_DEVICE_LOCAL_BIT" in line:
+            current_device_local = True
+            continue
+        if line.startswith("size"):
+            match = re.search(r"=\s*(\d+)", line)
+            if match:
+                current_size = int(match.group(1)) / (1024.0 * 1024.0)
+    flush()
+    return total
+
+
+def _read_vulkan_vram_mb() -> float:
+    """Total device-local VRAM via vulkaninfo JSON or text output."""
+    tool = shutil.which("vulkaninfo")
+    if not tool:
+        return 0.0
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    for args in (["--json"], ["--summary"], []):
+        try:
+            proc = subprocess.run(
+                [shell, "-lc", " ".join([tool, *args])],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+        if "--json" in args:
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                payload = None
+            if payload is not None:
+                total = _collect_vulkan_device_local_heap_mb(payload)
+                if total > 0:
+                    return total
+        total = _parse_vulkaninfo_text_total_vram_mb(output)
+        if total > 0:
+            return total
+    return 0.0
+
+
 def _read_metal_vram_mb() -> float:
     """Apple Silicon uses unified memory — VRAM = system RAM."""
     mem = read_memory_snapshot()
     return mem.total_mb if mem else 0.0
 
 
-def _detect_vram_mb(has_cuda: bool, has_rocm: bool, has_metal: bool) -> float:
+def _detect_vram_mb(has_cuda: bool, has_rocm: bool, has_metal: bool, has_vulkan: bool) -> float:
     if has_cuda:
         vram = _read_nvidia_vram_mb()
         if vram > 0:
             return vram
     if has_rocm:
         vram = _read_rocm_vram_mb()
+        if vram > 0:
+            return vram
+    if has_vulkan:
+        vram = _read_vulkan_vram_mb()
         if vram > 0:
             return vram
     if has_metal:
@@ -181,7 +309,7 @@ def detect_hardware_info() -> HardwareInfo:
     has_rocm = _detect_rocm()
     has_vulkan = _detect_vulkan()
     has_metal = _detect_metal()
-    vram_mb = _detect_vram_mb(has_cuda, has_rocm, has_metal)
+    vram_mb = _detect_vram_mb(has_cuda, has_rocm, has_metal, has_vulkan)
     board = read_device_model()
     if board:
         label = board
