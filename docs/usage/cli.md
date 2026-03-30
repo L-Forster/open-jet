@@ -5,7 +5,10 @@
 ```bash
 open-jet
 open-jet chat
+open-jet chat Explain the repo layout briefly.
 ```
+
+`open-jet chat <text>` runs one prompt through the shared SDK/runtime backend and prints the final response to stdout without launching the TUI.
 
 Optional setup flow:
 

@@ -206,6 +206,17 @@ def _read_workflow_logs(root: Path, name: str, tail: int) -> str:
     return "\n\n".join(chunks)
 
 
+async def _run_cli_chat_prompt(prompt: str) -> str:
+    from .sdk import OpenJetSession
+
+    session = await OpenJetSession.create()
+    try:
+        response = await session.run(prompt)
+        return response.text
+    finally:
+        await session.close()
+
+
 def _open_jet_version() -> str:
     try:
         return importlib.metadata.version("open-jet")
@@ -326,7 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--setup", action="store_true", help="start in setup wizard mode before launching the chat UI")
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("chat", help="start the interactive chat UI")
+    chat_parser = subparsers.add_parser("chat", help="start the interactive chat UI or run a one-shot prompt")
+    chat_parser.add_argument("prompt", nargs=argparse.REMAINDER, help="optional one-shot prompt text")
     subparsers.add_parser("setup", help="run setup wizard before launching the chat UI")
     subparsers.add_parser("models", help="list saved model presets")
     subparsers.add_parser("commands", help="list available slash commands")
@@ -377,6 +389,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
 
+    if args.command == "chat":
+        prompt_parts = [str(part) for part in getattr(args, "prompt", [])]
+        prompt = " ".join(prompt_parts).strip()
+        if prompt:
+            print(asyncio.run(_run_cli_chat_prompt(prompt)))
+            return
     if args.command == "models":
         print(_format_model_profiles_summary(load_config()))
         return
