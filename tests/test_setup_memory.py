@@ -18,19 +18,29 @@ from src.setup_memory import (
 )
 
 
-def _build_test_gguf(n_embd: int, n_head: int, n_head_kv: int, n_layer: int) -> bytes:
+def _build_test_gguf(
+    n_embd: int,
+    n_head: int,
+    n_head_kv: int,
+    n_layer: int,
+    *,
+    arch: str = "llama",
+    extras: list[tuple[str, str | int]] | None = None,
+) -> bytes:
     """Build a minimal valid GGUF file with the given model architecture params."""
     buf = bytearray()
     buf += b"GGUF"
     buf += struct.pack("<I", 3)  # version
     buf += struct.pack("<Q", 0)  # tensor count
     kvs: list[tuple[str, str | int]] = [
-        ("general.architecture", "llama"),
-        ("llama.embedding_length", n_embd),
-        ("llama.attention.head_count", n_head),
-        ("llama.attention.head_count_kv", n_head_kv),
-        ("llama.block_count", n_layer),
+        ("general.architecture", arch),
+        (f"{arch}.embedding_length", n_embd),
+        (f"{arch}.attention.head_count", n_head),
+        (f"{arch}.attention.head_count_kv", n_head_kv),
+        (f"{arch}.block_count", n_layer),
     ]
+    if extras:
+        kvs.extend(extras)
     buf += struct.pack("<Q", len(kvs))
     for key, value in kvs:
         key_bytes = key.encode("utf-8")
@@ -66,6 +76,27 @@ class SetupMemoryTests(unittest.TestCase):
             path = Path(tmp) / "test.gguf"
             path.write_bytes(data)
             self.assertEqual(_kv_bytes_per_token_from_gguf(path), 174080.0)
+
+    def test_kv_bytes_per_token_from_gguf_qwen35_hybrid_attention(self) -> None:
+        # Qwen3.5-style hybrid attention only stores growing KV state on every
+        # 4th layer. 64 layers -> 16 KV-bearing layers.
+        # 16 * 4 * (256 + 256) * (34/32) = 34816 bytes/token
+        data = _build_test_gguf(
+            n_embd=0,
+            n_head=64,
+            n_head_kv=4,
+            n_layer=64,
+            arch="qwen35",
+            extras=[
+                ("qwen35.attention.key_length", 256),
+                ("qwen35.attention.value_length", 256),
+                ("qwen35.full_attention_interval", 4),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.gguf"
+            path.write_bytes(data)
+            self.assertEqual(_kv_bytes_per_token_from_gguf(path), 34816.0)
 
     def test_max_tokens_for_memory(self) -> None:
         # 8 GB with Llama 8B KV (69632 B/tok) -> 8192*1024*1024/69632 = 123361

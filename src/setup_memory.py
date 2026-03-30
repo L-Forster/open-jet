@@ -81,6 +81,12 @@ def _kv_bytes_per_token_from_gguf(path: Path) -> float | None:
     if not all(isinstance(v, int) and v > 0 for v in (n_head_kv, n_layer)):
         return None
 
+    # Hybrid-attention Qwen3.5 models only allocate context-growing KV cache on
+    # their periodic full-attention layers. GGUF exposes that cadence directly.
+    full_attention_interval = meta.get(f"{arch}.full_attention_interval")
+    if isinstance(full_attention_interval, int) and full_attention_interval > 1:
+        n_layer = (n_layer + full_attention_interval - 1) // full_attention_interval
+
     # q8_0: 32 values stored in 34 bytes (32 quantized + 2-byte scale).
     bytes_per_element = 34 / 32
 
