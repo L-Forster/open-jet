@@ -180,26 +180,32 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
             "available_update",
             return_value=update,
         ) as available_update, patch.object(
+            app,
+            "_new_detached_prompt_session",
+            return_value=Mock(),
+        ) as prompt_session, patch.object(
             app_module,
-            "radiolist_dialog",
-        ) as radiolist_dialog, patch.object(
+            "_prompt_choice",
+            AsyncMock(return_value="skip"),
+        ) as prompt_choice, patch.object(
             app_module,
             "install_update",
         ) as install_release:
-            radiolist_dialog.return_value.run_async = AsyncMock(return_value="skip")
             await app._maybe_prompt_for_startup_update(app.query_one("#chat-log"))
 
         available_update.assert_called_once_with(
             current_version="0.3.0",
             timeout_seconds=app._STARTUP_UPDATE_CHECK_TIMEOUT_SECONDS,
         )
-        radiolist_dialog.assert_called_once_with(
-            title="Update open-jet repo",
-            text="Newer commit available: 1111111 -> aaaaaaa",
-            values=[
-                ("install", "Pull origin/master and restart open-jet"),
-                ("skip", "Skip for now"),
+        prompt_choice.assert_awaited_once_with(
+            prompt_session.return_value,
+            app.console,
+            "Update open-jet repo",
+            [
+                ("Pull origin/master and restart open-jet", "install"),
+                ("Skip for now", "skip"),
             ],
+            detail="Newer commit available: 1111111 -> aaaaaaa",
         )
         install_release.assert_not_called()
         self.assertFalse(app._quit_requested)
@@ -227,9 +233,14 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
             "available_update",
             return_value=update,
         ), patch.object(
+            app,
+            "_new_detached_prompt_session",
+            return_value=Mock(),
+        ), patch.object(
             app_module,
-            "radiolist_dialog",
-        ) as radiolist_dialog, patch.object(
+            "_prompt_choice",
+            AsyncMock(return_value="install"),
+        ), patch.object(
             app_module,
             "install_update",
             return_value="Updated open-jet repo from 1111111 to aaaaaaa.",
@@ -241,7 +252,6 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
             "_init_client",
             AsyncMock(),
         ) as init_client:
-            radiolist_dialog.return_value.run_async = AsyncMock(return_value="install")
             await app._maybe_prompt_for_startup_update(app.query_one("#chat-log"))
 
         install_release.assert_called_once_with(update, current_version="0.3.0")

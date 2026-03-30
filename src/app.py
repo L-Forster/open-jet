@@ -21,7 +21,6 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.shortcuts import radiolist_dialog
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markup import escape
@@ -111,7 +110,7 @@ from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
 from .self_update import RepoUpdateInfo, available_update, install_update
-from .setup import ACCENT_GREEN, discover_model_files, run_setup_wizard
+from .setup import ACCENT_GREEN, _prompt_choice, discover_model_files, run_setup_wizard
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
 from .tool_executor import format_tool_args, get_swap_manager, set_swap_manager
@@ -754,8 +753,7 @@ class OpenJetApp:
         )
 
     async def _run_setup_wizard(self) -> dict | None:
-        from prompt_toolkit import PromptSession as _PS
-        setup_session = _PS()
+        setup_session = self._new_detached_prompt_session()
         return await run_setup_wizard(
             session=setup_session,
             console=self.console,
@@ -763,6 +761,12 @@ class OpenJetApp:
             recommended_ctx=recommended_context_window_tokens(),
             current_cfg=self.cfg,
         )
+
+    @staticmethod
+    def _new_detached_prompt_session() -> PromptSession[object]:
+        from prompt_toolkit import PromptSession as _PS
+
+        return _PS()
 
     def _persist_setup_result(self, setup_result: dict[str, Any]) -> None:
         payload = dict(setup_result)
@@ -943,14 +947,16 @@ class OpenJetApp:
             return
         if update is None:
             return
-        selected = await radiolist_dialog(
-            title="Update open-jet repo",
-            text=f"Newer commit available: {update.local_short} -> {update.remote_short}",
-            values=[
-                ("install", f"Pull {update.remote}/{update.branch} and restart open-jet"),
-                ("skip", "Skip for now"),
+        selected = await _prompt_choice(
+            self._new_detached_prompt_session(),
+            self.console,
+            "Update open-jet repo",
+            [
+                (f"Pull {update.remote}/{update.branch} and restart open-jet", "install"),
+                ("Skip for now", "skip"),
             ],
-        ).run_async()
+            detail=f"Newer commit available: {update.local_short} -> {update.remote_short}",
+        )
         if selected != "install":
             if self.session_logger:
                 self.session_logger.log_event(
