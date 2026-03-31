@@ -31,7 +31,7 @@ rm -rf build dist ./*.egg-info ./*/*.egg-info
 # stdlib distutils removed in Python 3.12+; let setuptools provide it.
 unset SETUPTOOLS_USE_DISTUTILS 2>/dev/null || true
 python -m build --wheel --no-isolation
-RAW_WHEEL="$(ls -t dist/open_jet-*.whl | head -n1)"
+RAW_WHEEL="$(ls -t dist/openjet-*.whl dist/open_jet-*.whl 2>/dev/null | head -n1)"
 if [[ -z "${RAW_WHEEL}" ]]; then
   echo "No wheel produced in dist/." >&2
   exit 1
