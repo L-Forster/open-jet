@@ -54,9 +54,9 @@ fi
 export TWINE_USERNAME="${TWINE_USERNAME:-__token__}"
 
 if [[ "$TARGET" == "testpypi" ]]; then
-  python -m twine upload --repository testpypi dist/repaired/*
+  python -m twine upload --verbose --repository testpypi dist/repaired/*
   echo "Uploaded to TestPyPI."
 else
-  python -m twine upload dist/repaired/*
+  python -m twine upload --verbose dist/repaired/*
   echo "Uploaded to PyPI."
 fi
