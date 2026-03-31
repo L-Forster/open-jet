@@ -24,12 +24,12 @@ fi
 
 python scripts/sync_pypi_readme.py
 
-python -m pip install --upgrade "build" "twine" "Cython>=3.0" "setuptools>=68,<80" "wheel"
+python -m pip install --upgrade "build" "twine" "Cython>=3.0" "setuptools>=68" "wheel"
 
 rm -rf build dist ./*.egg-info ./*/*.egg-info
 
-# Required in some Debian/Ubuntu Python setups where numpy/distutils is injected.
-export SETUPTOOLS_USE_DISTUTILS="${SETUPTOOLS_USE_DISTUTILS:-stdlib}"
+# stdlib distutils removed in Python 3.12+; let setuptools provide it.
+unset SETUPTOOLS_USE_DISTUTILS 2>/dev/null || true
 python -m build --wheel --no-isolation
 RAW_WHEEL="$(ls -t dist/open_jet-*.whl | head -n1)"
 if [[ -z "${RAW_WHEEL}" ]]; then
