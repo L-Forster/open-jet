@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import re
 from typing import Mapping
 
-from ..hardware import HardwareInfo, effective_hardware_info
-from ..provisioning import recommend_direct_model
-from ..setup import build_recommended_payload
+from ..config import setup_direct_model_catalog
+from ..hardware import (
+    HardwareInfo,
+    effective_hardware_info,
+    recommended_context_window_tokens_from_total,
+    recommended_device_for_hardware,
+    recommended_gpu_layers,
+    recommended_param_budget_b,
+)
 
 
 @dataclass(frozen=True)
@@ -50,31 +58,24 @@ def recommend_hardware_config(
 ) -> HardwareRecommendation:
     detected = _coerce_hardware_info(hardware)
     current_cfg = _recommendation_cfg(hardware, cfg=cfg)
-    payload = build_recommended_payload(
-        hardware_info=detected,
-        recommended_ctx=0,
-        current_cfg=current_cfg,
-    )
-    hardware_profile = str(payload.get("hardware_profile") or "auto")
-    hardware_override = str(payload.get("hardware_override") or "")
+    hardware_profile = "other" if str(current_cfg.get("hardware_profile") or "") == "other" else "auto"
+    hardware_override = str(current_cfg.get("hardware_override") or "") if hardware_profile == "other" else ""
     effective = effective_hardware_info(
         hardware_profile,
         detected,
         hardware_override or None,
     )
-    direct_model = recommend_direct_model(effective, cfg=current_cfg)
-    target_path = str(payload.get("model_download_path") or payload.get("llama_model") or "")
-    direct_target = str(direct_model.get("target_path") or "")
-    model = RecommendedModel(
-        label=str(direct_model.get("label") or _model_label_from_target(target_path)),
-        filename=_filename_from_payload(payload),
-        url=str(payload.get("model_download_url") or (direct_model.get("url") if target_path == direct_target else "") or ""),
-        target_path=target_path,
+
+    device = recommended_device_for_hardware(
+        hardware_profile,
+        detected,
+        hardware_override or None,
     )
+    model = _recommend_model(effective, cfg=current_cfg)
     llama = RecommendedLlamaConfig(
-        device=str(payload.get("device") or "cpu"),
-        gpu_layers=int(payload.get("gpu_layers", 0) or 0),
-        context_window_tokens=int(payload.get("context_window_tokens", 1024) or 1024),
+        device=device,
+        gpu_layers=recommended_gpu_layers(device, effective.total_ram_gb),
+        context_window_tokens=_recommend_context_window_tokens(effective),
     )
 
     return HardwareRecommendation(
@@ -158,11 +159,77 @@ def _recommendation_cfg(
     return merged
 
 
-def _filename_from_payload(payload: Mapping[str, object]) -> str:
-    target = str(payload.get("model_download_path") or payload.get("llama_model") or "").strip()
-    if not target:
-        return ""
-    return target.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+def _recommend_model(
+    hardware: HardwareInfo,
+    *,
+    cfg: Mapping[str, object] | None,
+) -> RecommendedModel:
+    catalog = setup_direct_model_catalog(cfg)
+    if not catalog:
+        return RecommendedModel(label="", filename="", url="", target_path="")
+
+    sizing_hw = _model_sizing_hardware(hardware)
+    budget_b = recommended_param_budget_b("auto", sizing_hw)
+
+    parsed_catalog: list[tuple[Mapping[str, object], float | None]] = []
+    for row in catalog:
+        size_b = _parse_model_size_b(str(row.get("label") or ""))
+        parsed_catalog.append((row, size_b))
+
+    candidates = [item for item in parsed_catalog if item[1] is not None]
+    if candidates:
+        row, _size_b = min(
+            candidates,
+            key=lambda item: (
+                abs(float(item[1]) - budget_b),
+                0 if float(item[1]) <= budget_b else 1,
+                float(item[1]),
+            ),
+        )
+    else:
+        row = catalog[-1]
+
+    filename = str(row.get("filename") or "")
+    target_path = str(Path.home() / ".openjet" / "models" / filename) if filename else ""
+    return RecommendedModel(
+        label=str(row.get("label") or _model_label_from_target(target_path)),
+        filename=filename,
+        url=str(row.get("url") or ""),
+        target_path=target_path,
+    )
+
+
+def _model_sizing_hardware(hardware: HardwareInfo) -> HardwareInfo:
+    total_ram_gb = max(0.0, float(hardware.total_ram_gb))
+    if hardware.vram_mb > 0 and not hardware.has_metal and (hardware.has_cuda or hardware.has_rocm or hardware.has_vulkan):
+        total_ram_gb += max(0.0, float(hardware.vram_mb)) / 1024.0
+    return HardwareInfo(
+        label=hardware.label,
+        total_ram_gb=total_ram_gb,
+        has_cuda=hardware.has_cuda,
+        has_vulkan=hardware.has_vulkan,
+        has_rocm=hardware.has_rocm,
+        has_metal=hardware.has_metal,
+        vram_mb=hardware.vram_mb,
+    )
+
+
+def _recommend_context_window_tokens(hardware: HardwareInfo) -> int:
+    sizing_hw = _model_sizing_hardware(hardware)
+    return recommended_context_window_tokens_from_total(
+        sizing_hw.total_ram_gb,
+        headless=False,
+    )
+
+
+def _parse_model_size_b(label: str) -> float | None:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[Bb]", label)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
 
 
 def _model_label_from_target(target: str) -> str:
