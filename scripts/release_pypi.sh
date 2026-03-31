@@ -38,7 +38,11 @@ if [[ -z "${RAW_WHEEL}" ]]; then
 fi
 
 mkdir -p dist/repaired
-auditwheel repair "${RAW_WHEEL}" -w dist/repaired
+if auditwheel show "${RAW_WHEEL}" >/dev/null 2>&1; then
+  auditwheel repair "${RAW_WHEEL}" -w dist/repaired
+else
+  cp "${RAW_WHEEL}" dist/repaired/
+fi
 
 python -m twine check dist/repaired/*
 
