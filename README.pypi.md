@@ -1,6 +1,6 @@
-# openjet
+# open-jet
 
-`openjet` ships both:
+`open-jet` ships both:
 
 - the OpenJet Python SDK
 - the OpenJet CLI
@@ -8,7 +8,7 @@
 Install it with:
 
 ```bash
-pip install openjet
+pip install open-jet
 ```
 
 ## What Is In The Package
