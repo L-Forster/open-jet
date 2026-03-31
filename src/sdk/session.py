@@ -8,18 +8,16 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
-from .airgap import airgapped_from_cfg, set_airgapped
-from .agent import ActionKind, Agent
-from .config import load_config
-from .multimodal import build_user_content, content_to_plain_text
-from .persistent_memory import build_system_prompt
-from .runtime_limits import derive_context_budget, estimate_tokens
-from .runtime_protocol import ToolCall
-from .runtime_registry import create_runtime_client
-from .tool_executor import ToolExecutionResult, execute_tool
+from ..airgap import airgapped_from_cfg, set_airgapped
+from ..agent import ActionKind, Agent
+from ..config import load_config
+from ..multimodal import build_user_content, content_to_plain_text
+from ..runtime_limits import derive_context_budget, estimate_tokens
+from ..runtime_protocol import ToolCall
+from ..tool_executor import ToolExecutionResult, execute_tool
 
 if TYPE_CHECKING:
-    from .session_logging import SessionLogger
+    from ..session_logging import SessionLogger
 
 
 ApprovalHandler = Callable[[ToolCall], bool | Awaitable[bool]]
@@ -314,6 +312,8 @@ class OpenJetSession:
         allowed_tools: set[str] | None = None,
         airgapped: bool | None = None,
     ) -> OpenJetSession:
+        from . import build_system_prompt, create_runtime_client
+
         resolved_cfg = dict(cfg or load_config())
         resolved_root = Path(root or Path.cwd()).resolve()
         resolved_cfg["airgapped"] = airgapped_from_cfg(resolved_cfg, override=airgapped)

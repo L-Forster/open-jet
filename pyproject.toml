@@ -1,5 +1,5 @@
 [project]
-name = "open-jet"
+name = "openjet"
 version = "0.3.2"
 description = "Offline local-LLM terminal app for Jetson and edge Linux: chat with on-device models, run agent tools, and manage context safely."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
@@ -51,7 +51,7 @@ include-package-data = false
 license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
-include = ["src", "src.*", "open_jet", "open_jet.*"]
+include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*"]
 
 [tool.setuptools.package-data]
 src = ["app.tcss"]

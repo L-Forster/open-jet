@@ -345,6 +345,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("status", help="show runtime and configuration status")
     subparsers.add_parser("version", help="show version information")
     subparsers.add_parser("update", help="pull the latest repo commit from the tracked remote branch")
+    bench_parser = subparsers.add_parser("benchmark", aliases=("bench",), help="run llama-bench with the active model profile")
+    bench_parser.add_argument("-p", "--n-prompt", type=int, default=512, help="prompt tokens for pp test (default: 512)")
+    bench_parser.add_argument("-n", "--n-gen", type=int, default=128, help="tokens to generate for tg test (default: 128)")
+    bench_parser.add_argument("-r", "--repetitions", type=int, default=5, help="repetitions per test (default: 5)")
+    bench_parser.add_argument("-o", "--output", default="md", choices=("md", "csv", "json", "jsonl", "sql"), help="output format (default: md)")
+    bench_parser.add_argument("--sweep", action="store_true", help="run single-variable sweeps (gpu layers, batch size, threads)")
+    bench_parser.add_argument("extra", nargs=argparse.REMAINDER, help="extra flags passed directly to llama-bench")
     context_parser = subparsers.add_parser("context", help="set the configured context window token count")
     context_parser.add_argument("tokens", type=int, help="new context window token count")
     device_parser = subparsers.add_parser("device", aliases=("devices",), help="list and configure persistent device ids")
@@ -501,6 +508,20 @@ def main(argv: list[str] | None = None) -> None:
                 interval_seconds=args.interval,
             )
         )
+        return
+    if args.command in {"benchmark", "bench"}:
+        from .benchmark import run_benchmark, run_benchmark_sweep
+        if args.sweep:
+            run_benchmark_sweep(repetitions=args.repetitions)
+        else:
+            extra = [str(a) for a in getattr(args, "extra", []) if str(a) != "--"]
+            run_benchmark(
+                output_format=args.output,
+                n_prompt=args.n_prompt,
+                n_gen=args.n_gen,
+                repetitions=args.repetitions,
+                extra_args=extra or None,
+            )
         return
     if args.command == "version":
         print(f"open-jet {_open_jet_version()}")
