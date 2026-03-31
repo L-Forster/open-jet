@@ -1,0 +1,28 @@
+name: Release to PyPI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build twine auditwheel patchelf
+
+      - name: Run jet-push
+        env:
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+          GH_TOKEN: ${{ secrets.LURIA_PAT }}
+        run: ./jet-push pypi

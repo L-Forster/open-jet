@@ -74,4 +74,30 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   git push origin HEAD
 fi
 
+# Regenerate hardware data for luria-systems website
+if [[ "$TARGET" == "pypi" ]]; then
+  LURIA_DIR="$ROOT_DIR/../luria-systems"
+  if [[ -d "$LURIA_DIR" && -f "$LURIA_DIR/generate_hardware_data.py" ]]; then
+    echo "Regenerating hardware data for luria-systems..."
+    pip install --upgrade --force-reinstall openjet 2>/dev/null
+    python "$LURIA_DIR/generate_hardware_data.py"
+    cd "$LURIA_DIR"
+    if ! git diff --quiet openjet-hardware.json 2>/dev/null; then
+      git add openjet-hardware.json
+      git commit -m "data: update hardware recommendations (openjet v$NEW_VERSION)"
+      git push origin HEAD
+      echo "Updated luria-systems with new hardware data"
+    else
+      echo "No changes to hardware data"
+    fi
+    cd "$ROOT_DIR"
+  elif command -v gh >/dev/null 2>&1; then
+    echo "Triggering luria-systems hardware data update via GitHub Actions..."
+    gh workflow run update-hardware.yml -R l-forster/luria-systems
+  else
+    echo "luria-systems not found locally and gh CLI unavailable"
+    echo "Trigger manually: gh workflow run update-hardware.yml -R l-forster/luria-systems"
+  fi
+fi
+
 echo "Done: released v$NEW_VERSION to $TARGET"
