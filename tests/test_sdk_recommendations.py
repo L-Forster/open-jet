@@ -16,7 +16,7 @@ class SDKRecommendationTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(recommendation.model.label, "Qwen3.5 4B")
+        self.assertEqual(recommendation.model.label, "Qwen3.5 9B")
         self.assertEqual(recommendation.llama.device, "cpu")
         self.assertEqual(recommendation.llama.gpu_layers, 0)
         self.assertEqual(recommendation.llama.context_window_tokens, 3072)
@@ -48,7 +48,7 @@ class SDKRecommendationTests(unittest.TestCase):
 
         self.assertEqual(low_vram_gpu.model.label, "Qwen3.5 9B")
         self.assertEqual(high_vram_gpu.model.label, "Qwen3.5 27B")
-        self.assertEqual(cpu_only.model.label, "Qwen3.5 9B")
+        self.assertEqual(cpu_only.model.label, "Qwen3.5 27B")
         self.assertEqual(low_vram_gpu.llama.context_window_tokens, 128807)
         self.assertEqual(high_vram_gpu.llama.context_window_tokens, 202616)
         self.assertEqual(cpu_only.llama.context_window_tokens, 8192)

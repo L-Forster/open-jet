@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-import re
 from typing import Mapping
 
-from ..config import setup_direct_model_catalog
 from ..hardware import (
     HardwareInfo,
     effective_hardware_info,
-    recommended_context_window_tokens_from_total,
     recommended_device_for_hardware,
     recommended_gpu_layers,
-    recommended_param_budget_b,
 )
+from ..provisioning import recommend_direct_model
 
 
 @dataclass(frozen=True)
@@ -71,15 +67,17 @@ def recommend_hardware_config(
         detected,
         hardware_override or None,
     )
-    model, catalog_row = _recommend_model(effective, cfg=current_cfg)
+    direct = recommend_direct_model(effective, cfg=current_cfg)
+    model = RecommendedModel(
+        label=str(direct.get("label") or ""),
+        filename=str(direct.get("filename") or ""),
+        url=str(direct.get("url") or ""),
+        target_path=str(direct.get("target_path") or ""),
+    )
     llama = RecommendedLlamaConfig(
         device=device,
         gpu_layers=recommended_gpu_layers(device, effective.total_ram_gb),
-        context_window_tokens=_recommend_context_window_tokens(
-            effective,
-            model_size_mb=float(catalog_row.get("model_size_mb", 0) or 0),
-            kv_bytes_per_token=float(catalog_row.get("kv_bytes_per_token", 0) or 0),
-        ),
+        context_window_tokens=int(direct.get("context_window_tokens", 1024) or 1024),
     )
 
     return HardwareRecommendation(
@@ -163,93 +161,3 @@ def _recommendation_cfg(
     return merged
 
 
-def _recommend_model(
-    hardware: HardwareInfo,
-    *,
-    cfg: Mapping[str, object] | None,
-) -> tuple[RecommendedModel, Mapping[str, object]]:
-    catalog = setup_direct_model_catalog(cfg)
-    if not catalog:
-        return RecommendedModel(label="", filename="", url="", target_path=""), {}
-
-    sizing_hw = _model_sizing_hardware(hardware)
-    budget_b = recommended_param_budget_b("auto", sizing_hw)
-
-    parsed_catalog: list[tuple[Mapping[str, object], float | None]] = []
-    for row in catalog:
-        size_b = _parse_model_size_b(str(row.get("label") or ""))
-        parsed_catalog.append((row, size_b))
-
-    candidates = [item for item in parsed_catalog if item[1] is not None]
-    if candidates:
-        row, _size_b = min(
-            candidates,
-            key=lambda item: (
-                abs(float(item[1]) - budget_b),
-                0 if float(item[1]) <= budget_b else 1,
-                float(item[1]),
-            ),
-        )
-    else:
-        row = catalog[-1]
-
-    filename = str(row.get("filename") or "")
-    target_path = str(Path.home() / ".openjet" / "models" / filename) if filename else ""
-    return RecommendedModel(
-        label=str(row.get("label") or _model_label_from_target(target_path)),
-        filename=filename,
-        url=str(row.get("url") or ""),
-        target_path=target_path,
-    ), row
-
-
-def _model_sizing_hardware(hardware: HardwareInfo) -> HardwareInfo:
-    total_ram_gb = max(0.0, float(hardware.total_ram_gb))
-    if hardware.vram_mb > 0 and not hardware.has_metal and (hardware.has_cuda or hardware.has_rocm or hardware.has_vulkan):
-        total_ram_gb += max(0.0, float(hardware.vram_mb)) / 1024.0
-    return HardwareInfo(
-        label=hardware.label,
-        total_ram_gb=total_ram_gb,
-        has_cuda=hardware.has_cuda,
-        has_vulkan=hardware.has_vulkan,
-        has_rocm=hardware.has_rocm,
-        has_metal=hardware.has_metal,
-        vram_mb=hardware.vram_mb,
-    )
-
-
-def _recommend_context_window_tokens(
-    hardware: HardwareInfo,
-    model_size_mb: float = 0.0,
-    kv_bytes_per_token: float = 0.0,
-) -> int:
-    has_gpu = hardware.has_cuda or hardware.has_rocm or hardware.has_vulkan or hardware.has_metal
-    vram_mb = hardware.vram_mb
-    if hardware.has_metal:
-        vram_mb = hardware.total_ram_gb * 1024.0
-    if has_gpu and vram_mb > 0 and model_size_mb > 0 and kv_bytes_per_token > 0:
-        available_mb = (vram_mb - model_size_mb) * 0.9
-        if available_mb > 0:
-            return max(1024, int(available_mb * 1024 * 1024 / kv_bytes_per_token))
-    sizing_hw = _model_sizing_hardware(hardware)
-    return recommended_context_window_tokens_from_total(
-        sizing_hw.total_ram_gb,
-        headless=False,
-    )
-
-
-def _parse_model_size_b(label: str) -> float | None:
-    match = re.search(r"(\d+(?:\.\d+)?)\s*[Bb]", label)
-    if not match:
-        return None
-    try:
-        return float(match.group(1))
-    except ValueError:
-        return None
-
-
-def _model_label_from_target(target: str) -> str:
-    filename = target.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].strip()
-    if not filename:
-        return ""
-    return filename[:-5] if filename.lower().endswith(".gguf") else filename

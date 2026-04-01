@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping
 import httpx
 
 from .config import setup_direct_model_catalog
-from .hardware import HardwareInfo, is_jetson_label
+from .hardware import HardwareInfo, is_jetson_label, recommended_context_window_tokens_from_total
 
 def _fmt_size(nbytes: int) -> str:
     if nbytes >= 1 << 30:
@@ -35,29 +35,59 @@ def managed_llama_cpp_ref() -> str:
     ref = os.environ.get("OPENJET_LLAMA_CPP_REF", "").strip()
     return ref or LLAMA_CPP_PINNED_REF
 
+def _context_window_for_model(
+    hardware_info: HardwareInfo,
+    model_size_mb: float,
+    kv_bytes_per_token: float,
+) -> int:
+    has_gpu = (
+        hardware_info.has_cuda or hardware_info.has_rocm
+        or hardware_info.has_vulkan or hardware_info.has_metal
+    )
+    vram_mb = hardware_info.vram_mb
+    if hardware_info.has_metal:
+        vram_mb = hardware_info.total_ram_gb * 1024.0
+    if has_gpu and vram_mb > 0 and model_size_mb > 0 and kv_bytes_per_token > 0:
+        available_mb = (vram_mb - model_size_mb) * 0.9
+        if available_mb > 0:
+            return max(1024, int(available_mb * 1024 * 1024 / kv_bytes_per_token))
+    return recommended_context_window_tokens_from_total(
+        hardware_info.total_ram_gb,
+        headless=False,
+    )
+
+
 def recommend_direct_model(
     hardware_info: HardwareInfo,
     *,
     cfg: Mapping[str, object] | None = None,
-) -> dict[str, str]:
-    total_ram_gb = max(hardware_info.total_ram_gb, 0.0)
+) -> dict[str, Any]:
+    has_gpu = hardware_info.has_cuda or hardware_info.has_rocm or hardware_info.has_vulkan
+    if has_gpu and hardware_info.vram_mb > 0 and not hardware_info.has_metal:
+        effective_gb = hardware_info.vram_mb / 1024.0
+    else:
+        effective_gb = max(hardware_info.total_ram_gb, 0.0)
     model_catalog = setup_direct_model_catalog(cfg)
+    selected = None
     for row in model_catalog:
-        if total_ram_gb <= float(row["max_ram_gb"]):
-            filename = str(row["filename"])
-            return {
-                "label": str(row["label"]),
-                "filename": filename,
-                "url": str(row["url"]),
-                "target_path": str(MODELS_DIR / filename),
-            }
-    row = model_catalog[-1]
-    filename = str(row["filename"])
+        if effective_gb <= float(row["max_ram_gb"]):
+            selected = row
+            break
+    if selected is None:
+        selected = model_catalog[-1]
+    filename = str(selected["filename"])
+    model_size_mb = float(selected.get("model_size_mb", 0) or 0)
+    kv_bytes_per_token = float(selected.get("kv_bytes_per_token", 0) or 0)
     return {
-        "label": str(row["label"]),
+        "label": str(selected["label"]),
         "filename": filename,
-        "url": str(row["url"]),
+        "url": str(selected["url"]),
         "target_path": str(MODELS_DIR / filename),
+        "model_size_mb": model_size_mb,
+        "kv_bytes_per_token": kv_bytes_per_token,
+        "context_window_tokens": _context_window_for_model(
+            hardware_info, model_size_mb, kv_bytes_per_token,
+        ),
     }
 
 
