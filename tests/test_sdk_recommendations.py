@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 
 from openjet.sdk import HardwareRecommendationInput, recommend_hardware_config
 
@@ -17,38 +16,48 @@ class SDKRecommendationTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(recommendation.model.label, "Qwen3.5 9B")
+        self.assertEqual(recommendation.model.label, "Qwen3.5 4B")
         self.assertEqual(recommendation.llama.device, "cpu")
         self.assertEqual(recommendation.llama.gpu_layers, 0)
         self.assertEqual(recommendation.llama.context_window_tokens, 3072)
 
-    def test_recommend_hardware_config_wraps_existing_setup_builder(self) -> None:
-        with patch(
-            "src.sdk.recommendations.build_recommended_payload",
-            return_value={
-                "hardware_profile": "auto",
-                "hardware_override": "",
-                "device": "cuda",
-                "gpu_layers": 70,
-                "context_window_tokens": 12345,
-                "model_download_path": "/models/Qwen3.5-27B-Q4_K_M.gguf",
-                "model_download_url": "https://example.invalid/model.gguf",
-            },
-        ) as build_payload:
-            recommendation = recommend_hardware_config(
-                {
-                    "total_ram_gb": 16.0,
-                    "gpu": "cuda",
-                    "label": "RTX test box",
-                    "vram_mb": 24576.0,
-                }
-            )
+    def test_recommend_hardware_config_uses_passed_hardware_to_differentiate_results(self) -> None:
+        low_vram_gpu = recommend_hardware_config(
+            {
+                "total_ram_gb": 32.0,
+                "gpu": "cuda",
+                "label": "RTX 4060",
+                "vram_mb": 8192.0,
+            }
+        )
+        high_vram_gpu = recommend_hardware_config(
+            {
+                "total_ram_gb": 32.0,
+                "gpu": "cuda",
+                "label": "RTX 4090",
+                "vram_mb": 24576.0,
+            }
+        )
+        cpu_only = recommend_hardware_config(
+            {
+                "total_ram_gb": 32.0,
+                "gpu": "cpu",
+                "label": "CPU only",
+            }
+        )
 
-        self.assertEqual(recommendation.llama.context_window_tokens, 12345)
-        self.assertEqual(recommendation.llama.gpu_layers, 70)
-        self.assertEqual(recommendation.model.target_path, "/models/Qwen3.5-27B-Q4_K_M.gguf")
-        self.assertEqual(build_payload.call_args.kwargs["recommended_ctx"], 0)
-        self.assertEqual(build_payload.call_args.kwargs["hardware_info"].label, "RTX test box")
+        self.assertEqual(low_vram_gpu.model.label, "Qwen3.5 9B")
+        self.assertEqual(high_vram_gpu.model.label, "Qwen3.5 27B")
+        self.assertEqual(cpu_only.model.label, "Qwen3.5 9B")
+        self.assertEqual(low_vram_gpu.llama.context_window_tokens, 8192)
+        self.assertEqual(high_vram_gpu.llama.context_window_tokens, 12288)
+        self.assertEqual(cpu_only.llama.context_window_tokens, 8192)
+        self.assertEqual(low_vram_gpu.llama.device, "cuda")
+        self.assertEqual(high_vram_gpu.llama.device, "cuda")
+        self.assertEqual(cpu_only.llama.device, "cpu")
+        self.assertEqual(low_vram_gpu.llama.gpu_layers, 99)
+        self.assertEqual(high_vram_gpu.llama.gpu_layers, 99)
+        self.assertEqual(cpu_only.llama.gpu_layers, 0)
 
 
 if __name__ == "__main__":
