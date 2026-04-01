@@ -35,6 +35,16 @@ Automatic provisioning still depends on normal local prerequisites:
 open-jet
 ```
 
+Other primary entrypoints from the same install:
+
+```bash
+open-jet benchmark --sweep
+```
+
+```python
+from openjet.sdk import OpenJetSession, recommend_hardware_config
+```
+
 ## 4. What setup configures
 
 The setup wizard now focuses on:
@@ -47,8 +57,10 @@ The setup wizard now focuses on:
 
 ## 5. Next docs
 
+- [Product surfaces](overview.md)
 - [Installation](installation.md)
 - [Configuration](configuration.md)
 - [Backend Workflows](usage/backend-workflows.md)
 - [Runtime: llama.cpp](runtimes/llama-cpp.md)
 - [Python SDK](sdk/python-sdk.md)
+- [Benchmarking](benchmarking.md)

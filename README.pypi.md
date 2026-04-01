@@ -2,8 +2,9 @@
 
 `open-jet` ships both:
 
+- the OpenJet CLI and chat TUI
 - the OpenJet Python SDK
-- the OpenJet CLI
+- the OpenJet benchmarking entrypoints
 
 Install it with:
 
@@ -17,9 +18,29 @@ This package currently includes:
 
 - `openjet.sdk` for Python integrations
 - CLI entrypoints: `openjet` and `open-jet`
+- benchmark entrypoints via `open-jet benchmark`
 - the local/session runtime used by both the SDK and the CLI
 
 So this is not an SDK-only wheel. It is the full OpenJet package, with the SDK exposed as a supported import surface.
+
+## Product Surfaces
+
+OpenJet is one package with three primary surfaces:
+
+- **CLI + chat TUI** for interactive local agent use
+- **Python SDK** for embedded sessions and hardware profiling
+- **Benchmarking** for `llama-bench` runs and sweeps
+
+Typical entrypoints:
+
+```bash
+open-jet
+open-jet benchmark --sweep
+```
+
+```python
+from openjet.sdk import OpenJetSession, recommend_hardware_config
+```
 
 ## SDK Import Path
 
@@ -175,4 +196,10 @@ The CLI and the SDK share the same underlying package and runtime code.
 
 ## License
 
-`AGPL-3.0-only`
+`open-jet` core is licensed under `Apache-2.0`.
+
+This package covers the permissive core SDK and CLI. Any future hosted, team,
+or enterprise offerings may be licensed separately.
+
+External contributions are accepted under the contributor terms in
+the repository's `CONTRIBUTING.md` and `CLA.md`.

@@ -6,9 +6,17 @@
 open-jet
 open-jet chat
 open-jet chat Explain the repo layout briefly.
+open-jet benchmark
+open-jet benchmark --sweep
 ```
 
 `open-jet chat <text>` runs one prompt through the shared SDK/runtime backend and prints the final response to stdout without launching the TUI.
+
+OpenJet's CLI surface covers three adjacent jobs:
+
+- interactive local agent usage through the chat TUI
+- operational helpers like setup, status, models, and workflows
+- benchmark entrypoints for `llama-bench`
 
 Optional setup flow:
 
@@ -34,6 +42,17 @@ open-jet update
 ```
 
 `open-jet update` pulls the latest remote repo commit from the tracked branch.
+
+Benchmark helpers:
+
+```bash
+open-jet benchmark
+open-jet benchmark --sweep
+open-jet benchmark -p 1024 -n 256 -r 3
+```
+
+Benchmarking reuses the active model profile from `config.yaml`. See
+[benchmarking.md](../benchmarking.md).
 
 Persistent device setup:
 

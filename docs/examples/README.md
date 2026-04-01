@@ -87,13 +87,15 @@ This is useful for inventory, validation, and hardware triage in multi-device de
 open-jet status
 open-jet models
 open-jet commands
+open-jet benchmark --sweep
 ```
 
 ### Python SDK orchestration
 
 ```python
 import asyncio
-from open_jet import OpenJetSession
+
+from openjet.sdk import OpenJetSession
 
 
 async def main() -> None:
@@ -110,7 +112,22 @@ asyncio.run(main())
 
 This lets you compose OpenJet with schedulers, CI jobs, robotics pipelines, or other agent workflows while reusing the same bounded-memory runtime behavior.
 
-## 6) Workflow harness for structured task execution
+## 6) Benchmark the active model profile
+
+When you want to compare the currently configured runtime shape on one machine:
+
+```bash
+open-jet benchmark
+open-jet benchmark --sweep
+```
+
+This is useful for:
+
+- validating whether a new GGUF preset is actually faster
+- comparing GPU offload settings on the same host
+- collecting quick local throughput checks before embedding OpenJet elsewhere
+
+## 7) Workflow harness for structured task execution
 
 To keep agent work organized over many turns:
 

@@ -62,5 +62,5 @@ Manual build guides are still available if you want to control the runtime yours
 For scripts and integrations, use:
 
 ```python
-from open_jet import OpenJetSession
+from openjet.sdk import OpenJetSession
 ```

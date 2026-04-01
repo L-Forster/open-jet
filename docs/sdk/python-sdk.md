@@ -2,18 +2,23 @@
 
 Use the Python SDK when you want to embed OpenJet inside another app, agent, worker, or script without using the TUI.
 
-Public import:
+Primary imports:
 
 ```python
-from open_jet import OpenJetSession, create_agent
+from openjet.sdk import OpenJetSession, create_agent, recommend_hardware_config
 ```
+
+The SDK surface has two main jobs:
+
+- embed OpenJet sessions and tool execution in another Python application
+- profile hardware and recommend local `llama.cpp` settings
 
 ## Basic local session
 
 ```python
 import asyncio
 
-from open_jet import OpenJetSession
+from openjet.sdk import OpenJetSession
 
 
 async def main() -> None:
@@ -35,7 +40,7 @@ asyncio.run(main())
 ```python
 import asyncio
 
-from open_jet import OpenJetSession
+from openjet.sdk import OpenJetSession
 
 
 async def main() -> None:
@@ -76,6 +81,32 @@ Event kinds:
 - `CONDENSE`
 - `DONE`
 - `ERROR`
+
+## Hardware profiling and auto-configuration
+
+Use `recommend_hardware_config()` when you want OpenJet to turn machine details
+into a recommended model/runtime shape for local `llama.cpp`.
+
+```python
+from openjet.sdk import recommend_hardware_config
+
+result = recommend_hardware_config(
+    {
+        "total_ram_gb": 16,
+        "gpu": "cuda",
+        "vram_mb": 12288,
+        "label": "RTX 4070 workstation",
+    }
+)
+
+print(result.model.label)
+print(result.llama.device)
+print(result.llama.gpu_layers)
+print(result.llama.context_window_tokens)
+```
+
+This is the same recommendation path OpenJet uses to help set up the local CLI
+and TUI experience.
 
 ## Session creation options
 
@@ -132,3 +163,8 @@ If you already have your own orchestrator, prefer:
 2. keep the local model path in `cfg`
 3. use `stream()` if your outer agent needs incremental tokens or tool events
 4. use `allowed_tools` and `approval_handler` to enforce your own policy
+
+## Related surfaces
+
+- If you want the interactive terminal app, see [CLI usage](../usage/cli.md).
+- If you want throughput measurements for the active model profile, see [Benchmarking](../benchmarking.md).
