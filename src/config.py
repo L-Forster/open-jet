@@ -64,18 +64,24 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.5 4B",
         "filename": "Qwen3.5-4B-Q4_K_M.gguf",
         "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf?download=true",
+        "model_size_mb": 2806,
+        "kv_bytes_per_token": 17408,
     },
     {
         "max_ram_gb": 12.0,
         "label": "Qwen3.5 9B",
         "filename": "Qwen3.5-9B-Q4_K_M.gguf",
         "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true",
+        "model_size_mb": 5816,
+        "kv_bytes_per_token": 17408,
     },
     {
         "max_ram_gb": 24.0,
         "label": "Qwen3.5 27B",
         "filename": "Qwen3.5-27B-Q4_K_M.gguf",
         "url": "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf?download=true",
+        "model_size_mb": 17101,
+        "kv_bytes_per_token": 34816,
     },
 )
 

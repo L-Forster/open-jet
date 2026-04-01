@@ -71,11 +71,15 @@ def recommend_hardware_config(
         detected,
         hardware_override or None,
     )
-    model = _recommend_model(effective, cfg=current_cfg)
+    model, catalog_row = _recommend_model(effective, cfg=current_cfg)
     llama = RecommendedLlamaConfig(
         device=device,
         gpu_layers=recommended_gpu_layers(device, effective.total_ram_gb),
-        context_window_tokens=_recommend_context_window_tokens(effective),
+        context_window_tokens=_recommend_context_window_tokens(
+            effective,
+            model_size_mb=float(catalog_row.get("model_size_mb", 0) or 0),
+            kv_bytes_per_token=float(catalog_row.get("kv_bytes_per_token", 0) or 0),
+        ),
     )
 
     return HardwareRecommendation(
@@ -163,10 +167,10 @@ def _recommend_model(
     hardware: HardwareInfo,
     *,
     cfg: Mapping[str, object] | None,
-) -> RecommendedModel:
+) -> tuple[RecommendedModel, Mapping[str, object]]:
     catalog = setup_direct_model_catalog(cfg)
     if not catalog:
-        return RecommendedModel(label="", filename="", url="", target_path="")
+        return RecommendedModel(label="", filename="", url="", target_path=""), {}
 
     sizing_hw = _model_sizing_hardware(hardware)
     budget_b = recommended_param_budget_b("auto", sizing_hw)
@@ -196,7 +200,7 @@ def _recommend_model(
         filename=filename,
         url=str(row.get("url") or ""),
         target_path=target_path,
-    )
+    ), row
 
 
 def _model_sizing_hardware(hardware: HardwareInfo) -> HardwareInfo:
@@ -214,7 +218,19 @@ def _model_sizing_hardware(hardware: HardwareInfo) -> HardwareInfo:
     )
 
 
-def _recommend_context_window_tokens(hardware: HardwareInfo) -> int:
+def _recommend_context_window_tokens(
+    hardware: HardwareInfo,
+    model_size_mb: float = 0.0,
+    kv_bytes_per_token: float = 0.0,
+) -> int:
+    has_gpu = hardware.has_cuda or hardware.has_rocm or hardware.has_vulkan or hardware.has_metal
+    vram_mb = hardware.vram_mb
+    if hardware.has_metal:
+        vram_mb = hardware.total_ram_gb * 1024.0
+    if has_gpu and vram_mb > 0 and model_size_mb > 0 and kv_bytes_per_token > 0:
+        available_mb = (vram_mb - model_size_mb) * 0.9
+        if available_mb > 0:
+            return max(1024, int(available_mb * 1024 * 1024 / kv_bytes_per_token))
     sizing_hw = _model_sizing_hardware(hardware)
     return recommended_context_window_tokens_from_total(
         sizing_hw.total_ram_gb,
