@@ -1,9 +1,13 @@
 # OpenJet
+<div align="center">
 
 <img height="225" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
 
 **An AI coding agent that runs entirely on your machine.**
+  <h1><strong><a href="https://discord.com/invite/pspKHtExSa">Discord</a></strong><strong>, <a href="https://openjet.dev/">Website</a></strong>, <strong><a href="https://x.com/FlouisLF">X/Twitter</a></strong></h1>
 
+
+</div>
 This is Claude Code for local LLMs. OpenJet handles the model, the runtime, and the setup without having to manually wrangle complex confirgurations. You get a coding agent in your terminal that reads your files, edits your code, runs commands, and stays out of the cloud.
 
 OpenJet has three primary surfaces in one repo:
