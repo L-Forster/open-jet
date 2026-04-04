@@ -63,18 +63,31 @@ def recommend_direct_model(
     cfg: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     has_gpu = hardware_info.has_cuda or hardware_info.has_rocm or hardware_info.has_vulkan
-    if has_gpu and hardware_info.vram_mb > 0 and not hardware_info.has_metal:
-        effective_gb = hardware_info.vram_mb / 1024.0
+    if hardware_info.has_metal:
+        effective_memory_mb = max(hardware_info.total_ram_gb, 0.0) * 1024.0
+    elif has_gpu and hardware_info.vram_mb > 0:
+        effective_memory_mb = hardware_info.vram_mb
     else:
-        effective_gb = max(hardware_info.total_ram_gb, 0.0)
+        effective_memory_mb = max(hardware_info.total_ram_gb, 0.0) * 1024.0
+    effective_gb = effective_memory_mb / 1024.0
     model_catalog = setup_direct_model_catalog(cfg)
-    selected = None
-    for row in model_catalog:
-        if effective_gb <= float(row["max_ram_gb"]):
-            selected = row
-            break
-    if selected is None:
-        selected = model_catalog[-1]
+    fit_budget_mb = effective_memory_mb * 0.9
+    fitting_models = [
+        row
+        for row in model_catalog
+        if float(row.get("model_size_mb", 0) or 0) > 0
+        and float(row.get("model_size_mb", 0) or 0) <= fit_budget_mb
+    ]
+    if fitting_models:
+        selected = fitting_models[-1]
+    else:
+        selected = None
+        for row in model_catalog:
+            if effective_gb <= float(row["max_ram_gb"]):
+                selected = row
+                break
+        if selected is None:
+            selected = model_catalog[-1]
     filename = str(selected["filename"])
     model_size_mb = float(selected.get("model_size_mb", 0) or 0)
     kv_bytes_per_token = float(selected.get("kv_bytes_per_token", 0) or 0)
