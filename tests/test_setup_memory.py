@@ -15,6 +15,7 @@ from src.setup_memory import (
     _max_context_tokens_from_gguf,
     _max_tokens_for_memory,
     _model_file_size_mb,
+    recommend_context_window_for_model,
     recommend_setup_context_window,
 )
 
@@ -172,6 +173,16 @@ class SetupMemoryTests(unittest.TestCase):
                 total_vram_mb=24576.0,
             )
         self.assertEqual(recommended, 32768)
+
+    def test_shared_model_context_helper_caps_vulkan_like_setup(self) -> None:
+        recommended = recommend_context_window_for_model(
+            device="vulkan",
+            fallback_tokens=8192,
+            model_size_mb=5816.0,
+            kv_bytes_per_token=17408.0,
+            total_vram_mb=12288.0,
+        )
+        self.assertEqual(recommended, 117193)
 
     def test_max_context_tokens_from_gguf_reads_context_length(self) -> None:
         data = _build_test_gguf(

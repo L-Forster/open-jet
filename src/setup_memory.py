@@ -342,6 +342,49 @@ def _vulkan_max_alloc_ctx(kv_bpt: float) -> int | None:
     return max(_MIN_CTX, int(max_alloc * 0.95 / kv_bpt))
 
 
+def recommend_context_window_for_model(
+    *,
+    device: str,
+    fallback_tokens: int,
+    model_size_mb: float | None,
+    kv_bytes_per_token: float | None,
+    model_max_context: int | None = None,
+    total_vram_mb: float | None = None,
+    free_memory_mb: float | None = None,
+) -> int:
+    fallback = max(_MIN_CTX, int(fallback_tokens))
+    if model_size_mb is None or model_size_mb <= 0:
+        return fallback
+    if kv_bytes_per_token is None or kv_bytes_per_token <= 0:
+        return fallback
+
+    dev = (device or "").strip().lower()
+    effective_model_max_context = model_max_context
+    if dev == "vulkan":
+        alloc_cap = _vulkan_max_alloc_ctx(kv_bytes_per_token)
+        if alloc_cap is not None:
+            if effective_model_max_context is not None:
+                effective_model_max_context = min(effective_model_max_context, alloc_cap)
+            else:
+                effective_model_max_context = alloc_cap
+
+    if free_memory_mb is not None:
+        return _max_tokens_for_memory(
+            free_memory_mb - model_size_mb,
+            kv_bytes_per_token,
+            max_context_tokens=effective_model_max_context,
+        )
+
+    if total_vram_mb is not None and total_vram_mb > 0 and dev in {"cuda", "vulkan", "rocm", "metal"}:
+        return _max_tokens_for_memory(
+            total_vram_mb - model_size_mb,
+            kv_bytes_per_token,
+            max_context_tokens=effective_model_max_context,
+        )
+
+    return fallback
+
+
 def recommend_setup_context_window(
     *,
     runtime: str,
@@ -363,29 +406,12 @@ def recommend_setup_context_window(
         return fallback
     model_max_context = _max_context_tokens_from_gguf(gguf_path) if gguf_path else None
 
-    dev = (device or "").strip().lower()
-    # Vulkan drivers (notably Dozen/D3D12) enforce a per-allocation limit.
-    if dev == "vulkan":
-        alloc_cap = _vulkan_max_alloc_ctx(kv_bpt)
-        if alloc_cap is not None:
-            if model_max_context is not None:
-                model_max_context = min(model_max_context, alloc_cap)
-            else:
-                model_max_context = alloc_cap
-
-    free = _detect_free_memory_mb(device)
-    if free is not None:
-        return _max_tokens_for_memory(
-            free - model_mb,
-            kv_bpt,
-            max_context_tokens=model_max_context,
-        )
-
-    if dev in {"cuda", "vulkan", "rocm", "metal"} and total_vram_mb is not None and total_vram_mb > 0:
-        return _max_tokens_for_memory(
-            total_vram_mb - model_mb,
-            kv_bpt,
-            max_context_tokens=model_max_context,
-        )
-
-    return fallback
+    return recommend_context_window_for_model(
+        device=device,
+        fallback_tokens=fallback,
+        model_size_mb=model_mb,
+        kv_bytes_per_token=kv_bpt,
+        model_max_context=model_max_context,
+        total_vram_mb=total_vram_mb,
+        free_memory_mb=_detect_free_memory_mb(device),
+    )

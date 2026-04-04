@@ -13,7 +13,7 @@ import httpx
 
 from .config import setup_direct_model_catalog
 from .hardware import HardwareInfo, is_jetson_label, recommended_context_window_tokens_from_total
-from .setup_memory import _max_tokens_for_memory
+from .setup_memory import recommend_context_window_for_model
 
 def _fmt_size(nbytes: int) -> str:
     if nbytes >= 1 << 30:
@@ -48,14 +48,28 @@ def _context_window_for_model(
     vram_mb = hardware_info.vram_mb
     if hardware_info.has_metal:
         vram_mb = hardware_info.total_ram_gb * 1024.0
-    if has_gpu and vram_mb > 0 and model_size_mb > 0 and kv_bytes_per_token > 0:
-        available_mb = vram_mb - model_size_mb
-        if available_mb > 0:
-            return _max_tokens_for_memory(available_mb, kv_bytes_per_token)
-    return recommended_context_window_tokens_from_total(
+    fallback_tokens = recommended_context_window_tokens_from_total(
         hardware_info.total_ram_gb,
         headless=False,
     )
+    device = "cpu"
+    if hardware_info.has_cuda:
+        device = "cuda"
+    elif hardware_info.has_rocm:
+        device = "rocm"
+    elif hardware_info.has_vulkan:
+        device = "vulkan"
+    elif hardware_info.has_metal:
+        device = "metal"
+    if has_gpu and vram_mb > 0 and model_size_mb > 0 and kv_bytes_per_token > 0:
+        return recommend_context_window_for_model(
+            device=device,
+            fallback_tokens=fallback_tokens,
+            model_size_mb=model_size_mb,
+            kv_bytes_per_token=kv_bytes_per_token,
+            total_vram_mb=vram_mb,
+        )
+    return fallback_tokens
 
 
 def recommend_direct_model(

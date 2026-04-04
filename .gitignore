@@ -22,6 +22,7 @@ AGENTS.md
 claude.md
 config.yaml
 .installed_release
+VP_VULKANINFO_Microsoft_Direct3D12_(AMD_Radeon_RX_6700_XT)_25_3_6.json
 
 # Local tooling/cache artifacts
 .agents/
