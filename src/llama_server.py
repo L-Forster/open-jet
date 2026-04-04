@@ -333,10 +333,8 @@ class LlamaServerClient:
             cmd.extend(["--fit", "off"])
         if no_warmup:
             cmd.append("--no-warmup")
+        cmd.extend(["--flash-attn", "on", "-ctk", "q8_0", "-ctv", "q8_0"])
         cmd.extend([
-            "--flash-attn", "on",
-            "-ctk", "q8_0",
-            "-ctv", "q8_0",
             "-b",
             str(batch),
             "-ub",

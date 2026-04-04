@@ -330,6 +330,18 @@ def _max_tokens_for_memory(
     return max(_MIN_CTX, tokens)
 
 
+def _vulkan_max_alloc_ctx(kv_bpt: float) -> int | None:
+    """Cap context so the KV buffer stays within Vulkan's maxMemoryAllocationSize.
+
+    Dozen (Vulkan-over-D3D12 on WSL2) enforces a 2 GB per-allocation limit.
+    Allocations that exceed this silently produce broken buffers.
+    """
+    max_alloc = 2 * 1024 * 1024 * 1024  # 2 GB — typical D3D12 limit
+    if kv_bpt <= 0:
+        return None
+    return max(_MIN_CTX, int(max_alloc * 0.95 / kv_bpt))
+
+
 def recommend_setup_context_window(
     *,
     runtime: str,
@@ -351,6 +363,16 @@ def recommend_setup_context_window(
         return fallback
     model_max_context = _max_context_tokens_from_gguf(gguf_path) if gguf_path else None
 
+    dev = (device or "").strip().lower()
+    # Vulkan drivers (notably Dozen/D3D12) enforce a per-allocation limit.
+    if dev == "vulkan":
+        alloc_cap = _vulkan_max_alloc_ctx(kv_bpt)
+        if alloc_cap is not None:
+            if model_max_context is not None:
+                model_max_context = min(model_max_context, alloc_cap)
+            else:
+                model_max_context = alloc_cap
+
     free = _detect_free_memory_mb(device)
     if free is not None:
         return _max_tokens_for_memory(
@@ -359,7 +381,6 @@ def recommend_setup_context_window(
             max_context_tokens=model_max_context,
         )
 
-    dev = (device or "").strip().lower()
     if dev in {"cuda", "vulkan", "rocm", "metal"} and total_vram_mb is not None and total_vram_mb > 0:
         return _max_tokens_for_memory(
             total_vram_mb - model_mb,
