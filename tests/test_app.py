@@ -1678,6 +1678,50 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(starting["requested_ngl"], 99)
         self.assertEqual(starting["memavailable_mb"], 8192.0)
 
+    async def test_start_clamps_requested_context_to_model_max_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "model.gguf"
+            model_path.write_bytes(
+                b"GGUF"
+                + (3).to_bytes(4, "little")
+                + (0).to_bytes(8, "little")
+                + (2).to_bytes(8, "little")
+                + len(b"general.architecture").to_bytes(8, "little")
+                + b"general.architecture"
+                + (8).to_bytes(4, "little")
+                + len(b"llama").to_bytes(8, "little")
+                + b"llama"
+                + len(b"llama.context_length").to_bytes(8, "little")
+                + b"llama.context_length"
+                + (4).to_bytes(4, "little")
+                + (8192).to_bytes(4, "little")
+            )
+            client = LlamaServerClient(
+                model=str(model_path),
+                device="cuda",
+                gpu_layers=99,
+                context_window_tokens=65536,
+            )
+            start_once = AsyncMock()
+
+            with patch.object(client, "_stop_server", AsyncMock()), patch.object(
+                client, "_cleanup_stale_inference_processes", AsyncMock()
+            ), patch.object(client, "_prepare_memory_for_launch", AsyncMock(return_value=None)), patch.object(
+                client, "_start_once", start_once
+            ), patch.object(
+                client, "_ensure_jetson_clocks_sudoers", return_value=None
+            ), patch.object(
+                client, "_maximize_gpu_clocks", return_value=None
+            ), patch.object(
+                client, "_is_jetson_platform", return_value=False
+            ), patch(
+                "src.llama_server._find_llama_server", return_value="/usr/bin/llama-server"
+            ):
+                await client.start()
+
+        self.assertEqual(start_once.await_args.kwargs["ctx"], 8192)
+        self.assertEqual(client.context_window_tokens, 8192)
+
     async def test_start_once_emits_failure_diagnostics_with_stderr_tail(self) -> None:
         events: list[tuple[str, dict[str, object]]] = []
         client = LlamaServerClient(

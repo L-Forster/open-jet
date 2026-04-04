@@ -108,6 +108,20 @@ def _kv_bytes_per_token_from_gguf(path: Path) -> float | None:
     return 2 * n_layer * n_head_kv * head_dim * bytes_per_element
 
 
+def _max_context_tokens_from_gguf(path: Path) -> int | None:
+    """Read the model-declared maximum context length from GGUF metadata."""
+    meta = _read_gguf_metadata(path)
+    if not meta:
+        return None
+    arch = meta.get("general.architecture")
+    if not isinstance(arch, str):
+        return None
+    context_length = meta.get(f"{arch}.context_length")
+    if isinstance(context_length, int) and context_length > 0:
+        return context_length
+    return None
+
+
 def _model_file_size_mb(refs: Iterable[object]) -> float | None:
     for ref in refs:
         path = Path(str(ref).strip()).expanduser()
@@ -298,10 +312,22 @@ def _detect_free_memory_mb(device: str) -> float | None:
     return None
 
 
-def _max_tokens_for_memory(available_mb: float, kv_bytes_per_token: float) -> int:
+def _max_tokens_for_memory(
+    available_mb: float,
+    kv_bytes_per_token: float,
+    *,
+    max_context_tokens: int | None = None,
+    reserve_ratio: float = 0.10,
+) -> int:
     if available_mb <= 0 or kv_bytes_per_token <= 0:
         return _MIN_CTX
-    return max(_MIN_CTX, int(available_mb * 1024 * 1024 / kv_bytes_per_token))
+    usable_mb = max(0.0, float(available_mb) * (1.0 - max(0.0, reserve_ratio)))
+    if usable_mb <= 0:
+        return _MIN_CTX
+    tokens = max(_MIN_CTX, int(usable_mb * 1024 * 1024 / kv_bytes_per_token))
+    if max_context_tokens is not None and max_context_tokens > 0:
+        tokens = min(tokens, int(max_context_tokens))
+    return max(_MIN_CTX, tokens)
 
 
 def recommend_setup_context_window(
@@ -323,13 +349,22 @@ def recommend_setup_context_window(
     kv_bpt = _kv_bytes_per_token_from_gguf(gguf_path) if gguf_path else None
     if kv_bpt is None:
         return fallback
+    model_max_context = _max_context_tokens_from_gguf(gguf_path) if gguf_path else None
 
     free = _detect_free_memory_mb(device)
     if free is not None:
-        return _max_tokens_for_memory(free - model_mb, kv_bpt)
+        return _max_tokens_for_memory(
+            free - model_mb,
+            kv_bpt,
+            max_context_tokens=model_max_context,
+        )
 
     dev = (device or "").strip().lower()
     if dev in {"cuda", "vulkan", "rocm", "metal"} and total_vram_mb is not None and total_vram_mb > 0:
-        return _max_tokens_for_memory(total_vram_mb - model_mb, kv_bpt)
+        return _max_tokens_for_memory(
+            total_vram_mb - model_mb,
+            kv_bpt,
+            max_context_tokens=model_max_context,
+        )
 
     return fallback

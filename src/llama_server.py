@@ -14,6 +14,7 @@ import httpx
 
 from .airgap import apply_airgap_env, assert_endpoint_allowed
 from .runtime_protocol import StreamChunk, stream_openai_chat
+from .setup_memory import _max_context_tokens_from_gguf
 
 
 _FRAGMENTED_LFB_MB = 64
@@ -261,6 +262,11 @@ class LlamaServerClient:
             lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
             requested_ngl = self.gpu_layers if resolved_device in ("cuda", "vulkan", "rocm", "metal") else 0
             requested_ctx = self.context_window_tokens
+            model_path = Path(self.model).expanduser()
+            if model_path.suffix.lower() == ".gguf" and model_path.is_file():
+                model_max_context = _max_context_tokens_from_gguf(model_path)
+                if model_max_context is not None and model_max_context > 0:
+                    requested_ctx = min(requested_ctx, model_max_context)
             batch, ubatch, fit_off, no_warmup, no_mmap = self._startup_profile_for_lfb(lfb_mb)
             startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
             self._emit_diagnostic(

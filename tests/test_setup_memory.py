@@ -12,6 +12,7 @@ from src.setup_memory import (
     _amd_free_vram_mb,
     _detect_free_memory_mb,
     _kv_bytes_per_token_from_gguf,
+    _max_context_tokens_from_gguf,
     _max_tokens_for_memory,
     _model_file_size_mb,
     recommend_setup_context_window,
@@ -99,10 +100,16 @@ class SetupMemoryTests(unittest.TestCase):
             self.assertEqual(_kv_bytes_per_token_from_gguf(path), 34816.0)
 
     def test_max_tokens_for_memory(self) -> None:
-        # 8 GB with Llama 8B KV (69632 B/tok) -> 8192*1024*1024/69632 = 123361
-        self.assertEqual(_max_tokens_for_memory(8192.0, 69632), 123361)
-        # 1 GB -> 1024*1024*1024/69632 = 15420
-        self.assertEqual(_max_tokens_for_memory(1024.0, 69632), 15420)
+        # 8 GB with 10% reserve -> 7372.8 MiB usable -> 111025 tokens.
+        self.assertEqual(_max_tokens_for_memory(8192.0, 69632), 111025)
+        # 1 GB with 10% reserve -> 921.6 MiB usable -> 13878 tokens.
+        self.assertEqual(_max_tokens_for_memory(1024.0, 69632), 13878)
+
+    def test_max_tokens_for_memory_clamps_to_model_max_context(self) -> None:
+        self.assertEqual(
+            _max_tokens_for_memory(24576.0, 34816, max_context_tokens=131072),
+            131072,
+        )
 
     def test_max_tokens_for_memory_no_room(self) -> None:
         self.assertEqual(_max_tokens_for_memory(0.0, 69632), 1024)
@@ -137,11 +144,12 @@ class SetupMemoryTests(unittest.TestCase):
 
     def test_recommend_uses_gguf_kv_cost(self) -> None:
         # 24576 total - 15360 model = 9216 MB remaining
-        # Llama 8B KV (q8_0): 69632 B/tok
-        # 9216 * 1024 * 1024 / 69632 = 138862
+        # Hold back 10% reserve -> 8294.4 MiB usable
+        # 8294.4 * 1024 * 1024 / 69632 = 124903
         with patch("src.setup_memory._model_file_size_mb", return_value=15360.0), \
              patch("src.setup_memory._model_gguf_path", return_value=Path("/fake.gguf")), \
-             patch("src.setup_memory._kv_bytes_per_token_from_gguf", return_value=69632):
+             patch("src.setup_memory._kv_bytes_per_token_from_gguf", return_value=69632), \
+             patch("src.setup_memory._max_context_tokens_from_gguf", return_value=262144):
             recommended = recommend_setup_context_window(
                 runtime="llama_cpp",
                 device="cuda",
@@ -149,7 +157,34 @@ class SetupMemoryTests(unittest.TestCase):
                 model_refs=["/models/Qwen3.5-9B-Q4_K_M.gguf"],
                 total_vram_mb=24576.0,
             )
-        self.assertEqual(recommended, 138782)
+        self.assertEqual(recommended, 124903)
+
+    def test_recommend_clamps_to_model_max_context(self) -> None:
+        with patch("src.setup_memory._model_file_size_mb", return_value=15360.0), \
+             patch("src.setup_memory._model_gguf_path", return_value=Path("/fake.gguf")), \
+             patch("src.setup_memory._kv_bytes_per_token_from_gguf", return_value=69632), \
+             patch("src.setup_memory._max_context_tokens_from_gguf", return_value=32768):
+            recommended = recommend_setup_context_window(
+                runtime="llama_cpp",
+                device="cuda",
+                fallback_tokens=8192,
+                model_refs=["/models/demo.gguf"],
+                total_vram_mb=24576.0,
+            )
+        self.assertEqual(recommended, 32768)
+
+    def test_max_context_tokens_from_gguf_reads_context_length(self) -> None:
+        data = _build_test_gguf(
+            n_embd=4096,
+            n_head=32,
+            n_head_kv=8,
+            n_layer=32,
+            extras=[("llama.context_length", 131072)],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.gguf"
+            path.write_bytes(data)
+            self.assertEqual(_max_context_tokens_from_gguf(path), 131072)
 
     def test_recommend_returns_fallback_without_gguf(self) -> None:
         with patch("src.setup_memory._model_file_size_mb", return_value=15360.0), \
