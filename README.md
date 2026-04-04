@@ -1,7 +1,7 @@
 # OpenJet
 <div align="center">
 
-<img height="225" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
+<img height="500" alt="image" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
 
 **An AI coding agent that runs entirely on your machine.**
   <h1><strong><a href="https://discord.com/invite/pspKHtExSa">Discord</a></strong><strong>, <a href="https://openjet.dev/">Website</a></strong>, <strong><a href="https://x.com/FlouisLF">X/Twitter</a></strong></h1>
