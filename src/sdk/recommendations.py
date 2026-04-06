@@ -10,6 +10,7 @@ from ..hardware import (
     recommended_gpu_layers,
 )
 from ..provisioning import recommend_direct_model
+from .tok_s import TokenGenerationEstimate, estimate_recommended_token_generation_speed
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class HardwareRecommendation:
     effective_hardware: HardwareInfo
     model: RecommendedModel
     llama: RecommendedLlamaConfig
+    tok_s: TokenGenerationEstimate
     hardware_profile: str
     hardware_override: str
 
@@ -79,12 +81,19 @@ def recommend_hardware_config(
         gpu_layers=recommended_gpu_layers(device, effective.total_ram_gb),
         context_window_tokens=int(direct.get("context_window_tokens", 1024) or 1024),
     )
+    tok_s = estimate_recommended_token_generation_speed(
+        detected,
+        hardware_profile=hardware_profile,
+        hardware_override=hardware_override,
+        cfg=current_cfg,
+    )
 
     return HardwareRecommendation(
         detected_hardware=detected,
         effective_hardware=effective,
         model=model,
         llama=llama,
+        tok_s=tok_s,
         hardware_profile=hardware_profile,
         hardware_override=hardware_override,
     )
@@ -159,5 +168,4 @@ def _recommendation_cfg(
         if hardware.get("hardware_override") is not None:
             merged["hardware_override"] = str(hardware.get("hardware_override") or "")
     return merged
-
 

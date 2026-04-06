@@ -126,7 +126,10 @@ def _model_file_size_mb(refs: Iterable[object]) -> float | None:
     for ref in refs:
         path = Path(str(ref).strip()).expanduser()
         if path.is_file():
-            return round(path.stat().st_size / (1024 * 1024), 2)
+            try:
+                return round(path.stat().st_size / (1024 * 1024), 2)
+            except OSError:
+                continue
     return None
 
 

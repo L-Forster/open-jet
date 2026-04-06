@@ -1,0 +1,138 @@
+[
+  {
+    "key": "intel_core_i9_14900k",
+    "label": "Intel Core i9-14900K",
+    "device": "cpu",
+    "memory_gb": 64.0,
+    "memory_bandwidth_gbps": 89.6,
+    "compute_tflops": 0.0,
+    "source_urls": [
+      "https://www.intel.com/content/www/us/en/products/sku/236791/intel-core-i9-processor-14900k-36m-cache-up-to-6-00-ghz/specifications.html"
+    ],
+    "aliases": ["cpu only", "cpu-only device", "desktop / laptop"]
+  },
+  {
+    "key": "jetson_nano_4",
+    "label": "Jetson Nano (4GB RAM)",
+    "device": "cuda",
+    "memory_gb": 4.0,
+    "memory_bandwidth_gbps": 25.6,
+    "compute_tflops": 0.2358,
+    "source_urls": [
+      "https://developer.nvidia.com/embedded/jetson-nano-developer-kit"
+    ],
+    "aliases": ["jetson nano"]
+  },
+  {
+    "key": "jetson_xavier_nx_8",
+    "label": "Jetson Xavier NX (8GB RAM)",
+    "device": "cuda",
+    "memory_gb": 8.0,
+    "memory_bandwidth_gbps": 59.7,
+    "compute_tflops": 0.8448,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-xavier-nx/"
+    ],
+    "aliases": ["jetson xavier nx"]
+  },
+  {
+    "key": "jetson_orin_nano_8",
+    "label": "Jetson Orin Nano (8GB RAM)",
+    "device": "cuda",
+    "memory_gb": 8.0,
+    "memory_bandwidth_gbps": 68.0,
+    "compute_tflops": 1.28,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/"
+    ],
+    "aliases": ["jetson orin nano"]
+  },
+  {
+    "key": "jetson_orin_nx_16",
+    "label": "Jetson Orin NX (16GB RAM)",
+    "device": "cuda",
+    "memory_gb": 16.0,
+    "memory_bandwidth_gbps": 102.4,
+    "compute_tflops": 1.88,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/"
+    ],
+    "aliases": ["jetson orin nx"]
+  },
+  {
+    "key": "jetson_agx_orin_32",
+    "label": "Jetson AGX Orin (32GB RAM)",
+    "device": "cuda",
+    "memory_gb": 32.0,
+    "memory_bandwidth_gbps": 204.8,
+    "compute_tflops": 3.333,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/"
+    ],
+    "aliases": ["jetson agx orin"]
+  },
+  {
+    "key": "jetson_agx_orin_64",
+    "label": "Jetson AGX Orin (64GB RAM)",
+    "device": "cuda",
+    "memory_gb": 64.0,
+    "memory_bandwidth_gbps": 204.8,
+    "compute_tflops": 5.325,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/"
+    ],
+    "aliases": ["jetson agx orin"]
+  },
+  {
+    "key": "rtx_4060_8gb",
+    "label": "RTX 4060",
+    "device": "cuda",
+    "memory_gb": 8.0,
+    "memory_bandwidth_gbps": 272.0,
+    "compute_tflops": 15.11,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4060-4060ti/",
+      "https://www.techpowerup.com/gpu-specs/geforce-rtx-4060.c4107"
+    ],
+    "aliases": ["geforce rtx 4060", "rtx 4060"]
+  },
+  {
+    "key": "rtx_3090_24gb",
+    "label": "RTX 3090",
+    "device": "cuda",
+    "memory_gb": 24.0,
+    "memory_bandwidth_gbps": 936.0,
+    "compute_tflops": 35.58,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/30-series/rtx-3090-3090ti/",
+      "https://www.techpowerup.com/gpu-specs/geforce-rtx-3090.c3622"
+    ],
+    "aliases": ["geforce rtx 3090", "rtx 3090"]
+  },
+  {
+    "key": "rx_6700_xt_12gb",
+    "label": "RX 6700 XT",
+    "device": "vulkan",
+    "memory_gb": 12.0,
+    "memory_bandwidth_gbps": 384.0,
+    "compute_tflops": 13.21,
+    "source_urls": [
+      "https://www.amd.com/en/products/graphics/desktops/radeon/6000-series/amd-radeon-rx-6700-xt.html",
+      "https://www.techpowerup.com/gpu-specs/radeon-rx-6700-xt.c3695"
+    ],
+    "aliases": ["rx 6700 xt", "radeon rx 6700 xt"]
+  },
+  {
+    "key": "rtx_4090_24gb",
+    "label": "RTX 4090",
+    "device": "cuda",
+    "memory_gb": 24.0,
+    "memory_bandwidth_gbps": 1008.0,
+    "compute_tflops": 82.6,
+    "source_urls": [
+      "https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/",
+      "https://images.nvidia.com/aem-dam/Solutions/Data-Center/l4/nvidia-ada-gpu-architecture-whitepaper-V2.02.pdf?ncid=no-ncid"
+    ],
+    "aliases": ["geforce rtx 4090", "rtx 4090"]
+  }
+]

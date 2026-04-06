@@ -54,4 +54,4 @@ license-files = ["LICENSE"]
 include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*"]
 
 [tool.setuptools.package-data]
-src = ["app.tcss"]
+src = ["app.tcss", "data/*.json"]

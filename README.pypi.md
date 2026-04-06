@@ -1,10 +1,14 @@
-# open-jet
+# Open-Jet
 
-`open-jet` ships both:
+[GitHub](https://github.com/l-forster/open-jet) | [X / Twitter](https://x.com/FlouisLF) | [Discord](https://discord.gg/pspKHtExSa)
 
-- the OpenJet CLI and chat TUI
-- the OpenJet Python SDK
-- the OpenJet benchmarking entrypoints
+**An AI coding agent that runs entirely on your machine.**
+
+`open-jet` ships the full OpenJet package:
+
+- the CLI and chat TUI
+- the Python SDK
+- the benchmarking entrypoints
 
 Install it with:
 
@@ -12,24 +16,17 @@ Install it with:
 pip install open-jet
 ```
 
-## What Is In The Package
+OpenJet handles the model, runtime, and local setup without making you wire together `llama.cpp`, model files, and device-specific settings by hand. You get a coding agent in your terminal that can read files, edit code, run commands, and stay local.
 
-This package currently includes:
-
-- `openjet.sdk` for Python integrations
-- CLI entrypoints: `openjet` and `open-jet`
-- benchmark entrypoints via `open-jet benchmark`
-- the local/session runtime used by both the SDK and the CLI
-
-So this is not an SDK-only wheel. It is the full OpenJet package, with the SDK exposed as a supported import surface.
+This is not an SDK-only wheel. It installs the full OpenJet package, with `openjet.sdk` exposed as a supported import surface.
 
 ## Product Surfaces
 
-OpenJet is one package with three primary surfaces:
+OpenJet has three primary surfaces in one package:
 
-- **CLI + chat TUI** for interactive local agent use
-- **Python SDK** for embedded sessions and hardware profiling
-- **Benchmarking** for `llama-bench` runs and sweeps
+- **CLI + chat TUI** for interactive local agent work
+- **Python SDK** for embedded sessions, hardware profiling, and auto-configuration
+- **Benchmarking** for `llama-bench` runs and sweep comparisons
 
 Typical entrypoints:
 
@@ -41,6 +38,15 @@ open-jet benchmark --sweep
 ```python
 from openjet.sdk import OpenJetSession, recommend_hardware_config
 ```
+
+## What You Get
+
+- **Read and edit local code** from a terminal agent
+- **Run shell commands** through the same session flow
+- **Resume sessions** instead of losing context when the terminal closes
+- **Work on constrained hardware** with hardware-aware model selection
+- **Use the Python SDK** to embed the same runtime in your own app
+- **Run benchmarks** against your current model/runtime profile
 
 ## SDK Import Path
 
@@ -58,7 +64,7 @@ from openjet.sdk import OpenJetSession, create_agent
 
 ## SDK Surface
 
-The currently exported SDK surface is:
+The supported SDK surface includes:
 
 ```python
 from openjet.sdk import (
@@ -89,6 +95,7 @@ That covers two main use cases:
 - recommended llama device settings
 - recommended GPU layer count
 - recommended context window size
+- a token generation estimate for the recommended setup
 
 Example:
 
@@ -183,11 +190,16 @@ open-jet
 
 The CLI and the SDK share the same underlying package and runtime code.
 
-## Notes
+## Package Contents
 
-- This wheel currently ships the wider OpenJet application, not just the SDK subset.
-- The SDK is exposed through `openjet.sdk`.
-- If you only need one narrow SDK feature, the package still installs the full declared dependency set for this distribution.
+This wheel currently includes:
+
+- `openjet.sdk` for Python integrations
+- CLI entrypoints: `openjet` and `open-jet`
+- benchmark entrypoints via `open-jet benchmark`
+- the local/session runtime used by both the SDK and the CLI
+
+If you only need one narrow SDK feature, the package still installs the full declared dependency set for this distribution.
 
 ## Repository
 

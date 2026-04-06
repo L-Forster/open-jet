@@ -1,0 +1,35 @@
+[
+  {
+    "key": "qwen35_4b_q4_k_m",
+    "label": "Qwen3.5 4B",
+    "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+    "parameter_count_billion": 4.66,
+    "model_size_mb": 2806.0,
+    "kv_bytes_per_token": 17408.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://ollama.com/library/qwen3.5:4b"],
+    "aliases": ["qwen3.5 4b", "qwen3.5-4b-q4_k_m.gguf", "qwen3.5:4b"]
+  },
+  {
+    "key": "qwen35_9b_q4_k_m",
+    "label": "Qwen3.5 9B",
+    "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+    "parameter_count_billion": 9.65,
+    "model_size_mb": 5816.0,
+    "kv_bytes_per_token": 17408.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://ollama.com/library/qwen3.5:9b"],
+    "aliases": ["qwen3.5 9b", "qwen3.5-9b-q4_k_m.gguf", "qwen3.5:9b"]
+  },
+  {
+    "key": "qwen35_27b_q4_k_m",
+    "label": "Qwen3.5 27B",
+    "filename": "Qwen3.5-27B-Q4_K_M.gguf",
+    "parameter_count_billion": 27.8,
+    "model_size_mb": 17101.0,
+    "kv_bytes_per_token": 34816.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://ollama.com/library/qwen3.5:27b"],
+    "aliases": ["qwen3.5 27b", "qwen3.5-27b-q4_k_m.gguf", "qwen3.5:27b"]
+  }
+]
