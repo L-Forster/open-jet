@@ -4,6 +4,8 @@
 
 **An AI coding agent that runs entirely on your machine.**
 
+  This is Claude Code for local LLMs. OpenJet handles the model, runtime, and setup for you, so you can run a terminal coding agent on your own machine without fighting configuration. It reads files, edits code, runs commands, and keeps your work out of the cloud.
+  
 `open-jet` ships the full OpenJet package:
 
 - the CLI and chat TUI
