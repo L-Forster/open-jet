@@ -199,14 +199,30 @@ class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
 class AppStatusTests(unittest.TestCase):
     def test_prompt_message_includes_generating_status_above_prompt(self) -> None:
         app = OpenJetApp()
-        app._assistant_status_kind = "generating"
-        app._render_assistant_status()
+        app._start_thinking()
 
         prompt = app._prompt_message()
 
         self.assertIn("Generating...", prompt.value)
+        self.assertIn("Tip: Join Discord for community support", prompt.value)
+        self.assertIn("prompt-tip", prompt.value)
         self.assertIn("prompt-splash-block-", prompt.value)
         self.assertIn("open-jet", prompt.value)
+
+    def test_generating_tip_advances_per_message_not_time(self) -> None:
+        app = OpenJetApp()
+
+        first_token = app._start_thinking()
+        first_tip = app._current_generating_tip()
+        app._stop_thinking(first_token)
+
+        second_token = app._start_thinking()
+        second_tip = app._current_generating_tip()
+        app._stop_thinking(second_token)
+
+        self.assertNotEqual(first_tip, second_tip)
+        self.assertEqual(first_tip, app._GENERATING_TIPS[0])
+        self.assertEqual(second_tip, app._GENERATING_TIPS[1])
 
     def test_init_client_does_not_eagerly_start_runtime(self) -> None:
         app = OpenJetApp()
@@ -1115,6 +1131,8 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(applied)
         self.assertEqual(events[:3], ["save", "materialize", "save"])
         self.assertEqual(events[3], "init")
+        entries = app.query_one("#chat-log")._entries
+        self.assertTrue(any("Setup complete. Join the Discord" in str(entry) for entry in entries))
 
     async def test_startup_force_setup_saves_config_before_materializing_model(self) -> None:
         app = OpenJetApp(force_setup=True)
@@ -1138,6 +1156,8 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(events[:3], ["save", "materialize", "save"])
         self.assertEqual(events[3], "init")
+        entries = app.query_one("#chat-log")._entries
+        self.assertTrue(any("Setup complete. Join the Discord" in str(entry) for entry in entries))
 
     def test_persist_setup_result_keeps_existing_named_profiles(self) -> None:
         app = OpenJetApp()
@@ -1314,6 +1334,7 @@ class AppQuitAsyncTests(unittest.IsolatedAsyncioTestCase):
         entries = app.query_one("#chat-log")._entries
         self.assertTrue(any("Saved with OpenJet" in str(entry) for entry in entries))
         self.assertTrue(any("1,234 input tokens • 56 output tokens • $0 API Cost" in str(entry) for entry in entries))
+        self.assertTrue(any("Setup complete. Join the Discord" in str(entry) for entry in entries))
         app.client.close.assert_awaited_once()
         app.session_logger.stop.assert_awaited_once()
         app.state_store.save.assert_called_once()

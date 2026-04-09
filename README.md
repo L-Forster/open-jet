@@ -98,6 +98,8 @@ OpenJet closes that gap. It's built for local models on real hardware, where mem
 
 Discord: https://discord.gg/pspKHtExSa
 
+Benchmarkers and testers are appreciated.
+
 X: https://x.com/FlouisLF
 
 ## License

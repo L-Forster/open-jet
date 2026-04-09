@@ -2,6 +2,8 @@
 
 OpenJet supports backend workflows defined as Markdown files.
 
+Writing good agent constraints is hard. The community shares optimized `.openjet` workflow files for specific languages and frameworks in the Discord.
+
 These workflows reuse the same device backend as the chat TUI:
 
 - device discovery and aliases from `devices.md`

@@ -246,6 +246,29 @@ class OpenJetApp:
     TITLE = "open-jet"
     _SPLASH_BLOCKS = ("▉", "▉", "▉", "▉")
     _STARTUP_UPDATE_CHECK_TIMEOUT_SECONDS = 2.5
+    _DISCORD_INVITE_URL = "https://discord.com/invite/pspKHtExSa"
+    _SETUP_SUCCESS_MESSAGE = (
+        "Setup complete. Join the Discord to discuss models and hardware configs: "
+        f"{_DISCORD_INVITE_URL}"
+    )
+    _GENERATING_TIPS = (
+        f"Tip: Join Discord for community support {_DISCORD_INVITE_URL}",
+        "Tip: Use /model to switch saved model presets without rerunning setup.",
+        "Tip: Use /edit-model to rename or adjust a saved preset in place.",
+        "Tip: Use /resume to reload a saved chat checkpoint into the runtime.",
+        "Tip: Use /mode to switch between chat, code, review, debug, and status workflows.",
+        "Tip: Use /skill list to see available skills, then /skill load <name> to pin one.",
+        "Tip: Use /help or /commands to list the built-in slash commands.",
+        "Tip: Use /load <path> to load a file into context.",
+        "Tip: Use /status to inspect runtime memory and context state.",
+        "Tip: Use /clear to reset chat and flush the KV cache.",
+        "Tip: Use /clear-chat to clear chat while keeping the current runtime state.",
+        "Tip: Use /voice start to begin microphone input, or /voice status to inspect it.",
+        "Tip: Use /device list to inspect available devices and aliases.",
+        "Tip: Use /memory show project agent to inspect saved project memory.",
+        "Tip: Use /air-gapped true when you want strictly local-only operation.",
+        "Tip: Paste images directly into the prompt to have open-jet analyze them.",
+    )
 
     def __init__(self, *, force_setup: bool = False) -> None:
         self.force_setup = force_setup
@@ -322,6 +345,7 @@ class OpenJetApp:
         self._generation_decode_started_at: float | None = None
         self._generation_tokens_streamed = 0
         self._generation_decode_tokens_streamed = 0
+        self._generation_tip_index = -1
         self._last_generation_tps: float | None = None
         self._session_prompt_tokens = 0
         self._session_completion_tokens = 0
@@ -447,7 +471,11 @@ class OpenJetApp:
             f"[bold]Saved with OpenJet[/] "
             f"{prompt_tokens:,} input tokens • {completion_tokens:,} output tokens • $0 API Cost"
         )
+        log.write(f"[dim]{self._SETUP_SUCCESS_MESSAGE}[/]")
         log.write("")
+
+    def _write_setup_success_message(self, log: LogView) -> None:
+        log.write(f"[dim]{self._SETUP_SUCCESS_MESSAGE}[/]")
 
     def _request_terminal_exit(
         self,
@@ -946,6 +974,7 @@ class OpenJetApp:
         self.persist_session_state(reason="setup_command")
         self._render_token_counter()
         log.write("[bold bright_white]Setup applied. Runtime restarted and context reset.[/]")
+        self._write_setup_success_message(log)
         log.write("")
         return True
 
@@ -1066,6 +1095,7 @@ class OpenJetApp:
                     return
                 self._persist_setup_result(setup_result)
                 save_config(self.cfg)
+                self._write_setup_success_message(log)
             elif not self._has_any_configured_model():
                 self._quit_requested = True
                 return
@@ -1533,17 +1563,25 @@ class OpenJetApp:
         status_html = ""
         if not status.hidden and status.text:
             status_html = f"{self._render_prompt_status_html(status.text)}\n"
+        tip_html = ""
+        if self._assistant_status_kind == "generating":
+            tip_html = f"<prompt-tip>{html.escape(self._current_generating_tip())}</prompt-tip>\n"
         if self.is_airgapped():
             return HTML(
-                f"{status_html}<brand-chip-airgapped> open-jet air-gap </brand-chip-airgapped>"
+                f"{status_html}{tip_html}<brand-chip-airgapped> open-jet air-gap </brand-chip-airgapped>"
                 "<prompt-divider-airgapped> //</prompt-divider-airgapped>"
                 "<prompt-airgapped> ></prompt-airgapped>"
             )
         return HTML(
-            f"{status_html}<brand-chip> open-jet </brand-chip>"
+            f"{status_html}{tip_html}<brand-chip> open-jet </brand-chip>"
             "<prompt-divider> //</prompt-divider>"
             "<prompt> ></prompt>"
         )
+
+    def _current_generating_tip(self) -> str:
+        if self._generation_tip_index < 0:
+            return self._GENERATING_TIPS[0]
+        return self._GENERATING_TIPS[self._generation_tip_index % len(self._GENERATING_TIPS)]
 
     def set_utilization_visible(self, visible: bool) -> None:
         self._utilization_visible = bool(visible)
@@ -2550,6 +2588,7 @@ class OpenJetApp:
         self._generation_decode_started_at = None
         self._generation_tokens_streamed = 0
         self._generation_decode_tokens_streamed = 0
+        self._generation_tip_index = (self._generation_tip_index + 1) % len(self._GENERATING_TIPS)
         self._thinking_timer = True
         self._set_generating_status()
         return self._thinking_token

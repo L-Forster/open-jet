@@ -39,6 +39,7 @@ PROMPT_STYLE = {
     "prompt-divider": "#63e6be",
     "prompt-divider-airgapped": "#fecdd3",
     "prompt-status": "#b7efc5 bold",
+    "prompt-tip": "#9fb7aa italic",
     "prompt-status-label": "bg:#103126 #9ae6b4 bold",
     "prompt-command": "#8bd3ff bold",
     "prompt-splash-text": "#dcfce7 bold",
