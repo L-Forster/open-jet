@@ -8,6 +8,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 from typing import AsyncIterator, Callable
 
 from .multimodal import content_to_plain_text, estimate_message_content_tokens, runtime_content
@@ -70,6 +71,10 @@ class Agent:
         client: RuntimeClient,
         system_prompt: str,
         *,
+        base_system_prompt: str | None = None,
+        project_root: Path | None = None,
+        prompt_cfg: dict[str, object] | None = None,
+        global_memory_root: Path | None = None,
         context_window_tokens: int | None = None,
         context_reserved_tokens: int | None = None,
         min_prompt_tokens: int = 256,
@@ -81,7 +86,15 @@ class Agent:
         trace_hook: Callable[[str, dict[str, object]], None] | None = None,
     ) -> None:
         self.client = client
+        self.base_system_prompt = system_prompt if base_system_prompt is None else base_system_prompt
         self.system_prompt = system_prompt
+        self.project_root = Path(project_root).expanduser().resolve() if project_root is not None else None
+        self.prompt_cfg = dict(prompt_cfg) if isinstance(prompt_cfg, dict) else prompt_cfg
+        self.global_memory_root = (
+            Path(global_memory_root).expanduser().resolve()
+            if global_memory_root is not None
+            else None
+        )
         self.messages: list[dict] = [{"role": "system", "content": system_prompt}]
         self.context_window_tokens = context_window_tokens
         self.context_reserved_tokens = context_reserved_tokens
@@ -408,6 +421,16 @@ class Agent:
 
     def clear_turn_context(self) -> None:
         self.turn_context_messages = []
+
+    async def refresh_system_prompt(self) -> None:
+        from .memory_reflection import refresh_agent_system_prompt
+
+        await refresh_agent_system_prompt(self)
+
+    async def reflect_persistent_memory(self, *, recorded_turn: dict[str, object] | None) -> dict[str, object]:
+        from .memory_reflection import reflect_agent_persistent_memory
+
+        return await reflect_agent_persistent_memory(self, recorded_turn=recorded_turn)
 
     def runtime_request_snapshot(self, *, empty_retry_count: int = 0, use_tools: bool = True) -> dict[str, object]:
         extra_system_note = self._continuation_note_for_runtime(empty_retry_count)
@@ -746,6 +769,11 @@ class Agent:
             if name == "system_info":
                 scope = str(arguments.get("scope", "summary") or "summary").strip()
                 return f"{name} scope={scope}"
+            if name == "memory":
+                location = str(arguments.get("location", "project") or "project").strip()
+                scope = str(arguments.get("scope", "") or "").strip() or "<unknown>"
+                action = str(arguments.get("action", "") or "").strip() or "<unknown>"
+                return f"{name} action={action} location={location} scope={scope}"
         return self._compact_history_text(f"{name} {arguments}", max_len=140)
 
     def _consume_pending_tool_descriptor(

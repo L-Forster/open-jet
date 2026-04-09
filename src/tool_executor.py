@@ -110,7 +110,7 @@ def format_tool_args(tool_call: ToolCall) -> str:
             return f"scope={str(args.get('scope', 'summary') or 'summary').strip()}"
         case "device_list":
             kind = str(args.get("kind", "") or "").strip()
-            return f"kind={kind}" if kind else "all devices"
+            return f"kind={kind}" if kind else "active devices"
         case "camera_snapshot" | "microphone_record" | "sensor_read" | "gpio_read":
             source = str(args.get("source", "") or "").strip() or "<auto>"
             duration = args.get("duration_seconds")
@@ -119,7 +119,10 @@ def format_tool_args(tool_call: ToolCall) -> str:
             source = str(args.get("source", "") or "").strip() or "<auto>"
             return f"{source} -> {'on' if args.get('enabled') else 'off'}"
         case "memory":
-            return f"{str(args.get('action', ''))} {str(args.get('scope', ''))}".strip()
+            location = str(args.get("location", "project") or "project").strip()
+            action = str(args.get("action", "") or "").strip()
+            scope = str(args.get("scope", "") or "").strip()
+            return " ".join(part for part in (action, location, scope) if part)
         case "read_file" | "write_file" | "load_file" | "edit_file":
             return str(args.get("path", str(args)))
         case "glob" | "grep":
@@ -233,15 +236,29 @@ def _microphone_set_enabled_result(args: dict[str, Any]) -> ToolExecutionResult:
 
 
 async def _memory_result(args: dict[str, Any]) -> ToolExecutionResult:
+    location = args.get("location", "project")
     scope = args.get("scope", "")
     action = args.get("action", "")
     content = args.get("content", "")
     if not isinstance(scope, str) or not scope.strip() or not isinstance(action, str) or not action.strip():
         raise ToolArgumentError("required: scope, action")
+    if not isinstance(location, str):
+        raise ToolArgumentError("location must be string")
     if not isinstance(content, str):
         raise ToolArgumentError("content must be string")
-    text = await update_persistent_memory(Path.cwd(), scope=scope, action=action, content=content)
-    return ToolExecutionResult(output=text, meta={"ok": True, "scope": scope, "action": action})
+    text = await update_persistent_memory(
+        Path.cwd(),
+        scope=scope,
+        action=action,
+        content=content,
+        location=location,
+    )
+    ok = not text.startswith("Skipped ")
+    status = "completed" if ok else "skipped"
+    return ToolExecutionResult(
+        output=text,
+        meta={"ok": ok, "status": status, "location": location, "scope": scope, "action": action},
+    )
 
 
 async def _load_file_result(args: dict[str, Any]) -> ToolExecutionResult:
@@ -512,14 +529,15 @@ def _device_list_output(*, kind: str | None) -> tuple[str, dict[str, object]]:
     parsed_kind = _parse_device_kind(kind)
     if parsed_kind is not None:
         sources = [source for source in sources if source.device.kind is parsed_kind]
+    sources = [source for source in sources if source.enabled]
     if not sources:
         label = f"{parsed_kind.value} " if parsed_kind is not None else ""
-        message = f"No {label}device sources detected.".strip()
+        message = f"No active {label}device sources detected.".strip()
         hint = device_discovery_hint()
         if hint:
             message = f"{message}\n{hint}"
         return message, {"ok": True, "count": 0, "registry_path": str(registry_path) if registry_path else None}
-    lines = ["Discovered device sources:"]
+    lines = ["Discovered active device sources:"]
     for source in sources:
         refs = ", ".join(f"@{ref}" for ref in source.refs)
         path = f" | path={source.device.path}" if source.device.path else ""

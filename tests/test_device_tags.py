@@ -320,10 +320,87 @@ class DeviceCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(handled)
         rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("/voice", rendered)
         self.assertIn("/device", rendered)
         self.assertNotIn("/device-add", rendered)
         self.assertNotIn("/device-on", rendered)
         self.assertNotIn("/device-off", rendered)
+
+    async def test_voice_command_starts_default_microphone_stream(self) -> None:
+        app = OpenJetApp()
+        with patch.object(
+            app,
+            "start_voice_input",
+            AsyncMock(
+                return_value={
+                    "active": True,
+                    "source_ref": "mic0",
+                    "chunk_seconds": 3,
+                    "send_command": "send message",
+                    "clear_command": "clear message",
+                    "stop_command": "stop listening",
+                    "voice_output": {
+                        "available": False,
+                        "provider": None,
+                        "backend": None,
+                        "last_error": None,
+                    },
+                }
+            ),
+        ) as start_voice_input:
+            handled = await app.commands.maybe_handle("/voice")
+
+        self.assertTrue(handled)
+        start_voice_input.assert_awaited_once_with(source_ref=None)
+        rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Voice input started on @mic0", rendered)
+        self.assertIn("send message", rendered)
+        self.assertIn("clear message", rendered)
+        self.assertIn("stop listening", rendered)
+        self.assertIn("not configured", rendered)
+
+    async def test_voice_command_reports_status(self) -> None:
+        app = OpenJetApp()
+        with patch.object(
+            app,
+            "voice_status_snapshot",
+            return_value={
+                "active": True,
+                "source_ref": "room-mic",
+                "chunk_seconds": 3,
+                "draft_pending": True,
+                "draft_preview": "draft hello there",
+                "send_command": "send message",
+                "clear_command": "clear message",
+                "stop_command": "stop listening",
+                "voice_output_provider": "system_fallback",
+                "voice_output_available": False,
+                "voice_output_backend": None,
+                "voice_output_last_error": "Voice output provider 'system_fallback' is not implemented in this build.",
+                "last_error": None,
+            },
+        ):
+            handled = await app.commands.maybe_handle("/voice status")
+
+        self.assertTrue(handled)
+        rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Voice input is active on @room-mic", rendered)
+        self.assertIn("Draft is pending", rendered)
+        self.assertIn("send message", rendered)
+        self.assertIn("clear message", rendered)
+        self.assertIn("stop listening", rendered)
+        self.assertIn("draft hello there", rendered)
+        self.assertIn("not implemented in this build", rendered)
+
+    async def test_voice_command_stops_running_stream(self) -> None:
+        app = OpenJetApp()
+        with patch.object(app, "stop_voice_input", AsyncMock(return_value=True)) as stop_voice_input:
+            handled = await app.commands.maybe_handle("/voice stop")
+
+        self.assertTrue(handled)
+        stop_voice_input.assert_awaited_once()
+        rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Voice input stopped.", rendered)
 
     async def test_devices_command_lists_device_refs(self) -> None:
         app = OpenJetApp()

@@ -5,6 +5,7 @@
 - `/clear` clear chat and restart runtime (flush KV cache)
 - `/clear-chat` clear chat only
 - `/status` show context/RAM status
+- `/voice [status|start [mic]|stop]` start microphone dictation mode; spoken utterances build a local draft, `send message` submits it, `clear message` discards it, and `stop listening` exits voice mode. Spoken assistant/tool output is not implemented in this build.
 - `/device [list|add <existing_id> <new_id>|on <id>|off <id>|help]` list or configure devices in chat
 - `/devices` alias for `/device`
 - `/condense` condense older context
@@ -32,3 +33,5 @@ open-jet device add <existing_id> <new_id>
 open-jet device on <id>
 open-jet device off <id>
 ```
+
+Voice output currently has no shipped provider implementation. Any configured `voice_output.provider` value will be reported as unavailable until a real TTS backend is added.

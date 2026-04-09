@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 
 import httpx
 
+from .app_paths import openjet_install_root
 from .config import setup_direct_model_catalog
 from .hardware import HardwareInfo, is_jetson_label, recommended_context_window_tokens_from_total
 from .setup_memory import recommend_context_window_for_model
@@ -23,7 +24,7 @@ def _fmt_size(nbytes: int) -> str:
     return f"{nbytes / (1 << 10):.0f} KB"
 
 
-OPENJET_HOME = Path.home() / ".openjet"
+OPENJET_HOME = openjet_install_root()
 MODELS_DIR = OPENJET_HOME / "models"
 BIN_DIR = OPENJET_HOME / "bin"
 LLAMA_CPP_DIR = Path.home() / "llama.cpp"

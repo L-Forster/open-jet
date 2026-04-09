@@ -99,6 +99,7 @@ from .model_profiles import (
     list_model_profiles,
     sync_active_model_profile,
 )
+from .memory_reflection import build_recorded_turn_payload, reflect_agent_persistent_memory
 from .observation import ObservationStore
 from .persistent_memory import build_system_prompt
 from .provisioning import provision_setup_artifacts
@@ -114,6 +115,8 @@ from .setup import ACCENT_GREEN, _prompt_choice, discover_model_files, run_setup
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
 from .tool_executor import format_tool_args, get_swap_manager, set_swap_manager
+from .voice_input import VoiceInputController
+from .voice_output import VoiceOutputController
 
 
 def _format_error(exc: Exception) -> str:
@@ -325,6 +328,7 @@ class OpenJetApp:
         self._session_runtime_requests = 0
         self._pending_image_paths: list[str] = []
         self._active_turn_device_refs: tuple[str, ...] = ()
+        self._last_completed_turn: dict[str, Any] | None = None
         self._widgets = {
             "#chat-log": LogView(self.console),
             "#assistant-status": StatusWidget(),
@@ -337,6 +341,21 @@ class OpenJetApp:
         self._widgets["#token-counter"].hidden = False
         self._widgets["#utilization-bar"].hidden = False
         self.focused = self._widgets["#prompt"]
+        self.voice = VoiceInputController(
+            observation_store=self.observation_store,
+            cfg_provider=lambda: self.cfg,
+            list_sources=self.list_device_sources,
+            resolve_source=self.resolve_device_source,
+            submit_text=lambda text: self.submit_text(text, allow_slash_command=False),
+            is_busy=lambda: bool(self._awaiting_approval or (self._generation_worker and not self._generation_worker.done())),
+            is_quit_requested=lambda: self._quit_requested,
+            log_getter=lambda: self.query_one("#chat-log"),
+            log_event=self._log_voice_event,
+        )
+        self.voice_output = VoiceOutputController(
+            cfg_provider=lambda: self.cfg,
+            log_event=self._log_voice_event,
+        )
 
     def query_one(self, selector: str, _expected_type: object | None = None) -> Any:
         return self._widgets[selector]
@@ -349,6 +368,10 @@ class OpenJetApp:
 
     def exit(self) -> None:
         self._quit_requested = True
+
+    def _log_voice_event(self, event_type: str, **data: Any) -> None:
+        if self.session_logger:
+            self.session_logger.log_event(event_type, **data)
 
     def _restart_process(self) -> None:
         os.execv(sys.executable, [sys.executable, *sys.argv])
@@ -686,6 +709,9 @@ class OpenJetApp:
         self.agent = Agent(
             client=self.client,
             system_prompt=await build_system_prompt("", Path.cwd(), cfg=self.cfg),
+            base_system_prompt="",
+            project_root=Path.cwd(),
+            prompt_cfg=self.cfg,
             context_window_tokens=self.client.context_window_tokens,
             context_reserved_tokens=int(mem_cfg["context_reserved_tokens"]) if mem_cfg.get("context_reserved_tokens") is not None else None,
             min_prompt_tokens=int(mem_cfg.get("min_prompt_tokens", 256)),
@@ -1088,6 +1114,8 @@ class OpenJetApp:
         if self._active_turn_id:
             self._finish_turn_trace(success=False, status="abandoned", error="application quit")
         self.persist_session_state(reason="quit")
+        await self.voice.shutdown()
+        await self.voice_output.shutdown()
         if self._generation_worker and not self._generation_worker.done():
             self._generation_worker.cancel()
         if self.client:
@@ -1100,7 +1128,7 @@ class OpenJetApp:
         if normalized:
             self._prompt_history.append(normalized)
 
-    async def submit_text(self, text: str) -> None:
+    async def submit_text(self, text: str, *, allow_slash_command: bool = True) -> None:
         prompt = self.query_one("#prompt")
         prompt.value = text
         if self._awaiting_approval:
@@ -1128,7 +1156,7 @@ class OpenJetApp:
         prompt.value = ""
         self._pending_image_paths.clear()
 
-        if stripped and await self.commands.maybe_handle(stripped):
+        if allow_slash_command and stripped and await self.commands.maybe_handle(stripped):
             self._render_token_counter()
             return
 
@@ -1140,8 +1168,9 @@ class OpenJetApp:
             return
 
         display_text = stripped if stripped else "[image attachment]"
-        user_header = "Slash Command" if display_text.startswith("/") else "User"
-        user_text_style = "command" if display_text.startswith("/") else "muted"
+        display_as_command = allow_slash_command and display_text.startswith("/")
+        user_header = "Slash Command" if display_as_command else "User"
+        user_text_style = "command" if display_as_command else "muted"
         log.write(Rule(rich_text(user_header, "user"), style="user"))
         log.write(f"{rich_text('> ', 'user')}{rich_text(display_text, user_text_style)}")
         for image_path in attached_images:
@@ -1546,6 +1575,8 @@ class OpenJetApp:
         mem = read_memory_snapshot()
         active = active_step(self.harness_state)
         context_snapshot = self._last_turn_context_snapshot
+        voice_snapshot = self.voice.status_snapshot()
+        voice_output_snapshot = self.voice_output.status_snapshot()
         reasoning_mode = None
         if self.client and hasattr(self.client, "reasoning_status"):
             try:
@@ -1582,13 +1613,64 @@ class OpenJetApp:
             "harness_candidate_count": len(getattr(context_snapshot, "candidate_decisions", []) or []),
             "turn_docs_budget": getattr(getattr(context_snapshot, "budget", None), "docs_budget", 0),
             "turn_context_remaining_budget": getattr(getattr(context_snapshot, "budget", None), "remaining_budget", 0),
+            "voice_active": voice_snapshot["active"],
+            "voice_source_ref": voice_snapshot["source_ref"],
+            "voice_chunk_seconds": voice_snapshot["chunk_seconds"],
+            "voice_last_error": voice_snapshot["last_error"],
+            "draft_pending": voice_snapshot["draft_pending"],
+            "draft_preview": voice_snapshot["draft_preview"],
+            "send_command": voice_snapshot["send_command"],
+            "clear_command": voice_snapshot["clear_command"],
+            "stop_command": voice_snapshot["stop_command"],
+            "voice_output_enabled": voice_output_snapshot["enabled"],
+            "voice_output_provider": voice_output_snapshot["provider"],
+            "voice_output_backend": voice_output_snapshot["backend"],
+            "voice_output_available": voice_output_snapshot["available"],
+            "voice_output_last_error": voice_output_snapshot["last_error"],
         }
 
     def refresh_token_counter(self) -> None:
         self._render_token_counter()
 
+    def voice_status_snapshot(self) -> dict[str, Any]:
+        snapshot = self.voice.status_snapshot()
+        output_snapshot = self.voice_output.status_snapshot()
+        return {
+            **snapshot,
+            "voice_output_enabled": output_snapshot["enabled"],
+            "voice_output_provider": output_snapshot["provider"],
+            "voice_output_backend": output_snapshot["backend"],
+            "voice_output_available": output_snapshot["available"],
+            "voice_output_last_error": output_snapshot["last_error"],
+        }
+
+    async def start_voice_input(self, *, source_ref: str | None = None) -> dict[str, Any]:
+        if not self.agent:
+            raise RuntimeError("Agent not initialized.")
+        snapshot = await self.voice.start(source_ref=source_ref)
+        output_snapshot = await self.voice_output.enable()
+        return {**snapshot, "voice_output": output_snapshot}
+
+    async def stop_voice_input(self) -> bool:
+        stopped = await self.voice.stop()
+        await self.voice_output.disable()
+        return stopped
+
+    @classmethod
+    def voice_stop_command_hint(cls) -> str:
+        return VoiceInputController.stop_command_hint()
+
+    @classmethod
+    def voice_send_command_hint(cls) -> str:
+        return VoiceInputController.send_command_hint()
+
+    @classmethod
+    def voice_clear_command_hint(cls) -> str:
+        return VoiceInputController.clear_command_hint()
+
     def _start_new_chat_session(self) -> None:
         self._chat_session_id = self.chat_archive.new_chat_id()
+        self._last_completed_turn = None
 
     def _build_session_payload(self, *, reason: str) -> dict[str, Any]:
         return {
@@ -1603,6 +1685,7 @@ class OpenJetApp:
             "device": self.cfg.get("device", "auto"),
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
             "messages": self.agent.messages if self.agent else [],
+            "completed_turn": self._last_completed_turn,
             "loaded_files": self.loaded_files,
             "harness_state": self.harness_state.to_dict(),
             "token_usage": {
@@ -1675,6 +1758,8 @@ class OpenJetApp:
         self._turn_context_docs = []
         self._turn_context_tokens = 0
         self._last_turn_context_snapshot = None
+        completed_turn = state.get("completed_turn")
+        self._last_completed_turn = dict(completed_turn) if isinstance(completed_turn, dict) else None
         self.harness_state = HarnessState.from_dict(
             state.get("harness_state") if isinstance(state.get("harness_state"), dict) else None
         )
@@ -1852,10 +1937,7 @@ class OpenJetApp:
             log.write(f"  {rich_text(f'... ({len(lines) - 20} more lines)', 'dim')}")
         log.write("")
 
-    def persist_session_state(self, *, reason: str) -> None:
-        if not self.agent or not self.state_store.enabled:
-            return
-        payload = self._build_session_payload(reason=reason)
+    def _save_live_session_payload(self, payload: dict[str, Any]) -> None:
         try:
             self.state_store.save(payload)
         except Exception:
@@ -1865,10 +1947,18 @@ class OpenJetApp:
         except Exception:
             return
 
-    async def persist_resumable_session_state(self, *, reason: str) -> bool:
+    def persist_session_state(self, *, reason: str) -> dict[str, Any] | None:
+        if not self.agent or not self.state_store.enabled:
+            return None
+        payload = self._build_session_payload(reason=reason)
+        self._save_live_session_payload(payload)
+        return payload
+
+    async def persist_resumable_session_state(self, *, reason: str, payload: dict[str, Any] | None = None) -> bool:
         if not self.agent or not self.state_store.enabled:
             return False
-        payload = self._build_session_payload(reason=reason)
+        if payload is None:
+            payload = self._build_session_payload(reason=reason)
         try:
             self.chat_archive.save_resume_state(self._chat_session_id, payload)
         except Exception:
@@ -2087,6 +2177,7 @@ class OpenJetApp:
                             )
                             log.write(rendered)
                             text_buf = ""
+                        await self.voice_output.announce_tool_call(event.tool_call)
                         self._record_tool_request(event.tool_call, log, tool_status_tokens)
                     elif event.kind == SDKEventKind.TOOL_RESULT and event.tool_result:
                         tool_event = self._record_tool_result(event.tool_result, log, tool_status_tokens)
@@ -2160,10 +2251,39 @@ class OpenJetApp:
 
         self.harness_state = update_state_after_turn(self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
         self.persist_harness_state()
+        self._last_completed_turn = build_recorded_turn_payload(
+            user_prompt=self._active_turn_prompt,
+            assistant_text=assistant_turn_text,
+            tool_calls=[
+                {
+                    "tool": str(event.get("tool", "")).strip(),
+                    "arguments": event.get("arguments", {}),
+                }
+                for event in tool_events
+                if str(event.get("tool", "")).strip()
+            ],
+            tool_results=[
+                {
+                    "tool": str(event.get("tool", "")).strip(),
+                    "arguments": event.get("arguments", {}),
+                    "raw_output": str(event.get("raw_output", "")).strip(),
+                }
+                for event in tool_events
+                if str(event.get("tool", "")).strip()
+            ],
+        )
         if tool_events:
             self.persist_session_state(reason="assistant_turn_with_tools")
-        self.persist_session_state(reason="assistant_turn_done")
-        await self.persist_resumable_session_state(reason="assistant_turn_done")
+        session_payload = self.persist_session_state(reason="assistant_turn_done")
+        try:
+            await reflect_agent_persistent_memory(
+                self.agent,
+                recorded_turn=session_payload.get("completed_turn") if isinstance(session_payload, dict) else None,
+            )
+        except Exception as exc:
+            self._log_trace_event("memory_reflection_failed", error=str(exc))
+        await self.persist_resumable_session_state(reason="assistant_turn_done", payload=session_payload)
+        await self.voice_output.announce_assistant_text(assistant_turn_text)
         self._finish_turn_trace(success=True, status="completed")
         self._render_token_counter()
 
@@ -2258,6 +2378,8 @@ class OpenJetApp:
             "ok": bool(meta.get("ok", False)),
             "summary": tool_result.output.splitlines()[0] if tool_result.output else "",
             "target": format_tool_args(tc),
+            "arguments": dict(tc.arguments) if isinstance(tc.arguments, dict) else tc.arguments,
+            "raw_output": tool_result.output,
             "verification": tc.name == "shell" and shell_command_is_verification(str(tc.arguments.get("command", ""))),
             "command": tc.arguments.get("command") if isinstance(tc.arguments, dict) else None,
             "duration_ms": duration_ms,

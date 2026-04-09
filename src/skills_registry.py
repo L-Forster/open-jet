@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .app_paths import openjet_install_root
 
 
 @dataclass(frozen=True)
@@ -19,10 +20,7 @@ class SkillSummary:
 
 
 def openjet_home() -> Path:
-    override = os.environ.get("OPENJET_HOME", "").strip()
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".openjet"
+    return openjet_install_root()
 
 
 def local_openjet_home(root: Path) -> Path:
@@ -96,7 +94,7 @@ def render_skills_manifest(root: Path) -> str:
         "Do not assume the short summary here contains the full instructions.",
         "Do not rely on absolute filesystem paths in this index.",
         "",
-        "global_skills_dir: ~/.openjet/skills",
+        "global_skills_dir: <install>/skills",
         f"project_skills_dir: .openjet/skills ({'present' if project_dir.exists() else 'absent'})",
         "merge_policy: project skills overlay global skills with the same name.",
         "",
@@ -140,7 +138,7 @@ def _skill_source_dirs(root: Path) -> list[tuple[str, Path, str]]:
     sources: list[tuple[str, Path, str]] = []
     global_dir = skills_dir(root)
     if global_dir.exists():
-        sources.append(("global", global_dir, "~/.openjet/skills"))
+        sources.append(("global", global_dir, "<install>/skills"))
     local_dir = project_skills_dir(root)
     if local_dir.exists():
         sources.append(("project", local_dir, ".openjet/skills"))

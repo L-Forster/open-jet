@@ -962,19 +962,51 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(f"Attached image: {second_image_path}", content[0]["text"])
         self.assertEqual([block["type"] for block in content[1:]], ["image_url", "image_url"])
 
+    async def test_stream_surfaces_memory_reflection_failure(self) -> None:
+        client = SequencedRuntimeClient([[StreamChunk(text="done")]])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        session = OpenJetSession(agent)
+
+        with unittest.mock.patch(
+            "src.sdk.session.reflect_agent_persistent_memory",
+            side_effect=RuntimeError("disk full"),
+        ):
+            events = [event async for event in session.stream("hi")]
+
+        self.assertEqual([event.kind for event in events], [SDKEventKind.TEXT, SDKEventKind.ERROR])
+        self.assertIn("Persistent memory update failed: disk full", events[-1].text)
+
+    async def test_stream_passes_recorded_turn_payload_to_memory_reflection(self) -> None:
+        client = SequencedRuntimeClient([[StreamChunk(text="done")]])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        session = OpenJetSession(agent)
+
+        with unittest.mock.patch(
+            "src.sdk.session.reflect_agent_persistent_memory",
+            return_value={"ok": True, "applied": []},
+        ) as reflect_mock:
+            events = [event async for event in session.stream("hi")]
+
+        self.assertEqual(events[-1].kind, SDKEventKind.DONE)
+        reflect_mock.assert_awaited_once()
+        _, kwargs = reflect_mock.await_args
+        self.assertIn("recorded_turn", kwargs)
+        self.assertIsNone(kwargs["recorded_turn"])
+
 
 class PersistentMemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_system_prompt_includes_persistent_memory_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            global_root = root / "global-home"
             await update_persistent_memory(root, scope="user", action="replace", content="- prefers concise answers")
             await update_persistent_memory(root, scope="agent", action="replace", content="- repo uses apply_patch")
             with unittest.mock.patch("src.persistent_memory.load_config", return_value={}):
-                prompt = await build_system_prompt("base system", root)
+                prompt = await build_system_prompt("base system", root, global_root=global_root)
 
-        self.assertIn("Persistent user preferences", prompt)
+        self.assertIn("Local user memory", prompt)
         self.assertIn("prefers concise answers", prompt)
-        self.assertIn("Persistent agent memory", prompt)
+        self.assertIn("Local agent memory", prompt)
         self.assertIn("repo uses apply_patch", prompt)
         self.assertIn(str(root / ".openjet" / "state" / "devices.md"), prompt)
 

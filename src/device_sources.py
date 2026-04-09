@@ -10,10 +10,8 @@ from .observation import ObservationStore, process_audio_observation, save_frame
 from .peripherals import PeripheralDevice, PeripheralKind, PeripheralTransport, capture_snapshot, discover_peripherals, record_clip
 from .peripherals.system import resolve_binary, run_command
 from .peripherals.types import Observation, ObservationModality
-from .tools.registry import tool_names_with_tag
 
 DEFAULT_DEVICES_REGISTRY_PATH = Path(".openjet/state/devices.md")
-DEVICE_TOOL_NAMES = tool_names_with_tag("device")
 
 
 @dataclass(frozen=True)
@@ -171,7 +169,6 @@ def format_device_registry_prompt(
     registry_path: str | Path,
     *,
     referenced_ids: Sequence[str] | None = None,
-    include_tool_names: bool = True,
 ) -> str:
     normalized_path = Path(registry_path).expanduser().resolve()
     lines = [
@@ -182,12 +179,6 @@ def format_device_registry_prompt(
     if refs:
         lines.append(f"Referenced device ids for this turn: {', '.join(refs)}.")
     lines.append("Do not assume any device logs or payload files are already loaded.")
-    if include_tool_names:
-        lines.append(
-            "Available device tools include "
-            + ", ".join(f"`{name}`" for name in DEVICE_TOOL_NAMES[:-1])
-            + f", and `{DEVICE_TOOL_NAMES[-1]}`."
-        )
     return "\n".join(lines)
 
 

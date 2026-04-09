@@ -139,7 +139,7 @@ TOOL_REGISTRY = ToolRegistry(
     [
         _tool(
             "device_list",
-            "List detected camera, microphone, speaker, and sensor sources available to the agent.",
+            "List active currently connected camera, microphone, speaker, and sensor sources available to the agent.",
             parameters={
                 "kind": _param("string", "Optional filter: camera, microphone, speaker, or sensor"),
             },
@@ -199,7 +199,8 @@ TOOL_REGISTRY = ToolRegistry(
         _tool(
             "shell",
             (
-                "Run a shell command. For heavy local work you may set "
+                "Run a shell command. Use this for system operations such as cron setup, ssh, "
+                "package managers, build tools, and other CLI workflows. For heavy local work you may set "
                 "resource_mode=unload_first to unload the local model before the command "
                 "and reload it afterward."
             ),
@@ -230,8 +231,13 @@ TOOL_REGISTRY = ToolRegistry(
         ),
         _tool(
             "memory",
-            "Read or update persistent cross-session memory.",
+            (
+                "Read or update persistent cross-session memory. "
+                "Use location=global for facts reusable outside the current project, "
+                "and location=project for repo or cwd-specific facts."
+            ),
             parameters={
+                "location": _param("string", "Memory location: global or project"),
                 "scope": _param("string", "Memory scope: user or agent"),
                 "action": _param("string", "Operation: read, append, replace, or clear"),
                 "content": _param("string", "Memory content for append or replace"),

@@ -21,6 +21,7 @@ from ..harness import (
     update_state_for_user_message,
 )
 from ..multimodal import build_user_content, content_to_plain_text, estimate_message_content_tokens
+from ..memory_reflection import reflect_agent_persistent_memory, refresh_agent_system_prompt
 from ..persistent_memory import (
     build_system_prompt,
     load_persistent_memory,
@@ -50,6 +51,8 @@ __all__ = [
     "estimate_tokens",
     "load_persistent_memory",
     "read_memory_snapshot",
+    "reflect_agent_persistent_memory",
+    "refresh_agent_system_prompt",
     "set_mode",
     "set_preferred_skills",
     "split_active_step",

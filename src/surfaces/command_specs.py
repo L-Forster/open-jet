@@ -28,6 +28,10 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
     CommandSpec(
+        name="voice",
+        description="Start or inspect microphone voice input: /voice [status|start [mic]|stop]",
+    ),
+    CommandSpec(
         name="device",
         description="List or configure devices: /device [list|add <existing_id> <new_id>|on <id>|off <id>|help]",
         aliases=("devices", "sources"),
@@ -52,7 +56,10 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(name="condense", description="Manually condense older context"),
     CommandSpec(name="load", description="Load file into context: /load <path>", aliases=("add",)),
-    CommandSpec(name="memory", description="Inspect or update persistent memory: /memory [show|clear <user|agent>]"),
+    CommandSpec(
+        name="memory",
+        description="Inspect or update persistent memory: /memory [show [global|project] [user|agent]|clear [global] <user|agent>]",
+    ),
     CommandSpec(name="reasoning", description="Show or set llama.cpp reasoning mode: /reasoning [status|on|off|default]"),
     CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
     CommandSpec(name="resume", description="Pick and load a saved chat back into chat/runtime"),

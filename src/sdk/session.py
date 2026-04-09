@@ -11,6 +11,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from ..airgap import airgapped_from_cfg, set_airgapped
 from ..agent import ActionKind, Agent
 from ..config import load_config
+from ..memory_reflection import (
+    build_recorded_turn_payload,
+    reflect_agent_persistent_memory,
+    refresh_agent_system_prompt,
+)
 from ..multimodal import build_user_content, content_to_plain_text
 from ..runtime_limits import derive_context_budget, estimate_tokens
 from ..runtime_protocol import ToolCall
@@ -278,6 +283,25 @@ class _SessionArtifactRecorder:
             self.turn_state_paths.append(path_text)
         return path_text
 
+    def latest_turn_payload(self) -> dict[str, Any] | None:
+        if not self._turns:
+            return None
+        turn_index = max(self._turns)
+        state = self._turns.get(turn_index)
+        if state is None:
+            return None
+        return build_recorded_turn_payload(
+            user_prompt=state.user_prompt,
+            assistant_text=state.assistant_text,
+            tool_calls=list(state.tool_calls),
+            tool_results=list(state.tool_results),
+            extra={
+                "turn_index": state.turn_index,
+                "prompt_index": state.prompt_index,
+                "status": state.status,
+            },
+        )
+
     def _append_markdown(self, lines: list[str]) -> None:
         with self.chat_log_path.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines).rstrip() + "\n")
@@ -327,6 +351,9 @@ class OpenJetSession:
                 resolved_root,
                 cfg=resolved_cfg,
             ),
+            base_system_prompt=system_prompt or "",
+            project_root=resolved_root,
+            prompt_cfg=resolved_cfg,
             context_window_tokens=client.context_window_tokens,
             context_reserved_tokens=(
                 int(mem_cfg["context_reserved_tokens"])
@@ -477,6 +504,25 @@ class OpenJetSession:
                     yield SDKEvent(kind=SDKEventKind.ERROR, text=event.text)
                     return
                 if event.kind == ActionKind.DONE:
+                    try:
+                        recorded_turn = self._artifacts.latest_turn_payload() if self._artifacts else None
+                        report = await reflect_agent_persistent_memory(
+                            self.agent,
+                            recorded_turn=recorded_turn,
+                        )
+                    except Exception as exc:
+                        yield SDKEvent(
+                            kind=SDKEventKind.ERROR,
+                            text=f"Persistent memory update failed: {exc}",
+                        )
+                        return
+                    if isinstance(report, dict) and not bool(report.get("ok", True)):
+                        reason = str(report.get("reason", "unknown failure")).strip() or "unknown failure"
+                        yield SDKEvent(
+                            kind=SDKEventKind.ERROR,
+                            text=f"Persistent memory update failed: {reason}",
+                        )
+                        return
                     yield SDKEvent(kind=SDKEventKind.DONE)
                     return
             else:
@@ -566,6 +612,11 @@ class OpenJetSession:
         if result.meta.get("swapped") and not result.meta.get("swap_restore_ok", True):
             try:
                 await self.agent.client.reset_kv_cache()
+            except Exception:
+                pass
+        if tool_call.name == "memory" and result.ok:
+            try:
+                await refresh_agent_system_prompt(self.agent)
             except Exception:
                 pass
 

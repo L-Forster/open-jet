@@ -51,6 +51,44 @@ class DeviceToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Front Camera", result.output)
         self.assertEqual(str(result.meta["registry_path"]).replace("\\", "/"), "/tmp/devices.md")
 
+    async def test_device_list_tool_lists_only_active_sources(self) -> None:
+        enabled_source = DeviceSource(
+            primary_ref="front",
+            refs=("front", "camera0"),
+            device=PeripheralDevice(
+                id="camera:/dev/video0",
+                kind=PeripheralKind.CAMERA,
+                transport=PeripheralTransport.V4L2,
+                label="Front Camera",
+                path="/dev/video0",
+            ),
+            enabled=True,
+        )
+        disabled_source = DeviceSource(
+            primary_ref="room-mic",
+            refs=("room-mic", "mic0"),
+            device=PeripheralDevice(
+                id="microphone:hw:2,0",
+                kind=PeripheralKind.MICROPHONE,
+                transport=PeripheralTransport.ALSA,
+                label="Room Mic",
+                path="hw:2,0",
+            ),
+            enabled=False,
+        )
+        with patch("src.tool_executor.load_config", return_value={}), patch(
+            "src.tool_executor.list_device_sources",
+            return_value=[enabled_source, disabled_source],
+        ), patch(
+            "src.tool_executor.sync_devices_registry",
+            return_value=Path("/tmp/devices.md"),
+        ):
+            result = await execute_tool(ToolCall(name="device_list", arguments={}))
+
+        self.assertTrue(result.ok)
+        self.assertIn("@front", result.output)
+        self.assertNotIn("@room-mic", result.output)
+
     async def test_device_list_tool_includes_wsl_hint_when_no_sources_detected(self) -> None:
         with patch("src.tool_executor.load_config", return_value={}), patch(
             "src.tool_executor.list_device_sources",
@@ -62,7 +100,7 @@ class DeviceToolExecutionTests(unittest.IsolatedAsyncioTestCase):
             result = await execute_tool(ToolCall(name="device_list", arguments={}))
 
         self.assertTrue(result.ok)
-        self.assertIn("No device sources detected.", result.output)
+        self.assertIn("No active device sources detected.", result.output)
         self.assertIn("Running inside WSL2.", result.output)
 
     async def test_camera_snapshot_tool_returns_multimodal_context(self) -> None:
