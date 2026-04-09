@@ -330,21 +330,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="open-jet offline agentic terminal UI",
         epilog=(
-            "Useful commands: `open-jet commands` for slash commands, `open-jet status` for runtime/config status, "
-            "`open-jet device list` for persistent device setup, and `open-jet workflow list` for Markdown workflows. "
+            "Useful options: `open-jet --commands` for slash commands, `open-jet --status` for runtime/config status. "
+            "Useful commands: `open-jet device list` for persistent device setup, and `open-jet workflow list` for Markdown workflows. "
             "In the TUI, use `/device` and `@device_id` tags for device inputs. See docs/usage/device-sources.md."
         ),
     )
-    parser.add_argument("--setup", action="store_true", help="start in setup wizard mode before launching the chat UI")
+    parser.add_argument("--commands", action="store_true", help="list available slash commands and exit")
+    parser.add_argument("--models", action="store_true", help="list saved model presets and exit")
+    parser.add_argument("--status", action="store_true", help="show runtime and configuration status and exit")
+    parser.add_argument("--update", action="store_true", help="pull the latest repo commit from the tracked remote branch")
+    parser.add_argument("--version", action="store_true", help="show version information and exit")
+    parser.add_argument("--context", type=int, metavar="TOKENS", help="set the configured context window token count")
     subparsers = parser.add_subparsers(dest="command")
     chat_parser = subparsers.add_parser("chat", help="start the interactive chat UI or run a one-shot prompt")
     chat_parser.add_argument("prompt", nargs=argparse.REMAINDER, help="optional one-shot prompt text")
     subparsers.add_parser("setup", help="run setup wizard before launching the chat UI")
-    subparsers.add_parser("models", help="list saved model presets")
-    subparsers.add_parser("commands", help="list available slash commands")
-    subparsers.add_parser("status", help="show runtime and configuration status")
-    subparsers.add_parser("version", help="show version information")
-    subparsers.add_parser("update", help="pull the latest repo commit from the tracked remote branch")
     bench_parser = subparsers.add_parser("benchmark", aliases=("bench",), help="run llama-bench with the active model profile")
     bench_parser.add_argument("-p", "--n-prompt", type=int, default=512, help="prompt tokens for pp test (default: 512)")
     bench_parser.add_argument("-n", "--n-gen", type=int, default=128, help="tokens to generate for tg test (default: 128)")
@@ -352,8 +352,6 @@ def build_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("-o", "--output", default="md", choices=("md", "csv", "json", "jsonl", "sql"), help="output format (default: md)")
     bench_parser.add_argument("--sweep", action="store_true", help="run single-variable sweeps (gpu layers, batch size, threads)")
     bench_parser.add_argument("extra", nargs=argparse.REMAINDER, help="extra flags passed directly to llama-bench")
-    context_parser = subparsers.add_parser("context", help="set the configured context window token count")
-    context_parser.add_argument("tokens", type=int, help="new context window token count")
     device_parser = subparsers.add_parser("device", aliases=("devices",), help="list and configure persistent device ids")
     device_subparsers = device_parser.add_subparsers(dest="device_action")
     device_subparsers.add_parser("list", help="list discovered devices and current ids")
@@ -396,27 +394,36 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
 
+    if getattr(args, "version", False):
+        print(f"open-jet {_open_jet_version()}")
+        return
+    if getattr(args, "commands", False):
+        print(_format_slash_commands_summary())
+        return
+    if getattr(args, "models", False):
+        print(_format_model_profiles_summary(load_config()))
+        return
+    if getattr(args, "status", False):
+        print(_format_cli_status(load_config()))
+        return
+    if getattr(args, "context", None) is not None:
+        try:
+            print(_update_context_window(load_config(), int(args.context)))
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        return
+    if getattr(args, "update", False):
+        try:
+            print(update_from_latest_release(current_version=_open_jet_version()))
+        except RuntimeError as exc:
+            raise SystemExit(str(exc))
+        return
     if args.command == "chat":
         prompt_parts = [str(part) for part in getattr(args, "prompt", [])]
         prompt = " ".join(prompt_parts).strip()
         if prompt:
             print(asyncio.run(_run_cli_chat_prompt(prompt)))
             return
-    if args.command == "models":
-        print(_format_model_profiles_summary(load_config()))
-        return
-    if args.command == "commands":
-        print(_format_slash_commands_summary())
-        return
-    if args.command == "status":
-        print(_format_cli_status(load_config()))
-        return
-    if args.command == "context":
-        try:
-            print(_update_context_window(load_config(), int(args.tokens)))
-        except ValueError as exc:
-            raise SystemExit(str(exc))
-        return
     if args.command in {"device", "devices"}:
         cfg = load_config()
         action = str(getattr(args, "device_action", "") or "list").strip().lower()
@@ -523,15 +530,5 @@ def main(argv: list[str] | None = None) -> None:
                 extra_args=extra or None,
             )
         return
-    if args.command == "version":
-        print(f"open-jet {_open_jet_version()}")
-        return
-    if args.command == "update":
-        try:
-            print(update_from_latest_release(current_version=_open_jet_version()))
-        except RuntimeError as exc:
-            raise SystemExit(str(exc))
-        return
-
-    force_setup = bool(args.setup or args.command == "setup")
+    force_setup = bool(args.command == "setup")
     launch_tui(force_setup=force_setup)

@@ -1654,7 +1654,7 @@ class CliCommandTests(unittest.TestCase):
         save_cfg.assert_not_called()
         self.assertIn("at least 512", str(exc.exception))
 
-    def test_main_models_command_prints_saved_presets(self) -> None:
+    def test_main_models_option_prints_saved_presets(self) -> None:
         cfg = {
             "active_model_profile": "base",
             "model_profiles": [
@@ -1669,7 +1669,7 @@ class CliCommandTests(unittest.TestCase):
         }
 
         with patch("src.cli.load_config", return_value=cfg), patch("builtins.print") as printer:
-            main(["models"])
+            main(["--models"])
 
         printer.assert_called_once()
         self.assertIn("Active model preset: base", printer.call_args.args[0])
@@ -1679,6 +1679,32 @@ class CliCommandTests(unittest.TestCase):
             main(["setup"])
 
         launch_tui.assert_called_once_with(force_setup=True)
+
+    def test_main_version_option_prints_version(self) -> None:
+        with patch("src.cli._open_jet_version", return_value="0.3.8"), patch("builtins.print") as printer:
+            main(["--version"])
+
+        printer.assert_called_once_with("open-jet 0.3.8")
+
+    def test_parser_does_not_expose_setup_as_option(self) -> None:
+        from src.cli import build_parser
+
+        help_text = build_parser().format_help()
+
+        self.assertNotIn("--setup", help_text)
+
+    def test_parser_does_not_expose_models_status_or_update_as_commands(self) -> None:
+        from src.cli import build_parser
+
+        help_text = build_parser().format_help()
+
+        self.assertNotIn(" setup,models,", help_text)
+        self.assertNotIn(",commands,status,", help_text)
+        self.assertNotIn(",update,", help_text)
+        self.assertIn("--models", help_text)
+        self.assertIn("--commands", help_text)
+        self.assertIn("--status", help_text)
+        self.assertIn("--update", help_text)
 
 
 class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
