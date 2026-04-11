@@ -20,6 +20,16 @@ from ..multimodal import build_user_content, content_to_plain_text
 from ..runtime_limits import derive_context_budget, estimate_tokens
 from ..runtime_protocol import ToolCall
 from ..tool_executor import ToolExecutionResult, execute_tool
+from ..harness import (
+    HarnessState,
+    clear_todos,
+    complete_todo,
+    pre_edit_gate_message,
+    exit_plan_mode as harness_exit_plan_mode,
+    record_verification_skip,
+    upsert_todos,
+    verification_gate_message,
+)
 
 if TYPE_CHECKING:
     from ..session_logging import SessionLogger
@@ -314,12 +324,16 @@ class OpenJetSession:
         *,
         approval_handler: ApprovalHandler | None = None,
         allowed_tools: set[str] | None = None,
+        harness_state_getter: Callable[[], HarnessState | None] | None = None,
+        harness_state_setter: Callable[[HarnessState], None] | None = None,
         airgapped: bool = False,
         session_logger: "SessionLogger | None" = None,
     ) -> None:
         self.agent = agent
         self._approval_handler = approval_handler
         self._allowed_tools = allowed_tools
+        self._harness_state_getter = harness_state_getter
+        self._harness_state_setter = harness_state_setter
         self.airgapped = bool(airgapped)
         self.session_logger = session_logger
         self._artifacts = _SessionArtifactRecorder(session_logger.session_dir) if session_logger else None
@@ -334,6 +348,8 @@ class OpenJetSession:
         root: Path | None = None,
         approval_handler: ApprovalHandler | None = None,
         allowed_tools: set[str] | None = None,
+        harness_state_getter: Callable[[], HarnessState | None] | None = None,
+        harness_state_setter: Callable[[HarnessState], None] | None = None,
         airgapped: bool | None = None,
     ) -> OpenJetSession:
         from . import build_system_prompt, create_runtime_client
@@ -379,6 +395,8 @@ class OpenJetSession:
             agent,
             approval_handler=approval_handler,
             allowed_tools=allowed_tools,
+            harness_state_getter=harness_state_getter,
+            harness_state_setter=harness_state_setter,
             airgapped=bool(resolved_cfg["airgapped"]),
         )
 
@@ -486,6 +504,7 @@ class OpenJetSession:
         )
 
     async def stream_existing_turn(self):
+        completion_gate_retry_used = False
         while True:
             pending_tool_calls: list[ToolCall] = []
             async for event in self.agent.run_turn():
@@ -504,6 +523,17 @@ class OpenJetSession:
                     yield SDKEvent(kind=SDKEventKind.ERROR, text=event.text)
                     return
                 if event.kind == ActionKind.DONE:
+                    gate_message = self._completion_gate_message()
+                    if gate_message:
+                        if completion_gate_retry_used:
+                            yield SDKEvent(
+                                kind=SDKEventKind.ERROR,
+                                text=gate_message,
+                            )
+                            return
+                        completion_gate_retry_used = True
+                        self.agent.turn_context_messages.append({"role": "system", "content": gate_message})
+                        break
                     try:
                         recorded_turn = self._artifacts.latest_turn_payload() if self._artifacts else None
                         report = await reflect_agent_persistent_memory(
@@ -575,6 +605,31 @@ class OpenJetSession:
                 approved=False,
             )
 
+        state = self._current_harness_state()
+        if state is not None:
+            gate_message = pre_edit_gate_message(state, tool_name=tool_call.name)
+            if gate_message:
+                self.agent.complete_tool_call(tool_call, gate_message)
+                return ToolResult(
+                    tool_call=tool_call,
+                    output=gate_message,
+                    meta={"ok": False, "denied": True, "status": "blocked_by_harness"},
+                    approved=False,
+                    context_output=gate_message,
+                    context_output_text=gate_message,
+                )
+
+        if tool_call.name == "exit_plan_mode":
+            result = await self._handle_exit_plan_mode(tool_call)
+            if result is not None:
+                self.agent.complete_tool_call(tool_call, result.context_output or result.output)
+            return result
+
+        control_result = self._handle_control_tool(tool_call)
+        if control_result is not None:
+            self.agent.complete_tool_call(tool_call, control_result.context_output or control_result.output)
+            return control_result
+
         needs_confirmation = getattr(self.agent, "needs_confirmation", None)
         if callable(needs_confirmation) and needs_confirmation(tool_call):
             approved = await self._approve(tool_call)
@@ -638,6 +693,172 @@ class OpenJetSession:
             context_output=context_output,
             context_output_text=context_output_text,
         )
+
+    def _current_harness_state(self) -> HarnessState | None:
+        if self._harness_state_getter is None:
+            return None
+        try:
+            state = self._harness_state_getter()
+        except Exception:
+            return None
+        return state if isinstance(state, HarnessState) else None
+
+    def _set_harness_state(self, state: HarnessState) -> None:
+        if self._harness_state_setter is None:
+            return
+        self._harness_state_setter(state)
+
+    def _handle_control_tool(self, tool_call: ToolCall) -> ToolResult | None:
+        state = self._current_harness_state()
+        if state is None:
+            return None
+        if not isinstance(tool_call.arguments, dict):
+            return None
+        if tool_call.name == "todo_write":
+            todos = tool_call.arguments.get("todos")
+            if not isinstance(todos, list):
+                output = "todo_write requires a todos array."
+                return ToolResult(
+                    tool_call=tool_call,
+                    output=output,
+                    meta={"ok": False, "status": "invalid"},
+                    approved=True,
+                    context_output=output,
+                    context_output_text=output,
+                )
+            try:
+                updated = upsert_todos(state, todos)
+            except Exception as exc:
+                output = f"todo_write failed: {exc}"
+                return ToolResult(
+                    tool_call=tool_call,
+                    output=output,
+                    meta={"ok": False, "status": "invalid"},
+                    approved=True,
+                    context_output=output,
+                    context_output_text=output,
+                )
+            self._set_harness_state(updated)
+            output = "Todo ledger updated."
+            return ToolResult(
+                tool_call=tool_call,
+                output=output,
+                meta={"ok": True, "status": "completed"},
+                approved=True,
+                context_output=output,
+                context_output_text=output,
+            )
+        if tool_call.name == "todo_complete":
+            try:
+                updated = complete_todo(state, str(tool_call.arguments.get("id", "")))
+            except Exception as exc:
+                output = f"todo_complete failed: {exc}"
+                return ToolResult(
+                    tool_call=tool_call,
+                    output=output,
+                    meta={"ok": False, "status": "invalid"},
+                    approved=True,
+                    context_output=output,
+                    context_output_text=output,
+                )
+            self._set_harness_state(updated)
+            output = "Todo marked completed."
+            return ToolResult(
+                tool_call=tool_call,
+                output=output,
+                meta={"ok": True, "status": "completed"},
+                approved=True,
+                context_output=output,
+                context_output_text=output,
+            )
+        if tool_call.name == "todo_clear":
+            updated = clear_todos(state)
+            self._set_harness_state(updated)
+            output = "Todo list cleared."
+            return ToolResult(
+                tool_call=tool_call,
+                output=output,
+                meta={"ok": True, "status": "completed"},
+                approved=True,
+                context_output=output,
+                context_output_text=output,
+            )
+        if tool_call.name == "verify_skip":
+            try:
+                updated = record_verification_skip(
+                    state,
+                    reason=str(tool_call.arguments.get("reason", "")),
+                    next_command=str(tool_call.arguments.get("next_command", "")),
+                )
+            except Exception as exc:
+                output = f"verify_skip failed: {exc}"
+                return ToolResult(
+                    tool_call=tool_call,
+                    output=output,
+                    meta={"ok": False, "status": "invalid"},
+                    approved=True,
+                    context_output=output,
+                    context_output_text=output,
+                )
+            self._set_harness_state(updated)
+            output = "Verification skip recorded."
+            return ToolResult(
+                tool_call=tool_call,
+                output=output,
+                meta={"ok": True, "status": "completed"},
+                approved=True,
+                context_output=output,
+                context_output_text=output,
+            )
+        return None
+
+    async def _handle_exit_plan_mode(self, tool_call: ToolCall) -> ToolResult | None:
+        state = self._current_harness_state()
+        if state is None or not isinstance(tool_call.arguments, dict):
+            return None
+        summary = str(tool_call.arguments.get("plan_summary", ""))
+        approved = False
+        status = "pending_approval"
+        if self._approval_handler is not None:
+            approved = await self._approve(tool_call)
+            status = "approved" if approved else "rejected"
+        try:
+            updated = harness_exit_plan_mode(
+                state,
+                plan_summary=summary,
+                approved=approved,
+            )
+        except Exception as exc:
+            output = f"exit_plan_mode failed: {exc}"
+            return ToolResult(
+                tool_call=tool_call,
+                output=output,
+                meta={"ok": False, "status": "invalid"},
+                approved=True,
+                context_output=output,
+                context_output_text=output,
+            )
+        self._set_harness_state(updated)
+        if approved:
+            output = "Plan approved. Plan mode exited and edit tools are available."
+        elif self._approval_handler is not None:
+            output = "Plan was not approved. Remaining in plan mode."
+        else:
+            output = "Plan summary recorded. Approval is still required before edits."
+        return ToolResult(
+            tool_call=tool_call,
+            output=output,
+            meta={"ok": True, "status": status, "plan_approved": approved},
+            approved=approved if self._approval_handler is not None else True,
+            context_output=output,
+            context_output_text=output,
+        )
+
+    def _completion_gate_message(self) -> str | None:
+        state = self._current_harness_state()
+        if state is None:
+            return None
+        return verification_gate_message(state)
 
     async def handle_tool_call(self, tool_call: ToolCall, *, turn_index: int | None = None) -> ToolResult | None:
         tool_result = await self._handle_tool_call(tool_call)

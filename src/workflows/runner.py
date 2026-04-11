@@ -8,7 +8,13 @@ from typing import Mapping
 from ..config import load_config
 from ..device_sources import ensure_devices_registry
 from ..executor import load_file
-from ..harness import HarnessState, build_turn_context, set_preferred_skills, update_state_for_user_message
+from ..harness import (
+    HarnessState,
+    build_turn_context,
+    enter_plan_mode,
+    set_preferred_skills,
+    update_state_for_user_message,
+)
 from ..runtime_limits import MIN_TOKEN_BUDGET, derive_context_budget, read_memory_snapshot
 from ..sdk import OpenJetSession
 from ..tool_executor import format_tool_args
@@ -60,20 +66,25 @@ async def run_workflow(
     resolved_cfg = dict(cfg or load_config())
     session: OpenJetSession | None = None
     context = None
+    state_box: dict[str, HarnessState | None] = {"state": None}
     bindings = WorkflowBindings(source="workflow", requested_ids=(), sources=())
     try:
         ensure_devices_registry(root, cfg=resolved_cfg)
         bindings = resolve_workflow_bindings(root, spec, resolved_cfg, cli_device_ids=cli_device_ids)
+        state_box["state"] = _build_workflow_state(spec)
         session = await OpenJetSession.create(
             cfg=resolved_cfg,
             system_prompt="",
             root=root,
             allowed_tools=allowed_tools_for_workflow(spec),
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda state: state_box.__setitem__("state", state),
         )
         context = await _build_workflow_turn_context(
             root,
             spec,
             bindings,
+            state=state_box["state"] or HarnessState(),
             cfg=resolved_cfg,
             current_context_tokens=(
                 session.agent.persistent_context_tokens()
@@ -135,7 +146,7 @@ async def run_workflow(
 
 
 def allowed_tools_for_workflow(spec: WorkflowSpec) -> set[str]:
-    allowed = set(WORKFLOW_BASE_TOOLS)
+    allowed = set(WORKFLOW_BASE_TOOLS) | {"todo_write", "exit_plan_mode", "verify_skip"}
     if spec.allow_shell:
         allowed |= set(WORKFLOW_OPTIONAL_TOOLS)
     return allowed
@@ -147,12 +158,30 @@ def _workflow_run_prompt(spec: WorkflowSpec, bindings: WorkflowBindings) -> str:
         "Use the workflow document and device registry already loaded in context.",
         "Read or capture device data only when relevant to the workflow instructions.",
     ]
+    if spec.require_plan:
+        lines.append("Do not edit files. Produce or refine the plan for this workflow and record it before execution.")
     if bindings.primary_refs:
         lines.append(f"Bound device ids for this run: {', '.join(bindings.primary_refs)}.")
     else:
         lines.append("No device ids are explicitly bound for this run.")
     lines.append("Return a concise run summary with any useful observations or failures.")
     return "\n".join(lines)
+
+
+def _build_workflow_state(spec: WorkflowSpec) -> HarnessState:
+    state = update_state_for_user_message(
+        HarnessState(),
+        f"Run workflow {spec.name}",
+        mode=spec.mode,
+        files=list(spec.files),
+    )
+    if spec.require_verification is not None:
+        state.verification_enabled = spec.require_verification
+    if spec.skills:
+        state = set_preferred_skills(state, list(spec.skills))
+    if spec.require_plan:
+        state = enter_plan_mode(state)
+    return state
 
 
 def _utcnow() -> str:
@@ -164,18 +193,11 @@ async def _build_workflow_turn_context(
     spec: WorkflowSpec,
     bindings: WorkflowBindings,
     *,
+    state: HarnessState,
     cfg: Mapping[str, object] | None,
     current_context_tokens: int,
     effective_window: int,
 ):
-    state = update_state_for_user_message(
-        HarnessState(),
-        f"Run workflow {spec.name}",
-        mode=spec.mode,
-        files=list(spec.files),
-    )
-    if spec.skills:
-        state = set_preferred_skills(state, list(spec.skills))
     workflow_messages = [{"role": "system", "content": _render_workflow_doc(spec)}]
     preloaded_messages, preloaded_files = await _preload_workflow_files(
         root,
@@ -258,6 +280,12 @@ def _render_workflow_doc(spec: WorkflowSpec) -> str:
         f"path: {spec.path}",
         f"mode: {spec.mode}",
         f"allow_shell: {'true' if spec.allow_shell else 'false'}",
+        f"require_plan: {'true' if spec.require_plan else 'false'}",
+        (
+            f"require_verification: {'true' if spec.require_verification else 'false'}"
+            if spec.require_verification is not None
+            else "require_verification: default"
+        ),
         f"devices: {', '.join(spec.devices) if spec.devices else 'none'}",
         f"skills: {', '.join(spec.skills) if spec.skills else 'none'}",
         f"files: {', '.join(spec.files) if spec.files else 'none'}",

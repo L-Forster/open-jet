@@ -108,14 +108,17 @@ class SlashCommandHandler:
         if cmd == "mode":
             self._mode(log, arg)
             return True
+        if cmd == "plan":
+            self._plan(log, arg)
+            return True
         if cmd == "skills":
             await self._skills(log, arg)
             return True
         if cmd == "skill":
             await self._skill(log, arg)
             return True
-        if cmd == "step":
-            self._step(log, arg)
+        if cmd == "todo":
+            self._todo(log, arg)
             return True
         if cmd == "util":
             self._util(log, arg)
@@ -894,6 +897,41 @@ class SlashCommandHandler:
         log.write(f"[bold bright_white]Harness mode set to {arg}.[/]")
         log.write("")
 
+    def _plan(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        state = self.app.harness_state
+        if not arg or arg == "status":
+            log.write(
+                "[bold bright_white]"
+                f"Plan mode: {'on' if state.plan_mode else 'off'} | approved={'yes' if state.plan_approved else 'no'}"
+                "[/]"
+            )
+            if state.plan_summary:
+                log.write(f"[bold bright_white]Plan summary:[/] {state.plan_summary}")
+            log.write("")
+            return
+        if arg == "on":
+            self.app.enter_harness_plan_mode()
+            log.write("[bold bright_white]Plan mode enabled. Edits are blocked until the plan is approved.[/]")
+            log.write("")
+            return
+        if arg == "approve":
+            if not state.plan_summary.strip():
+                log.write("[yellow]Plan approval requires a recorded plan summary first.[/]")
+                log.write("")
+                return
+            self.app.approve_harness_plan()
+            log.write("[bold bright_white]Plan approved. Edit tools are available again.[/]")
+            log.write("")
+            return
+        if arg == "reject":
+            self.app.reject_harness_plan()
+            log.write("[bold bright_white]Plan approval cleared. Plan mode remains read-only.[/]")
+            log.write("")
+            return
+        log.write("[yellow]Usage:[/] /plan [status|on|approve|reject]")
+        log.write("")
+
     async def _skills(self, log: Any, raw_arg: str) -> None:
         await self._skill(log, raw_arg)
 
@@ -957,25 +995,30 @@ class SlashCommandHandler:
         log.write(f"[bold bright_white]Skills manifest:[/] {skills_manifest_path(Path.cwd())}")
         log.write("")
 
-    def _step(self, log: Any, raw_arg: str) -> None:
+    def _todo(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip().lower()
+        state = self.app.harness_state
         if not arg or arg == "status":
-            active = self.app.harness_active_step()
-            log.write(f"[bold bright_white]Active step: {active or 'n/a'}[/]")
-            log.write(f"[bold bright_white]Next action: {self.app.harness_state.next_action or 'n/a'}[/]")
+            if not state.todos:
+                log.write("[bold bright_white]Todo ledger: empty[/]")
+                log.write("")
+                return
+            log.write("[bold bright_white]Todo ledger:[/]")
+            for todo in state.todos:
+                files = f" | files={', '.join(todo.files)}" if todo.files else ""
+                log.write(
+                    "[bold bright_white]"
+                    f"- {todo.id}: {todo.content} | status={todo.status} | kind={todo.kind}{files}"
+                    "[/]"
+                )
             log.write("")
             return
-        if arg == "next":
-            self.app.advance_harness_step()
-            log.write("[bold bright_white]Advanced to the next step.[/]")
+        if arg == "clear":
+            self.app.clear_harness_todos()
+            log.write("[bold bright_white]Todo ledger cleared.[/]")
             log.write("")
             return
-        if arg == "split":
-            self.app.split_harness_step()
-            log.write("[bold bright_white]Split the active step into smaller turns.[/]")
-            log.write("")
-            return
-        log.write("[yellow]Usage:[/] /step [status|next|split]")
+        log.write("[yellow]Usage:[/] /todo [status|clear]")
         log.write("")
 
     def _util(self, log: Any, raw_arg: str) -> None:

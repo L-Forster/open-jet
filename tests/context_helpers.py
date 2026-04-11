@@ -25,14 +25,20 @@ def write_repo_fixture(
     *,
     architecture_lines: list[str],
     role_docs: dict[str, str] | None = None,
+    stage_docs: dict[str, str] | None = None,
+    framework_docs: dict[str, str] | None = None,
     project_doc: str = "project guidance",
     skills: dict[str, str] | None = None,
     repo_files: dict[str, str] | None = None,
 ) -> None:
     agents = root / ".openjet" / "agents"
+    stages = root / ".openjet" / "stages"
+    frameworks = root / ".openjet" / "frameworks"
     projects = root / ".openjet" / "projects"
     skills_dir = root / ".openjet" / "skills"
     agents.mkdir(parents=True, exist_ok=True)
+    stages.mkdir(parents=True, exist_ok=True)
+    frameworks.mkdir(parents=True, exist_ok=True)
     projects.mkdir(parents=True, exist_ok=True)
     skills_dir.mkdir(parents=True, exist_ok=True)
 
@@ -55,6 +61,10 @@ def write_repo_fixture(
     default_roles = {"coder": "coder guidance", "debugger": "debugger guidance", "reviewer": "reviewer guidance"}
     for role_name, body in {**default_roles, **(role_docs or {})}.items():
         (agents / f"{role_name}.md").write_text(body, encoding="utf-8")
+    for stage_name, body in (stage_docs or {}).items():
+        (stages / f"{stage_name}.md").write_text(body, encoding="utf-8")
+    for framework_name, body in (framework_docs or {}).items():
+        (frameworks / f"{framework_name}.md").write_text(body, encoding="utf-8")
     (projects / "default.md").write_text(project_doc, encoding="utf-8")
 
     for name, body in (skills or {}).items():

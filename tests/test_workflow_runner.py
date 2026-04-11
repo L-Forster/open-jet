@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from src.peripherals import PeripheralDevice, PeripheralKind, PeripheralTransport
@@ -121,6 +122,63 @@ class WorkflowRunnerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result.success)
         self.assertIn("shell", create_session.await_args.kwargs["allowed_tools"])
+
+    async def test_run_workflow_passes_plan_state_when_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "workflows").mkdir(parents=True, exist_ok=True)
+            (root / "workflows" / "planner.md").write_text(
+                "---\nmode: code\nrequire_plan: true\n---\nPlan the fix before editing.\n",
+                encoding="utf-8",
+            )
+            spec = load_workflow_spec(root, "planner")
+            fake_session = _FakeSession(SDKResponse(text="plan ready"))
+
+            with patch(
+                "src.workflows.runner.OpenJetSession.create",
+                AsyncMock(return_value=fake_session),
+            ) as create_session, patch(
+                "src.workflows.runner.build_turn_context",
+                return_value=SimpleNamespace(
+                    messages=[{"role": "system", "content": "WORKFLOW DOCUMENT: planner\nrequire_plan: true\nSTAGE: plan"}],
+                    docs_loaded=(),
+                    preloaded_files=(),
+                ),
+            ):
+                result = await run_workflow(root, spec, cfg={})
+
+        self.assertTrue(result.success)
+        joined_context = "\n\n".join(message["content"] for message in fake_session.turn_context)
+        self.assertIn("require_plan: true", joined_context)
+        self.assertIn("STAGE: plan", joined_context)
+
+    async def test_run_workflow_applies_verification_policy_from_spec(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "workflows").mkdir(parents=True, exist_ok=True)
+            (root / "workflows" / "planner.md").write_text(
+                "---\nmode: code\nrequire_verification: false\n---\nPlan the fix before editing.\n",
+                encoding="utf-8",
+            )
+            spec = load_workflow_spec(root, "planner")
+            fake_session = _FakeSession(SDKResponse(text="plan ready"))
+
+            with patch(
+                "src.workflows.runner.OpenJetSession.create",
+                AsyncMock(return_value=fake_session),
+            ) as create_session, patch(
+                "src.workflows.runner.build_turn_context",
+                return_value=SimpleNamespace(
+                    messages=[{"role": "system", "content": "WORKFLOW DOCUMENT: planner"}],
+                    docs_loaded=(),
+                    preloaded_files=(),
+                ),
+            ):
+                result = await run_workflow(root, spec, cfg={})
+
+        self.assertTrue(result.success)
+        getter = create_session.await_args.kwargs["harness_state_getter"]
+        self.assertFalse(getter().verification_enabled)
 
     async def test_run_workflow_fails_for_disabled_bound_device(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

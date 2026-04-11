@@ -27,29 +27,48 @@ ROLE_BY_MODE = {
 
 CONFIRMATION_GATED_TOOLS = set(confirmation_required_tool_names())
 DEVICE_TOOLS = set(tool_names_with_tag("device"))
+READ_DEVICE_TOOLS = DEVICE_TOOLS & set(tool_names_with_tag("read"))
 TOOL_BUNDLES = {mode: set(tool_bundle_names_for_mode(mode)) for mode in TOOL_MODES}
 
+TODO_STATUSES = frozenset({"pending", "in_progress", "completed", "blocked"})
+TODO_KINDS = frozenset({"inspect", "change", "verify", "review", "report"})
+
+
 @dataclass
-class PlanStep:
+class TodoItem:
     id: str
-    title: str
+    content: str
     status: str
     kind: str
     files: list[str] = field(default_factory=list)
     skill: str | None = None
     acceptance: str = ""
 
+    @property
+    def title(self) -> str:
+        return self.content
+
 
 @dataclass
 class HarnessState:
     goal: str = ""
     mode: str | None = None
+    stage: str | None = None
+    plan_mode: bool = False
+    plan_approved: bool = True
+    plan_summary: str = ""
     preferred_skills: list[str] = field(default_factory=list)
-    plan: list[PlanStep] = field(default_factory=list)
-    active_step_id: str | None = None
+    todos: list[TodoItem] = field(default_factory=list)
+    active_todo_id: str | None = None
     files_in_play: list[str] = field(default_factory=list)
     last_action: dict[str, Any] = field(default_factory=dict)
     last_verification: dict[str, Any] = field(default_factory=dict)
+    verification_required: bool = False
+    verification_enabled: bool = True
+    verification_skip_reason: str = ""
+    verification_status: str = "none"
+    verification_blocker: str = ""
+    verification_next_command: str = ""
     open_questions: list[str] = field(default_factory=list)
     constraints: list[str] = field(default_factory=lambda: ["local-first", "small focused turns"])
     next_action: str = ""
@@ -58,26 +77,45 @@ class HarnessState:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data["plan"] = [asdict(step) for step in self.plan]
+        data["todos"] = [asdict(todo) for todo in self.todos]
         return data
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None) -> HarnessState:
         if not isinstance(payload, dict):
             return cls()
-        plan_payload = payload.get("plan")
-        plan: list[PlanStep] = []
-        if isinstance(plan_payload, list):
-            for item in plan_payload:
+        todos_payload = payload.get("todos")
+        todos: list[TodoItem] = []
+        if isinstance(todos_payload, list):
+            for item in todos_payload:
                 if not isinstance(item, dict):
                     continue
                 try:
-                    plan.append(
-                        PlanStep(
+                    todos.append(
+                        TodoItem(
                             id=str(item.get("id", "")),
-                            title=str(item.get("title", "")),
+                            content=str(item.get("content", "")),
                             status=str(item.get("status", "pending")),
-                            kind=str(item.get("kind", "work")),
+                            kind=str(item.get("kind", "inspect")),
+                            files=[str(path) for path in item.get("files", []) if str(path)],
+                            skill=str(item["skill"]) if item.get("skill") else None,
+                            acceptance=str(item.get("acceptance", "")),
+                        )
+                    )
+                except Exception:
+                    continue
+        elif isinstance(payload.get("plan"), list):
+            for item in payload.get("plan", []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    step_status = str(item.get("status", "pending"))
+                    todos.append(
+                        TodoItem(
+                            id=str(item.get("id", "")),
+                            content=str(item.get("title", "")),
+                            status="completed" if step_status == "done" else "in_progress" if step_status == "active" else "pending",
+                            kind=str(item.get("kind", "inspect")),
                             files=[str(path) for path in item.get("files", []) if str(path)],
                             skill=str(item["skill"]) if item.get("skill") else None,
                             acceptance=str(item.get("acceptance", "")),
@@ -88,12 +126,22 @@ class HarnessState:
         return cls(
             goal=str(payload.get("goal", "")),
             mode=str(payload["mode"]) if payload.get("mode") else None,
+            stage=str(payload["stage"]) if payload.get("stage") else None,
+            plan_mode=bool(payload.get("plan_mode", False)),
+            plan_approved=bool(payload.get("plan_approved", True)),
+            plan_summary=str(payload.get("plan_summary", "")),
             preferred_skills=[str(item) for item in payload.get("preferred_skills", []) if str(item)],
-            plan=plan,
-            active_step_id=str(payload["active_step_id"]) if payload.get("active_step_id") else None,
+            todos=todos,
+            active_todo_id=str(payload["active_todo_id"]) if payload.get("active_todo_id") else None,
             files_in_play=[str(path) for path in payload.get("files_in_play", []) if str(path)],
             last_action=dict(payload.get("last_action", {})) if isinstance(payload.get("last_action"), dict) else {},
             last_verification=dict(payload.get("last_verification", {})) if isinstance(payload.get("last_verification"), dict) else {},
+            verification_required=bool(payload.get("verification_required", False)),
+            verification_enabled=bool(payload.get("verification_enabled", True)),
+            verification_skip_reason=str(payload.get("verification_skip_reason", "")),
+            verification_status=str(payload.get("verification_status", "none")),
+            verification_blocker=str(payload.get("verification_blocker", "")),
+            verification_next_command=str(payload.get("verification_next_command", "")),
             open_questions=[str(item) for item in payload.get("open_questions", []) if str(item)],
             constraints=[str(item) for item in payload.get("constraints", []) if str(item)] or ["local-first", "small focused turns"],
             next_action=str(payload.get("next_action", "")),
@@ -147,6 +195,15 @@ class HarnessContext:
 
 
 @dataclass(frozen=True)
+class HarnessPolicy:
+    tier: str
+    max_skill_docs: int
+    include_stage_doc: bool
+    include_framework_doc: bool
+    compact_state_rendering: bool
+
+
+@dataclass(frozen=True)
 class HarnessDocCandidate:
     layer: str
     label: str
@@ -182,28 +239,30 @@ class HarnessSessionStore:
         temp.replace(self.path)
 
 
-def create_plan(goal: str, mode: str | None, files: list[str]) -> list[PlanStep]:
-    focus = ", ".join(files[:2]) if files else "the relevant area"
-    if mode == "review":
-        return [
-            PlanStep("inspect", f"Inspect {focus}", "active", "inspect", files=files, acceptance="understand the target area"),
-            PlanStep("review", f"Review {focus} for risks", "pending", "review", files=files, acceptance="identify concrete findings"),
-            PlanStep("report", "Summarize findings and gaps", "pending", "report", acceptance="deliver actionable review notes"),
-        ]
-    if mode == "debug":
-        return [
-            PlanStep("inspect", f"Inspect the failing area in {focus}", "active", "inspect", files=files, acceptance="localize the likely cause"),
-            PlanStep("fix", f"Implement a narrow fix for {focus}", "pending", "change", files=files, acceptance="apply the smallest useful fix"),
-            PlanStep("verify", "Verify the fix", "pending", "verify", files=files, acceptance="confirm the failure is resolved"),
-        ]
-    if mode == "chat":
-        return [
-            PlanStep("answer", _shorten(goal, 72), "active", "answer", files=files, acceptance="answer the current request clearly"),
-        ]
+def _merge_files(existing: Sequence[str], incoming: Sequence[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for raw in [*existing, *incoming]:
+        path = str(raw).strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        merged.append(path)
+    return merged
+
+
+def _clone_todos(todos: Sequence[TodoItem]) -> list[TodoItem]:
     return [
-        PlanStep("inspect", f"Inspect {focus}", "active", "inspect", files=files, acceptance="understand the target area"),
-        PlanStep("change", f"Implement the requested change in {focus}", "pending", "change", files=files, acceptance="complete the active code change"),
-        PlanStep("verify", "Verify the changed behavior", "pending", "verify", files=files, acceptance="run a focused verification"),
+        TodoItem(
+            id=todo.id,
+            content=todo.content,
+            status=todo.status,
+            kind=todo.kind,
+            files=list(todo.files),
+            skill=todo.skill,
+            acceptance=todo.acceptance,
+        )
+        for todo in todos
     ]
 
 
@@ -216,17 +275,36 @@ def update_state_for_user_message(
 ) -> HarnessState:
     chosen_mode = mode or state.mode
     mentioned_files = [path for path in (files or []) if path]
+    preserve_plan_mode = bool(state.plan_mode and not state.plan_approved)
     next_state = HarnessState.from_dict(state.to_dict())
-    next_state.goal = text.strip()
+    if preserve_plan_mode:
+        next_state.goal = next_state.goal or text.strip()
+    else:
+        next_state.goal = text.strip()
     next_state.mode = chosen_mode
+    next_state.stage = None
+    next_state.plan_mode = preserve_plan_mode
+    next_state.plan_approved = False if preserve_plan_mode else True
+    next_state.plan_summary = next_state.plan_summary if preserve_plan_mode else ""
     next_state.preferred_skills = next_state.preferred_skills[:]
-    next_state.plan = create_plan(next_state.goal, chosen_mode, mentioned_files)
-    next_state.active_step_id = next_state.plan[0].id if next_state.plan else None
-    next_state.files_in_play = mentioned_files
-    next_state.last_action = {}
-    next_state.last_verification = {}
-    next_state.next_action = next_state.plan[0].title if next_state.plan else ""
-    next_state.failure_count_for_active_step = 0
+    next_state.files_in_play = _merge_files(next_state.files_in_play, mentioned_files) if preserve_plan_mode else mentioned_files
+    if preserve_plan_mode:
+        next_state.todos = _clone_todos(next_state.todos)
+        next_state.active_todo_id = active_todo(next_state).id if active_todo(next_state) else None
+        next_state.next_action = active_todo(next_state).title if active_todo(next_state) else "Await the next user instruction."
+    else:
+        next_state.todos = []
+        next_state.active_todo_id = None
+        next_state.last_action = {}
+        next_state.last_verification = {}
+        next_state.verification_required = False
+        next_state.verification_skip_reason = ""
+        next_state.verification_status = "none"
+        next_state.verification_blocker = ""
+        next_state.verification_next_command = ""
+        next_state.next_action = ""
+        next_state.failure_count_for_active_step = 0
+    next_state.stage = infer_stage(next_state)
     next_state.updated_at = time.time()
     return next_state
 
@@ -311,6 +389,7 @@ def build_turn_context(
     candidate_decisions: list[dict[str, Any]] = []
 
     state_summary = build_state_summary(state, budget)
+    policy = select_harness_policy(state=state, budget=budget)
     state_summary_tokens = estimate_tokens(state_summary)
     messages.append({"role": "system", "content": state_summary})
 
@@ -336,7 +415,7 @@ def build_turn_context(
     }
     stop_after_global_floor = False
 
-    for candidate in _candidate_docs(root, state, effective_window):
+    for candidate in _candidate_docs(root, state, effective_window, policy=policy):
         if not candidate.body.strip():
             candidate_decisions.append(
                 asdict(
@@ -493,19 +572,34 @@ def _normalize_context_device_refs(referenced_device_ids: Sequence[str] | None) 
 
 def build_state_summary(state: HarnessState, budget: TurnBudget | None = None) -> str:
     active = active_step(state)
-    completed = [step.title for step in state.plan if step.status == "done"]
+    current_todo = active_todo(state)
+    completed = [todo.content for todo in state.todos if todo.status == "completed"]
+    stage = infer_stage(state)
     lines = [
         "OPEN-JET HARNESS STATE",
         f"MODE: {state.mode}",
+        f"STAGE: {stage}",
+        f"PLAN_MODE: {'on' if state.plan_mode else 'off'}",
+        f"PLAN_APPROVED: {'yes' if state.plan_approved else 'no'}",
         f"GOAL: {state.goal or 'n/a'}",
-        f"ACTIVE_STEP: {active.title if active else 'n/a'}",
+        f"ACTIVE_TODO: {current_todo.content if current_todo else 'n/a'}",
         f"FILES_IN_PLAY: {', '.join(state.files_in_play) if state.files_in_play else 'n/a'}",
-        f"COMPLETED_STEPS: {', '.join(completed) if completed else 'none'}",
+        f"COMPLETED_TODOS: {', '.join(completed) if completed else 'none'}",
         f"LAST_ACTION: {_compact_json(state.last_action) if state.last_action else 'n/a'}",
         f"LAST_VERIFICATION: {_compact_json(state.last_verification) if state.last_verification else 'n/a'}",
+        f"VERIFICATION_REQUIRED: {'yes' if state.verification_required else 'no'}",
+        f"VERIFICATION_STATUS: {state.verification_status}",
         f"NEXT_ACTION: {state.next_action or (active.title if active else 'n/a')}",
         f"OPEN_QUESTIONS: {', '.join(state.open_questions) if state.open_questions else 'none'}",
     ]
+    if state.plan_summary:
+        lines.append(f"PLAN_SUMMARY: {state.plan_summary}")
+    if state.verification_skip_reason:
+        lines.append(f"VERIFICATION_SKIP_REASON: {state.verification_skip_reason}")
+    if state.verification_blocker:
+        lines.append(f"VERIFICATION_BLOCKER: {state.verification_blocker}")
+    if state.verification_next_command:
+        lines.append(f"VERIFICATION_NEXT_COMMAND: {state.verification_next_command}")
     if budget is not None:
         lines.append(
             "PROMPT_BUDGET: "
@@ -516,7 +610,9 @@ def build_state_summary(state: HarnessState, budget: TurnBudget | None = None) -
             f"layer2={budget.layer2_budget} "
             f"layer3={budget.layer3_budget}"
         )
-    lines.append("Work on the active step only. If the step is too broad, split it instead of carrying excess context.")
+    lines.append("Work on the active todo only. Keep the change narrow and move to verification when the edit is done.")
+    if state.verification_required:
+        lines.append("A code edit has not been verified yet. The next action must be verification or an explicit verification skip.")
     return "\n".join(lines)
 
 
@@ -527,7 +623,7 @@ def update_state_after_turn(
     assistant_text: str,
 ) -> HarnessState:
     next_state = HarnessState.from_dict(state.to_dict())
-    active = active_step(next_state)
+    next_state.stage = None
     read_ops = {"read_file", "load_file", "glob", "grep", "list_directory"}
     write_ops = {"write_file", "edit_file"}
     saw_read = any(event.get("tool") in read_ops and event.get("ok", True) for event in tool_events)
@@ -543,25 +639,26 @@ def update_state_after_turn(
         }
 
     if verification:
-        next_state.last_verification = {
-            "status": "pass" if verification.get("ok") else "fail",
-            "summary": verification.get("summary"),
-            "command": verification.get("command"),
-        }
+        next_state = record_verification_result(
+            next_state,
+            ok=bool(verification.get("ok")),
+            summary=str(verification.get("summary", "")),
+            command=str(verification.get("command", "")) or None,
+        )
 
-    if active:
-        if active.kind == "inspect" and saw_read:
-            _complete_and_advance(next_state, active.id)
-        elif active.kind in {"change", "fix"} and saw_write:
-            _complete_and_advance(next_state, active.id)
-        elif active.kind == "verify" and verification and verification.get("ok"):
-            _complete_and_advance(next_state, active.id)
-        elif active.kind in {"review", "report", "answer"} and assistant_text.strip():
-            _complete_and_advance(next_state, active.id)
-        elif verification and not verification.get("ok"):
+    if saw_write and next_state.verification_enabled:
+        next_state = mark_verification_pending(next_state)
+
+    todo = active_todo(next_state)
+    if todo is not None:
+        if verification and not verification.get("ok"):
             next_state.failure_count_for_active_step += 1
 
-    active = active_step(next_state)
+    if verification and verification.get("ok"):
+        next_state.verification_required = False
+
+    active = active_todo(next_state)
+    next_state.stage = infer_stage(next_state)
     next_state.next_action = active.title if active else "Await the next user instruction."
     next_state.updated_at = time.time()
     return next_state
@@ -574,6 +671,45 @@ def available_skill_names(root: Path) -> list[str]:
 def set_mode(state: HarnessState, mode: str) -> HarnessState:
     next_state = HarnessState.from_dict(state.to_dict())
     next_state.mode = mode
+    next_state.stage = None
+    next_state.updated_at = time.time()
+    return next_state
+
+
+def enter_plan_mode(state: HarnessState) -> HarnessState:
+    next_state = HarnessState.from_dict(state.to_dict())
+    next_state.plan_mode = True
+    next_state.plan_approved = False
+    next_state.stage = "plan"
+    next_state.updated_at = time.time()
+    return next_state
+
+
+def exit_plan_mode(
+    state: HarnessState,
+    *,
+    plan_summary: str,
+    approved: bool = False,
+) -> HarnessState:
+    summary = str(plan_summary).strip()
+    if not summary:
+        raise ValueError("plan_summary is required")
+    next_state = HarnessState.from_dict(state.to_dict())
+    next_state.plan_summary = summary
+    next_state.plan_mode = not approved
+    next_state.plan_approved = bool(approved)
+    next_state.stage = None
+    next_state.updated_at = time.time()
+    return next_state
+
+
+def set_plan_approved(state: HarnessState, approved: bool) -> HarnessState:
+    if approved and not str(state.plan_summary).strip():
+        raise ValueError("cannot approve plan mode without a recorded plan summary")
+    next_state = HarnessState.from_dict(state.to_dict())
+    next_state.plan_approved = bool(approved)
+    next_state.plan_mode = not bool(approved)
+    next_state.stage = None
     next_state.updated_at = time.time()
     return next_state
 
@@ -600,40 +736,202 @@ def clear_preferred_skills(state: HarnessState) -> HarnessState:
     return next_state
 
 
-def advance_step(state: HarnessState) -> HarnessState:
+def active_todo(state: HarnessState) -> TodoItem | None:
+    if state.active_todo_id:
+        for todo in state.todos:
+            if todo.id == state.active_todo_id:
+                return todo
+    for todo in state.todos:
+        if todo.status == "in_progress":
+            return todo
+    return None
+
+
+def upsert_todos(state: HarnessState, todos_payload: Sequence[Mapping[str, Any]]) -> HarnessState:
+    todos: list[TodoItem] = []
+    in_progress_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for item in todos_payload:
+        todo_id = str(item.get("id", "")).strip()
+        content = str(item.get("content", "")).strip()
+        status = str(item.get("status", "pending")).strip()
+        kind = str(item.get("kind", "inspect")).strip()
+        if not todo_id or not content:
+            raise ValueError("todo items require id and content")
+        if todo_id in seen_ids:
+            raise ValueError(f"duplicate todo id: {todo_id}")
+        seen_ids.add(todo_id)
+        if status not in TODO_STATUSES:
+            raise ValueError(f"invalid todo status: {status}")
+        if kind not in TODO_KINDS:
+            raise ValueError(f"invalid todo kind: {kind}")
+        todo = TodoItem(
+            id=todo_id,
+            content=content,
+            status=status,
+            kind=kind,
+            files=[str(path) for path in item.get("files", []) if str(path)],
+            skill=str(item["skill"]) if item.get("skill") else None,
+            acceptance=str(item.get("acceptance", "")),
+        )
+        todos.append(todo)
+        if status == "in_progress":
+            in_progress_ids.append(todo_id)
+    if len(in_progress_ids) > 1:
+        raise ValueError("only one todo may be in_progress")
     next_state = HarnessState.from_dict(state.to_dict())
-    active = active_step(next_state)
-    if active:
-        _complete_and_advance(next_state, active.id)
-        active = active_step(next_state)
-        next_state.next_action = active.title if active else "Await the next user instruction."
+    next_state.todos = todos
+    next_state.active_todo_id = in_progress_ids[0] if in_progress_ids else None
+    next_state.next_action = active_todo(next_state).title if active_todo(next_state) else "Await the next user instruction."
     next_state.updated_at = time.time()
     return next_state
 
 
-def split_active_step(state: HarnessState) -> HarnessState:
+def clear_todos(state: HarnessState) -> HarnessState:
     next_state = HarnessState.from_dict(state.to_dict())
-    active = active_step(next_state)
-    if not active:
-        return next_state
-    index = next((idx for idx, step in enumerate(next_state.plan) if step.id == active.id), None)
-    if index is None:
-        return next_state
-    active.status = "done"
-    prefix = active.title.rstrip(".")
-    files = active.files[:]
-    skill = active.skill
-    split_steps = [
-        PlanStep(f"{active.id}_a", f"{prefix}: inspect narrowly", "active", "inspect", files=files, skill=skill, acceptance="narrow the target scope"),
-        PlanStep(f"{active.id}_b", f"{prefix}: implement the smallest change", "pending", "change", files=files, skill=skill, acceptance="complete the narrow change"),
-        PlanStep(f"{active.id}_c", f"{prefix}: verify the result", "pending", "verify", files=files, skill=skill, acceptance="confirm the narrowed step"),
-    ]
-    next_state.plan[index:index + 1] = split_steps
-    next_state.active_step_id = split_steps[0].id
-    next_state.next_action = split_steps[0].title
-    next_state.failure_count_for_active_step = 0
+    next_state.todos = []
+    next_state.active_todo_id = None
     next_state.updated_at = time.time()
     return next_state
+
+
+def complete_todo(state: HarnessState, todo_id: str) -> HarnessState:
+    needle = str(todo_id).strip()
+    if not needle:
+        raise ValueError("todo id is required")
+    next_state = HarnessState.from_dict(state.to_dict())
+    found = False
+    activate_next = False
+    target_was_active = False
+    for todo in next_state.todos:
+        if todo.id == needle:
+            found = True
+            target_was_active = todo.status == "in_progress" or next_state.active_todo_id == needle
+            todo.status = "completed"
+            activate_next = target_was_active
+            continue
+        if activate_next and todo.status == "pending":
+            todo.status = "in_progress"
+            next_state.active_todo_id = todo.id
+            activate_next = False
+            break
+    if not found:
+        raise ValueError(f"todo not found: {needle}")
+    if target_was_active and activate_next:
+        next_state.active_todo_id = None
+    next_state.next_action = active_todo(next_state).title if active_todo(next_state) else "Await the next user instruction."
+    next_state.updated_at = time.time()
+    return next_state
+
+
+def record_verification_result(
+    state: HarnessState,
+    *,
+    ok: bool,
+    summary: str,
+    command: str | None,
+) -> HarnessState:
+    next_state = HarnessState.from_dict(state.to_dict())
+    next_state.last_verification = {
+        "status": "pass" if ok else "fail",
+        "summary": str(summary).strip(),
+        "command": str(command or "").strip() or None,
+    }
+    next_state.verification_required = not ok
+    next_state.verification_status = "passed" if ok else "failed"
+    next_state.verification_skip_reason = ""
+    next_state.verification_blocker = ""
+    next_state.verification_next_command = str(command or "").strip()
+    next_state.stage = None
+    next_state.updated_at = time.time()
+    return next_state
+
+
+def mark_verification_pending(state: HarnessState) -> HarnessState:
+    next_state = HarnessState.from_dict(state.to_dict())
+    next_state.verification_required = bool(next_state.verification_enabled)
+    next_state.verification_skip_reason = ""
+    next_state.verification_status = "pending" if next_state.verification_enabled else "none"
+    next_state.verification_blocker = ""
+    next_state.verification_next_command = ""
+    next_state.stage = None
+    next_state.updated_at = time.time()
+    return next_state
+
+
+def record_verification_skip(
+    state: HarnessState,
+    *,
+    reason: str,
+    next_command: str,
+) -> HarnessState:
+    reason_text = str(reason).strip()
+    next_command_text = str(next_command).strip()
+    if not reason_text:
+        raise ValueError("verification skip reason is required")
+    if not next_command_text:
+        raise ValueError("verification next_command is required")
+    next_state = HarnessState.from_dict(state.to_dict())
+    next_state.verification_required = False
+    next_state.verification_status = "skipped"
+    next_state.verification_skip_reason = reason_text
+    next_state.verification_blocker = reason_text
+    next_state.verification_next_command = next_command_text
+    next_state.stage = None
+    next_state.updated_at = time.time()
+    return next_state
+
+
+def verification_gate_message(state: HarnessState) -> str | None:
+    if not state.verification_enabled or not state.verification_required:
+        return None
+    command = str(state.verification_next_command or "").strip()
+    suffix = f" Run or propose `{command}` if it is still valid." if command else ""
+    return (
+        "A code edit has not been verified yet. "
+        "Do not finish the task until you run focused verification or explicitly skip it with a reason and next command."
+        f"{suffix}"
+    )
+
+
+def pre_edit_gate_message(state: HarnessState, *, tool_name: str) -> str | None:
+    if tool_name not in {"edit_file", "write_file"}:
+        return None
+    if state.plan_mode and not state.plan_approved:
+        return "Plan mode is active. Stay read-only until the plan is approved."
+    return None
+
+
+def quality_gate_messages(state: HarnessState) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    verification_message = verification_gate_message(state)
+    if verification_message:
+        messages.append(
+            {
+                "role": "system",
+                "content": "QUALITY GATE\n" + verification_message,
+            }
+        )
+    if state.plan_mode and not state.plan_approved:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "PLAN MODE\n"
+                    "Read and inspect only. Do not request edit or write tools until the plan is approved."
+                ),
+            }
+        )
+    return messages
+
+
+def quality_gate_doc_labels(state: HarnessState) -> list[str]:
+    labels: list[str] = []
+    if verification_gate_message(state):
+        labels.append("[quality-gate]")
+    if state.plan_mode and not state.plan_approved:
+        labels.append("[plan-gate]")
+    return labels
 
 
 def normalize_skill_name(name: str) -> str:
@@ -646,6 +944,19 @@ def allowed_tools_for_mode(mode: str | None) -> set[str]:
         return allowed | set(TOOL_BUNDLES.get(str(mode).strip().lower(), set()))
     for bundle in TOOL_BUNDLES.values():
         allowed |= set(bundle)
+    return allowed
+
+
+def allowed_tools_for_state(state: HarnessState | None) -> set[str]:
+    if state is None:
+        return allowed_tools_for_mode(None)
+    allowed = allowed_tools_for_mode(state.mode)
+    if state.plan_mode and not state.plan_approved:
+        return {
+            name
+            for name in allowed
+            if name in {"read_file", "load_file", "glob", "grep", "list_directory", "system_info", "todo_write", "exit_plan_mode", *READ_DEVICE_TOOLS}
+        }
     return allowed
 
 
@@ -664,33 +975,74 @@ def max_skill_docs_for_window(window_tokens: int) -> int:
     return 3
 
 
-def active_step(state: HarnessState) -> PlanStep | None:
-    if state.active_step_id:
-        for step in state.plan:
-            if step.id == state.active_step_id:
-                return step
-    for step in state.plan:
-        if step.status == "active":
-            return step
-    return None
+def select_harness_policy(*, state: HarnessState, budget: TurnBudget) -> HarnessPolicy:
+    usable = max(0, int(budget.remaining_budget))
+    if usable < 700:
+        return HarnessPolicy(
+            tier="minimal",
+            max_skill_docs=0,
+            include_stage_doc=False,
+            include_framework_doc=False,
+            compact_state_rendering=True,
+        )
+    if usable < 1800:
+        return HarnessPolicy(
+            tier="compact",
+            max_skill_docs=1,
+            include_stage_doc=True,
+            include_framework_doc=False,
+            compact_state_rendering=False,
+        )
+    return HarnessPolicy(
+        tier="rich",
+        max_skill_docs=max_skill_docs_for_window(budget.effective_window),
+        include_stage_doc=True,
+        include_framework_doc=True,
+        compact_state_rendering=False,
+    )
 
 
-def _complete_and_advance(state: HarnessState, step_id: str) -> None:
-    found_active = False
-    for step in state.plan:
-        if step.id == step_id:
-            step.status = "done"
-            found_active = True
-            continue
-        if found_active and step.status == "pending":
-            step.status = "active"
-            state.active_step_id = step.id
-            return
-    state.active_step_id = None
+def active_step(state: HarnessState) -> TodoItem | None:
+    return active_todo(state)
 
 
-def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list[HarnessDocCandidate]:
+def infer_stage(state: HarnessState) -> str:
+    explicit = str(state.stage or "").strip().lower()
+    if explicit:
+        return explicit
+    if state.plan_mode and not state.plan_approved:
+        return "plan"
+    if state.verification_required:
+        return "verify"
+    active = active_step(state)
+    if active is None:
+        return "implement" if state.mode == "code" else str(state.mode or "chat")
+    if active.kind == "inspect":
+        return "review" if state.mode == "review" else "implement"
+    if active.kind in {"change", "fix"}:
+        return "implement"
+    if active.kind == "verify":
+        return "verify"
+    if active.kind in {"review", "report"}:
+        return "review"
+    return str(state.mode or "chat")
+
+
+def _candidate_docs(
+    root: Path,
+    state: HarnessState,
+    window_tokens: int,
+    *,
+    policy: HarnessPolicy | None = None,
+) -> list[HarnessDocCandidate]:
     candidates: list[tuple[str, str, str]] = []
+    resolved_policy = policy or HarnessPolicy(
+        tier="rich",
+        max_skill_docs=max_skill_docs_for_window(window_tokens),
+        include_stage_doc=True,
+        include_framework_doc=True,
+        compact_state_rendering=False,
+    )
     repo_index = load_repo_context_index(root)
     if repo_index.project_summary:
         candidates.append(("layer1", "[project summary]", repo_index.project_summary))
@@ -704,14 +1056,20 @@ def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list
     role_doc = _load_doc(root / ".openjet" / "agents" / f"{role_name}.md") if role_name else ""
     if role_name and role_doc:
         candidates.append(("layer2", f".openjet/agents/{role_name}.md", role_doc))
+    stage_doc = _stage_doc_candidate(root, state, resolved_policy)
+    if stage_doc is not None:
+        candidates.append(stage_doc)
     project_doc = _load_doc(root / ".openjet" / "projects" / "default.md")
     if project_doc:
         candidates.append(("layer1", ".openjet/projects/default.md", project_doc))
+    framework_doc = _framework_doc_candidate(root, state, resolved_policy)
+    if framework_doc is not None:
+        candidates.append(framework_doc)
 
     for file_summary in _file_context_docs(repo_index, state):
         candidates.append(("layer2", file_summary[0], file_summary[1]))
 
-    selected_skills = _select_skills(root, state, window_tokens)
+    selected_skills = _select_skills(root, state, window_tokens, policy=resolved_policy)
     candidates.extend(selected_skills)
     candidates.extend(_recent_context_docs(state))
 
@@ -729,7 +1087,13 @@ def _candidate_docs(root: Path, state: HarnessState, window_tokens: int) -> list
     return formatted
 
 
-def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[tuple[str, str, str]]:
+def _select_skills(
+    root: Path,
+    state: HarnessState,
+    window_tokens: int,
+    *,
+    policy: HarnessPolicy | None = None,
+) -> list[tuple[str, str, str]]:
     query = " ".join(
         part
         for part in [
@@ -758,7 +1122,14 @@ def _select_skills(root: Path, state: HarnessState, window_tokens: int) -> list[
             continue
         scored.append((score, summary.path.name, content.strip()))
     scored.sort(key=lambda item: (-item[0], item[1]))
-    limit = max_skill_docs_for_window(window_tokens)
+    resolved_policy = policy or HarnessPolicy(
+        tier="rich",
+        max_skill_docs=max_skill_docs_for_window(window_tokens),
+        include_stage_doc=True,
+        include_framework_doc=True,
+        compact_state_rendering=False,
+    )
+    limit = min(max_skill_docs_for_window(window_tokens), resolved_policy.max_skill_docs)
     active = active_step(state)
     if active and active.skill:
         limit = max(limit, 1)
@@ -792,11 +1163,67 @@ def _recent_context_docs(state: HarnessState) -> list[tuple[str, str, str]]:
         lines.append(f"Last action: {_compact_json(state.last_action)}")
     if state.last_verification:
         lines.append(f"Last verification: {_compact_json(state.last_verification)}")
+    if state.verification_required:
+        lines.append("Verification is required before the task can be considered complete.")
+    todo = active_todo(state)
+    if todo is not None:
+        lines.append(f"Active todo: {todo.content} ({todo.kind})")
     if state.files_in_play:
         lines.append(f"Files in play: {', '.join(state.files_in_play[:4])}")
     if len(lines) == 1:
         return []
     return [("layer3", "recent-context", "\n".join(lines))]
+
+
+def _stage_doc_candidate(
+    root: Path,
+    state: HarnessState,
+    policy: HarnessPolicy,
+) -> tuple[str, str, str] | None:
+    stage = infer_stage(state)
+    if policy.include_stage_doc:
+        path = root / ".openjet" / "stages" / f"{stage}.md"
+        body = _load_doc(path)
+        if body:
+            return ("layer2", f".openjet/stages/{stage}.md", body)
+    if policy.compact_state_rendering:
+        return (
+            "layer2",
+            f"[stage:{stage}]",
+            f"CURRENT STAGE\nStage: {stage}\nFocus only on the active {stage} work for this turn.",
+        )
+    return None
+
+
+def _framework_doc_candidate(
+    root: Path,
+    state: HarnessState,
+    policy: HarnessPolicy,
+) -> tuple[str, str, str] | None:
+    if not policy.include_framework_doc:
+        return None
+    if infer_stage(state) not in {"implement", "verify"}:
+        return None
+    framework = _infer_framework_name(root, state)
+    if not framework:
+        return None
+    path = root / ".openjet" / "frameworks" / f"{framework}.md"
+    body = _load_doc(path)
+    if not body:
+        return None
+    return ("layer2", f".openjet/frameworks/{framework}.md", body)
+
+
+def _infer_framework_name(root: Path, state: HarnessState) -> str | None:
+    suffixes = {Path(path).suffix.lower() for path in state.files_in_play if str(path).strip()}
+    if ".py" in suffixes or (root / "pyproject.toml").exists():
+        return "python"
+    if suffixes & {".ts", ".tsx", ".js", ".jsx"}:
+        if any("react" in path.lower() for path in state.files_in_play) or (root / "package.json").exists():
+            return "react"
+    if ".rs" in suffixes or (root / "Cargo.toml").exists():
+        return "rust"
+    return None
 
 
 def layered_context_config(raw: dict[str, Any] | None) -> LayeredContextConfig:
@@ -873,6 +1300,12 @@ def _doc_title(label: str) -> str:
         return "AVAILABLE SKILLS"
     if label.startswith("skills/"):
         return "LOADED SKILL GUIDANCE"
+    if label.startswith(".openjet/stages/"):
+        return "CURRENT STAGE GUIDANCE"
+    if label.startswith(".openjet/frameworks/"):
+        return "FRAMEWORK GUIDANCE"
+    if label.startswith("[stage:"):
+        return "CURRENT STAGE"
     if label.startswith("file-context:"):
         return "FILE CONTEXT"
     if label == "recent-context":

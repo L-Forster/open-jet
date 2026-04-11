@@ -6,17 +6,22 @@ from pathlib import Path
 
 from src.harness import (
     HarnessState,
+    active_todo,
     _candidate_docs,
     _file_context_docs,
     _recent_context_docs,
     active_step,
+    allowed_tools_for_state,
     build_state_summary,
     build_turn_context,
     compute_turn_budget,
+    infer_stage,
     layered_context_config,
     max_skill_docs_for_window,
+    select_harness_policy,
     update_state_after_turn,
     update_state_for_user_message,
+    upsert_todos,
 )
 
 from tests.context_helpers import memory_snapshot, skill_doc, write_repo_fixture
@@ -186,6 +191,7 @@ class StateSummaryTests(unittest.TestCase):
         self.assertIn("GOAL: Fix the harness", summary)
         self.assertIn("FILES_IN_PLAY: src/harness.py", summary)
         self.assertIn("PROMPT_BUDGET:", summary)
+        self.assertIn("STAGE: implement", summary)
 
     def test_state_summary_is_deterministic(self) -> None:
         state = update_state_for_user_message(HarnessState(), "Implement change", files=["src/harness.py"])
@@ -234,6 +240,55 @@ class CandidateDocTests(unittest.TestCase):
                 ("layer3", "recent-context"),
             ],
         )
+
+    def test_stage_doc_is_loaded_for_matching_stage_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_repo_fixture(
+                root,
+                architecture_lines=["- `src/harness.py`: owns layered context budgeting."],
+                stage_docs={"implement": "implement stage guidance"},
+                repo_files={"src/harness.py": "pass\n"},
+            )
+            state = update_state_for_user_message(
+                HarnessState(),
+                "Inspect the harness flow",
+                mode="code",
+                files=["src/harness.py"],
+            )
+
+            candidates = _candidate_docs(root, state, 8192)
+
+        labels = [candidate.label for candidate in candidates]
+        self.assertIn(".openjet/stages/implement.md", labels)
+
+    def test_framework_doc_is_loaded_only_for_relevant_implement_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_repo_fixture(
+                root,
+                architecture_lines=["- `src/harness.py`: owns layered context budgeting."],
+                stage_docs={"implement": "implement guidance"},
+                framework_docs={"python": "python framework guidance"},
+                repo_files={"src/harness.py": "pass\n"},
+            )
+            state = update_state_for_user_message(
+                HarnessState(),
+                "Implement a harness change",
+                mode="code",
+                files=["src/harness.py"],
+            )
+            state = update_state_after_turn(
+                state,
+                tool_events=[{"tool": "read_file", "ok": True, "summary": "read", "target": "src/harness.py"}],
+                assistant_text="inspected file",
+            )
+
+            candidates = _candidate_docs(root, state, 20000)
+
+        labels = [candidate.label for candidate in candidates]
+        self.assertIn(".openjet/stages/implement.md", labels)
+        self.assertIn(".openjet/frameworks/python.md", labels)
 
     def test_file_context_docs_only_exist_when_summaries_exist(self) -> None:
         index = type("Index", (), {"files": {"src/harness.py": type("Summary", (), {"path": "src/harness.py", "purpose": "owns context", "related_tests": ("tests/test_context_harness.py",)})()}})()
@@ -293,6 +348,59 @@ class CandidateDocTests(unittest.TestCase):
 
 
 class BuildTurnContextTests(unittest.TestCase):
+    def test_minimal_policy_uses_compact_stage_block_and_drops_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_repo_fixture(
+                root,
+                architecture_lines=["- `src/harness.py`: owns layered context budgeting."],
+                stage_docs={"implement": "implement stage guidance"},
+                skills={"python-harness.md": skill_doc(tags=["python", "harness"], mode="code", body="preferred harness skill")},
+                repo_files={"src/harness.py": "pass\n"},
+            )
+            state = update_state_for_user_message(
+                HarnessState(preferred_skills=["python-harness"]),
+                "Implement a Python harness change",
+                files=["src/harness.py"],
+            )
+            budget = compute_turn_budget(
+                effective_window=4096,
+                current_context_tokens=2600,
+                memory_snapshot=memory_snapshot(4096, 900),
+            )
+
+            policy = select_harness_policy(state=state, budget=budget)
+            context = build_turn_context(
+                root=root,
+                state=state,
+                current_context_tokens=2600,
+                effective_window=4096,
+                memory_snapshot=memory_snapshot(4096, 900),
+            )
+
+        self.assertEqual(policy.tier, "minimal")
+        self.assertIn("[stage:implement]", context.docs_loaded)
+        self.assertNotIn(".openjet/stages/implement.md", context.docs_loaded)
+        self.assertFalse(any(label.startswith("skills/") for label in context.docs_loaded))
+
+    def test_state_summary_renders_active_todo_and_verification_gate(self) -> None:
+        state = update_state_for_user_message(HarnessState(), "Implement change", files=["src/harness.py"])
+        state = upsert_todos(
+            state,
+            [{"id": "t1", "content": "Patch harness", "status": "in_progress", "kind": "change"}],
+        )
+        state.verification_required = True
+        state.verification_status = "pending"
+        state.verification_next_command = "pytest tests/test_harness.py"
+
+        summary = build_state_summary(state)
+
+        self.assertEqual(active_todo(state).id, "t1")
+        self.assertIn("ACTIVE_TODO: Patch harness", summary)
+        self.assertIn("COMPLETED_TODOS:", summary)
+        self.assertIn("VERIFICATION_REQUIRED: yes", summary)
+        self.assertIn("VERIFICATION_NEXT_COMMAND: pytest tests/test_harness.py", summary)
+
     def test_state_summary_is_first_system_message_and_context_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -154,6 +154,11 @@ def approval_summary_text(tc: ToolCall) -> str:
     if tc.name == "system_info":
         scope = str(tc.arguments.get("scope", "summary") or "summary").strip()
         return f"system_info -> {scope}"
+    if tc.name == "exit_plan_mode":
+        summary = str(tc.arguments.get("plan_summary", "")).strip()
+        if len(summary) > 120:
+            summary = summary[:117] + "..."
+        return f"exit_plan_mode -> {summary or 'plan summary'}"
     return f"{tc.name} -> {format_tool_args(tc)}"
 
 
@@ -185,4 +190,6 @@ def tool_preview_lines(tc: ToolCall) -> list[str]:
         return [f"path: {str(tc.arguments.get('path', '')).strip()}"]
     if tc.name == "memory":
         return [f"scope: {str(tc.arguments.get('scope', '')).strip()}", f"action: {str(tc.arguments.get('action', '')).strip()}"]
+    if tc.name == "exit_plan_mode":
+        return [f"plan_summary: {str(tc.arguments.get('plan_summary', '')).strip()}"]
     return [str(format_tool_args(tc))]

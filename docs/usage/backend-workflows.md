@@ -70,6 +70,8 @@ Supported frontmatter fields:
 - `devices`: optional list of device ids
 - `interval_seconds`: polling interval for background runs
 - `allow_shell`: allow shell tool access for this workflow
+- `require_plan`: keep the workflow in read-only planning mode until a plan is produced and approved
+- `require_verification`: require post-edit verification handling for workflow runs; defaults to the mode-specific runtime behavior when omitted
 - `skills`: optional list of harness skills
 - `files`: optional list of files to preload into workflow context
 

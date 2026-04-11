@@ -18,15 +18,24 @@ from src.harness import (
     CONFIRMATION_GATED_TOOLS,
     DEVICE_TOOLS,
     HarnessState,
+    TodoItem,
     active_step,
+    active_todo,
     allowed_tools_for_mode,
-    advance_step,
+    allowed_tools_for_state,
     build_turn_context,
     clear_preferred_skills,
+    clear_todos,
+    enter_plan_mode,
+    exit_plan_mode,
+    infer_stage,
+    record_verification_skip,
+    set_plan_approved,
     set_preferred_skills,
-    split_active_step,
+    upsert_todos,
     update_state_after_turn,
     update_state_for_user_message,
+    verification_gate_message,
 )
 from src.persistent_memory import build_system_prompt, update_persistent_memory
 from src.runtime_limits import MemorySnapshot, estimate_tokens
@@ -117,6 +126,18 @@ class HarnessContextTests(unittest.TestCase):
         for mode in ("chat", "code", "review", "debug"):
             with self.subTest(mode=mode):
                 self.assertIn("system_info", allowed_tools_for_mode(mode))
+
+    def test_unapproved_plan_stage_restricts_tools_to_read_only(self) -> None:
+        state = HarnessState(mode="code", stage="plan", plan_approved=False)
+
+        allowed = allowed_tools_for_state(state)
+
+        self.assertIn("read_file", allowed)
+        self.assertIn("grep", allowed)
+        self.assertNotIn("edit_file", allowed)
+        self.assertNotIn("write_file", allowed)
+        self.assertNotIn("shell", allowed)
+        self.assertNotIn("microphone_set_enabled", allowed)
 
     def test_device_tools_are_allowed_in_every_mode(self) -> None:
         for mode in ("chat", "code", "review", "debug"):
@@ -527,8 +548,22 @@ class HarnessContextTests(unittest.TestCase):
 
 
 class HarnessStateTests(unittest.TestCase):
+    def test_user_message_starts_without_harness_generated_todos(self) -> None:
+        state = update_state_for_user_message(HarnessState(), "Implement a harness change", files=["src/harness.py"])
+
+        self.assertEqual(state.todos, [])
+        self.assertIsNone(state.active_todo_id)
+        self.assertIsNone(active_todo(state))
+
     def test_tool_turn_advances_from_inspect_to_change(self) -> None:
         state = update_state_for_user_message(HarnessState(), "Implement a harness change", files=["src/harness.py"])
+        state = upsert_todos(
+            state,
+            [
+                {"id": "inspect", "content": "Inspect src/harness.py", "status": "in_progress", "kind": "inspect"},
+                {"id": "change", "content": "Patch src/harness.py", "status": "pending", "kind": "change"},
+            ],
+        )
         self.assertEqual(active_step(state).id, "inspect")
 
         updated = update_state_after_turn(
@@ -538,10 +573,18 @@ class HarnessStateTests(unittest.TestCase):
         )
 
         self.assertEqual(active_step(updated).id, "change")
+        self.assertEqual(active_todo(updated).id, "change")
         self.assertEqual(updated.last_action["type"], "read_file")
 
     def test_verification_failure_stays_on_step_and_increments_failure_count(self) -> None:
         state = update_state_for_user_message(HarnessState(), "Implement a harness change", files=["src/harness.py"])
+        state = upsert_todos(
+            state,
+            [
+                {"id": "inspect", "content": "Inspect src/harness.py", "status": "in_progress", "kind": "inspect"},
+                {"id": "change", "content": "Patch src/harness.py", "status": "pending", "kind": "change"},
+            ],
+        )
         state = update_state_after_turn(
             state,
             tool_events=[{"tool": "read_file", "ok": True, "summary": "read", "target": "src/harness.py"}],
@@ -567,16 +610,202 @@ class HarnessStateTests(unittest.TestCase):
         self.assertEqual(active_step(failed).id, "change")
         self.assertEqual(failed.failure_count_for_active_step, 1)
         self.assertEqual(failed.last_verification["status"], "fail")
+        self.assertTrue(failed.verification_required)
 
-    def test_step_controls_advance_and_split_active_step(self) -> None:
+    def test_successful_write_moves_to_verify_stage_and_requires_verification(self) -> None:
         state = update_state_for_user_message(HarnessState(), "Implement a harness change", files=["src/harness.py"])
-        advanced = advance_step(state)
-        self.assertEqual(active_step(advanced).id, "change")
+        state = upsert_todos(
+            state,
+            [
+                {"id": "inspect", "content": "Inspect src/harness.py", "status": "in_progress", "kind": "inspect"},
+                {"id": "change", "content": "Patch src/harness.py", "status": "pending", "kind": "change"},
+                {"id": "verify", "content": "Verify src/harness.py", "status": "pending", "kind": "verify"},
+            ],
+        )
+        state = update_state_after_turn(
+            state,
+            tool_events=[{"tool": "read_file", "ok": True, "summary": "read", "target": "src/harness.py"}],
+            assistant_text="inspected file",
+        )
 
-        split = split_active_step(advanced)
-        self.assertEqual(active_step(split).id, "change_a")
-        self.assertEqual(len(split.plan), 5)
-        self.assertIn("inspect narrowly", active_step(split).title)
+        updated = update_state_after_turn(
+            state,
+            tool_events=[{"tool": "edit_file", "ok": True, "summary": "patched", "target": "src/harness.py"}],
+            assistant_text="implemented change",
+        )
+
+        self.assertEqual(active_step(updated).id, "verify")
+        self.assertEqual(active_todo(updated).id, "verify")
+        self.assertEqual(infer_stage(updated), "verify")
+        self.assertTrue(updated.verification_required)
+
+    def test_successful_verification_clears_verification_required(self) -> None:
+        state = update_state_for_user_message(HarnessState(), "Implement a harness change", files=["src/harness.py"])
+        state = upsert_todos(
+            state,
+            [
+                {"id": "inspect", "content": "Inspect src/harness.py", "status": "in_progress", "kind": "inspect"},
+                {"id": "change", "content": "Patch src/harness.py", "status": "pending", "kind": "change"},
+                {"id": "verify", "content": "Verify src/harness.py", "status": "pending", "kind": "verify"},
+            ],
+        )
+        state = update_state_after_turn(
+            state,
+            tool_events=[{"tool": "read_file", "ok": True, "summary": "read", "target": "src/harness.py"}],
+            assistant_text="inspected file",
+        )
+        state = update_state_after_turn(
+            state,
+            tool_events=[{"tool": "edit_file", "ok": True, "summary": "patched", "target": "src/harness.py"}],
+            assistant_text="implemented change",
+        )
+
+        verified = update_state_after_turn(
+            state,
+            tool_events=[
+                {
+                    "tool": "shell",
+                    "ok": True,
+                    "summary": "pytest passed",
+                    "target": "pytest",
+                    "verification": True,
+                    "command": "pytest tests/test_harness.py",
+                }
+            ],
+            assistant_text="verified",
+        )
+
+        self.assertFalse(verified.verification_required)
+        self.assertIsNone(active_todo(verified))
+
+    def test_plan_mode_helpers_toggle_approval_and_summary(self) -> None:
+        state = update_state_for_user_message(HarnessState(), "Plan a change", files=["src/harness.py"])
+        planned = enter_plan_mode(state)
+
+        self.assertTrue(planned.plan_mode)
+        self.assertFalse(planned.plan_approved)
+        self.assertEqual(infer_stage(planned), "plan")
+
+        recorded = exit_plan_mode(planned, plan_summary="Inspect then patch the harness path", approved=False)
+        self.assertTrue(recorded.plan_mode)
+        self.assertFalse(recorded.plan_approved)
+        self.assertEqual(recorded.plan_summary, "Inspect then patch the harness path")
+
+        approved = set_plan_approved(recorded, True)
+        self.assertFalse(approved.plan_mode)
+        self.assertTrue(approved.plan_approved)
+        self.assertEqual(approved.todos, [])
+        self.assertIsNone(active_todo(approved))
+
+    def test_update_state_for_user_message_preserves_unapproved_plan_mode(self) -> None:
+        state = enter_plan_mode(update_state_for_user_message(HarnessState(), "Plan a change", files=["src/harness.py"]))
+
+        updated = update_state_for_user_message(state, "Refine the plan for the same task", files=["src/harness.py"])
+
+        self.assertTrue(updated.plan_mode)
+        self.assertFalse(updated.plan_approved)
+        self.assertEqual(infer_stage(updated), "plan")
+        self.assertEqual(updated.goal, "Plan a change")
+
+    def test_follow_up_message_preserves_existing_todos_and_verification_state(self) -> None:
+        state = update_state_for_user_message(HarnessState(), "Implement a harness change", files=["src/harness.py"])
+        state = upsert_todos(
+            state,
+            [
+                {"id": "change", "content": "Patch harness path", "status": "in_progress", "kind": "change"},
+                {"id": "verify", "content": "Verify with pytest", "status": "pending", "kind": "verify"},
+            ],
+        )
+        state.plan_summary = "1. Inspect src/harness.py\n2. Patch harness path\n3. Verify with pytest"
+        state.verification_required = True
+        state.verification_status = "pending"
+        state.verification_next_command = "pytest tests/test_harness.py"
+
+        updated = update_state_for_user_message(state, "continue", files=["src/harness.py"])
+
+        self.assertEqual(active_todo(updated).id, "change")
+        self.assertTrue(updated.verification_required)
+        self.assertEqual(updated.verification_next_command, "pytest tests/test_harness.py")
+        self.assertEqual(updated.goal, "Implement a harness change")
+        self.assertEqual(updated.plan_summary, state.plan_summary)
+
+    def test_new_user_message_starts_fresh_task_state(self) -> None:
+        state = update_state_for_user_message(HarnessState(), "Implement a harness change", files=["src/harness.py"])
+        state = upsert_todos(
+            state,
+            [
+                {"id": "change", "content": "Patch harness path", "status": "in_progress", "kind": "change"},
+                {"id": "verify", "content": "Verify with pytest", "status": "pending", "kind": "verify"},
+            ],
+        )
+        state.plan_summary = "Inspect, patch, verify"
+        state.verification_required = True
+        state.verification_status = "pending"
+
+        updated = update_state_for_user_message(state, "Add logging to startup", files=["src/startup.py"])
+
+        self.assertEqual(updated.goal, "Add logging to startup")
+        self.assertIsNone(active_todo(updated))
+        self.assertFalse(updated.verification_required)
+        self.assertEqual(updated.plan_summary, "")
+
+    def test_cannot_approve_plan_without_recorded_summary(self) -> None:
+        state = enter_plan_mode(update_state_for_user_message(HarnessState(), "Plan a change", files=["src/harness.py"]))
+
+        with self.assertRaises(ValueError):
+            set_plan_approved(state, True)
+
+    def test_todo_helpers_enforce_single_in_progress(self) -> None:
+        state = HarnessState()
+        updated = upsert_todos(
+            state,
+            [
+                {"id": "t1", "content": "Inspect file", "status": "in_progress", "kind": "inspect"},
+                {"id": "t2", "content": "Verify change", "status": "pending", "kind": "verify"},
+            ],
+        )
+
+        self.assertEqual(active_todo(updated).id, "t1")
+
+        with self.assertRaises(ValueError):
+            upsert_todos(
+                state,
+                [
+                    {"id": "t1", "content": "Inspect file", "status": "in_progress", "kind": "inspect"},
+                    {"id": "t2", "content": "Patch file", "status": "in_progress", "kind": "change"},
+                ],
+            )
+
+        cleared = clear_todos(updated)
+        self.assertEqual(cleared.todos, [])
+        self.assertIsNone(active_todo(cleared))
+
+    def test_record_verification_skip_clears_gate(self) -> None:
+        state = HarnessState(verification_required=True, verification_status="pending")
+
+        skipped = record_verification_skip(
+            state,
+            reason="pytest is not installed",
+            next_command="python -m pytest tests/test_harness.py",
+        )
+
+        self.assertFalse(skipped.verification_required)
+        self.assertEqual(skipped.verification_status, "skipped")
+        self.assertEqual(skipped.verification_skip_reason, "pytest is not installed")
+        self.assertEqual(skipped.verification_next_command, "python -m pytest tests/test_harness.py")
+
+    def test_verification_gate_message_requires_reasoned_follow_up(self) -> None:
+        state = HarnessState(
+            verification_required=True,
+            verification_status="pending",
+            verification_next_command="pytest tests/test_harness.py",
+        )
+
+        message = verification_gate_message(state)
+
+        self.assertIsNotNone(message)
+        self.assertIn("not been verified", message or "")
+        self.assertIn("pytest tests/test_harness.py", message or "")
 
 class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_turn_traces_runtime_token_usage_for_tool_call_response(self) -> None:
@@ -992,6 +1221,176 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
         _, kwargs = reflect_mock.await_args
         self.assertIn("recorded_turn", kwargs)
         self.assertIsNone(kwargs["recorded_turn"])
+
+    async def test_control_tool_updates_harness_state(self) -> None:
+        tool_call = ToolCall(
+            name="todo_write",
+            arguments={"todos": [{"id": "t1", "content": "Inspect", "status": "in_progress", "kind": "inspect"}]},
+        )
+        client = SequencedRuntimeClient([[StreamChunk(tool_calls=[tool_call])], [StreamChunk(text="done")]])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        state = HarnessState()
+        session = OpenJetSession(
+            agent,
+            harness_state_getter=lambda: state,
+            harness_state_setter=lambda updated: locals_box.__setitem__("state", updated),
+        )
+        locals_box = {"state": state}
+        session._harness_state_getter = lambda: locals_box["state"]
+
+        events = [event async for event in session.stream("plan the work")]
+
+        self.assertTrue(any(event.kind == SDKEventKind.TOOL_RESULT for event in events))
+        self.assertEqual(locals_box["state"].todos[0].id, "t1")
+
+    async def test_exit_plan_mode_uses_approval_handler_to_approve_plan(self) -> None:
+        tool_call = ToolCall(
+            name="exit_plan_mode",
+            arguments={"plan_summary": "Inspect src/harness.py, then patch the verify step, then run focused tests."},
+        )
+        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
+        state = enter_plan_mode(update_state_for_user_message(HarnessState(), "Plan a change", mode="code", files=["src/harness.py"]))
+        state_box = {"state": state}
+        session = OpenJetSession(
+            agent,
+            approval_handler=lambda tc: tc.name == "exit_plan_mode",
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
+        )
+
+        result = await session._handle_tool_call(tool_call)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.meta.get("status"), "approved")
+        self.assertFalse(state_box["state"].plan_mode)
+        self.assertTrue(state_box["state"].plan_approved)
+
+    async def test_exit_plan_mode_rejection_keeps_plan_mode_active(self) -> None:
+        tool_call = ToolCall(
+            name="exit_plan_mode",
+            arguments={"plan_summary": "Inspect src/harness.py, then patch the verify step, then run focused tests."},
+        )
+        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
+        state = enter_plan_mode(update_state_for_user_message(HarnessState(), "Plan a change", mode="code", files=["src/harness.py"]))
+        state_box = {"state": state}
+        session = OpenJetSession(
+            agent,
+            approval_handler=lambda tc: False,
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
+        )
+
+        result = await session._handle_tool_call(tool_call)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.meta.get("status"), "rejected")
+        self.assertTrue(state_box["state"].plan_mode)
+        self.assertFalse(state_box["state"].plan_approved)
+        self.assertEqual(state_box["state"].plan_summary, tool_call.arguments["plan_summary"])
+
+    async def test_exit_plan_mode_without_approval_handler_records_pending_plan(self) -> None:
+        tool_call = ToolCall(
+            name="exit_plan_mode",
+            arguments={"plan_summary": "Inspect src/harness.py, then patch the verify step, then run focused tests."},
+        )
+        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
+        state = enter_plan_mode(update_state_for_user_message(HarnessState(), "Plan a change", mode="code", files=["src/harness.py"]))
+        state_box = {"state": state}
+        session = OpenJetSession(
+            agent,
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
+        )
+
+        result = await session._handle_tool_call(tool_call)
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.meta.get("status"), "pending_approval")
+        self.assertTrue(state_box["state"].plan_mode)
+        self.assertFalse(state_box["state"].plan_approved)
+        self.assertEqual(state_box["state"].plan_summary, tool_call.arguments["plan_summary"])
+
+    async def test_edit_tool_is_blocked_until_inspection_happens(self) -> None:
+        tool_call = ToolCall(name="edit_file", arguments={"path": "src/harness.py", "find": "x", "replace": "y"})
+        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
+        state = update_state_for_user_message(HarnessState(), "Implement a harness change", mode="code", files=["src/harness.py"])
+        state_box = {"state": state}
+        session = OpenJetSession(
+            agent,
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
+        )
+
+        result = await session._handle_tool_call(tool_call)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.meta.get("status"), "blocked_by_harness")
+        self.assertIn("Inspect the target area", result.output)
+
+    async def test_edit_tool_is_blocked_without_an_active_todo(self) -> None:
+        tool_call = ToolCall(name="edit_file", arguments={"path": "src/harness.py", "find": "x", "replace": "y"})
+        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
+        state = HarnessState(
+            mode="code",
+            todos=[TodoItem(id="t1", content="Inspect file", status="pending", kind="inspect")],
+            active_todo_id=None,
+        )
+        state_box = {"state": state}
+        session = OpenJetSession(
+            agent,
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
+        )
+
+        result = await session._handle_tool_call(tool_call)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.meta.get("status"), "blocked_by_harness")
+        self.assertIn("in-progress todo", result.output)
+
+    async def test_edit_tool_reaches_normal_approval_after_inspection(self) -> None:
+        tool_call = ToolCall(name="edit_file", arguments={"path": "src/harness.py", "find": "x", "replace": "y"})
+        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
+        state = update_state_for_user_message(HarnessState(), "Implement a harness change", mode="code", files=["src/harness.py"])
+        state = update_state_after_turn(
+            state,
+            tool_events=[{"tool": "read_file", "ok": True, "summary": "read", "target": "src/harness.py"}],
+            assistant_text="inspected file",
+        )
+        state_box = {"state": state}
+        session = OpenJetSession(
+            agent,
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
+        )
+
+        result = await session._handle_tool_call(tool_call)
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.meta.get("status"), "denied")
+        self.assertNotIn("todo_write", result.output)
+
+    async def test_stream_blocks_done_when_verification_is_pending(self) -> None:
+        client = SequencedRuntimeClient([[StreamChunk(text="done")], [StreamChunk(text="still done")]])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        state = HarnessState(verification_required=True, verification_status="pending")
+        session = OpenJetSession(
+            agent,
+            harness_state_getter=lambda: state_box["state"],
+            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
+        )
+        state_box = {"state": state}
+
+        events = [event async for event in session.stream("finish")]
+
+        self.assertEqual(events[-1].kind, SDKEventKind.ERROR)
+        self.assertIn("not been verified", events[-1].text)
 
 
 class PersistentMemoryTests(unittest.IsolatedAsyncioTestCase):

@@ -20,9 +20,10 @@
 - `/reasoning [status|on|off|default]` control llama.cpp reasoning mode
 - `/air-gapped [status|true|false]` control air-gapped mode
 - `/mode [chat|code|review|debug|status]` set harness mode
+- `/plan [status|on|approve|reject]` inspect or control read-only plan mode
 - `/skill [status|list|clear|load <name[,name...]>|<name[,name...]>]` inspect, load into the current chat, and pin harness skills
 - `/skills [status|list|clear|load <name[,name...]>|<name[,name...]>]` alias for `/skill`
-- `/step [status|next|split]` inspect or control the active workflow step
+- `/todo [status|clear]` inspect or clear the current todo ledger
 - `/util [show|hide|toggle|status]` show or hide the utilization line
 
 Persistent device setup is usually clearer from the regular CLI:

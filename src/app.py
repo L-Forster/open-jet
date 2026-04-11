@@ -64,16 +64,21 @@ from .harness import (
     HarnessSessionStore,
     HarnessState,
     active_step,
-    advance_step,
-    allowed_tools_for_mode,
+    allowed_tools_for_state,
     available_skill_names,
     build_turn_context,
     clear_preferred_skills,
+    clear_todos,
+    enter_plan_mode,
+    exit_plan_mode,
     normalize_skill_name,
+    quality_gate_doc_labels,
+    quality_gate_messages,
+    record_verification_skip,
+    set_plan_approved,
     set_mode,
     set_preferred_skills,
     shell_command_is_verification,
-    split_active_step,
     update_state_after_turn,
     update_state_for_user_message,
 )
@@ -2045,26 +2050,54 @@ class OpenJetApp:
         return applied, missing
 
     def clear_harness_skills(self) -> None:
-        self.harness_state = clear_preferred_skills(self.harness_state)
-        self.persist_harness_state()
-        self.persist_session_state(reason="harness_skills_cleared")
-        self._render_token_counter()
+        self._apply_harness_state_update(
+            lambda state: clear_preferred_skills(state),
+            reason="harness_skills_cleared",
+        )
 
     def harness_active_step(self) -> str | None:
         active = active_step(self.harness_state)
         return active.title if active else None
 
-    def advance_harness_step(self) -> None:
-        self.harness_state = advance_step(self.harness_state)
-        self.persist_harness_state()
-        self.persist_session_state(reason="harness_step_advanced")
-        self._render_token_counter()
+    def enter_harness_plan_mode(self) -> None:
+        self._apply_harness_state_update(
+            lambda state: enter_plan_mode(state),
+            reason="harness_plan_mode:on",
+        )
 
-    def split_harness_step(self) -> None:
-        self.harness_state = split_active_step(self.harness_state)
-        self.persist_harness_state()
-        self.persist_session_state(reason="harness_step_split")
-        self._render_token_counter()
+    def approve_harness_plan(self) -> None:
+        self._apply_harness_state_update(
+            lambda state: set_plan_approved(state, True),
+            reason="harness_plan_mode:approved",
+        )
+
+    def reject_harness_plan(self) -> None:
+        self._apply_harness_state_update(
+            lambda state: set_plan_approved(state, False),
+            reason="harness_plan_mode:rejected",
+        )
+
+    def record_harness_plan_summary(self, summary: str, *, approved: bool = False) -> None:
+        self._apply_harness_state_update(
+            lambda state: exit_plan_mode(state, plan_summary=summary, approved=approved),
+            reason="harness_plan_summary",
+        )
+
+    def clear_harness_todos(self) -> None:
+        self._apply_harness_state_update(
+            lambda state: clear_todos(state),
+            reason="harness_todos:cleared",
+        )
+
+    def record_harness_verification_skip(self, *, reason: str, next_command: str) -> None:
+        self._apply_harness_state_update(
+            lambda state: record_verification_skip(
+                state,
+                reason=reason,
+                next_command=next_command,
+            ),
+            reason="harness_verification:skipped",
+        )
 
     def _start_agent_turn(self, recovery_attempted: bool = False) -> None:
         if self._generation_worker and not self._generation_worker.done():
@@ -2098,6 +2131,8 @@ class OpenJetApp:
             cfg=self.cfg,
             referenced_device_ids=self._active_turn_device_refs,
             device_registry_path=device_registry_path,
+            extra_system_messages=quality_gate_messages(self.harness_state),
+            extra_docs_loaded=quality_gate_doc_labels(self.harness_state),
         )
         self.agent.set_turn_context(context.messages)
         self._last_turn_context_snapshot = context
@@ -2174,7 +2209,9 @@ class OpenJetApp:
             session = OpenJetSession(
                 self.agent,
                 approval_handler=lambda tc: self._approve_tool_call_via_session(tc, log),
-                allowed_tools=allowed_tools_for_mode(self.harness_state.mode),
+                allowed_tools=allowed_tools_for_state(self.harness_state),
+                harness_state_getter=lambda: self.harness_state,
+                harness_state_setter=self._replace_harness_state,
                 airgapped=self.is_airgapped(),
             )
             while True:
@@ -2323,6 +2360,21 @@ class OpenJetApp:
         await self.persist_resumable_session_state(reason="assistant_turn_done", payload=session_payload)
         await self.voice_output.announce_assistant_text(assistant_turn_text)
         self._finish_turn_trace(success=True, status="completed")
+        self._render_token_counter()
+
+    def _replace_harness_state(self, state: HarnessState) -> None:
+        self.harness_state = state
+        self.persist_harness_state()
+
+    def _apply_harness_state_update(
+        self,
+        transform: Any,
+        *,
+        reason: str,
+    ) -> None:
+        self.harness_state = transform(self.harness_state)
+        self.persist_harness_state()
+        self.persist_session_state(reason=reason)
         self._render_token_counter()
 
     async def _approve_tool_call_via_session(self, tc: ToolCall, log: LogView) -> bool:

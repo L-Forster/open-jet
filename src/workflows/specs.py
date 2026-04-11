@@ -19,6 +19,8 @@ class WorkflowSpec:
     devices: tuple[str, ...] = ()
     interval_seconds: int | None = None
     allow_shell: bool = False
+    require_plan: bool = False
+    require_verification: bool | None = None
     skills: tuple[str, ...] = ()
     files: tuple[str, ...] = ()
     source: str = "repo"
@@ -89,6 +91,8 @@ def parse_workflow_markdown(path: Path, *, source: str = "repo") -> WorkflowSpec
         devices=_normalize_string_list(metadata.get("devices"), field_name="devices"),
         interval_seconds=_normalize_interval(metadata.get("interval_seconds")),
         allow_shell=bool(metadata.get("allow_shell", False)),
+        require_plan=bool(metadata.get("require_plan", False)),
+        require_verification=_normalize_optional_bool(metadata.get("require_verification"), field_name="require_verification"),
         skills=_normalize_string_list(metadata.get("skills"), field_name="skills"),
         files=_normalize_string_list(metadata.get("files"), field_name="files"),
         source=source,
@@ -151,3 +155,11 @@ def _normalize_interval(value: object) -> int | None:
     if value <= 0:
         raise ValueError("workflow interval_seconds must be greater than zero")
     return value
+
+
+def _normalize_optional_bool(value: object, *, field_name: str) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"workflow {field_name} must be boolean")

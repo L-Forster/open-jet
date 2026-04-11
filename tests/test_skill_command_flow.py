@@ -263,3 +263,79 @@ class SkillCommandFlowTests(unittest.IsolatedAsyncioTestCase):
         joined = "\n".join(log.entries)
         self.assertNotIn("Selected skills: python-refactor", joined)
         self.assertIn("Loaded into current chat: python-refactor", joined)
+
+    async def test_plan_and_todo_commands_use_harness_controls(self) -> None:
+        log = _FakeLog()
+
+        class FakeApp:
+            def __init__(self) -> None:
+                self.harness_state = SimpleNamespace(
+                    preferred_skills=[],
+                    plan_mode=False,
+                    plan_approved=True,
+                    plan_summary="",
+                    todos=[],
+                )
+                self.session_logger = None
+                self.plan_on_calls = 0
+                self.plan_approve_calls = 0
+                self.todo_clear_calls = 0
+
+            def query_one(self, selector: str):
+                return log
+
+            def enter_harness_plan_mode(self) -> None:
+                self.plan_on_calls += 1
+                self.harness_state.plan_mode = True
+                self.harness_state.plan_approved = False
+
+            def approve_harness_plan(self) -> None:
+                self.plan_approve_calls += 1
+                self.harness_state.plan_mode = False
+                self.harness_state.plan_approved = True
+
+            def reject_harness_plan(self) -> None:
+                return
+
+            def clear_harness_todos(self) -> None:
+                self.todo_clear_calls += 1
+                self.harness_state.todos = []
+
+        handler = SlashCommandHandler(FakeApp(), banner="banner")
+
+        handled_plan = await handler.maybe_handle("/plan on")
+        handled_todo = await handler.maybe_handle("/todo clear")
+
+        self.assertTrue(handled_plan)
+        self.assertTrue(handled_todo)
+        self.assertEqual(handler.app.plan_on_calls, 1)
+        self.assertEqual(handler.app.todo_clear_calls, 1)
+
+    async def test_plan_approve_requires_recorded_summary(self) -> None:
+        log = _FakeLog()
+
+        class FakeApp:
+            def __init__(self) -> None:
+                self.harness_state = SimpleNamespace(
+                    preferred_skills=[],
+                    plan_mode=True,
+                    plan_approved=False,
+                    plan_summary="",
+                    todos=[],
+                )
+                self.session_logger = None
+                self.plan_approve_calls = 0
+
+            def query_one(self, selector: str):
+                return log
+
+            def approve_harness_plan(self) -> None:
+                self.plan_approve_calls += 1
+
+        handler = SlashCommandHandler(FakeApp(), banner="banner")
+
+        handled = await handler.maybe_handle("/plan approve")
+
+        self.assertTrue(handled)
+        self.assertEqual(handler.app.plan_approve_calls, 0)
+        self.assertIn("requires a recorded plan summary", "\n".join(log.entries))

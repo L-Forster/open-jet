@@ -247,6 +247,63 @@ TOOL_REGISTRY = ToolRegistry(
             tags=("memory", "write"),
         ),
         _tool(
+            "todo_write",
+            "Create or replace the current todo list for a complex task. The model should write the list itself when explicit tracking is useful.",
+            parameters={
+                "todos": {
+                    "type": "array",
+                    "description": "Todo items to store for the current session.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": _param("string", "Stable todo id"),
+                            "content": _param("string", "Todo text"),
+                            "status": _param("string", "pending, in_progress, completed, or blocked"),
+                            "kind": _param("string", "inspect, change, verify, review, or report"),
+                            "files": {"type": "array", "items": {"type": "string"}, "description": "Relevant files"},
+                            "acceptance": _param("string", "Acceptance criteria"),
+                        },
+                    },
+                },
+            },
+            required=("todos",),
+            tags=("control", "state"),
+        ),
+        _tool(
+            "todo_complete",
+            "Mark one todo item as completed. Use this after finishing a tracked task, then continue with the next remaining item.",
+            parameters={
+                "id": _param("string", "Todo id to mark completed"),
+            },
+            required=("id",),
+            tags=("control", "state"),
+        ),
+        _tool(
+            "todo_clear",
+            "Clear the current todo list when the tracked work is finished or no longer relevant.",
+            parameters={},
+            tags=("control", "state"),
+        ),
+        _tool(
+            "exit_plan_mode",
+            "Record the current plan summary and request leaving plan mode after approval.",
+            parameters={
+                "plan_summary": _param("string", "Short summary of the approved plan"),
+            },
+            required=("plan_summary",),
+            tags=("control", "state"),
+        ),
+        _tool(
+            "verify_skip",
+            "Explicitly skip verification with a concrete blocker and next command.",
+            parameters={
+                "reason": _param("string", "Why verification could not be run"),
+                "next_command": _param("string", "The next concrete command to try later"),
+            },
+            required=("reason", "next_command"),
+            tags=("control", "state"),
+        ),
+        _tool(
             "read_file",
             "Read a file.",
             parameters={

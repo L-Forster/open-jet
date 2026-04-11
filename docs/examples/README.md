@@ -134,7 +134,7 @@ To keep agent work organized over many turns:
 ```text
 /mode code
 /skill repo-maintainer
-/step status
+/todo status
 ```
 
-The workflow harness keeps step-aware state under `.openjet/`, helping constrained local models stay on-task across longer jobs.
+The workflow harness keeps todo and verification state under `.openjet/`, helping constrained local models stay on-task across longer jobs.

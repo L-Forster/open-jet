@@ -261,6 +261,14 @@ async def _memory_result(args: dict[str, Any]) -> ToolExecutionResult:
     )
 
 
+async def _control_tool_result(args: dict[str, Any]) -> ToolExecutionResult:
+    del args
+    return ToolExecutionResult(
+        output="Control tool should be handled by the session runtime before execution.",
+        meta={"ok": False, "status": "control_tool_unhandled"},
+    )
+
+
 async def _load_file_result(args: dict[str, Any]) -> ToolExecutionResult:
     loaded = await load_file(_str_arg(args, "path", required=True, allow_empty=False), max_tokens=_int_arg(args, "max_tokens", allow_none=True))
     if not loaded.ok:
@@ -693,6 +701,11 @@ def _bind_tool_executors() -> None:
     bind_tool_executor("microphone_set_enabled", _microphone_set_enabled_result)
     bind_tool_executor("read_file", _read_file_result)
     bind_tool_executor("memory", _memory_result)
+    bind_tool_executor("todo_write", _control_tool_result)
+    bind_tool_executor("todo_complete", _control_tool_result)
+    bind_tool_executor("todo_clear", _control_tool_result)
+    bind_tool_executor("exit_plan_mode", _control_tool_result)
+    bind_tool_executor("verify_skip", _control_tool_result)
     bind_tool_executor("write_file", _write_file_result)
     bind_tool_executor("load_file", _load_file_result)
     bind_tool_executor("edit_file", _edit_file_result)

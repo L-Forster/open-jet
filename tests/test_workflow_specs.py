@@ -32,6 +32,20 @@ class WorkflowSpecTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "frontmatter"):
                 parse_workflow_markdown(path)
 
+    def test_parse_workflow_markdown_reads_plan_and_verification_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "workflows" / "planner.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "---\nmode: code\nrequire_plan: true\nrequire_verification: false\n---\nPlan first.\n",
+                encoding="utf-8",
+            )
+
+            spec = parse_workflow_markdown(path)
+
+        self.assertTrue(spec.require_plan)
+        self.assertFalse(spec.require_verification)
+
     def test_discover_workflow_specs_prefers_local_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

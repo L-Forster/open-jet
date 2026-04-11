@@ -1619,6 +1619,8 @@ class CliCommandTests(unittest.TestCase):
 
         self.assertIn("/model: Show or switch saved model presets", text)
         self.assertIn("/models", text)
+        self.assertIn("/plan", text)
+        self.assertIn("/todo", text)
 
     def test_main_context_command_updates_active_profile(self) -> None:
         cfg = {
