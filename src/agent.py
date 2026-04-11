@@ -218,13 +218,15 @@ class Agent:
                             return
 
             except Exception as e:
+                error_msg = str(e) or f"{type(e).__name__} (no message)"
                 self._trace(
                     "run_turn_error",
-                    error=str(e),
+                    error=error_msg,
+                    error_type=type(e).__name__,
                     chunk_count=chunk_count,
                     collected_text_len=len(collected_text),
                 )
-                yield AgentEvent(kind=ActionKind.ERROR, text=str(e))
+                yield AgentEvent(kind=ActionKind.ERROR, text=error_msg)
                 return
 
             assistant_text = collected_text.strip()

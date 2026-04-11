@@ -55,7 +55,7 @@ class LlamaServerClient:
         self.gpu_layers = max(0, int(gpu_layers))
         self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
-        self._http = httpx.AsyncClient(timeout=120.0)
+        self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=30.0))
         self._proc: asyncio.subprocess.Process | None = None
         self._start_lock = asyncio.Lock()
         self.reasoning_mode = "default"
