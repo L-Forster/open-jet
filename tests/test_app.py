@@ -37,7 +37,6 @@ from src.runtime_protocol import StreamChunk, ToolCall
 from src.sdk import ToolResult
 from src.session_state import ChatArchiveStore, SavedChatEntry, SessionStateStore
 from src.setup import _prompt_choice, _runtime_prompt_options, build_recommended_payload, run_setup_wizard
-from src.voice_input import VoiceInputController
 
 
 class FakeAgent:
@@ -240,21 +239,6 @@ class AppStatusTests(unittest.TestCase):
         fake_client.start.assert_not_awaited()
         self.assertIsNotNone(app.agent)
 
-    def test_voice_status_snapshot_includes_voice_output_provider_state(self) -> None:
-        app = OpenJetApp()
-        app.cfg["voice_output"] = {
-            "provider": "system_fallback",
-            "backend": "spd-say",
-        }
-
-        snapshot = app.voice_status_snapshot()
-
-        self.assertFalse(snapshot["voice_output_enabled"])
-        self.assertFalse(snapshot["voice_output_available"])
-        self.assertEqual(snapshot["voice_output_provider"], "system_fallback")
-        self.assertIsNone(snapshot["voice_output_backend"])
-        self.assertIn("not implemented in this build", snapshot["voice_output_last_error"])
-
     def test_tool_output_line_highlights_shell_commands(self) -> None:
         app = OpenJetApp()
 
@@ -417,7 +401,7 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
         app._resolve_approval(True)
         await wait_task
 
-    async def test_submit_text_can_bypass_slash_command_handling_for_voice_input(self) -> None:
+    async def test_submit_text_can_bypass_slash_command_handling_when_requested(self) -> None:
         app = OpenJetApp()
         app.agent = SimpleNamespace(
             messages=[],
@@ -459,110 +443,6 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
         entries = app.query_one("#chat-log")._entries
         self.assertTrue(any("User" in str(entry) for entry in entries))
         self.assertFalse(any("Slash Command" in str(entry) for entry in entries))
-
-    async def test_voice_capture_loop_stops_on_standalone_spoken_stop_phrase(self) -> None:
-        app = OpenJetApp()
-        source = DeviceSource(
-            primary_ref="mic0",
-            refs=("mic0",),
-            device=PeripheralDevice(
-                id="microphone:hw:2,0",
-                kind=PeripheralKind.MICROPHONE,
-                transport=PeripheralTransport.ALSA,
-                label="Room Mic",
-                path="hw:2,0",
-            ),
-        )
-        observation = Observation(
-            source_id=source.device.id,
-            source_type="microphone",
-            transport=source.device.transport.value,
-            modality=ObservationModality.TEXT,
-            summary="Transcript from mic0: stop listening",
-            metadata={"transcript_text": "stop listening", "speech_detected": True},
-        )
-        silence_observation = Observation(
-            source_id=source.device.id,
-            source_type="microphone",
-            transport=source.device.transport.value,
-            modality=ObservationModality.TEXT,
-            summary="No speech detected on mic0",
-            metadata={"speech_detected": False},
-        )
-        app.voice._source_ref = "mic0"
-
-        with patch.object(app.voice, "_resolve_source", return_value=source), patch(
-            "src.voice_input.collect_device_observation",
-            side_effect=[observation, silence_observation],
-        ), patch.object(app, "submit_text", AsyncMock()) as submit_text:
-            await app.voice._capture_loop(source_ref="mic0", chunk_seconds=3)
-
-        submit_text.assert_not_awaited()
-        self.assertIsNone(app.voice._source_ref)
-        rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
-        self.assertIn("Voice input stopped by spoken command", rendered)
-        self.assertIn("stop listening", rendered)
-
-    async def test_voice_capture_loop_buffers_until_send_command(self) -> None:
-        app = OpenJetApp()
-        source = DeviceSource(
-            primary_ref="mic0",
-            refs=("mic0",),
-            device=PeripheralDevice(
-                id="microphone:hw:2,0",
-                kind=PeripheralKind.MICROPHONE,
-                transport=PeripheralTransport.ALSA,
-                label="Room Mic",
-                path="hw:2,0",
-            ),
-        )
-        message_observation = Observation(
-            source_id=source.device.id,
-            source_type="microphone",
-            transport=source.device.transport.value,
-            modality=ObservationModality.TEXT,
-            summary="Transcript from mic0: hello there",
-            metadata={"transcript_text": "hello there", "speech_detected": True},
-        )
-        silence_observation = Observation(
-            source_id=source.device.id,
-            source_type="microphone",
-            transport=source.device.transport.value,
-            modality=ObservationModality.TEXT,
-            summary="No speech detected on mic0",
-            metadata={"speech_detected": False},
-        )
-        send_observation = Observation(
-            source_id=source.device.id,
-            source_type="microphone",
-            transport=source.device.transport.value,
-            modality=ObservationModality.TEXT,
-            summary="Transcript from mic0: send message",
-            metadata={"transcript_text": "send message", "speech_detected": True},
-        )
-
-        observations = iter([message_observation, silence_observation, send_observation, silence_observation])
-        with patch.object(app.voice, "_resolve_source", return_value=source), patch(
-            "src.voice_input.collect_device_observation",
-            side_effect=lambda *args, **kwargs: next(observations),
-        ), patch.object(app, "submit_text", AsyncMock(side_effect=lambda *_args, **_kwargs: setattr(app, "_quit_requested", True))) as submit_text:
-            await app.voice._capture_loop(source_ref="mic0", chunk_seconds=3)
-
-        submit_text.assert_awaited_once_with("hello there", allow_slash_command=False)
-        self.assertEqual(app.voice._draft_segments, [])
-        rendered = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
-        self.assertIn("Voice draft updated.", rendered)
-
-    def test_voice_stop_parser_requires_standalone_stop_phrase(self) -> None:
-        self.assertTrue(VoiceInputController.transcript_requests_stop("stop listening"))
-        self.assertTrue(VoiceInputController.transcript_requests_stop("voice off"))
-        self.assertFalse(VoiceInputController.transcript_requests_stop("please stop voice"))
-        self.assertFalse(VoiceInputController.transcript_requests_stop("can you stop listening and summarize that"))
-
-    def test_voice_send_parser_requires_standalone_send_phrase(self) -> None:
-        self.assertTrue(VoiceInputController.transcript_requests_send("send message"))
-        self.assertTrue(VoiceInputController.transcript_requests_send("send"))
-        self.assertFalse(VoiceInputController.transcript_requests_send("please send message now"))
 
     def test_status_cli_does_not_import_tui_surface(self) -> None:
         original_app_module = sys.modules.pop("src.app", None)
@@ -616,20 +496,6 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
             snapshot = app.runtime_status_snapshot()
 
         self.assertEqual(snapshot["reasoning_mode"], "on")
-
-    def test_runtime_status_snapshot_reports_active_voice_input(self) -> None:
-        app = OpenJetApp()
-        app.agent = FakeAgent()
-        app.voice._task = SimpleNamespace(done=lambda: False)
-        app.voice._source_ref = "mic0"
-        app.voice._chunk_seconds = 3
-
-        with patch("src.app.read_memory_snapshot", return_value=None):
-            snapshot = app.runtime_status_snapshot()
-
-        self.assertTrue(snapshot["voice_active"])
-        self.assertEqual(snapshot["voice_source_ref"], "mic0")
-        self.assertEqual(snapshot["voice_chunk_seconds"], 3)
 
     def test_runtime_status_snapshot_includes_runtime_overhead_and_context_breakdown(self) -> None:
         app = OpenJetApp()
@@ -1818,11 +1684,7 @@ class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(return_value={"ok": True, "applied": []}),
         ), patch.object(
             app, "persist_harness_state"
-        ) as persist_harness, patch.object(
-            app.voice_output, "announce_tool_call", AsyncMock()
-        ) as announce_tool_call, patch.object(
-            app.voice_output, "announce_assistant_text", AsyncMock()
-        ) as announce_assistant_text:
+        ) as persist_harness:
             await app.run_agent_turn()
 
         start_next.assert_not_called()
@@ -1830,8 +1692,6 @@ class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.agent.run_count, 2)
         persist_session.assert_any_call(reason="assistant_turn_with_tools")
         persist_session.assert_any_call(reason="assistant_turn_done")
-        announce_tool_call.assert_awaited_once()
-        announce_assistant_text.assert_awaited_once_with("done")
 
     async def test_run_agent_turn_passes_completed_turn_output_to_memory_reflection(self) -> None:
         app = OpenJetApp()
@@ -1882,9 +1742,7 @@ class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
         ) as persist_harness, patch.object(
             app, "persist_resumable_session_state",
             AsyncMock(),
-        ), patch.object(
-            app.voice_output, "announce_assistant_text", AsyncMock()
-        ) as announce_assistant_text:
+        ):
             await app.run_agent_turn()
 
         reflect_mock.assert_awaited_once()
@@ -1900,7 +1758,6 @@ class AppCondenseTests(unittest.IsolatedAsyncioTestCase):
         )
         persist_harness.assert_called_once()
         persist_session.assert_any_call(reason="assistant_turn_done")
-        announce_assistant_text.assert_awaited_once_with("done")
 
 
 class LlamaServerStartupTests(unittest.TestCase):

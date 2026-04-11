@@ -28,10 +28,6 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
     CommandSpec(
-        name="voice",
-        description="Start or inspect microphone voice input: /voice [status|start [mic]|stop]",
-    ),
-    CommandSpec(
         name="device",
         description="List or configure devices: /device [list|add <existing_id> <new_id>|on <id>|off <id>|help]",
         aliases=("devices", "sources"),

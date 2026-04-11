@@ -22,7 +22,7 @@ OpenJet has three primary surfaces in one repo:
 git clone https://github.com/l-forster/open-jet.git
 cd open-jet
 ./install.sh
-open-jet --setup
+open-jet setup
 ```
 
 That's it. Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.

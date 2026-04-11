@@ -63,9 +63,6 @@ class SlashCommandHandler:
         if cmd == "status":
             self._status(log)
             return True
-        if cmd == "voice":
-            await self._voice(log, arg)
-            return True
         if cmd == "device":
             self._device(log, arg)
             return True
@@ -224,38 +221,6 @@ class SlashCommandHandler:
                 f"Reasoning mode: {snapshot.get('reasoning_mode')}"
                 "[/]"
             )
-        stop_command = snapshot.get("stop_command") or self.app.voice_stop_command_hint()
-        send_command = snapshot.get("send_command") or self.app.voice_send_command_hint()
-        clear_command = snapshot.get("clear_command") or self.app.voice_clear_command_hint()
-        if snapshot.get("voice_active"):
-            draft_state = "pending" if snapshot.get("draft_pending") else "empty"
-            output_target = _format_voice_output_target(
-                snapshot.get("voice_output_provider"),
-                snapshot.get("voice_output_backend"),
-            )
-            output_state = "on" if snapshot.get("voice_output_enabled") else "off"
-            log.write(
-                "[bold bright_white]"
-                f"Voice input: active | source=@{snapshot.get('voice_source_ref')} | chunk={snapshot.get('voice_chunk_seconds')}s | draft={draft_state} | send='{send_command}' | clear='{clear_command}' | stop='{stop_command}' | tts={output_state}({output_target})"
-                "[/]"
-            )
-        else:
-            voice_error = str(snapshot.get("voice_last_error") or "").strip()
-            voice_line = "Voice input: inactive"
-            if voice_error:
-                voice_line += f" | last_error={voice_error}"
-            log.write(f"[bold bright_white]{voice_line}[/]")
-            if snapshot.get("voice_output_available") or snapshot.get("voice_output_last_error"):
-                output_provider = snapshot.get("voice_output_provider") or "unconfigured"
-                output_backend = snapshot.get("voice_output_backend") or "unavailable"
-                output_error = str(snapshot.get("voice_output_last_error") or "").strip()
-                output_line = (
-                    f"Voice output: {'on' if snapshot.get('voice_output_enabled') else 'off'}"
-                    f" | provider={output_provider} | backend={output_backend}"
-                )
-                if output_error:
-                    output_line += f" | last_error={output_error}"
-                log.write(f"[bold bright_white]{output_line}[/]")
         log.write(
             "[bold bright_white]"
             f"Air-gapped mode: {'true' if snapshot.get('airgapped') else 'false'}"
@@ -319,82 +284,6 @@ class SlashCommandHandler:
         self.app.persist_session_state(reason="manual_condense")
         if self.app.session_logger:
             self.app.session_logger.record_manual_condense(summary)
-
-    async def _voice(self, log: Any, raw_arg: str) -> None:
-        arg = raw_arg.strip()
-        lowered = arg.lower()
-
-        if not arg and self.app.voice_status_snapshot().get("active"):
-            self._voice_status(log)
-            return
-
-        if lowered == "status":
-            self._voice_status(log)
-            return
-
-        if lowered in {"stop", "off"}:
-            stopped = await self.app.stop_voice_input()
-            if stopped:
-                log.write("[bold bright_white]Voice input stopped.[/]")
-            else:
-                log.write("[bold bright_white]Voice input is not running.[/]")
-            log.write("")
-            return
-
-        source_ref = None
-        if lowered.startswith("start "):
-            source_ref = arg.split(maxsplit=1)[1].strip()
-        elif lowered.startswith("on "):
-            source_ref = arg.split(maxsplit=1)[1].strip()
-        elif lowered in {"start", "on", ""}:
-            source_ref = None
-        else:
-            source_ref = arg
-
-        try:
-            snapshot = await self.app.start_voice_input(source_ref=source_ref)
-        except (RuntimeError, ValueError) as exc:
-            log.write(f"[yellow]{exc}[/]")
-            log.write("")
-            return
-
-        source = snapshot.get("source_ref")
-        chunk_seconds = snapshot.get("chunk_seconds")
-        send_command = snapshot.get("send_command") or self.app.voice_send_command_hint()
-        clear_command = snapshot.get("clear_command") or self.app.voice_clear_command_hint()
-        stop_command = snapshot.get("stop_command") or self.app.voice_stop_command_hint()
-        output = snapshot.get("voice_output") if isinstance(snapshot.get("voice_output"), dict) else {}
-        output_clause = _voice_output_clause(output, mode="start")
-        log.write(
-            "[bold bright_white]"
-            f"Voice input started on @{source}. Speech is buffered into a local draft. Say '{send_command}' to submit, '{clear_command}' to discard the draft, or '{stop_command}' to exit voice mode. {output_clause}"
-            "[/]"
-        )
-        log.write("")
-
-    def _voice_status(self, log: Any) -> None:
-        snapshot = self.app.voice_status_snapshot()
-        if snapshot.get("active"):
-            send_command = snapshot.get("send_command") or self.app.voice_send_command_hint()
-            clear_command = snapshot.get("clear_command") or self.app.voice_clear_command_hint()
-            stop_command = snapshot.get("stop_command") or self.app.voice_stop_command_hint()
-            draft_state = "pending" if snapshot.get("draft_pending") else "empty"
-            output_clause = _voice_output_clause(snapshot, mode="status")
-            log.write(
-                "[bold bright_white]"
-                f"Voice input is active on @{snapshot.get('source_ref')} with {snapshot.get('chunk_seconds')}s chunks. Draft is {draft_state}. Say '{send_command}' to submit, '{clear_command}' to discard, or '{stop_command}' to exit. {output_clause}"
-                "[/]"
-            )
-            preview = str(snapshot.get("draft_preview") or "").strip()
-            if preview:
-                log.write(f"[dim]{preview}[/]")
-        else:
-            line = "Voice input is inactive."
-            last_error = str(snapshot.get("last_error") or "").strip()
-            if last_error:
-                line += f" Last error: {last_error}"
-            log.write(f"[bold bright_white]{line}[/]")
-        log.write("")
 
     def _device(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip()
@@ -1079,26 +968,3 @@ def _format_device_error(exc: ValueError) -> str:
         return "unknown device reference: " + text.split(": ", 1)[1]
     return text
 
-
-def _format_voice_output_target(provider: object, backend: object) -> str:
-    provider_text = str(provider or "").strip()
-    backend_text = str(backend or "").strip()
-    if provider_text and backend_text:
-        return f"{provider_text}:{backend_text}"
-    return backend_text or provider_text or "unavailable"
-
-
-def _voice_output_clause(snapshot: dict[str, Any], *, mode: str) -> str:
-    target = _format_voice_output_target(
-        snapshot.get("voice_output_provider") or snapshot.get("provider"),
-        snapshot.get("voice_output_backend") or snapshot.get("backend"),
-    )
-    if snapshot.get("voice_output_available") or snapshot.get("available"):
-        if mode == "start":
-            return f"Assistant replies and tool calls will be spoken with {target}."
-        return f"Spoken output target: {target}."
-
-    error = str(snapshot.get("voice_output_last_error") or snapshot.get("last_error") or "").strip()
-    if error:
-        return f"Spoken output is unavailable: {error}"
-    return "Spoken output is not configured. No voice output provider is implemented in this build."

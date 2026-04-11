@@ -32,7 +32,7 @@ OpenJet is local-only. It uses `llama-server` from `llama.cpp` with GGUF models.
 Start with:
 
 ```bash
-open-jet --setup
+open-jet setup
 ```
 
 OpenJet will first try to reuse an existing local setup. If pieces are missing, setup can provision them for you.

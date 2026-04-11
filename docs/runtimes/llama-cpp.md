@@ -16,7 +16,7 @@ The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/b
 
 ## What setup automates
 
-When you run `open-jet --setup`, OpenJet can:
+When you run `open-jet setup`, OpenJet can:
 
 - reuse an existing `llama-server` binary
 - clone and build `llama.cpp` if `llama-server` is missing

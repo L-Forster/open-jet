@@ -120,8 +120,6 @@ from .setup import ACCENT_GREEN, _prompt_choice, discover_model_files, run_setup
 from .system_metrics import SystemMetricsReader, format_hours
 from .theme import PROMPT_STYLE, RICH_THEME, rich_text
 from .tool_executor import format_tool_args, get_swap_manager, set_swap_manager
-from .voice_input import VoiceInputController
-from .voice_output import VoiceOutputController
 
 
 def _format_error(exc: Exception) -> str:
@@ -268,7 +266,6 @@ class OpenJetApp:
         "Tip: Use /status to inspect runtime memory and context state.",
         "Tip: Use /clear to reset chat and flush the KV cache.",
         "Tip: Use /clear-chat to clear chat while keeping the current runtime state.",
-        "Tip: Use /voice start to begin microphone input, or /voice status to inspect it.",
         "Tip: Use /device list to inspect available devices and aliases.",
         "Tip: Use /memory show project agent to inspect saved project memory.",
         "Tip: Use /air-gapped true when you want strictly local-only operation.",
@@ -370,22 +367,6 @@ class OpenJetApp:
         self._widgets["#token-counter"].hidden = False
         self._widgets["#utilization-bar"].hidden = False
         self.focused = self._widgets["#prompt"]
-        self.voice = VoiceInputController(
-            observation_store=self.observation_store,
-            cfg_provider=lambda: self.cfg,
-            list_sources=self.list_device_sources,
-            resolve_source=self.resolve_device_source,
-            submit_text=lambda text: self.submit_text(text, allow_slash_command=False),
-            is_busy=lambda: bool(self._awaiting_approval or (self._generation_worker and not self._generation_worker.done())),
-            is_quit_requested=lambda: self._quit_requested,
-            log_getter=lambda: self.query_one("#chat-log"),
-            log_event=self._log_voice_event,
-        )
-        self.voice_output = VoiceOutputController(
-            cfg_provider=lambda: self.cfg,
-            log_event=self._log_voice_event,
-        )
-
     def query_one(self, selector: str, _expected_type: object | None = None) -> Any:
         return self._widgets[selector]
 
@@ -397,10 +378,6 @@ class OpenJetApp:
 
     def exit(self) -> None:
         self._quit_requested = True
-
-    def _log_voice_event(self, event_type: str, **data: Any) -> None:
-        if self.session_logger:
-            self.session_logger.log_event(event_type, **data)
 
     def _restart_process(self) -> None:
         os.execv(sys.executable, [sys.executable, *sys.argv])
@@ -1149,8 +1126,6 @@ class OpenJetApp:
         if self._active_turn_id:
             self._finish_turn_trace(success=False, status="abandoned", error="application quit")
         self.persist_session_state(reason="quit")
-        await self.voice.shutdown()
-        await self.voice_output.shutdown()
         if self._generation_worker and not self._generation_worker.done():
             self._generation_worker.cancel()
         if self.client:
@@ -1618,8 +1593,6 @@ class OpenJetApp:
         mem = read_memory_snapshot()
         active = active_step(self.harness_state)
         context_snapshot = self._last_turn_context_snapshot
-        voice_snapshot = self.voice.status_snapshot()
-        voice_output_snapshot = self.voice_output.status_snapshot()
         reasoning_mode = None
         if self.client and hasattr(self.client, "reasoning_status"):
             try:
@@ -1656,60 +1629,10 @@ class OpenJetApp:
             "harness_candidate_count": len(getattr(context_snapshot, "candidate_decisions", []) or []),
             "turn_docs_budget": getattr(getattr(context_snapshot, "budget", None), "docs_budget", 0),
             "turn_context_remaining_budget": getattr(getattr(context_snapshot, "budget", None), "remaining_budget", 0),
-            "voice_active": voice_snapshot["active"],
-            "voice_source_ref": voice_snapshot["source_ref"],
-            "voice_chunk_seconds": voice_snapshot["chunk_seconds"],
-            "voice_last_error": voice_snapshot["last_error"],
-            "draft_pending": voice_snapshot["draft_pending"],
-            "draft_preview": voice_snapshot["draft_preview"],
-            "send_command": voice_snapshot["send_command"],
-            "clear_command": voice_snapshot["clear_command"],
-            "stop_command": voice_snapshot["stop_command"],
-            "voice_output_enabled": voice_output_snapshot["enabled"],
-            "voice_output_provider": voice_output_snapshot["provider"],
-            "voice_output_backend": voice_output_snapshot["backend"],
-            "voice_output_available": voice_output_snapshot["available"],
-            "voice_output_last_error": voice_output_snapshot["last_error"],
         }
 
     def refresh_token_counter(self) -> None:
         self._render_token_counter()
-
-    def voice_status_snapshot(self) -> dict[str, Any]:
-        snapshot = self.voice.status_snapshot()
-        output_snapshot = self.voice_output.status_snapshot()
-        return {
-            **snapshot,
-            "voice_output_enabled": output_snapshot["enabled"],
-            "voice_output_provider": output_snapshot["provider"],
-            "voice_output_backend": output_snapshot["backend"],
-            "voice_output_available": output_snapshot["available"],
-            "voice_output_last_error": output_snapshot["last_error"],
-        }
-
-    async def start_voice_input(self, *, source_ref: str | None = None) -> dict[str, Any]:
-        if not self.agent:
-            raise RuntimeError("Agent not initialized.")
-        snapshot = await self.voice.start(source_ref=source_ref)
-        output_snapshot = await self.voice_output.enable()
-        return {**snapshot, "voice_output": output_snapshot}
-
-    async def stop_voice_input(self) -> bool:
-        stopped = await self.voice.stop()
-        await self.voice_output.disable()
-        return stopped
-
-    @classmethod
-    def voice_stop_command_hint(cls) -> str:
-        return VoiceInputController.stop_command_hint()
-
-    @classmethod
-    def voice_send_command_hint(cls) -> str:
-        return VoiceInputController.send_command_hint()
-
-    @classmethod
-    def voice_clear_command_hint(cls) -> str:
-        return VoiceInputController.clear_command_hint()
 
     def _start_new_chat_session(self) -> None:
         self._chat_session_id = self.chat_archive.new_chat_id()
@@ -2252,7 +2175,6 @@ class OpenJetApp:
                             )
                             log.write(rendered)
                             text_buf = ""
-                        await self.voice_output.announce_tool_call(event.tool_call)
                         self._record_tool_request(event.tool_call, log, tool_status_tokens)
                     elif event.kind == SDKEventKind.TOOL_RESULT and event.tool_result:
                         tool_event = self._record_tool_result(event.tool_result, log, tool_status_tokens)
@@ -2358,7 +2280,6 @@ class OpenJetApp:
         except Exception as exc:
             self._log_trace_event("memory_reflection_failed", error=str(exc))
         await self.persist_resumable_session_state(reason="assistant_turn_done", payload=session_payload)
-        await self.voice_output.announce_assistant_text(assistant_turn_text)
         self._finish_turn_trace(success=True, status="completed")
         self._render_token_counter()
 
