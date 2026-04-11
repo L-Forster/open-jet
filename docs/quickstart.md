@@ -15,7 +15,7 @@ This is the normal editable-source install path.
 Start with:
 
 ```bash
-open-jet --setup
+open-jet setup
 ```
 
 If you already have local runtime pieces, setup will reuse them. If not, setup can:

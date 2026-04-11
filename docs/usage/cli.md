@@ -21,7 +21,6 @@ OpenJet's CLI surface covers three adjacent jobs:
 Optional setup flow:
 
 ```bash
-open-jet --setup
 open-jet setup
 ```
 
