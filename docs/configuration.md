@@ -68,12 +68,15 @@ shell_targets:
     scp_command: scp -P 2222
     scp_target: louis@localhost
     remote_tmp_dir: /tmp
+    control_path: ~/.openjet/state/ssh-jetson.sock
+    control_persist: 10m
 ```
 
 Behavior:
 
 - omit `target` or use `local` to run on the machine hosting OpenJet
 - use `target: jetson` to run on the configured Jetson target
+- one persistent OpenSSH control connection is reused across commands
 - file writes and edits remain local unless you separately use a mounted filesystem such as `sshfs`
 
 ## Model profiles
