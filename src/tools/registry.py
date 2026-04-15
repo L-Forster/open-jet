@@ -110,6 +110,9 @@ def _param(type_name: str, description: str) -> dict[str, str]:
     return {"type": type_name, "description": description}
 
 
+_TARGET_PARAM = _param("string", "Optional shell target such as local or a configured remote target like jetson")
+
+
 def _tool(
     name: str,
     description: str,
@@ -206,6 +209,7 @@ TOOL_REGISTRY = ToolRegistry(
             ),
             parameters={
                 "command": _param("string", "Command to run"),
+                "target": _TARGET_PARAM,
                 "timeout_seconds": _param("integer", "Timeout in seconds"),
                 "resource_mode": _param("string", "Resource strategy: normal, auto, or unload_first"),
                 "estimated_ram_mb": _param("integer", "Optional estimated RAM needed by the command in MB"),

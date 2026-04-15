@@ -54,6 +54,31 @@ memory_guard:
   keep_last_messages: 6
 ```
 
+## Shell Targets
+
+You can expose named remote shell targets for the `shell` tool. OpenJet stays on the local machine, and when the model sets `target` on a shell call, OpenJet writes a temporary script locally, copies it to the target with `scp`, runs it with `ssh`, and returns stdout/stderr.
+
+Example:
+
+```yaml
+shell_targets:
+  jetson:
+    description: Jetson for running scripts and commands.
+    ssh_command: ssh -p 2222 louis@localhost
+    scp_command: scp -P 2222
+    scp_target: louis@localhost
+    remote_tmp_dir: /tmp
+    control_path: ~/.openjet/state/ssh-jetson.sock
+    control_persist: 10m
+```
+
+Behavior:
+
+- omit `target` or use `local` to run on the machine hosting OpenJet
+- use `target: jetson` to run on the configured Jetson target
+- one persistent OpenSSH control connection is reused across commands
+- file writes and edits remain local unless you separately use a mounted filesystem such as `sshfs`
+
 ## Model profiles
 
 Setup stores reusable model presets under `model_profiles`. The active preset is tracked by `active_model_profile`.

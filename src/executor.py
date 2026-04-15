@@ -19,6 +19,7 @@ from .runtime_limits import (
     estimate_tokens,
     read_memory_snapshot,
 )
+from .shell_targets import resolve_shell_target, run_shell_via_target
 
 
 @dataclass
@@ -128,10 +129,32 @@ _FUZZY_AMBIGUITY_DELTA = 0.02
 # -- Shell executor ----------------------------------------------------------
 
 
-async def run_shell(command: str, timeout_seconds: int = DEFAULT_SHELL_TIMEOUT_SECONDS) -> ExecResult:
+async def run_shell(
+    command: str,
+    timeout_seconds: int = DEFAULT_SHELL_TIMEOUT_SECONDS,
+    *,
+    target: str | None = None,
+) -> ExecResult:
     """Run a shell command and capture output. Caller must gate on approval first."""
     if timeout_seconds <= 0:
         timeout_seconds = DEFAULT_SHELL_TIMEOUT_SECONDS
+    shell_target = resolve_shell_target(target)
+    if shell_target is not None:
+        exit_code, stdout, stderr, timed_out = await run_shell_via_target(
+            command,
+            target=shell_target,
+            timeout_seconds=timeout_seconds,
+        )
+        if timed_out:
+            exit_code = SHELL_TIMEOUT_EXIT_CODE
+        return ExecResult(
+            command=command,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            timed_out=timed_out,
+            timeout_seconds=timeout_seconds,
+        )
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
@@ -172,7 +195,6 @@ async def read_system_info(scope: str | None = None) -> str:
     normalized_scope = (scope or "summary").strip().lower() or "summary"
     if normalized_scope not in {"summary", "memory", "gpu", "disk", "all"}:
         return "Error: invalid arguments for system_info (scope must be summary, memory, gpu, disk, or all)"
-
     lines = ["SYSTEM INFO", f"cwd: {Path.cwd()}"]
 
     if normalized_scope in {"summary", "memory", "all"}:
