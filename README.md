@@ -10,6 +10,8 @@
 </div>
 This is Claude Code for local LLMs. OpenJet handles the model, the runtime, and the setup without having to manually wrangle complex confirgurations. You get a coding agent in your terminal that reads your files, edits your code, runs commands, and stays out of the cloud.
 
+OpenJet can connect to remote devices, so the agent can run on one device, but execute and write code on another (even if it isn't powerful enough to run the model)
+
 OpenJet has three primary surfaces in one repo:
 
 - **CLI + chat TUI** for interactive local agent work
