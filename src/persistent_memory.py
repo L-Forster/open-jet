@@ -10,6 +10,7 @@ from .config import load_config
 from .device_sources import ensure_devices_registry, format_device_registry_prompt
 from .executor import edit_file
 from .runtime_limits import MIN_TOKEN_BUDGET, derive_file_token_budget, estimate_tokens, read_memory_snapshot
+from .shell_targets import shell_targets_prompt
 
 DEFAULT_BASE_SYSTEM_PROMPT = """You are OpenJet, a local terminal AI assistant.
 - Be concise, direct, and practical.
@@ -222,7 +223,8 @@ async def build_system_prompt(
     snapshot = await load_persistent_memory(root, global_root=global_root)
     memory_prompt = snapshot.as_system_prompt()
     devices_prompt = _device_registry_prompt(root, cfg=resolved_cfg)
-    sections = [resolved_base_prompt, memory_prompt, devices_prompt]
+    targets_prompt = shell_targets_prompt(resolved_cfg)
+    sections = [resolved_base_prompt, memory_prompt, devices_prompt, targets_prompt]
     return "\n\n".join(section for section in sections if section).strip()
 
 

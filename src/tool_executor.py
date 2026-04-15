@@ -105,7 +105,9 @@ def format_tool_args(tool_call: ToolCall) -> str:
             command = args.get("command", str(args))
             timeout_seconds = args.get("timeout_seconds")
             mode = str(args.get("resource_mode", "normal") or "normal").strip()
-            return f"$ {command} (timeout: {timeout_seconds}s, mode: {mode})" if isinstance(timeout_seconds, int) else f"$ {command} (mode: {mode})"
+            target = str(args.get("target", "local") or "local").strip()
+            suffix = f", target: {target}"
+            return f"$ {command} (timeout: {timeout_seconds}s, mode: {mode}{suffix})" if isinstance(timeout_seconds, int) else f"$ {command} (mode: {mode}{suffix})"
         case "system_info":
             return f"scope={str(args.get('scope', 'summary') or 'summary').strip()}"
         case "device_list":
@@ -135,6 +137,7 @@ def format_tool_args(tool_call: ToolCall) -> str:
 
 async def _shell_result(args: dict[str, Any]) -> ToolExecutionResult:
     command = _str_arg(args, "command", required=True, allow_empty=False)
+    target = _str_arg(args, "target")
     timeout_seconds = _int_arg(args, "timeout_seconds", allow_none=True)
     if timeout_seconds is not None and timeout_seconds <= 0:
         raise ToolArgumentError("timeout_seconds must be > 0")
@@ -156,7 +159,19 @@ async def _shell_result(args: dict[str, Any]) -> ToolExecutionResult:
     if resource_mode == "auto" and plan is not None:
         use_swap = plan.unload_recommended
 
-    if use_swap and _swap_manager is not None:
+    if target and target != "local":
+        res = await run_shell(command, timeout_seconds=timeout, target=target)
+        swap_meta = {
+            "swap_mode": resource_mode,
+            "swap_available": False,
+            "swap_attempted": False,
+            "swap_plan_recommended": False,
+            "estimated_ram_mb": estimated_ram_mb,
+            "estimated_vram_mb": estimated_vram_mb,
+            "reload_delay_seconds": reload_delay_seconds,
+            "target": target,
+        }
+    elif use_swap and _swap_manager is not None:
         swap = await _swap_manager.run_with_swap(command, timeout=timeout, reload_delay_seconds=reload_delay_seconds)
         res = swap.exec_result
         swap_meta = {
@@ -171,9 +186,10 @@ async def _shell_result(args: dict[str, Any]) -> ToolExecutionResult:
             "swap_reload_ok": swap.reload_ok,
             "swap_restore_ok": swap.restore_ok,
             "swap_duration_s": swap.swap_duration_s,
+            "target": "local",
         }
     else:
-        res = await run_shell(command, timeout_seconds=timeout)
+        res = await run_shell(command, timeout_seconds=timeout, target=target)
         swap_meta = {
             "swap_mode": resource_mode,
             "swap_available": _swap_manager is not None,
@@ -182,6 +198,7 @@ async def _shell_result(args: dict[str, Any]) -> ToolExecutionResult:
             "estimated_ram_mb": estimated_ram_mb,
             "estimated_vram_mb": estimated_vram_mb,
             "reload_delay_seconds": reload_delay_seconds,
+            "target": target or "local",
         }
 
     resource_hint = _resource_failure_hint(res)
