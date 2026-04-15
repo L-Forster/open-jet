@@ -320,6 +320,7 @@ class OpenJetApp:
         self._active_turn_hallucinated_commands = 0
         self._active_turn_recovered_after_resume = False
         self.loaded_files: dict[str, dict] = {}
+        self._turn_active = False
         self._thinking_timer = None
         self._thinking_token = 0
         self._assistant_status_kind: str | None = None
@@ -1146,7 +1147,7 @@ class OpenJetApp:
             self.query_one("#chat-log").write("")
             prompt.value = ""
             return
-        if self._generation_worker and not self._generation_worker.done():
+        if self._turn_active:
             self.query_one("#chat-log").write("[warning]Wait for the current generation to finish, then retry.[/]")
             self.query_one("#chat-log").write("")
             prompt.value = ""
@@ -2125,6 +2126,7 @@ class OpenJetApp:
         assistant_header_written = False
         assistant_in_code_block = False
         overflow_condense_attempted = False
+        self._turn_active = True
         thinking_token = self._start_thinking()
         self._log_trace_event("run_agent_turn_started", recovery_attempted=recovery_attempted)
         try:
@@ -2241,10 +2243,9 @@ class OpenJetApp:
         except asyncio.CancelledError:
             return
         finally:
-            self._stop_thinking(thinking_token)
+            self._turn_active = False
+            self._stop_thinking()  # force-clear; token may have been bumped by tool status
             self._active_turn_device_refs = ()
-            if self._generation_worker and self._generation_worker.done():
-                self._generation_worker = None
 
         self.harness_state = update_state_after_turn(self.harness_state, tool_events=tool_events, assistant_text=assistant_turn_text)
         self.persist_harness_state()
@@ -2314,6 +2315,16 @@ class OpenJetApp:
         if approved:
             log.write(f"  {rich_text('approved', 'success')}")
             self._active_turn_approval_grants += 1
+            if tc.name == "shell" and isinstance(tc.arguments, dict):
+                command = str(tc.arguments.get("command", "")).strip()
+                if command:
+                    self._assistant_status_kind = "command"
+                    self._assistant_status_command = command
+                    self._render_assistant_status()
+                else:
+                    self._set_generating_status()
+            else:
+                self._set_generating_status()
         else:
             log.write(f"  {rich_text('denied', 'error')}")
             log.write("")
@@ -2761,7 +2772,7 @@ class OpenJetApp:
         bindings = KeyBindings()
         awaiting_approval = Condition(lambda: self._awaiting_approval)
         generating = Condition(
-            lambda: bool(self._generation_worker and not self._generation_worker.done() and not self._awaiting_approval)
+            lambda: bool(self._turn_active and not self._awaiting_approval)
         )
 
         @bindings.add("c-c")
