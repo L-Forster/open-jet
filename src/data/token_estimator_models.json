@@ -33,15 +33,15 @@
     "aliases": ["qwen3.5 27b", "qwen3.5-27b-q4_k_m.gguf", "qwen3.5:27b"]
   },
   {
-    "key": "gemma4_26b_a4b_q4_k_m",
+    "key": "gemma4_26b_a4b_q4_k_s",
     "label": "Gemma 4 26B A4B",
-    "filename": "gemma-4-26B-A4B.i1-Q4_K_M.gguf",
+    "filename": "gemma-4-26B-A4B.i1-Q4_K_S.gguf",
     "parameter_count_billion": 26.0,
-    "model_size_mb": 17306.0,
+    "model_size_mb": 15974.0,
     "kv_bytes_per_token": 16384.0,
     "decode_context_tokens": 8192,
     "source_urls": ["https://huggingface.co/mradermacher/gemma-4-26B-A4B-i1-GGUF"],
-    "aliases": ["gemma 4 26b", "gemma-4-26b-a4b.i1-q4_k_m.gguf", "gemma4:26b-a4b"]
+    "aliases": ["gemma 4 26b", "gemma-4-26b-a4b.i1-q4_k_s.gguf", "gemma4:26b-a4b"]
   },
   {
     "key": "qwen36_35b_a3b_q4_k_m",

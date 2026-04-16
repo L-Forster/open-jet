@@ -86,9 +86,9 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
     {
         "max_ram_gb": 24.0,
         "label": "Gemma 4 26B A4B",
-        "filename": "gemma-4-26B-A4B.i1-Q4_K_M.gguf",
-        "url": "https://huggingface.co/mradermacher/gemma-4-26B-A4B-i1-GGUF/resolve/main/gemma-4-26B-A4B.i1-Q4_K_M.gguf?download=true",
-        "model_size_mb": 17306,
+        "filename": "gemma-4-26B-A4B.i1-Q4_K_S.gguf",
+        "url": "https://huggingface.co/mradermacher/gemma-4-26B-A4B-i1-GGUF/resolve/main/gemma-4-26B-A4B.i1-Q4_K_S.gguf?download=true",
+        "model_size_mb": 15974,
         "kv_bytes_per_token": 16384,
         "unified_memory_only": True,
     },
