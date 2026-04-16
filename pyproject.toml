@@ -1,6 +1,6 @@
 [project]
 name = "open-jet"
-version = "0.4.0"
+version = "0.4.1"
 description = "Claude Code for local devices: chat with self-hosted models, run agent tools, and manage context safely ─ all without an internet connection."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
