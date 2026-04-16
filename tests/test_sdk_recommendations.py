@@ -142,7 +142,7 @@ class SDKRecommendationTests(unittest.TestCase):
             hardware_key="rtx_4060_8gb",
         )
 
-        self.assertEqual(len(estimates), 3)
+        self.assertEqual(len(estimates), 5)
         self.assertEqual(estimates[0].hardware_key, "rtx_4060_8gb")
         self.assertTrue(any(item.fits_in_memory for item in estimates))
         self.assertTrue(any(not item.fits_in_memory for item in estimates))

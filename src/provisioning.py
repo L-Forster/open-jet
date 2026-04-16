@@ -87,6 +87,10 @@ def recommend_direct_model(
         effective_memory_mb = max(hardware_info.total_ram_gb, 0.0) * 1024.0
     effective_gb = effective_memory_mb / 1024.0
     model_catalog = setup_direct_model_catalog(cfg)
+    if not hardware_info.has_metal:
+        model_catalog = tuple(
+            row for row in model_catalog if not bool(row.get("unified_memory_only"))
+        )
     fit_budget_mb = effective_memory_mb * 0.9
     fitting_models = [
         row
@@ -98,12 +102,12 @@ def recommend_direct_model(
         selected = fitting_models[-1]
     else:
         selected = None
-        for row in model_catalog:
-            if effective_gb <= float(row["max_ram_gb"]):
+        for row in reversed(model_catalog):
+            if effective_gb >= float(row["max_ram_gb"]):
                 selected = row
                 break
         if selected is None:
-            selected = model_catalog[-1]
+            selected = model_catalog[0]
     filename = str(selected["filename"])
     model_size_mb = float(selected.get("model_size_mb", 0) or 0)
     kv_bytes_per_token = float(selected.get("kv_bytes_per_token", 0) or 0)

@@ -83,6 +83,24 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "model_size_mb": 17101,
         "kv_bytes_per_token": 34816,
     },
+    {
+        "max_ram_gb": 24.0,
+        "label": "Gemma 4 26B A4B",
+        "filename": "gemma-4-26B-A4B.i1-Q4_K_M.gguf",
+        "url": "https://huggingface.co/mradermacher/gemma-4-26B-A4B-i1-GGUF/resolve/main/gemma-4-26B-A4B.i1-Q4_K_M.gguf?download=true",
+        "model_size_mb": 17306,
+        "kv_bytes_per_token": 16384,
+        "unified_memory_only": True,
+    },
+    {
+        "max_ram_gb": 32.0,
+        "label": "Qwen3.6 35B A3B",
+        "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf?download=true",
+        "model_size_mb": 22630,
+        "kv_bytes_per_token": 24576,
+        "unified_memory_only": True,
+    },
 )
 
 HARDWARE_OVERRIDE_OPTIONS: tuple[tuple[str, str, float, bool], ...] = (
