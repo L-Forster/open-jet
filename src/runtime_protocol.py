@@ -25,6 +25,7 @@ class StreamChunk:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     done: bool = False
+    reasoning: str = ""
 
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
@@ -169,6 +170,7 @@ async def stream_openai_chat(
             reasoning_text = delta.get("reasoning_content", "") or ""
             if reasoning_text:
                 reasoning_buf += reasoning_text
+                yield StreamChunk(reasoning=reasoning_text)
 
             for tc in delta.get("tool_calls", []) or []:
                 idx = int(tc.get("index", 0))

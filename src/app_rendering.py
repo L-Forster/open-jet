@@ -6,8 +6,11 @@ handle text formatting, syntax detection, and approval display formatting.
 
 from __future__ import annotations
 
+import difflib
 import re
 from pathlib import Path
+
+DIFF_CONTEXT_LINES = 1
 
 from rich.syntax import Syntax
 from rich.text import Text
@@ -15,6 +18,35 @@ from rich.text import Text
 from .agent import ToolCall
 from .theme import rich_text
 from .tool_executor import format_tool_args
+
+
+def _read_file_or_empty(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace") if path else ""
+    except OSError:
+        return ""
+
+
+def _diff_preview(old: str, new: str, *, context: int = DIFF_CONTEXT_LINES) -> list[str]:
+    if old == new:
+        return []
+    out: list[str] = []
+    old_no = new_no = 0
+    for raw in difflib.unified_diff(old.splitlines(), new.splitlines(), n=context, lineterm=""):
+        if raw.startswith(("--- ", "+++ ")):
+            continue
+        m = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+        if m:
+            old_no, new_no = int(m.group(1)), int(m.group(2))
+            continue
+        prefix, body = raw[:1], raw[1:]
+        if prefix == "+":
+            out.append(f"+{new_no:>4} + {body}"); new_no += 1
+        elif prefix == "-":
+            out.append(f"-{old_no:>4} - {body}"); old_no += 1
+        else:
+            out.append(f" {new_no:>4}   {body}"); old_no += 1; new_no += 1
+    return out
 
 
 def format_assistant_output_line(line: str, *, in_code_block: bool) -> tuple[object, bool]:
@@ -185,9 +217,16 @@ def tool_preview_lines(tc: ToolCall) -> list[str]:
         return [f"scope: {str(tc.arguments.get('scope', 'summary') or 'summary').strip()}"]
     if tc.name == "write_file":
         path = str(tc.arguments.get("path", "")).strip()
-        return [f"path: {path}", f"bytes: {len(str(tc.arguments.get('content', '')))}"]
+        new = str(tc.arguments.get("content", ""))
+        old = _read_file_or_empty(path)
+        return [f"path: {path}", f"bytes: {len(new)}", *_diff_preview(old, new)]
     if tc.name == "edit_file":
-        return [f"path: {str(tc.arguments.get('path', '')).strip()}"]
+        path = str(tc.arguments.get("path", "")).strip()
+        old_str = tc.arguments.get("old_string") or ""
+        new_str = tc.arguments.get("new_string") or ""
+        src = _read_file_or_empty(path)
+        new_src = src.replace(old_str, new_str, 1) if isinstance(old_str, str) and old_str else src
+        return [f"path: {path}", *_diff_preview(src, new_src)]
     if tc.name == "memory":
         return [f"scope: {str(tc.arguments.get('scope', '')).strip()}", f"action: {str(tc.arguments.get('action', '')).strip()}"]
     if tc.name == "exit_plan_mode":

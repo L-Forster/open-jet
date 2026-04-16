@@ -2169,6 +2169,12 @@ class OpenJetApp:
                                 in_code_block=assistant_in_code_block,
                             )
                             log.write(rendered)
+                    elif event.kind == SDKEventKind.REASONING:
+                        snippet = " ".join(event.text.split())
+                        if snippet:
+                            buf = (getattr(self, "_reasoning_tail", "") + " " + snippet).strip()
+                            self._reasoning_tail = snippet if len(buf) > 120 else buf
+                            self._render_assistant_status()
                     elif event.kind == SDKEventKind.TOOL_REQUEST and event.tool_call:
                         if text_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
@@ -2352,7 +2358,12 @@ class OpenJetApp:
         log.write(Rule(rich_text(f"Tool: {tc.name}", "tool"), style="tool"))
         log.write(rich_text(f"{tc.name}:", "tool"))
         for preview_line in self._tool_preview_lines(tc):
-            preview_style = "command" if tc.name == "shell" else "muted"
+            if tc.name == "shell":
+                preview_style = "command"
+            elif tc.name in {"edit_file", "write_file"} and preview_line[:1] in {"+", "-"}:
+                preview_style = "diff_add" if preview_line[0] == "+" else "diff_remove"
+            else:
+                preview_style = "muted"
             log.write(f"  {rich_text(preview_line, preview_style)}")
         active_status_tokens[tool_key] = self._start_tool_status(tc)
 
@@ -2568,6 +2579,7 @@ class OpenJetApp:
 
     def _start_thinking(self) -> int:
         self._thinking_token += 1
+        self._reasoning_tail = ""
         self._generation_started_at = time.monotonic()
         self._generation_decode_started_at = None
         self._generation_tokens_streamed = 0
@@ -2596,6 +2608,7 @@ class OpenJetApp:
         self._thinking_timer = None
         self._assistant_status_kind = None
         self._assistant_status_command = None
+        self._reasoning_tail = ""
         self._clear_assistant_status()
 
     def _start_tool_status(self, tc: ToolCall) -> int | None:
@@ -2629,7 +2642,8 @@ class OpenJetApp:
             return
         if self._assistant_status_kind == "generating":
             status.remove_class("hidden")
-            status.update("Generating...")
+            tail = getattr(self, "_reasoning_tail", "")
+            status.update(f"Thinking · {tail}" if tail else "Generating...")
             if self._session and self._session.app:
                 self._session.app.invalidate()
             return
