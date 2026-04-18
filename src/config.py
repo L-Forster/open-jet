@@ -89,6 +89,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "filename": "gemma-4-26B-A4B.i1-Q4_K_S.gguf",
         "url": "https://huggingface.co/mradermacher/gemma-4-26B-A4B-i1-GGUF/resolve/main/gemma-4-26B-A4B.i1-Q4_K_S.gguf?download=true",
         "model_size_mb": 15974,
+        "active_model_size_mb": 4096,
         "kv_bytes_per_token": 16384,
         "unified_memory_only": True,
     },
@@ -98,6 +99,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
         "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf?download=true",
         "model_size_mb": 22630,
+        "active_model_size_mb": 3072,
         "kv_bytes_per_token": 24576,
         "unified_memory_only": True,
     },
@@ -179,14 +181,22 @@ def setup_direct_model_catalog(cfg: Mapping[str, object] | None = None) -> tuple
             continue
         if max_ram_gb <= 0 or not label or not filename or not url:
             continue
-        parsed.append(
-            {
-                "max_ram_gb": max_ram_gb,
-                "label": label,
-                "filename": filename,
-                "url": url,
-            }
-        )
+        row: dict[str, Any] = {
+            "max_ram_gb": max_ram_gb,
+            "label": label,
+            "filename": filename,
+            "url": url,
+        }
+        for key in ("model_size_mb", "kv_bytes_per_token", "resident_model_size_mb", "active_model_size_mb"):
+            try:
+                value = float(item.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                row[key] = value
+        if "unified_memory_only" in item:
+            row["unified_memory_only"] = bool(item.get("unified_memory_only"))
+        parsed.append(row)
 
     if not parsed:
         return DEFAULT_DIRECT_MODEL_CATALOG

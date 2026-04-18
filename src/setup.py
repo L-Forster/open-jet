@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 from rich.console import Console
 from rich.markup import escape
 
-from .config import HARDWARE_OVERRIDE_OPTIONS
+from .config import HARDWARE_OVERRIDE_OPTIONS, setup_direct_model_catalog
 from .hardware import (
     HardwareInfo,
     effective_hardware_info,
@@ -19,8 +19,8 @@ from .hardware import (
     recommended_gpu_layers,
 )
 from .model_profiles import default_profile_name
-from .provisioning import recommend_direct_model
-from .setup_memory import recommend_setup_context_window
+from .provisioning import MODELS_DIR, recommend_direct_model
+from .setup_memory import recommend_context_window_for_model, recommend_setup_context_window
 
 if TYPE_CHECKING:
     from prompt_toolkit import PromptSession
@@ -347,6 +347,95 @@ def _recommended_local_payload(
     }
 
 
+def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
+    filename = str(row["filename"])
+    payload: dict[str, object] = {
+        "model_source": "direct",
+        "model_download_url": str(row["url"]),
+        "model_download_path": str(MODELS_DIR / filename),
+        "setup_missing_model": True,
+        "model_profile_name": str(row.get("label") or "").strip() or Path(filename).stem,
+    }
+    for key in ("model_size_mb", "kv_bytes_per_token", "resident_model_size_mb", "active_model_size_mb"):
+        if row.get(key) is not None:
+            payload[key] = row[key]
+    if "unified_memory_only" in row:
+        payload["unified_memory_only"] = bool(row.get("unified_memory_only"))
+    return payload
+
+
+def _direct_catalog_label(row: Mapping[str, object], recommended_url: str) -> str:
+    label = str(row.get("label") or row.get("filename") or "Model")
+    filename = str(row.get("filename") or "").strip()
+    max_ram = float(row.get("max_ram_gb") or 0.0)
+    size_mb = float(row.get("model_size_mb") or 0.0)
+    details: list[str] = []
+    if max_ram > 0:
+        details.append(f"{max_ram:g}GB tier")
+    if size_mb > 0:
+        details.append(f"{size_mb / 1024.0:.1f}GB download")
+    if bool(row.get("unified_memory_only")):
+        details.append("unified memory")
+    if str(row.get("url") or "") == recommended_url:
+        details.append("recommended")
+    suffix = f" ({', '.join(details)})" if details else ""
+    if filename and filename != label:
+        return f"{label}: {filename}{suffix}"
+    return f"{label}{suffix}"
+
+
+def _recommended_context_for_payload(
+    payload: Mapping[str, object],
+    *,
+    device: str,
+    fallback_tokens: int,
+    total_vram_mb: float,
+) -> int:
+    if str(payload.get("model_source") or "") == "direct":
+        try:
+            model_size_mb = float(payload.get("model_size_mb") or 0.0)
+            kv_bytes_per_token = float(payload.get("kv_bytes_per_token") or 0.0)
+        except (TypeError, ValueError):
+            model_size_mb = 0.0
+            kv_bytes_per_token = 0.0
+        for resident_key in ("resident_model_size_mb", "active_model_size_mb"):
+            try:
+                resident_mb = float(payload.get(resident_key) or 0.0)
+            except (TypeError, ValueError):
+                resident_mb = 0.0
+            if resident_mb > 0:
+                model_size_mb = resident_mb
+                break
+        if model_size_mb > 0 and kv_bytes_per_token > 0:
+            return recommend_context_window_for_model(
+                device=device,
+                fallback_tokens=fallback_tokens,
+                model_size_mb=model_size_mb,
+                kv_bytes_per_token=kv_bytes_per_token,
+                total_vram_mb=total_vram_mb,
+            )
+    return recommend_setup_context_window(
+        runtime="llama_cpp",
+        device=device,
+        fallback_tokens=fallback_tokens,
+        model_refs=_setup_model_refs(payload),
+        total_vram_mb=total_vram_mb,
+    )
+
+
+def _payload_matches_current_model(
+    payload: Mapping[str, object],
+    current_cfg: Mapping[str, object] | None,
+) -> bool:
+    if not isinstance(current_cfg, Mapping):
+        return False
+    return (
+        str(payload.get("model_source") or "") == str(current_cfg.get("model_source") or "")
+        and str(payload.get("llama_model") or "") == str(current_cfg.get("llama_model") or "")
+        and str(payload.get("model_download_url") or "") == str(current_cfg.get("model_download_url") or "")
+    )
+
+
 def build_recommended_payload(
     *,
     hardware_info: HardwareInfo,
@@ -394,11 +483,10 @@ def build_recommended_payload(
             )
         )
     )
-    payload["context_window_tokens"] = recommend_setup_context_window(
-        runtime="llama_cpp",
+    payload["context_window_tokens"] = _recommended_context_for_payload(
+        payload,
         device=device,
         fallback_tokens=fallback_ctx,
-        model_refs=_setup_model_refs(payload),
         total_vram_mb=effective_hw.vram_mb,
     )
     payload["gpu_layers"] = (
@@ -491,11 +579,12 @@ async def run_setup_wizard(
     model_files = discover_model_files()
     saved_model_files = _saved_model_refs(current_cfg, "llama_cpp")
     direct = recommend_direct_model(effective_hw, cfg=current_cfg)
+    direct_catalog = list(setup_direct_model_catalog(current_cfg))
     model_plan_options: list[tuple[str, object]] = [
         ("Use a local .gguf model file", "__local__"),
-        (f"Download recommended GGUF: {direct['label']}", "__direct__"),
+        ("Download a GGUF from the model catalog", "__direct__"),
     ]
-    detail = "Choose a local GGUF or let setup download the recommended GGUF."
+    detail = f"Choose a local GGUF or download a catalog model. Recommended: {direct['label']}."
     current_llama_model = _current_string(current_cfg, "llama_model")
     default_model_plan = "__local__"
     if setup_mode != "manual":
@@ -556,10 +645,29 @@ async def run_setup_wizard(
         payload["llama_model"] = str(model_file)
         _remember_model_ref(payload, current_cfg, "llama_cpp", str(model_file))
     else:
-        payload["model_source"] = "direct"
-        payload["model_download_url"] = str(direct["url"])
-        payload["model_download_path"] = str(direct["target_path"])
-        payload["setup_missing_model"] = True
+        recommended_url = str(direct["url"])
+        catalog_options = [
+            (_direct_catalog_label(row, recommended_url), row)
+            for row in direct_catalog
+        ]
+        selected_direct = await _prompt_choice(
+            session,
+            console,
+            "Model download",
+            catalog_options,
+            default_index=next(
+                (
+                    index
+                    for index, (_label, row) in enumerate(catalog_options)
+                    if str(row.get("url") or "") == recommended_url
+                ),
+                0,
+            ),
+            detail="Select any configured GGUF catalog entry to download.",
+        )
+        if not isinstance(selected_direct, Mapping):
+            raise RuntimeError("Invalid model catalog selection.")
+        payload.update(_direct_catalog_payload(selected_direct))
 
     headless = not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     fallback_ctx = (
@@ -574,15 +682,24 @@ async def run_setup_wizard(
             )
         )
     )
-    recommended_ctx_value = recommend_setup_context_window(
-        runtime="llama_cpp",
+    recommended_ctx_value = _recommended_context_for_payload(
+        payload,
         device=device,
         fallback_tokens=fallback_ctx,
-        model_refs=_setup_model_refs(payload),
         total_vram_mb=effective_hw.vram_mb,
     )
-    context_default = _current_int(current_cfg, "context_window_tokens") or recommended_ctx_value
-    if setup_mode != "manual":
+    current_model_matches_payload = _payload_matches_current_model(payload, current_cfg)
+    context_default = (
+        _current_int(current_cfg, "context_window_tokens")
+        if current_model_matches_payload and _current_int(current_cfg, "context_window_tokens") is not None
+        else recommended_ctx_value
+    )
+    model_matches_recommendation = (
+        payload.get("model_source") == recommended_payload.get("model_source")
+        and str(payload.get("llama_model") or "") == str(recommended_payload.get("llama_model") or "")
+        and str(payload.get("model_download_url") or "") == str(recommended_payload.get("model_download_url") or "")
+    )
+    if setup_mode != "manual" and model_matches_recommendation:
         context_default = int(recommended_payload.get("context_window_tokens", context_default))
     context_values = context_window_options(recommended_ctx_value)
     if context_default not in context_values:
@@ -602,8 +719,12 @@ async def run_setup_wizard(
     )
 
     recommended_gpu = recommended_gpu_layers(device, effective_hw.total_ram_gb)
-    gpu_default = _current_int(current_cfg, "gpu_layers") if _current_int(current_cfg, "gpu_layers") is not None else recommended_gpu
-    if setup_mode != "manual":
+    gpu_default = (
+        _current_int(current_cfg, "gpu_layers")
+        if current_model_matches_payload and _current_int(current_cfg, "gpu_layers") is not None
+        else recommended_gpu
+    )
+    if setup_mode != "manual" and model_matches_recommendation:
         gpu_default = int(recommended_payload.get("gpu_layers", gpu_default))
     gpu_values = gpu_layer_options(device, recommended_gpu)
     if gpu_default not in gpu_values:
@@ -635,6 +756,6 @@ async def run_setup_wizard(
     payload["model_profile_name"] = await _prompt_text(
         session,
         "model name> ",
-        default=str(recommended_payload.get("model_profile_name") or default_profile_name(payload)),
+        default=str(payload.get("model_profile_name") or default_profile_name(payload)),
     )
     return payload

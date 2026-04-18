@@ -877,8 +877,14 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         console = Mock()
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
         profile_name = "Downloaded Local Model"
+        selected_model = {
+            "max_ram_gb": 12.0,
+            "label": "Qwen3.5 9B",
+            "filename": "Qwen3.5-9B-Q4_K_M.gguf",
+            "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true",
+        }
 
-        choices = iter(["manual", "auto", "__direct__", 2048, 0])
+        choices = iter(["manual", "auto", "__direct__", selected_model, 2048, 0])
         texts = iter([profile_name])
 
         async def fake_choice(*_args, **_kwargs):
@@ -905,9 +911,126 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload["model_source"], "direct")
         self.assertTrue(payload["setup_missing_model"])
-        self.assertIn("model_download_url", payload)
-        self.assertIn("model_download_path", payload)
+        self.assertEqual(payload["model_download_url"], selected_model["url"])
+        self.assertTrue(str(payload["model_download_path"]).endswith(selected_model["filename"]))
         self.assertEqual(payload["model_profile_name"], profile_name)
+
+    async def test_run_setup_wizard_allows_catalog_download_selection(self) -> None:
+        console = Mock()
+        hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
+        catalog = [
+            {
+                "max_ram_gb": 6.0,
+                "label": "Small",
+                "filename": "small.gguf",
+                "url": "https://huggingface.co/example/small-GGUF/resolve/main/small.gguf?download=true",
+            },
+            {
+                "max_ram_gb": 24.0,
+                "label": "Large",
+                "filename": "large.gguf",
+                "url": "https://huggingface.co/example/large-GGUF/resolve/main/large.gguf?download=true",
+            },
+        ]
+        prompts: list[tuple[str, list[str]]] = []
+        choices = iter(["manual", "auto", "__direct__", catalog[1], 2048, 0])
+        texts = iter(["Large"])
+
+        async def fake_choice(_session, _console, title, options, **_kwargs):
+            prompts.append((title, [label for label, _value in options]))
+            return next(choices)
+
+        async def fake_text(*_args, **_kwargs):
+            return next(texts)
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.setup_direct_model_catalog", return_value=tuple(catalog)
+        ), patch("src.setup.recommend_direct_model", return_value={**catalog[0], "target_path": "/models/small.gguf"}), patch(
+            "src.setup.recommended_context_window_tokens", return_value=2048
+        ), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=2048
+        ), patch("src.setup.recommended_gpu_layers", return_value=0):
+            payload = await run_setup_wizard(
+                session=None,
+                console=console,
+                hardware_info=hardware,
+                recommended_ctx=2048,
+                current_cfg={},
+            )
+
+        model_download_prompt = next(labels for title, labels in prompts if title == "Model download")
+        self.assertEqual(len(model_download_prompt), 2)
+        self.assertTrue(any("Small" in label for label in model_download_prompt))
+        self.assertTrue(any("Large" in label for label in model_download_prompt))
+        self.assertEqual(payload["model_download_url"], catalog[1]["url"])
+        self.assertTrue(str(payload["model_download_path"]).endswith("large.gguf"))
+
+    async def test_run_setup_wizard_defaults_name_and_sizing_to_selected_catalog_model(self) -> None:
+        console = Mock()
+        hardware = HardwareInfo(
+            label="CUDA-capable device",
+            total_ram_gb=64.0,
+            has_cuda=True,
+            vram_mb=24576.0,
+        )
+        catalog = [
+            {
+                "max_ram_gb": 12.0,
+                "label": "Recommended",
+                "filename": "recommended.gguf",
+                "url": "https://huggingface.co/example/recommended-GGUF/resolve/main/recommended.gguf",
+                "model_size_mb": 4096,
+                "kv_bytes_per_token": 32768,
+            },
+            {
+                "max_ram_gb": 32.0,
+                "label": "Selected MoE",
+                "filename": "selected-moe.gguf",
+                "url": "https://huggingface.co/example/selected-moe-GGUF/resolve/main/selected-moe.gguf",
+                "model_size_mb": 22630,
+                "kv_bytes_per_token": 24576,
+                "unified_memory_only": True,
+            },
+        ]
+        defaults: dict[str, object] = {}
+        choices = iter(["manual", "auto", "__direct__", catalog[1], 32768, 99])
+
+        async def fake_choice(_session, _console, title, options, **kwargs):
+            defaults[title] = options[kwargs.get("default_index", 0)][1]
+            return next(choices)
+
+        async def fake_text(_session, _prompt, *, default=""):
+            defaults["model name"] = default
+            return default
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.setup_direct_model_catalog", return_value=tuple(catalog)
+        ), patch("src.setup.recommend_direct_model", return_value={**catalog[0], "target_path": "/models/recommended.gguf"}), patch(
+            "src.setup.recommended_context_window_tokens", return_value=2048
+        ), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=2048
+        ), patch("src.setup.recommended_gpu_layers", return_value=99):
+            payload = await run_setup_wizard(
+                session=None,
+                console=console,
+                hardware_info=hardware,
+                recommended_ctx=2048,
+                current_cfg={
+                    "model_source": "direct",
+                    "model_download_url": catalog[0]["url"],
+                    "context_window_tokens": 2048,
+                    "gpu_layers": 0,
+                },
+            )
+
+        self.assertEqual(defaults["model name"], "Selected MoE")
+        self.assertGreater(int(defaults["Context window"]), 2048)
+        self.assertEqual(defaults["GPU layers"], 99)
+        self.assertEqual(payload["model_profile_name"], "Selected MoE")
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
@@ -925,45 +1048,67 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             "Qwen3.5 27B",
         )
 
+    def test_recommend_direct_model_allows_moe_catalog_entries_on_gpu(self) -> None:
+        recommended = recommend_direct_model(
+            HardwareInfo(
+                label="CUDA-capable device",
+                total_ram_gb=32.0,
+                has_cuda=True,
+                vram_mb=12288.0,
+            )
+        )
+
+        self.assertIn(recommended["label"], {"Gemma 4 26B A4B", "Qwen3.6 35B A3B"})
+
+    def test_recommend_direct_model_prioritizes_large_dense_before_moe(self) -> None:
+        recommended = recommend_direct_model(
+            HardwareInfo(
+                label="RTX 3090",
+                total_ram_gb=32.0,
+                has_cuda=True,
+                vram_mb=24576.0,
+            )
+        )
+
+        self.assertEqual(recommended["label"], "Qwen3.5 27B")
+
+    def test_recommend_direct_model_prioritizes_moe_before_small_dense(self) -> None:
+        recommended = recommend_direct_model(
+            HardwareInfo(
+                label="RX 6700 XT",
+                total_ram_gb=32.0,
+                has_cuda=False,
+                has_vulkan=True,
+                vram_mb=12288.0,
+            )
+        )
+
+        self.assertEqual(recommended["label"], "Qwen3.6 35B A3B")
+
     async def test_ensure_direct_model_downloads_target_file(self) -> None:
-        class FakeResponse:
-            status_code = 200
-            headers = {"Content-Length": "8"}
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            async def aiter_bytes(self):
-                yield b"test"
-                yield b"-gguf"
-
-        class FakeClient:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, tb):
-                return False
-
-            def stream(self, method, url, headers=None):
-                return FakeResponse()
-
         updates: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "model.gguf"
             payload = {
                 "model_source": "direct",
-                "model_download_url": "https://example.invalid/model.gguf",
+                "model_download_url": "https://huggingface.co/example/test-GGUF/resolve/main/model.gguf?download=true",
                 "model_download_path": str(target),
                 "setup_missing_model": True,
             }
 
-            with patch("src.provisioning.httpx.AsyncClient", return_value=FakeClient()):
+            async def fake_download(**kwargs):
+                self.assertEqual(kwargs["repo_id"], "example/test-GGUF")
+                self.assertEqual(kwargs["filename"], "model.gguf")
+                self.assertEqual(kwargs["revision"], "main")
+                kwargs["progress"]("model.gguf: 50%|#####     | 4.0M/8.0M")
+                Path(kwargs["local_dir"], "model.gguf").write_bytes(b"test-gguf")
+                return 0, "", ""
+
+            log = Mock()
+            with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download) as download:
                 resolved = await ensure_direct_model(
                     payload,
-                    log=Mock(),
+                    log=log,
                     set_status=updates.append,
                     clear_status=lambda: None,
                 )
@@ -973,6 +1118,8 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved["llama_model"], str(target))
         self.assertFalse(resolved["setup_missing_model"])
         self.assertTrue(any(text.startswith("downloading model.gguf") for text in updates))
+        self.assertTrue(any("50%" in str(call.args[0]) for call in log.write.call_args_list))
+        download.assert_awaited_once()
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):

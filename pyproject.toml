@@ -23,6 +23,8 @@ classifiers = [
 ]
 dependencies = [
     "faster-whisper>=1.2",
+    "hf_transfer>=0.1.8",
+    "huggingface_hub[hf_transfer]>=0.25",
     "httpx>=0.27",
     "opentelemetry-exporter-otlp-proto-http>=1.40",
     "opentelemetry-sdk>=1.40",
