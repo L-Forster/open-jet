@@ -1999,6 +1999,100 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(starting["requested_ngl"], 99)
         self.assertEqual(starting["memavailable_mb"], 8192.0)
 
+    async def test_start_passes_moe_options_to_launch(self) -> None:
+        client = LlamaServerClient(
+            model="model.gguf",
+            device="cuda",
+            gpu_layers=99,
+            cpu_moe=True,
+            n_cpu_moe=12,
+        )
+        start_once = AsyncMock()
+
+        with patch.object(client, "_stop_server", AsyncMock()), patch.object(
+            client, "_cleanup_stale_inference_processes", AsyncMock()
+        ), patch.object(client, "_prepare_memory_for_launch", AsyncMock(return_value=None)), patch.object(
+            client, "_start_once", start_once
+        ), patch.object(
+            client, "_ensure_jetson_clocks_sudoers", return_value=None
+        ), patch.object(
+            client, "_maximize_gpu_clocks", return_value=None
+        ), patch.object(
+            client, "_is_jetson_platform", return_value=False
+        ), patch(
+            "src.llama_server._find_llama_server", return_value="/usr/bin/llama-server"
+        ):
+            await client.start()
+
+        kwargs = start_once.await_args.kwargs
+        self.assertTrue(kwargs["cpu_moe"])
+        self.assertEqual(kwargs["n_cpu_moe"], 12)
+
+    async def test_start_once_adds_moe_cpu_flags_to_command(self) -> None:
+        client = LlamaServerClient(model="model.gguf")
+
+        class _EmptyStream:
+            async def readline(self) -> bytes:
+                await asyncio.sleep(60)
+                return b""
+
+        proc = SimpleNamespace(returncode=None, pid=4321, stderr=_EmptyStream())
+        health = SimpleNamespace(status_code=200)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as create_proc, patch.object(
+            client._http, "get", AsyncMock(return_value=health)
+        ):
+            await client._start_once(
+                binary="/usr/bin/llama-server",
+                env={},
+                ngl=99,
+                ctx=4096,
+                batch=2048,
+                ubatch=512,
+                fit_off=False,
+                no_warmup=False,
+                no_mmap=False,
+                cpu_moe=False,
+                n_cpu_moe=8,
+            )
+
+        cmd = list(create_proc.await_args.args)
+        self.assertIn("--n-cpu-moe", cmd)
+        self.assertEqual(cmd[cmd.index("--n-cpu-moe") + 1], "8")
+        self.assertNotIn("--cpu-moe", cmd)
+
+    async def test_start_once_prefers_all_cpu_moe_over_layer_count(self) -> None:
+        client = LlamaServerClient(model="model.gguf")
+
+        class _EmptyStream:
+            async def readline(self) -> bytes:
+                await asyncio.sleep(60)
+                return b""
+
+        proc = SimpleNamespace(returncode=None, pid=4321, stderr=_EmptyStream())
+        health = SimpleNamespace(status_code=200)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as create_proc, patch.object(
+            client._http, "get", AsyncMock(return_value=health)
+        ):
+            await client._start_once(
+                binary="/usr/bin/llama-server",
+                env={},
+                ngl=99,
+                ctx=4096,
+                batch=2048,
+                ubatch=512,
+                fit_off=False,
+                no_warmup=False,
+                no_mmap=False,
+                cpu_moe=True,
+                n_cpu_moe=8,
+            )
+
+        cmd = list(create_proc.await_args.args)
+        self.assertIn("--cpu-moe", cmd)
+        self.assertNotIn("--n-cpu-moe", cmd)
+
     async def test_start_clamps_requested_context_to_model_max_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model_path = Path(tmp) / "model.gguf"
@@ -2085,6 +2179,8 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
                     fit_off=True,
                     no_warmup=False,
                     no_mmap=True,
+                    cpu_moe=False,
+                    n_cpu_moe=0,
                 )
 
         self.assertTrue(any(name == "runtime_llama_start_failed" for name, _ in events))

@@ -34,6 +34,29 @@ When `llama.cpp` is the active runtime, OpenJet can:
 - clear or rebuild the KV cache with `/clear`
 - save and restore slot state for low-memory shell workflows
 
+## MoE models
+
+OpenJet can pass llama.cpp's MoE placement flags through to `llama-server`:
+
+```yaml
+gpu_layers: 99
+llama_cpu_moe: true
+```
+
+`llama_cpu_moe: true` maps to `--cpu-moe`, which keeps all routed expert weights in CPU RAM. This is useful for MoE GGUFs whose full weights do not fit in VRAM: the dense/attention tensors can remain GPU-offloaded via `gpu_layers`, while llama.cpp copies the selected expert rows to the GPU for execution as needed.
+
+For a partial split, use:
+
+```yaml
+gpu_layers: 99
+llama_cpu_moe: false
+llama_n_cpu_moe: 12
+```
+
+That maps to `--n-cpu-moe 12`, keeping routed expert weights for the first 12 layers in CPU RAM. If `llama_cpu_moe` and `llama_n_cpu_moe` are both set, OpenJet launches with `--cpu-moe`.
+
+Current upstream llama.cpp does not provide a persistent VRAM cache that keeps only the currently hot experts resident across decode steps. The available behavior is CPU-resident expert weights plus GPU execution/copy of the selected experts during computation.
+
 ## Low-memory shell swap behavior
 
 For memory-heavy shell commands, OpenJet can temporarily unload the active `llama-server` process, run the command, then reload the model.
