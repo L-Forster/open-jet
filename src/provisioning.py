@@ -219,7 +219,8 @@ async def _run_exec(*args: str, cwd: Path | None = None) -> tuple[int, str, str]
     return proc.returncode or 0, out_raw.decode(errors="replace"), err_raw.decode(errors="replace")
 
 
-_BUILD_PROGRESS_RE = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]")
+_BUILD_PROGRESS_NINJA_RE = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]")
+_BUILD_PROGRESS_MAKE_RE = re.compile(r"\[\s*(\d+)\s*%\s*\]")
 
 
 async def _run_build_with_progress(
@@ -228,32 +229,81 @@ async def _run_build_with_progress(
     set_status: Callable[[str], None],
     log: Any,
 ) -> tuple[int, str]:
+    tail: list[str] = []
+    last_logged_pct = -1
+
+    def handle_line(line: str) -> None:
+        nonlocal last_logged_pct
+        tail.append(line)
+        if len(tail) > 200:
+            del tail[: len(tail) - 200]
+        pct: int | None = None
+        detail: str | None = None
+        ninja = _BUILD_PROGRESS_NINJA_RE.search(line)
+        if ninja:
+            n, m = int(ninja.group(1)), int(ninja.group(2))
+            if m > 0:
+                pct = int(n * 100 / m)
+                detail = f"{n}/{m}"
+        else:
+            make = _BUILD_PROGRESS_MAKE_RE.search(line)
+            if make:
+                pct = int(make.group(1))
+                detail = f"{pct}%"
+        if pct is not None:
+            set_status(f"building llama-server {detail}")
+            if pct - last_logged_pct >= 25 and pct < 100:
+                log.write(f"  [dim]Building llama-server {pct}%...[/]")
+                last_logged_pct = pct
+
+    if os.name == "posix":
+        master_fd, slave_fd = pty.openpty()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=str(cwd),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=slave_fd,
+                stderr=slave_fd,
+            )
+        finally:
+            os.close(slave_fd)
+        pending = ""
+        try:
+            while True:
+                try:
+                    raw = await asyncio.to_thread(os.read, master_fd, 4096)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        break
+                    raise
+                if not raw:
+                    break
+                pending += raw.decode(errors="replace")
+                parts = pending.replace("\r", "\n").split("\n")
+                pending = parts.pop() if parts else ""
+                for part in parts:
+                    if part.strip():
+                        handle_line(part.rstrip())
+            if pending.strip():
+                handle_line(pending.rstrip())
+        finally:
+            os.close(master_fd)
+        await proc.wait()
+        return proc.returncode or 0, "\n".join(tail)
+
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    tail: list[str] = []
-    last_logged_pct = -1
     assert proc.stdout is not None
     while True:
         raw = await proc.stdout.readline()
         if not raw:
             break
-        line = raw.decode(errors="replace").rstrip()
-        tail.append(line)
-        if len(tail) > 200:
-            del tail[: len(tail) - 200]
-        match = _BUILD_PROGRESS_RE.search(line)
-        if match:
-            n, m = int(match.group(1)), int(match.group(2))
-            set_status(f"building llama-server {n}/{m}")
-            if m > 0:
-                pct = int(n * 100 / m)
-                if pct - last_logged_pct >= 25 and pct < 100:
-                    log.write(f"  [dim]Building llama-server {pct}% ({n}/{m})...[/]")
-                    last_logged_pct = pct
+        handle_line(raw.decode(errors="replace").rstrip())
     await proc.wait()
     return proc.returncode or 0, "\n".join(tail)
 
