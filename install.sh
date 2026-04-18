@@ -9,6 +9,7 @@ SYSTEM_BIN_DIR="/usr/local/bin"
 INSTALL_MODE="${OPENJET_INSTALL_MODE:-install}"
 UPDATE_REINSTALL="${OPENJET_UPDATE_REINSTALL:-0}"
 INSTALL_STATE_FILE="${VENV_DIR}/.openjet-install-hash"
+BUILD_SETUPTOOLS_SPEC="setuptools>=68,<80"
 
 link_launchers() {
   local target_dir="$1"
@@ -68,6 +69,16 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! "${PYTHON_BIN}" - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+then
+  echo "error: OpenJet requires Python 3.10 or newer; ${PYTHON_BIN} is too old" >&2
+  echo "set PYTHON to a newer interpreter, for example: PYTHON=python3.11 ./install.sh" >&2
+  exit 1
+fi
+
 create_virtualenv() {
   if "${PYTHON_BIN}" -c "import ensurepip" >/dev/null 2>&1; then
     "${PYTHON_BIN}" -m venv "${VENV_DIR}"
@@ -79,20 +90,45 @@ create_virtualenv() {
   "${PYTHON_BIN}" -m virtualenv "${VENV_DIR}"
 }
 
+build_backend_ready() {
+  "${VENV_DIR}/bin/python" - <<'PY'
+import importlib.util
+import re
+import sys
+
+try:
+    import setuptools
+except Exception:
+    sys.exit(1)
+
+def version_tuple(value):
+    match = re.match(r"(\d+(?:\.\d+)*)", value)
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+setuptools_version = version_tuple(getattr(setuptools, "__version__", ""))
+has_supported_setuptools = (68,) <= setuptools_version < (80,)
+has_wheel = importlib.util.find_spec("wheel") is not None
+sys.exit(0 if has_supported_setuptools and has_wheel else 1)
+PY
+}
+
+ensure_build_backend() {
+  if build_backend_ready; then
+    return 0
+  fi
+
+  echo "Installing Python build requirements for editable metadata"
+  "${VENV_DIR}/bin/python" -m pip install --upgrade pip "${BUILD_SETUPTOOLS_SPEC}" wheel
+}
+
 clean_inplace_extensions
 if [ ! -f "${VENV_DIR}/bin/python" ]; then
   create_virtualenv
   "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
-  "${VENV_DIR}/bin/python" -m pip install setuptools
-elif ! "${VENV_DIR}/bin/python" - <<'PY' >/dev/null 2>&1
-import importlib.util
-import sys
-
-sys.exit(0 if importlib.util.find_spec("setuptools") is not None else 1)
-PY
-then
-  "${VENV_DIR}/bin/python" -m pip install setuptools
 fi
+ensure_build_backend
 
 CURRENT_INSTALL_HASH="$(install_fingerprint)"
 
