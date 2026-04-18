@@ -87,7 +87,10 @@ def recommend_direct_model(
         effective_memory_mb = max(hardware_info.total_ram_gb, 0.0) * 1024.0
     effective_gb = effective_memory_mb / 1024.0
     model_catalog = setup_direct_model_catalog(cfg)
-    if not hardware_info.has_metal:
+    # Gate unified_memory_only MoE models away from discrete-GPU hosts only.
+    # Apple Silicon (unified memory) and CPU-only hosts (incl. Intel Macs) both
+    # keep all experts in a single fast memory pool, so they can run them.
+    if has_gpu and not hardware_info.has_metal:
         model_catalog = tuple(
             row for row in model_catalog if not bool(row.get("unified_memory_only"))
         )
