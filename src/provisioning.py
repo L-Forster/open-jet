@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import platform
 import shlex
 import shutil
 import stat
+import sys
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -29,7 +33,9 @@ MODELS_DIR = OPENJET_HOME / "models"
 BIN_DIR = OPENJET_HOME / "bin"
 LLAMA_CPP_DIR = Path.home() / "llama.cpp"
 LLAMA_SERVER_BIN = BIN_DIR / "llama-server"
+LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
+LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 LLAMA_CPP_PINNED_REF = "64ac9ab6"
 
 
@@ -225,34 +231,186 @@ async def _sync_managed_llama_cpp_checkout(
     return target_ref
 
 
-async def ensure_llama_server(
-    setup_result: dict[str, Any],
+def _prebuilt_asset_candidates(hardware_info: HardwareInfo) -> list[str]:
+    """Return substrings identifying release assets that match this host.
+
+    The llama.cpp release assets are named like
+    `llama-<tag>-bin-<os>-<variant>-<arch>.zip`. We match by substring so the
+    logic stays robust to minor naming churn.
+
+    Returns an empty list when no prebuilt covers this host (e.g. Linux CUDA or
+    Jetson), which causes the caller to fall back to a source build.
+    """
+    machine = platform.machine().lower()
+    if sys.platform == "darwin":
+        if hardware_info.has_metal:
+            return ["bin-macos-arm64"]
+        return ["bin-macos-x64"]
+    if sys.platform.startswith("linux"):
+        if hardware_info.has_cuda:
+            # Linux CUDA is not distributed as a release asset; build from source.
+            return []
+        if machine in {"x86_64", "amd64"}:
+            if hardware_info.has_vulkan:
+                return ["bin-ubuntu-vulkan-x64"]
+            return ["bin-ubuntu-x64"]
+        if machine in {"aarch64", "arm64"}:
+            return ["bin-ubuntu-arm64"]
+    return []
+
+
+def _installed_llama_server_tag() -> str | None:
+    try:
+        return LLAMA_CPP_TAG_FILE.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+async def _fetch_latest_release_tag_and_assets() -> tuple[str, list[dict[str, Any]]]:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+        headers = {"Accept": "application/vnd.github+json"}
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        response = await client.get(LLAMA_CPP_RELEASES_API, headers=headers)
+        response.raise_for_status()
+        payload = response.json()
+    tag = str(payload.get("tag_name") or "").strip()
+    if not tag:
+        raise RuntimeError("llama.cpp latest release is missing tag_name.")
+    assets = payload.get("assets") or []
+    if not isinstance(assets, list):
+        raise RuntimeError("llama.cpp latest release returned malformed assets.")
+    return tag, assets
+
+
+def _pick_asset(assets: list[dict[str, Any]], candidates: list[str]) -> dict[str, Any] | None:
+    for pattern in candidates:
+        for asset in assets:
+            name = str(asset.get("name") or "")
+            if pattern in name and name.endswith(".zip"):
+                return asset
+    return None
+
+
+async def _download_to_path(
+    url: str,
+    target_path: Path,
+    *,
+    label: str,
+    log: Any,
+    set_status: Callable[[str], None],
+) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    set_status(f"downloading {label}")
+    log.write(f"  [dim]Downloading {label}...[/]")
+    async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            total = response.headers.get("Content-Length")
+            total_bytes = int(total) if total and total.isdigit() else None
+            downloaded = 0
+            last_log_pct = -10
+            last_log_time = time.monotonic()
+            with target_path.open("wb") as fh:
+                async for chunk in response.aiter_bytes():
+                    if not chunk:
+                        continue
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if total_bytes:
+                        pct = max(0, min(100, int(downloaded * 100 / total_bytes)))
+                        now = time.monotonic()
+                        set_status(f"downloading {label} {pct}%")
+                        if pct - last_log_pct >= 20 and now - last_log_time >= 1.0:
+                            log.write(f"  [dim]{pct}% ({_fmt_size(downloaded)} / {_fmt_size(total_bytes)})[/]")
+                            last_log_pct = pct
+                            last_log_time = now
+
+
+def _install_from_zip(archive_path: Path) -> Path:
+    """Extract a llama.cpp release zip, copy binaries into BIN_DIR, return llama-server path."""
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        with zipfile.ZipFile(archive_path) as zf:
+            zf.extractall(tmp)
+        server_candidates = list(tmp.rglob("llama-server")) + list(tmp.rglob("llama-server.exe"))
+        server_candidates = [p for p in server_candidates if p.is_file()]
+        if not server_candidates:
+            raise RuntimeError("llama-server binary not found in downloaded archive.")
+        source_bin_dir = server_candidates[0].parent
+        for entry in source_bin_dir.iterdir():
+            if not entry.is_file():
+                continue
+            dest = BIN_DIR / entry.name
+            shutil.copy2(entry, dest)
+            if entry.name.startswith("llama-") and not entry.suffix:
+                dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    installed = BIN_DIR / "llama-server"
+    if not installed.is_file():
+        raise RuntimeError("llama-server was not installed correctly.")
+    installed.chmod(installed.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if sys.platform == "darwin":
+        # Strip quarantine so Gatekeeper doesn't block first launch.
+        os.system(f"xattr -dr com.apple.quarantine {shlex.quote(str(BIN_DIR))} 2>/dev/null")
+    return installed
+
+
+async def _install_prebuilt_llama_server(
+    hardware_info: HardwareInfo,
+    *,
+    log: Any,
+    set_status: Callable[[str], None],
+) -> tuple[Path, str] | None:
+    candidates = _prebuilt_asset_candidates(hardware_info)
+    if not candidates:
+        return None
+    try:
+        tag, assets = await _fetch_latest_release_tag_and_assets()
+    except Exception as exc:
+        log.write(f"  [dim]Could not reach llama.cpp releases API ({exc}); will build from source.[/]")
+        return None
+    asset = _pick_asset(assets, candidates)
+    if asset is None:
+        log.write(f"  [dim]No prebuilt asset matches this host for {tag}; will build from source.[/]")
+        return None
+    url = str(asset.get("browser_download_url") or "")
+    if not url:
+        return None
+    set_status(f"downloading llama-server {tag}")
+    log.write(f"[bold bright_white]Downloading prebuilt llama-server {tag}...[/]")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive = Path(tmpdir) / str(asset.get("name") or "llama-cpp.zip")
+        try:
+            await _download_to_path(
+                url,
+                archive,
+                label=str(asset.get("name") or "llama.cpp release"),
+                log=log,
+                set_status=set_status,
+            )
+        except Exception as exc:
+            log.write(f"  [dim]Download failed ({exc}); will build from source.[/]")
+            return None
+        try:
+            installed = _install_from_zip(archive)
+        except Exception as exc:
+            log.write(f"  [dim]Install failed ({exc}); will build from source.[/]")
+            return None
+    LLAMA_CPP_TAG_FILE.write_text(tag, encoding="utf-8")
+    log.write(f"[bold bright_white]llama-server {tag} installed.[/]")
+    return installed, tag
+
+
+async def _build_llama_server_from_source(
     *,
     hardware_info: HardwareInfo,
+    rebuilding: bool,
     log: Any,
     set_status: Callable[[str], None],
     clear_status: Callable[[], None],
-) -> dict[str, Any]:
-    existing = current_llama_server_path()
-    managed_binary = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
-    existing_is_managed = existing is not None and Path(existing).resolve() == managed_binary.resolve()
-
-    target_ref = managed_llama_cpp_ref()
-    current_managed_ref = None
-    if (LLAMA_CPP_DIR / ".git").is_dir():
-        rc, out, _err = await _run_exec("git", "rev-parse", "HEAD", cwd=LLAMA_CPP_DIR)
-        if rc == 0:
-            current_managed_ref = out.strip()
-
-    managed_ref_mismatch = existing_is_managed and current_managed_ref not in {None, target_ref}
-
-    if existing and not _needs_rebuild(hardware_info, existing) and not managed_ref_mismatch:
-        merged = dict(setup_result)
-        merged["llama_server_path"] = existing
-        merged["setup_missing_runtime"] = False
-        return merged
-
-    rebuilding = existing is not None
+) -> tuple[Path, str]:
     if rebuilding:
         set_status("rebuilding llama-server for GPU support")
         log.write("[bold bright_white]Rebuilding llama-server for GPU support...[/]")
@@ -286,6 +444,62 @@ async def ensure_llama_server(
     built = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
     if not built.is_file():
         raise RuntimeError("llama-server build completed but binary was not found.")
+    return built, synced_ref
+
+
+async def ensure_llama_server(
+    setup_result: dict[str, Any],
+    *,
+    hardware_info: HardwareInfo,
+    log: Any,
+    set_status: Callable[[str], None],
+    clear_status: Callable[[], None],
+) -> dict[str, Any]:
+    # Cache hit: managed binary + tag file present and binary doesn't need a GPU rebuild.
+    if LLAMA_SERVER_BIN.is_file() and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN)):
+        cached_tag = _installed_llama_server_tag()
+        if cached_tag:
+            merged = dict(setup_result)
+            merged["llama_server_path"] = str(LLAMA_SERVER_BIN)
+            merged["setup_missing_runtime"] = False
+            merged["llama_cpp_ref"] = cached_tag
+            return merged
+
+    # Legacy source-built binary on PATH or at the old location that still works.
+    existing = current_llama_server_path()
+    managed_source_binary = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
+    existing_is_source_managed = (
+        existing is not None and Path(existing).resolve() == managed_source_binary.resolve()
+    )
+    if existing and not existing_is_source_managed and not _needs_rebuild(hardware_info, existing):
+        merged = dict(setup_result)
+        merged["llama_server_path"] = existing
+        merged["setup_missing_runtime"] = False
+        return merged
+
+    rebuilding = existing is not None
+
+    prebuilt = await _install_prebuilt_llama_server(
+        hardware_info,
+        log=log,
+        set_status=set_status,
+    )
+    if prebuilt is not None:
+        clear_status()
+        installed_path, tag = prebuilt
+        merged = dict(setup_result)
+        merged["llama_server_path"] = str(installed_path)
+        merged["setup_missing_runtime"] = False
+        merged["llama_cpp_ref"] = tag
+        return merged
+
+    built, synced_ref = await _build_llama_server_from_source(
+        hardware_info=hardware_info,
+        rebuilding=rebuilding,
+        log=log,
+        set_status=set_status,
+        clear_status=clear_status,
+    )
     merged = dict(setup_result)
     merged["llama_server_path"] = str(built)
     merged["setup_missing_runtime"] = False
