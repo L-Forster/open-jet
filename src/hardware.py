@@ -56,8 +56,21 @@ def _detect_vulkan() -> bool:
     return False
 
 
+def _darwin_sysctl(name: str) -> str:
+    try:
+        return subprocess.check_output(["sysctl", "-n", name], text=True, timeout=5).strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def _detect_metal() -> bool:
-    return sys.platform == "darwin" and platform.machine() == "arm64"
+    if sys.platform != "darwin":
+        return False
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return True
+    # Under Rosetta, Python can report x86_64 even on Apple Silicon.
+    return _darwin_sysctl("hw.optional.arm64") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -281,14 +294,9 @@ def recommended_device() -> str:
 
 def read_device_model() -> str | None:
     if sys.platform == "darwin":
-        try:
-            chip = subprocess.check_output(
-                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, timeout=5,
-            ).strip()
-            if chip:
-                return chip
-        except (OSError, subprocess.SubprocessError):
-            pass
+        chip = _darwin_sysctl("machdep.cpu.brand_string")
+        if chip:
+            return chip
         return f"Apple {platform.machine()}"
     try:
         raw = Path("/proc/device-tree/model").read_bytes()

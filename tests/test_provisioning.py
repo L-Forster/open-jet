@@ -6,10 +6,22 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.hardware import HardwareInfo
-from src.provisioning import ensure_llama_server
+from src.provisioning import ensure_llama_server, recommend_direct_model
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
+    def test_recommend_direct_model_prefers_unified_memory_moe_on_metal(self) -> None:
+        hardware = HardwareInfo(
+            label="Apple M-series",
+            total_ram_gb=32.0,
+            has_cuda=False,
+            has_metal=True,
+        )
+
+        direct = recommend_direct_model(hardware)
+
+        self.assertEqual(direct["label"], "Qwen3.6 35B A3B")
+
     async def test_ensure_llama_server_records_pinned_llama_cpp_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             llama_dir = Path(tmp) / "llama.cpp"
