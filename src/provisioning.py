@@ -219,6 +219,45 @@ async def _run_exec(*args: str, cwd: Path | None = None) -> tuple[int, str, str]
     return proc.returncode or 0, out_raw.decode(errors="replace"), err_raw.decode(errors="replace")
 
 
+_BUILD_PROGRESS_RE = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]")
+
+
+async def _run_build_with_progress(
+    *args: str,
+    cwd: Path,
+    set_status: Callable[[str], None],
+    log: Any,
+) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    tail: list[str] = []
+    last_logged_pct = -1
+    assert proc.stdout is not None
+    while True:
+        raw = await proc.stdout.readline()
+        if not raw:
+            break
+        line = raw.decode(errors="replace").rstrip()
+        tail.append(line)
+        if len(tail) > 200:
+            del tail[: len(tail) - 200]
+        match = _BUILD_PROGRESS_RE.search(line)
+        if match:
+            n, m = int(match.group(1)), int(match.group(2))
+            set_status(f"building llama-server {n}/{m}")
+            if m > 0:
+                pct = int(n * 100 / m)
+                if pct - last_logged_pct >= 25 and pct < 100:
+                    log.write(f"  [dim]Building llama-server {pct}% ({n}/{m})...[/]")
+                    last_logged_pct = pct
+    await proc.wait()
+    return proc.returncode or 0, "\n".join(tail)
+
+
 def _parse_huggingface_resolve_url(url: str) -> tuple[str, str, str] | None:
     parsed = urlparse(url)
     if parsed.netloc.lower() not in {"huggingface.co", "www.huggingface.co"}:
@@ -641,10 +680,15 @@ async def _build_llama_server_from_source(
     set_status("building llama-server (this may take a few minutes)")
     log.write("  [dim]Building llama-server (this may take a few minutes)...[/]")
     jobs = os.cpu_count() or 4
-    rc, out, err = await _run_exec("cmake", "--build", ".", "--target", "llama-server", f"-j{jobs}", cwd=build_dir)
+    rc, tail = await _run_build_with_progress(
+        "cmake", "--build", ".", "--target", "llama-server", f"-j{jobs}",
+        cwd=build_dir,
+        set_status=set_status,
+        log=log,
+    )
     clear_status()
     if rc != 0:
-        raise RuntimeError((err or out).strip() or "Failed to build llama-server")
+        raise RuntimeError(tail.strip() or "Failed to build llama-server")
     log.write("[bold bright_white]llama-server built successfully.[/]")
 
     built = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
