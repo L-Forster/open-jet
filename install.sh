@@ -46,7 +46,12 @@ path_has_dir() {
 }
 
 clean_inplace_extensions() {
-  mapfile -t built_exts < <(find "${ROOT_DIR}/src" -maxdepth 1 \( -name '*.so' -o -name '*.pyd' \) -type f | sort)
+  local built_exts=()
+  local artifact
+  while IFS= read -r artifact; do
+    built_exts+=("${artifact}")
+  done < <(find "${ROOT_DIR}/src" -maxdepth 1 \( -name '*.so' -o -name '*.pyd' \) -type f | sort)
+
   if ((${#built_exts[@]} == 0)); then
     return 0
   fi

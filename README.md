@@ -27,6 +27,13 @@ cd open-jet
 open-jet setup
 ```
 
+On macOS, you can use the macOS entry point:
+
+```bash
+./install-macos.sh
+open-jet setup
+```
+
 That's it. Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
 
 Then just:

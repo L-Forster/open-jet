@@ -8,6 +8,12 @@ cd open-jet
 ./install.sh
 ```
 
+On macOS, use:
+
+```bash
+./install-macos.sh
+```
+
 This creates a local virtualenv, installs the repo, and links `open-jet` / `openjet` into `~/.local/bin`.
 It is an editable Python install, not a compiled release build.
 
