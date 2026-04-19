@@ -170,6 +170,9 @@ else
   echo "Skipping pip install: ${INSTALL_REASON}"
 fi
 
+"${VENV_DIR}/bin/python" -m pip install --quiet --disable-pip-version-check hf_transfer 'huggingface_hub[hf_transfer]' || \
+  echo "warning: could not install hf_transfer; downloads will fall back to single-stream"
+
 if [ "${RUN_PROVISION}" -eq 1 ] && "${VENV_DIR}/bin/python" - <<'PY'
 from src.observation.processors import provision_default_faster_whisper_model
 raise SystemExit(0 if provision_default_faster_whisper_model() else 1)
