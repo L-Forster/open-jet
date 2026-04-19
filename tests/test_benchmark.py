@@ -1,4 +1,4 @@
-no Dfrom __future__ import annotations
+from __future__ import annotations
 
 import tempfile
 import unittest
