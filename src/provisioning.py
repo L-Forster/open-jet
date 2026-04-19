@@ -22,7 +22,7 @@ import httpx
 
 from .app_paths import openjet_install_root
 from .config import setup_direct_model_catalog
-from .hardware import HardwareInfo, is_jetson_label, recommended_context_window_tokens_from_total
+from .hardware import HardwareInfo, is_jetson_label, recommended_context_window_tokens_from_total, running_on_jetson
 from .setup_memory import recommend_context_window_for_model
 
 def _fmt_size(nbytes: int) -> str:
@@ -170,8 +170,8 @@ def recommend_direct_model(
     cfg: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     model_catalog = setup_direct_model_catalog(cfg)
-    has_gpu = hardware_info.has_cuda or hardware_info.has_rocm or hardware_info.has_vulkan
-    if not has_gpu and not hardware_info.has_metal:
+    unified_memory = hardware_info.has_metal or running_on_jetson()
+    if not unified_memory:
         model_catalog = tuple(
             row for row in model_catalog if not _is_moe_catalog_row(row)
         )

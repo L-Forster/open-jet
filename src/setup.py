@@ -361,6 +361,9 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
             payload[key] = row[key]
     if "unified_memory_only" in row:
         payload["unified_memory_only"] = bool(row.get("unified_memory_only"))
+    if bool(row.get("unified_memory_only")) and row.get("active_model_size_mb") is not None:
+        payload["llama_cpu_moe"] = False
+        payload["llama_n_cpu_moe"] = 0
     return payload
 
 

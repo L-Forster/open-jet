@@ -11,15 +11,11 @@ llama_server_path: /home/you/llama.cpp/build/bin/llama-server
 context_window_tokens: 4096
 device: cuda
 gpu_layers: 99
-llama_cpu_moe: false
-llama_n_cpu_moe: 0
 ```
 
 `llama_server_path` is optional. Setup will populate it automatically when it provisions or discovers `llama-server`.
 
 If setup starts from a direct GGUF download, it will download into the OpenJet models directory and then persist the resolved `llama_model` path for future runs.
-
-For MoE GGUFs, `llama_cpu_moe: true` passes `--cpu-moe` to `llama-server`, keeping all routed expert weights in system RAM while GPU-offloaded compute still runs on the GPU. `llama_n_cpu_moe: N` passes `--n-cpu-moe N`, keeping routed experts for the first `N` layers in system RAM. Leave `llama_cpu_moe` false when using `llama_n_cpu_moe`; if both are set, `--cpu-moe` wins.
 
 You can override the setup wizard's direct-download recommendations in `config.yaml`:
 

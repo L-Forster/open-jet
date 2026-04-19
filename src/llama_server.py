@@ -44,8 +44,6 @@ class LlamaServerClient:
         context_window_tokens: int = 2048,
         device: str = "auto",
         gpu_layers: int = 99,
-        cpu_moe: bool = False,
-        n_cpu_moe: int = 0,
         airgapped: bool = False,
         diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -55,8 +53,6 @@ class LlamaServerClient:
         self.context_window_tokens = max(512, int(context_window_tokens))
         self.device = device.strip().lower() if device else "auto"
         self.gpu_layers = max(0, int(gpu_layers))
-        self.cpu_moe = bool(cpu_moe)
-        self.n_cpu_moe = max(0, int(n_cpu_moe))
         self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=30.0))
@@ -284,8 +280,6 @@ class LlamaServerClient:
                 fit_off=fit_off,
                 no_warmup=no_warmup,
                 no_mmap=no_mmap,
-                cpu_moe=self.cpu_moe,
-                n_cpu_moe=self.n_cpu_moe,
                 jetson_platform=self._is_jetson_platform(),
                 airgapped=self.airgapped,
                 **startup_snapshot,
@@ -300,8 +294,6 @@ class LlamaServerClient:
                 fit_off=fit_off,
                 no_warmup=no_warmup,
                 no_mmap=no_mmap,
-                cpu_moe=self.cpu_moe,
-                n_cpu_moe=self.n_cpu_moe,
             )
             self.gpu_layers = requested_ngl
             self.context_window_tokens = requested_ctx
@@ -318,8 +310,6 @@ class LlamaServerClient:
         fit_off: bool,
         no_warmup: bool,
         no_mmap: bool,
-        cpu_moe: bool,
-        n_cpu_moe: int,
     ) -> None:
         # Ensure swap state directory exists for KV cache save/restore.
         slot_save_dir = Path(".openjet/state/swap")
@@ -343,10 +333,6 @@ class LlamaServerClient:
             cmd.extend(["--fit", "off"])
         if no_warmup:
             cmd.append("--no-warmup")
-        if cpu_moe:
-            cmd.append("--cpu-moe")
-        elif n_cpu_moe > 0:
-            cmd.extend(["--n-cpu-moe", str(n_cpu_moe)])
         cmd.extend(["--flash-attn", "on", "-ctk", "q8_0", "-ctv", "q8_0"])
         cmd.extend([
             "-b",
@@ -368,8 +354,6 @@ class LlamaServerClient:
             fit_off=fit_off,
             no_warmup=no_warmup,
             no_mmap=no_mmap,
-            cpu_moe=cpu_moe,
-            n_cpu_moe=n_cpu_moe,
             cuda_module_loading=env.get("CUDA_MODULE_LOADING", ""),
             ggml_cuda_enable_unified_memory=env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY", ""),
             ggml_cuda_vmm_chunk_mb=env.get("GGML_CUDA_VMM_CHUNK_MB", ""),
