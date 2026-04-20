@@ -216,12 +216,12 @@ class LlamaServerClient:
         return snapshot
 
     @staticmethod
-    def _startup_profile_for_lfb(lfb_mb: float | None) -> tuple[int, int, bool, bool, bool]:
+    def _startup_profile_for_lfb(lfb_mb: float | None) -> tuple[int, int, str, bool, bool]:
         if lfb_mb is not None and lfb_mb < _FRAGMENTED_LFB_MB:
-            return (128, 32, True, True, True)
+            return (128, 32, "off", True, True)
         # Match llama.cpp's normal defaults unless we detect fragmentation severe
         # enough to warrant the small-footprint startup path.
-        return (2048, 512, False, False, False)
+        return (2048, 512, "on", False, False)
 
     async def _prepare_memory_for_launch(self) -> float | None:
         lfb_mb = self._largest_free_block_mb()
@@ -267,7 +267,7 @@ class LlamaServerClient:
                 model_max_context = _max_context_tokens_from_gguf(model_path)
                 if model_max_context is not None and model_max_context > 0:
                     requested_ctx = min(requested_ctx, model_max_context)
-            batch, ubatch, fit_off, no_warmup, no_mmap = self._startup_profile_for_lfb(lfb_mb)
+            batch, ubatch, fit_mode, no_warmup, no_mmap = self._startup_profile_for_lfb(lfb_mb)
             startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
             self._emit_diagnostic(
                 "runtime_llama_starting",
@@ -277,7 +277,7 @@ class LlamaServerClient:
                 requested_ngl=requested_ngl,
                 batch=batch,
                 ubatch=ubatch,
-                fit_off=fit_off,
+                fit_mode=fit_mode,
                 no_warmup=no_warmup,
                 no_mmap=no_mmap,
                 jetson_platform=self._is_jetson_platform(),
@@ -291,7 +291,7 @@ class LlamaServerClient:
                 ctx=requested_ctx,
                 batch=batch,
                 ubatch=ubatch,
-                fit_off=fit_off,
+                fit_mode=fit_mode,
                 no_warmup=no_warmup,
                 no_mmap=no_mmap,
             )
@@ -307,7 +307,7 @@ class LlamaServerClient:
         ctx: int,
         batch: int,
         ubatch: int,
-        fit_off: bool,
+        fit_mode: str,
         no_warmup: bool,
         no_mmap: bool,
     ) -> None:
@@ -329,8 +329,8 @@ class LlamaServerClient:
         ]
         if no_mmap:
             cmd.append("--no-mmap")
-        if fit_off:
-            cmd.extend(["--fit", "off"])
+        if fit_mode:
+            cmd.extend(["--fit", fit_mode])
         if no_warmup:
             cmd.append("--no-warmup")
         cmd.extend(["--flash-attn", "on", "-ctk", "q8_0", "-ctv", "q8_0"])
@@ -351,7 +351,7 @@ class LlamaServerClient:
             ngl=ngl,
             batch=batch,
             ubatch=ubatch,
-            fit_off=fit_off,
+            fit_mode=fit_mode,
             no_warmup=no_warmup,
             no_mmap=no_mmap,
             cuda_module_loading=env.get("CUDA_MODULE_LOADING", ""),
@@ -389,7 +389,7 @@ class LlamaServerClient:
                     ngl=ngl,
                     batch=batch,
                     ubatch=ubatch,
-                    fit_off=fit_off,
+                    fit_mode=fit_mode,
                     no_warmup=no_warmup,
                     returncode=self._proc.returncode,
                     stderr_line_count=len(stderr_lines),

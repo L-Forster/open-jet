@@ -769,6 +769,22 @@ class OpenJetApp:
     def _runtime_diagnostic(self, event_type: str, data: dict[str, object]) -> None:
         if self.session_logger:
             self.session_logger.log_event(event_type, **data)
+        if event_type != "runtime_llama_start_ready":
+            return
+        changed = False
+        if "ctx" in data:
+            ctx = int(data["ctx"])
+            if int(self.cfg.get("context_window_tokens", 0) or 0) != ctx:
+                self.cfg["context_window_tokens"] = ctx
+                changed = True
+        if "ngl" in data:
+            gpu_layers = int(data["ngl"])
+            if int(self.cfg.get("gpu_layers", -1) or -1) != gpu_layers:
+                self.cfg["gpu_layers"] = gpu_layers
+                changed = True
+        if changed:
+            sync_active_model_profile(self.cfg)
+            save_config(self.cfg)
 
     async def _materialize_setup_model(self, setup_result: dict, log: LogView) -> dict:
         status = self.query_one("#assistant-status")

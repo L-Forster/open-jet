@@ -1215,6 +1215,34 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("system_prompt", app.cfg)
 
+    def test_runtime_ready_diagnostic_persists_resolved_llama_config(self) -> None:
+        app = OpenJetApp()
+        app.cfg.update(
+            {
+                "active_model_profile": "Base",
+                "llama_model": "/models/base.gguf",
+                "model_profiles": [
+                    {
+                        "name": "Base",
+                        "llama_model": "/models/base.gguf",
+                        "context_window_tokens": 65536,
+                        "gpu_layers": 99,
+                    }
+                ],
+                "context_window_tokens": 65536,
+                "gpu_layers": 99,
+            }
+        )
+
+        with patch("src.app.save_config") as save_cfg:
+            app._runtime_diagnostic("runtime_llama_start_ready", {"ctx": 8192, "ngl": 70})
+
+        self.assertEqual(app.cfg["context_window_tokens"], 8192)
+        self.assertEqual(app.cfg["gpu_layers"], 70)
+        self.assertEqual(app.cfg["model_profiles"][0]["context_window_tokens"], 8192)
+        self.assertEqual(app.cfg["model_profiles"][0]["gpu_layers"], 70)
+        save_cfg.assert_called_once_with(app.cfg)
+
 
 class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_command_switches_to_saved_profile(self) -> None:
@@ -1921,12 +1949,12 @@ class LlamaServerStartupTests(unittest.TestCase):
     def test_startup_profile_uses_fit_off_and_no_warmup_when_fragmented(self) -> None:
         profile = LlamaServerClient._startup_profile_for_lfb(4.0)
 
-        self.assertEqual(profile, (128, 32, True, True, True))
+        self.assertEqual(profile, (128, 32, "off", True, True))
 
-    def test_startup_profile_uses_llama_defaults_when_memory_is_not_fragmented(self) -> None:
+    def test_startup_profile_uses_fit_on_when_memory_is_not_fragmented(self) -> None:
         profile = LlamaServerClient._startup_profile_for_lfb(None)
 
-        self.assertEqual(profile, (2048, 512, False, False, False))
+        self.assertEqual(profile, (2048, 512, "on", False, False))
 
 
 class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
@@ -2082,7 +2110,7 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
                     ctx=6144,
                     batch=128,
                     ubatch=32,
-                    fit_off=True,
+                    fit_mode="off",
                     no_warmup=False,
                     no_mmap=True,
                 )
@@ -2093,6 +2121,37 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failure["ngl"], 99)
         self.assertIn("CUDA error: out of memory", failure["error"])
         self.assertIn("NvMapMemAllocInternalTagged: 1075072515 error 12", failure["stderr_tail"])
+
+    async def test_start_once_passes_fit_mode_to_llama_server(self) -> None:
+        client = LlamaServerClient(model="model.gguf")
+
+        class _FakeStream:
+            async def readline(self) -> bytes:
+                await asyncio.sleep(0)
+                return b""
+
+        proc = SimpleNamespace(returncode=None, pid=4321, stderr=_FakeStream())
+
+        async def fake_get(url: str):
+            return SimpleNamespace(status_code=200)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as create_proc:
+            client._http.get = AsyncMock(side_effect=fake_get)  # type: ignore[method-assign]
+            await client._start_once(
+                binary="/usr/bin/llama-server",
+                env={},
+                ngl=99,
+                ctx=6144,
+                batch=2048,
+                ubatch=512,
+                fit_mode="on",
+                no_warmup=False,
+                no_mmap=False,
+            )
+
+        cmd = create_proc.await_args.args
+        self.assertIn("--fit", cmd)
+        self.assertEqual(cmd[cmd.index("--fit") + 1], "on")
 
 class DebugPromptLoggingTests(unittest.TestCase):
     def test_prepare_turn_context_saves_full_runtime_messages_in_debug_mode(self) -> None:
