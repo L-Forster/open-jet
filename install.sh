@@ -170,7 +170,7 @@ else
   echo "Skipping pip install: ${INSTALL_REASON}"
 fi
 
-"${VENV_DIR}/bin/python" -m pip install --quiet --disable-pip-version-check hf_transfer 'huggingface_hub[hf_transfer]' || \
+"${VENV_DIR}/bin/python" -m pip install --quiet --disable-pip-version-check hf_transfer 'huggingface_hub>=0.25' || \
   echo "warning: could not install hf_transfer; downloads will fall back to single-stream"
 
 if [ "${RUN_PROVISION}" -eq 1 ] && "${VENV_DIR}/bin/python" - <<'PY'

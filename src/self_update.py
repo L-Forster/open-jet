@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -106,6 +108,8 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     git_dir = LLAMA_CPP_DIR / ".git"
     if not git_dir.is_dir():
         return None
+    if sys.platform == "darwin":
+        return None
 
     status = _has_tracked_changes(LLAMA_CPP_DIR)
     if status is None:
@@ -123,6 +127,8 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     needs_rebuild = not binary.is_file() or _needs_rebuild(hardware_info, str(binary))
     if current_ref == target_ref and not needs_rebuild:
         return None
+    if shutil.which("cmake") is None:
+        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet --setup`.")
 
     try:
         subprocess.run(

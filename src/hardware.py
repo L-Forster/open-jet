@@ -58,7 +58,12 @@ def _detect_vulkan() -> bool:
 
 def _darwin_sysctl(name: str) -> str:
     try:
-        return subprocess.check_output(["sysctl", "-n", name], text=True, timeout=5).strip()
+        return subprocess.check_output(
+            ["sysctl", "-n", name],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        ).strip()
     except (OSError, subprocess.SubprocessError):
         return ""
 

@@ -22,7 +22,7 @@ import httpx
 
 from .app_paths import openjet_install_root
 from .config import setup_direct_model_catalog
-from .hardware import HardwareInfo, is_jetson_label, recommended_context_window_tokens_from_total, running_on_jetson
+from .hardware import HardwareInfo, _darwin_sysctl, is_jetson_label, recommended_context_window_tokens_from_total, running_on_jetson
 from .setup_memory import recommend_context_window_for_model
 
 def _fmt_size(nbytes: int) -> str:
@@ -523,9 +523,9 @@ def _prebuilt_asset_candidates(hardware_info: HardwareInfo) -> list[str]:
     """
     machine = platform.machine().lower()
     if sys.platform == "darwin":
-        if hardware_info.has_metal:
-            return ["bin-macos-arm64"]
-        return ["bin-macos-x64"]
+        if machine in {"arm64", "aarch64"} or _darwin_sysctl("hw.optional.arm64") == "1":
+            return ["bin-macos-arm64.tar.gz"]
+        return ["bin-macos-x64.tar.gz"]
     if sys.platform.startswith("linux"):
         if hardware_info.has_cuda:
             # Linux CUDA is not distributed as a release asset; build from source.
@@ -663,11 +663,11 @@ async def _install_prebuilt_llama_server(
     try:
         tag, assets = await _fetch_latest_release_tag_and_assets()
     except Exception as exc:
-        log.write(f"  [dim]Could not reach llama.cpp releases API ({exc}); will build from source.[/]")
+        log.write(f"  [dim]Could not reach llama.cpp releases API ({exc}).[/]")
         return None
     asset = _pick_asset(assets, candidates)
     if asset is None:
-        log.write(f"  [dim]No prebuilt asset matches this host for {tag}; will build from source.[/]")
+        log.write(f"  [dim]No prebuilt asset matches this host for {tag}.[/]")
         return None
     url = str(asset.get("browser_download_url") or "")
     if not url:
@@ -685,12 +685,12 @@ async def _install_prebuilt_llama_server(
                 set_status=set_status,
             )
         except Exception as exc:
-            log.write(f"  [dim]Download failed ({exc}); will build from source.[/]")
+            log.write(f"  [dim]Download failed ({exc}).[/]")
             return None
         try:
             installed = _install_from_archive(archive)
         except Exception as exc:
-            log.write(f"  [dim]Install failed ({exc}); will build from source.[/]")
+            log.write(f"  [dim]Install failed ({exc}).[/]")
             return None
     LLAMA_CPP_TAG_FILE.write_text(tag, encoding="utf-8")
     log.write(f"[bold bright_white]llama-server {tag} installed.[/]")
@@ -705,6 +705,8 @@ async def _build_llama_server_from_source(
     set_status: Callable[[str], None],
     clear_status: Callable[[], None],
 ) -> tuple[Path, str]:
+    if shutil.which("cmake") is None:
+        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet --setup`.")
     if rebuilding:
         set_status("rebuilding llama-server for GPU support")
         log.write("[bold bright_white]Rebuilding llama-server for GPU support...[/]")
@@ -792,6 +794,9 @@ async def ensure_llama_server(
         merged["setup_missing_runtime"] = False
         merged["llama_cpp_ref"] = tag
         return merged
+
+    if sys.platform == "darwin":
+        raise RuntimeError("Failed to install the macOS prebuilt llama-server.")
 
     built, synced_ref = await _build_llama_server_from_source(
         hardware_info=hardware_info,
