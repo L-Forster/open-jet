@@ -20,7 +20,7 @@ On Windows, run:
 curl -L https://www.openjet.dev/install.bat -o install.bat && install.bat
 ```
 
-This creates a local virtualenv, installs the repo, creates `openjet` / `open-jet` command launchers, and starts setup.
+This creates a local virtualenv, installs the repo, creates `openjet` / `openjet` command launchers, and starts setup.
 It is an editable Python install, not a compiled release build.
 
 If stale in-place compiled extension artifacts exist under `src/`, the installer removes them so imports continue to use the source tree.
@@ -44,7 +44,7 @@ OpenJet is local-only. It uses `llama-server` from `llama.cpp` with GGUF models.
 Start with:
 
 ```bash
-open-jet setup
+openjet setup
 ```
 
 OpenJet will first try to reuse an existing local setup. If pieces are missing, setup can provision them for you.

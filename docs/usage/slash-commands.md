@@ -28,8 +28,8 @@
 Persistent device setup is usually clearer from the regular CLI:
 
 ```bash
-open-jet device list
-open-jet device add <existing_id> <new_id>
-open-jet device on <id>
-open-jet device off <id>
+openjet device list
+openjet device add <existing_id> <new_id>
+openjet device on <id>
+openjet device off <id>
 ```

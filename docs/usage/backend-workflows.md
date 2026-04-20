@@ -31,32 +31,32 @@ If no useful reading is available, say so clearly.
 List discovered workflows:
 
 ```bash
-open-jet workflow list
+openjet workflow list
 ```
 
 Run a workflow once:
 
 ```bash
-open-jet workflow run smoke
+openjet workflow run smoke
 ```
 
 Start it as a background runner:
 
 ```bash
-open-jet workflow start smoke
+openjet workflow start smoke
 ```
 
 Check status and logs:
 
 ```bash
-open-jet workflow status smoke
-open-jet workflow logs smoke
+openjet workflow status smoke
+openjet workflow logs smoke
 ```
 
 Stop it immediately:
 
 ```bash
-open-jet workflow stop smoke
+openjet workflow stop smoke
 ```
 
 ## Markdown Contract
@@ -112,19 +112,19 @@ Workflows can bind devices three ways, in this precedence order:
 1. CLI override:
 
 ```bash
-open-jet workflow run smoke --device gpio0
-open-jet workflow start smoke --device camera0
+openjet workflow run smoke --device gpio0
+openjet workflow start smoke --device camera0
 ```
 
 2. Saved local assignment:
 
 ```bash
-open-jet workflow assign smoke gpio0 camera0
+openjet workflow assign smoke gpio0 camera0
 ```
 
 3. `devices:` in the workflow frontmatter
 
-Use `open-jet device list` first so you do not have to guess ids.
+Use `openjet device list` first so you do not have to guess ids.
 
 ## Tool Policy
 
@@ -139,15 +139,15 @@ Shell is available only when `allow_shell: true`.
 
 ## Stop Semantics
 
-`open-jet workflow stop <name>` is intended to stop the background runner immediately.
+`openjet workflow stop <name>` is intended to stop the background runner immediately.
 
 The stop path terminates the detached workflow process and, if needed, force-kills it so state does not remain stuck in `running`.
 
 ## Typical Flow
 
-1. Add or rename devices with `open-jet device ...`
+1. Add or rename devices with `openjet device ...`
 2. Create `workflows/<name>.md`
-3. Run `open-jet workflow list`
-4. Test with `open-jet workflow run <name>`
-5. Start background mode with `open-jet workflow start <name>`
+3. Run `openjet workflow list`
+4. Test with `openjet workflow run <name>`
+5. Start background mode with `openjet workflow start <name>`
 6. Inspect `status`, `logs`, and `last-run.md`

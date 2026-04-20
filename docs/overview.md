@@ -9,9 +9,9 @@ Use this when you want an interactive local coding agent in your terminal.
 Primary entrypoints:
 
 ```bash
-open-jet
-open-jet chat
-open-jet chat Explain the repo layout briefly.
+openjet
+openjet chat
+openjet chat Explain the repo layout briefly.
 ```
 
 This surface is for:
@@ -58,8 +58,8 @@ currently configured model profile.
 Primary entrypoints:
 
 ```bash
-open-jet benchmark
-open-jet benchmark --sweep
+openjet benchmark
+openjet benchmark --sweep
 ```
 
 This surface is for:
@@ -85,9 +85,9 @@ OpenJet keeps these surfaces in one repo because they share:
 
 That keeps the product coherent for users:
 
-- use `open-jet` for the app
+- use `openjet` for the app
 - import `openjet.sdk` to build on it
-- run `open-jet benchmark` to measure it
+- run `openjet benchmark` to measure it
 
 ## When to split packages later
 
@@ -95,7 +95,7 @@ Keep one repo unless a surface grows into a clearly separate product.
 
 The likely future split is packaging, not repositories:
 
-- `open-jet` for the main CLI + SDK distribution
+- `openjet` for the main CLI + SDK distribution
 - `openjet-benchmark` as an optional package if benchmarking grows a larger independent audience
 
 If that happens, keep the same docs and brand architecture so the surfaces still

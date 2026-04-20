@@ -25,7 +25,7 @@ Manual fallback is still available if you want explicit control:
 Then run your other task while the model is not resident in memory, and relaunch with:
 
 ```bash
-open-jet
+openjet
 ```
 
 ## 2) Unload model for a heavy task, then reload and continue analysis
@@ -35,7 +35,7 @@ A practical low-memory flow:
 1. Run inference and capture outputs to files.
 2. Let OpenJet auto-unload/reload runtime around a heavy shell task when memory is tight.
 3. If needed, force manual unload with `/exit`, then run the heavy non-LLM task.
-4. Start OpenJet again with `open-jet` (manual path only).
+4. Start OpenJet again with `openjet` (manual path only).
 5. Recover analysis context with:
 
 ```text
@@ -84,10 +84,10 @@ This is useful for inventory, validation, and hardware triage in multi-device de
 ### CLI helpers
 
 ```bash
-open-jet status
-open-jet models
-open-jet commands
-open-jet benchmark --sweep
+openjet status
+openjet models
+openjet commands
+openjet benchmark --sweep
 ```
 
 ### Python SDK orchestration
@@ -117,8 +117,8 @@ This lets you compose OpenJet with schedulers, CI jobs, robotics pipelines, or o
 When you want to compare the currently configured runtime shape on one machine:
 
 ```bash
-open-jet benchmark
-open-jet benchmark --sweep
+openjet benchmark
+openjet benchmark --sweep
 ```
 
 This is useful for:

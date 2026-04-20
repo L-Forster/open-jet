@@ -1,6 +1,6 @@
 # Telemetry
 
-`open-jet` emits real OpenTelemetry logs, traces, and metrics. The app does not write its own telemetry files anymore; it exports OTLP/HTTP to an OpenTelemetry Collector when telemetry is enabled.
+`openjet` emits real OpenTelemetry logs, traces, and metrics. The app does not write its own telemetry files anymore; it exports OTLP/HTTP to an OpenTelemetry Collector when telemetry is enabled.
 
 ## What is sent
 
@@ -49,7 +49,7 @@ telemetry:
       x-api-key: your-token
 ```
 
-`telemetry.broadcast.endpoint` is the collector base URL. `open-jet` appends `/v1/logs`, `/v1/metrics`, and `/v1/traces`.
+`telemetry.broadcast.endpoint` is the collector base URL. `openjet` appends `/v1/logs`, `/v1/metrics`, and `/v1/traces`.
 
 `logging.directory` now stores session manifests only under `.openjet/state/` by default. Telemetry signal storage belongs to the collector and its configured exporters.
 
@@ -76,7 +76,7 @@ Use an OpenTelemetry Collector as the ingress service.
 
 Recommended flow:
 
-1. `open-jet` sends OTLP/HTTP to the collector.
+1. `openjet` sends OTLP/HTTP to the collector.
 2. The collector batches, filters, retries, and redacts as needed.
 3. The collector forwards logs, metrics, and traces to your actual backend or local file exporters.
 

@@ -1,6 +1,6 @@
 # Runtime: llama.cpp
 
-`open-jet` uses `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) as its local/offline inference backend.
+`openjet` uses `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) as its local/offline inference backend.
 
 In this simplified build, `llama.cpp` is the only supported local runtime.
 
@@ -16,7 +16,7 @@ The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/b
 
 ## What setup automates
 
-When you run `open-jet setup`, OpenJet can:
+When you run `openjet setup`, OpenJet can:
 
 - reuse an existing `llama-server` binary
 - clone and build `llama.cpp` if `llama-server` is missing

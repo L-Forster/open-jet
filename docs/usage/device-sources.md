@@ -5,13 +5,13 @@ OpenJet keeps a shared device registry in `devices.md` and lets you tag device i
 Persistent device setup is usually clearer from the regular CLI, not from chat. Use:
 
 ```bash
-open-jet device list
-open-jet device add <existing_id> <new_id>
-open-jet device on <id>
-open-jet device off <id>
+openjet device list
+openjet device add <existing_id> <new_id>
+openjet device on <id>
+openjet device off <id>
 ```
 
-Run `open-jet device list` first. Do not guess ids. Use the current id shown on the left as `<existing_id>` if you want to rename a device for chat.
+Run `openjet device list` first. Do not guess ids. Use the current id shown on the left as `<existing_id>` if you want to rename a device for chat.
 
 ## What Exists At Startup
 
@@ -23,16 +23,16 @@ Run `open-jet device list` first. Do not guess ids. Use the current id shown on 
 
 ## Commands
 
-- `open-jet device list`
+- `openjet device list`
   Lists discovered devices, writes `devices.md`, and shows the current ids you can tag in chat.
 
-- `open-jet device add <existing_id> <new_id>`
+- `openjet device add <existing_id> <new_id>`
   Adds or renames a persistent device id for a discovered device and rewrites `devices.md`.
 
-- `open-jet device on <id>`
+- `openjet device on <id>`
   Enables a device that was previously turned off.
 
-- `open-jet device off <id>`
+- `openjet device off <id>`
   Disables a device. This is useful for microphones when you want them visible but not capturable.
 
 - `/device [list|add <existing_id> <new_id>|on <id>|off <id>|help]`
@@ -44,9 +44,9 @@ Run `open-jet device list` first. Do not guess ids. Use the current id shown on 
 Examples:
 
 ```text
-open-jet device list
-open-jet device add camera0 desk_camera
-open-jet device off mic0
+openjet device list
+openjet device add camera0 desk_camera
+openjet device off mic0
 /device list
 /device add camera0 desk_camera
 ```
@@ -56,7 +56,7 @@ open-jet device off mic0
 ### 1. List Devices
 
 ```text
-open-jet device list
+openjet device list
 ```
 
 Current flow:
@@ -71,7 +71,7 @@ This command does not capture a frame, record audio, or read GPIO by itself.
 ### 2. Add Or Rename A Device Id
 
 ```text
-open-jet device add camera0 desk_camera
+openjet device add camera0 desk_camera
 ```
 
 Current flow:
@@ -86,8 +86,8 @@ This command does not create a new hardware device. It assigns a stable chat id 
 ### 3. Enable Or Disable A Device
 
 ```text
-open-jet device off mic0
-open-jet device on mic0
+openjet device off mic0
+openjet device on mic0
 ```
 
 Current flow:
@@ -167,7 +167,7 @@ Once a device exists, tag its id directly in the prompt. Tagging the id adds a p
 ## Current Behavior
 
 - `devices.md` is a registry, not a payload dump
-- `open-jet device ...` and `/device ...` both rewrite `devices.md` when they change naming or enabled state
+- `openjet device ...` and `/device ...` both rewrite `devices.md` when they change naming or enabled state
 - device tools that capture or read devices also rewrite `devices.md`
 - tagged device ids do not capture or load logs by themselves
 - the model can open `devices.md` and then choose a specific backing file only when relevant

@@ -14,7 +14,7 @@ The session folder contains:
 
 Normal chat turns do not dump full prompt payloads into the session directory. Full runtime prompt dumps are only written in debug mode under `.openjet/state/debug_prompts/`.
 
-Telemetry is no longer persisted by the app itself. `open-jet` emits OTLP to a collector, and the collector decides where logs, traces, and metrics are stored.
+Telemetry is no longer persisted by the app itself. `openjet` emits OTLP to a collector, and the collector decides where logs, traces, and metrics are stored.
 
 The emitted payload is intentionally metadata-only:
 

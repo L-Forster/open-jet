@@ -1,6 +1,6 @@
 # Workflow Harness
 
-`open-jet` includes a lightweight harness layer to keep agent work structured under constrained context.
+`openjet` includes a lightweight harness layer to keep agent work structured under constrained context.
 
 It provides:
 

@@ -15,7 +15,7 @@ This is the normal editable-source install path.
 Start with:
 
 ```bash
-open-jet setup
+openjet setup
 ```
 
 If you already have local runtime pieces, setup will reuse them. If not, setup can:
@@ -32,13 +32,13 @@ Automatic provisioning still depends on normal local prerequisites:
 ## 3. Launch OpenJet
 
 ```bash
-open-jet
+openjet
 ```
 
 Other primary entrypoints from the same install:
 
 ```bash
-open-jet benchmark --sweep
+openjet benchmark --sweep
 ```
 
 ```python

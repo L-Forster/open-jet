@@ -14,14 +14,14 @@ Use it when you want to answer questions like:
 Run one benchmark against the active model profile:
 
 ```bash
-open-jet benchmark
+openjet benchmark
 ```
 
 Useful flags:
 
 ```bash
-open-jet benchmark -p 1024 -n 256 -r 3 -o md
-open-jet benchmark -- -ub 512
+openjet benchmark -p 1024 -n 256 -r 3 -o md
+openjet benchmark -- -ub 512
 ```
 
 OpenJet passes the active model path, configured device, and GPU layer count to
@@ -32,7 +32,7 @@ OpenJet passes the active model path, configured device, and GPU layer count to
 Run a one-variable-at-a-time sweep:
 
 ```bash
-open-jet benchmark --sweep
+openjet benchmark --sweep
 ```
 
 Sweep mode currently checks:

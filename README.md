@@ -20,24 +20,22 @@ OpenJet has three primary surfaces in one repo:
 
 ## Get started
 
+MacOS/Linux:
+
 ```bash
 curl -fsSL https://www.openjet.dev/install.sh | bash
 ```
 
-```bash
-wget -qO- https://www.openjet.dev/install.sh | bash
-```
-
-On Windows:
+Windows:
 
 ```bat
 curl -L https://www.openjet.dev/install.bat -o install.bat && install.bat
 ```
 
-That installs OpenJet and starts setup. On Linux and macOS, run setup after install:
+After install:
 
 ```bash
-open-jet setup
+openjet setup
 ```
 
 That's it. Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
@@ -45,13 +43,13 @@ That's it. Setup detects your hardware, picks a model that fits your RAM, downlo
 Then just:
 
 ```bash
-open-jet
+openjet
 ```
 
 Other entrypoints from the same install:
 
 ```bash
-open-jet benchmark --sweep
+openjet benchmark --sweep
 ```
 
 ```python

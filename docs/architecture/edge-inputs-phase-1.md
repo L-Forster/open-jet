@@ -205,7 +205,7 @@ Speaker discovery belongs in `device_list`, but speaker playback can wait until 
 
 ## Setup Requirements
 
-`open-jet setup` should eventually detect and validate:
+`openjet setup` should eventually detect and validate:
 
 - available cameras
 - available audio input devices
