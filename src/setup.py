@@ -48,7 +48,8 @@ def _discover_llama_server() -> str | None:
     found = shutil.which("llama-server")
     if found:
         return found
-    candidate = Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"
+    exe_name = "llama-server.exe" if os.name == "nt" else "llama-server"
+    candidate = Path.home() / "llama.cpp" / "build" / "bin" / exe_name
     if candidate.is_file():
         return str(candidate)
     return None

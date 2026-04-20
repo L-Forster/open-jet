@@ -14,7 +14,13 @@ On macOS, use:
 ./install-macos.sh
 ```
 
-This creates a local virtualenv, installs the repo, and links `open-jet` / `openjet` into `~/.local/bin`.
+On Windows, run:
+
+```bat
+curl -L https://www.openjet.dev/install.bat -o install.bat && install.bat
+```
+
+This creates a local virtualenv, installs the repo, creates `openjet` / `open-jet` command launchers, and starts setup.
 It is an editable Python install, not a compiled release build.
 
 If stale in-place compiled extension artifacts exist under `src/`, the installer removes them so imports continue to use the source tree.

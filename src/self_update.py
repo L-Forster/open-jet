@@ -9,7 +9,10 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INSTALL_SCRIPT = _REPO_ROOT / "install.sh"
+_WINDOWS_INSTALL_SCRIPT = _REPO_ROOT / "install.bat"
 _INSTALL_RELEVANT_FILES = {
+    "install.bat",
+    "install.sh",
     "pyproject.toml",
     "setup.py",
 }
@@ -122,13 +125,14 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     if current_ref is None:
         raise RuntimeError("Failed to read managed llama.cpp revision before update.")
 
-    binary = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
+    binary_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+    binary = LLAMA_CPP_DIR / "build" / "bin" / binary_name
     hardware_info = detect_hardware_info()
     needs_rebuild = not binary.is_file() or _needs_rebuild(hardware_info, str(binary))
     if current_ref == target_ref and not needs_rebuild:
         return None
     if shutil.which("cmake") is None:
-        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet --setup`.")
+        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet setup`.")
 
     try:
         subprocess.run(
@@ -172,6 +176,12 @@ def _update_requires_install(update: RepoUpdateInfo) -> bool:
     if changed_files is None:
         return True
     return any(path in _INSTALL_RELEVANT_FILES for path in changed_files)
+
+
+def _install_command() -> list[str]:
+    if sys.platform == "win32":
+        return ["cmd", "/c", str(_WINDOWS_INSTALL_SCRIPT)]
+    return ["bash", str(_INSTALL_SCRIPT)]
 
 
 def _repo_tracking_target() -> tuple[str, str] | None:
@@ -232,7 +242,7 @@ def install_update(update: RepoUpdateInfo, *, current_version: str | None = None
             check=True,
         )
         subprocess.run(
-            ["bash", str(_INSTALL_SCRIPT)],
+            _install_command(),
             cwd=_REPO_ROOT,
             env={
                 **os.environ,

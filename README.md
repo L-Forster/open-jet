@@ -28,7 +28,13 @@ curl -fsSL https://www.openjet.dev/install.sh | sh
 wget -qO- https://www.openjet.dev/install.sh | sh
 ```
 
-Then run setup:
+On Windows:
+
+```bat
+curl -L https://www.openjet.dev/install.bat -o install.bat && install.bat
+```
+
+That installs OpenJet and starts setup. On Linux and macOS, run setup after install:
 
 ```bash
 open-jet setup

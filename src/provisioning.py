@@ -4,7 +4,6 @@ import asyncio
 import errno
 import os
 import platform
-import pty
 import re
 import shlex
 import shutil
@@ -19,6 +18,11 @@ from typing import Any, Callable, Mapping
 from urllib.parse import unquote, urlparse
 
 import httpx
+
+if os.name == "posix":
+    import pty
+else:
+    pty = None  # type: ignore[assignment]
 
 from .app_paths import openjet_install_root
 from .config import setup_direct_model_catalog
@@ -37,7 +41,8 @@ OPENJET_HOME = openjet_install_root()
 MODELS_DIR = OPENJET_HOME / "models"
 BIN_DIR = OPENJET_HOME / "bin"
 LLAMA_CPP_DIR = Path.home() / "llama.cpp"
-LLAMA_SERVER_BIN = BIN_DIR / "llama-server"
+LLAMA_SERVER_EXE_NAME = "llama-server.exe" if sys.platform == "win32" else "llama-server"
+LLAMA_SERVER_BIN = BIN_DIR / LLAMA_SERVER_EXE_NAME
 LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
@@ -200,7 +205,7 @@ def current_llama_server_path() -> str | None:
     found = shutil.which("llama-server")
     if found:
         return found
-    fallback = Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"
+    fallback = Path.home() / "llama.cpp" / "build" / "bin" / LLAMA_SERVER_EXE_NAME
     if fallback.is_file():
         return str(fallback)
     if LLAMA_SERVER_BIN.is_file():
@@ -641,10 +646,11 @@ def _install_from_archive(archive_path: Path) -> Path:
             shutil.copy2(entry, dest)
             if entry.name.startswith("llama-") and not entry.suffix:
                 dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    installed = BIN_DIR / "llama-server"
+    installed = LLAMA_SERVER_BIN
     if not installed.is_file():
         raise RuntimeError("llama-server was not installed correctly.")
-    installed.chmod(installed.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    if sys.platform != "win32":
+        installed.chmod(installed.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     if sys.platform == "darwin":
         # Strip quarantine so Gatekeeper doesn't block first launch.
         os.system(f"xattr -dr com.apple.quarantine {shlex.quote(str(BIN_DIR))} 2>/dev/null")
@@ -706,7 +712,7 @@ async def _build_llama_server_from_source(
     clear_status: Callable[[], None],
 ) -> tuple[Path, str]:
     if shutil.which("cmake") is None:
-        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet --setup`.")
+        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet setup`.")
     if rebuilding:
         set_status("rebuilding llama-server for GPU support")
         log.write("[bold bright_white]Rebuilding llama-server for GPU support...[/]")
@@ -743,7 +749,7 @@ async def _build_llama_server_from_source(
         raise RuntimeError(tail.strip() or "Failed to build llama-server")
     log.write("[bold bright_white]llama-server built successfully.[/]")
 
-    built = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
+    built = LLAMA_CPP_DIR / "build" / "bin" / LLAMA_SERVER_EXE_NAME
     if not built.is_file():
         raise RuntimeError("llama-server build completed but binary was not found.")
     return built, synced_ref
@@ -769,7 +775,7 @@ async def ensure_llama_server(
 
     # Legacy source-built binary on PATH or at the old location that still works.
     existing = current_llama_server_path()
-    managed_source_binary = LLAMA_CPP_DIR / "build" / "bin" / "llama-server"
+    managed_source_binary = LLAMA_CPP_DIR / "build" / "bin" / LLAMA_SERVER_EXE_NAME
     existing_is_source_managed = (
         existing is not None and Path(existing).resolve() == managed_source_binary.resolve()
     )

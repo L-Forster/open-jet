@@ -20,6 +20,7 @@ from .setup_memory import _max_context_tokens_from_gguf
 _FRAGMENTED_LFB_MB = 64
 _JETSON_VMM_CHUNK_MB = "1"
 _JETSON_VMM_RESERVE_MB = "4096"
+_LLAMA_SERVER_EXE_NAME = "llama-server.exe" if os.name == "nt" else "llama-server"
 
 
 def _find_llama_server() -> str:
@@ -27,7 +28,7 @@ def _find_llama_server() -> str:
     if path:
         return path
     from pathlib import Path
-    candidate = Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"
+    candidate = Path.home() / "llama.cpp" / "build" / "bin" / _LLAMA_SERVER_EXE_NAME
     if candidate.is_file():
         return str(candidate)
     raise FileNotFoundError("llama-server not found on PATH or ~/llama.cpp/build/bin/")
@@ -531,7 +532,7 @@ class LlamaServerClient:
             if not parts:
                 continue
             exe_name = Path(parts[0]).name.lower()
-            if exe_name != "llama-server":
+            if exe_name != _LLAMA_SERVER_EXE_NAME:
                 continue
 
             stale.append(pid)
