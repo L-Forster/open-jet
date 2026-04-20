@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [ -n "${SCRIPT_SOURCE}" ]; then
+  ROOT_DIR="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
+else
+  ROOT_DIR="$(pwd -P)"
+fi
 PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="${ROOT_DIR}/.venv"
 LOCAL_BIN_DIR="${HOME}/.local/bin"

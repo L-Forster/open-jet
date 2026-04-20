@@ -21,11 +21,11 @@ OpenJet has three primary surfaces in one repo:
 ## Get started
 
 ```bash
-curl -fsSL https://www.openjet.dev/install.sh | sh
+curl -fsSL https://www.openjet.dev/install.sh | bash
 ```
 
 ```bash
-wget -qO- https://www.openjet.dev/install.sh | sh
+wget -qO- https://www.openjet.dev/install.sh | bash
 ```
 
 On Windows:
