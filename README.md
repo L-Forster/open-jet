@@ -21,16 +21,16 @@ OpenJet has three primary surfaces in one repo:
 ## Get started
 
 ```bash
-git clone https://github.com/l-forster/open-jet.git
-cd open-jet
-./install.sh
-open-jet setup
+curl -fsSL https://www.openjet.dev/install.sh | sh
 ```
 
-On macOS, you can use the macOS entry point:
+```bash
+wget -qO- https://www.openjet.dev/install.sh | sh
+```
+
+Then run setup:
 
 ```bash
-./install-macos.sh
 open-jet setup
 ```
 
