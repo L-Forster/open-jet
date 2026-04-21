@@ -1,12 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
-if [ -n "${SCRIPT_SOURCE}" ]; then
-  ROOT_DIR="$(cd "$(dirname "${SCRIPT_SOURCE}")" && pwd)"
-else
-  ROOT_DIR="$(pwd -P)"
-fi
+OPENJET_REPO_URL="${OPENJET_REPO_URL:-https://github.com/l-forster/open-jet.git}"
+OPENJET_BASE="${OPENJET_BASE:-${HOME}/.openjet}"
+OPENJET_SOURCE="${OPENJET_SOURCE:-${OPENJET_BASE}/source}"
+
+is_openjet_checkout() {
+  local candidate="$1"
+  [ -f "${candidate}/pyproject.toml" ] && [ -f "${candidate}/src/cli.py" ]
+}
+
+resolve_root_dir() {
+  local script_source="${BASH_SOURCE[0]:-}"
+  local script_dir=""
+
+  if [ -n "${script_source}" ]; then
+    script_dir="$(cd "$(dirname "${script_source}")" && pwd)"
+    if is_openjet_checkout "${script_dir}"; then
+      printf '%s\n' "${script_dir}"
+      return 0
+    fi
+  fi
+
+  local cwd
+  cwd="$(pwd -P)"
+  if is_openjet_checkout "${cwd}"; then
+    printf '%s\n' "${cwd}"
+    return 0
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    echo "error: git was not found and this installer is not running from an OpenJet checkout." >&2
+    echo "install git, or clone ${OPENJET_REPO_URL} and run ./install.sh from the checkout." >&2
+    exit 1
+  fi
+
+  mkdir -p "${OPENJET_BASE}"
+  if [ -d "${OPENJET_SOURCE}/.git" ]; then
+    git -C "${OPENJET_SOURCE}" pull --ff-only >&2
+  elif [ -e "${OPENJET_SOURCE}" ]; then
+    echo "error: ${OPENJET_SOURCE} exists but is not an OpenJet git checkout." >&2
+    exit 1
+  else
+    git clone "${OPENJET_REPO_URL}" "${OPENJET_SOURCE}" >&2
+  fi
+
+  if ! is_openjet_checkout "${OPENJET_SOURCE}"; then
+    echo "error: ${OPENJET_SOURCE} is not a valid OpenJet checkout." >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${OPENJET_SOURCE}"
+}
+
+ROOT_DIR="$(resolve_root_dir)"
 PYTHON_BIN="${PYTHON:-python3}"
 VENV_DIR="${ROOT_DIR}/.venv"
 LOCAL_BIN_DIR="${HOME}/.local/bin"
@@ -26,11 +73,12 @@ link_launchers() {
 }
 
 install_fingerprint() {
-  "${VENV_DIR}/bin/python" - <<'PY'
+  OPENJET_ROOT_DIR="${ROOT_DIR}" "${VENV_DIR}/bin/python" - <<'PY'
 import hashlib
+import os
 from pathlib import Path
 
-root = Path.cwd()
+root = Path(os.environ["OPENJET_ROOT_DIR"])
 digest = hashlib.sha256()
 for relative_path in ("pyproject.toml", "setup.py"):
     path = root / relative_path
