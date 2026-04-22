@@ -22,15 +22,15 @@
     "aliases": ["qwen3.5 9b", "qwen3.5-9b-q4_k_m.gguf", "qwen3.5:9b"]
   },
   {
-    "key": "qwen35_27b_q4_k_m",
-    "label": "Qwen3.5 27B",
-    "filename": "Qwen3.5-27B-Q4_K_M.gguf",
-    "parameter_count_billion": 27.8,
-    "model_size_mb": 17101.0,
+    "key": "qwen36_27b_q4_k_m",
+    "label": "Qwen3.6 27B",
+    "filename": "Qwen3.6-27B-Q4_K_M.gguf",
+    "parameter_count_billion": 27.0,
+    "model_size_mb": 16817.0,
     "kv_bytes_per_token": 34816.0,
     "decode_context_tokens": 8192,
-    "source_urls": ["https://ollama.com/library/qwen3.5:27b"],
-    "aliases": ["qwen3.5 27b", "qwen3.5-27b-q4_k_m.gguf", "qwen3.5:27b"]
+    "source_urls": ["https://huggingface.co/unsloth/Qwen3.6-27B-GGUF"],
+    "aliases": ["qwen3.6 27b", "qwen3.6-27b-q4_k_m.gguf", "qwen3.6:27b"]
   },
   {
     "key": "gemma4_26b_a4b_q4_k_s",

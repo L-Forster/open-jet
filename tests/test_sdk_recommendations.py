@@ -65,10 +65,10 @@ class SDKRecommendationTests(unittest.TestCase):
         )
 
         self.assertEqual(low_vram_gpu.model.label, "Qwen3.5 9B")
-        self.assertEqual(high_vram_gpu.model.label, "Qwen3.5 27B")
-        self.assertEqual(cpu_only.model.label, "Qwen3.5 27B")
+        self.assertEqual(high_vram_gpu.model.label, "Qwen3.6 27B")
+        self.assertEqual(cpu_only.model.label, "Qwen3.6 27B")
         self.assertEqual(low_vram_gpu.llama.context_window_tokens, 128807)
-        self.assertEqual(high_vram_gpu.llama.context_window_tokens, 202616)
+        self.assertEqual(high_vram_gpu.llama.context_window_tokens, 210314)
         self.assertEqual(cpu_only.llama.context_window_tokens, 8192)
         self.assertEqual(low_vram_gpu.llama.device, "cuda")
         self.assertEqual(high_vram_gpu.llama.device, "cuda")
@@ -146,18 +146,18 @@ class SDKRecommendationTests(unittest.TestCase):
         self.assertEqual(estimates[0].hardware_key, "rtx_4060_8gb")
         self.assertTrue(any(item.fits_in_memory for item in estimates))
         self.assertTrue(any(not item.fits_in_memory for item in estimates))
-        qwen35_27b = next(item for item in estimates if item.model_key == "qwen35_27b_q4_k_m")
-        self.assertFalse(qwen35_27b.fits_in_memory)
-        self.assertIsNone(qwen35_27b.estimate)
+        qwen36_27b = next(item for item in estimates if item.model_key == "qwen36_27b_q4_k_m")
+        self.assertFalse(qwen36_27b.fits_in_memory)
+        self.assertIsNone(qwen36_27b.estimate)
 
     def test_rtx_3090_qwen_27b_q4_uses_raw_spec_math(self) -> None:
         estimate = estimate_token_generation_speed(
             hardware_key="rtx_3090_24gb",
-            model_key="qwen35_27b_q4_k_m",
+            model_key="qwen36_27b_q4_k_m",
         )
 
         self.assertEqual(estimate.context_window_tokens, 8192)
-        self.assertAlmostEqual(estimate.estimated_tokens_per_second, 51.4, places=1)
+        self.assertAlmostEqual(estimate.estimated_tokens_per_second, 52.2, places=1)
         self.assertEqual(estimate.limiting_factor, "memory")
 
     def test_tok_s_registry_profiles_are_exposed_via_sdk(self) -> None:
@@ -189,7 +189,7 @@ class SDKRecommendationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             estimate_token_generation_speed(
                 hardware_key="rtx_4060_8gb",
-                model_key="qwen35_27b_q4_k_m",
+                model_key="qwen36_27b_q4_k_m",
                 context_window_tokens=8192,
             )
 

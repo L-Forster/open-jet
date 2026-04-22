@@ -14,7 +14,7 @@ LEGACY_LOG_DIRECTORY = "session_logs"
 # Curated, size-banded shortlist used by setup recommendations.
 # Band limit = max param budget in billions for that RAM tier.
 # Disk/RAM sizes (Q4_K_M): 0.6B~523MB, 1.7B~1.4GB, 4B~2.6GB, 8B~5.2GB,
-# 14B~9.3GB, 27B~17GB, 32B~20GB, 35B-A3B~24GB, 122B-A10B~81GB.
+# 14B~9.3GB, 27B~16.8GB, 32B~20GB, 35B-A3B~24GB, 122B-A10B~81GB.
 RECOMMENDED_LLM_BANDS: tuple[tuple[float, tuple[tuple[str, float, str], ...]], ...] = (
     (
         2.0,
@@ -51,7 +51,7 @@ RECOMMENDED_LLM_BANDS: tuple[tuple[float, tuple[tuple[str, float, str], ...]], .
     (
         32.0,
         (
-            ("qwen3.5:27b", 27.0, "Qwen3.5 27B"),
+            ("qwen3.6:27b", 27.0, "Qwen3.6 27B"),
             ("qwen3.5:35b-a3b", 35.0, "Qwen3.5 35B MoE"),
             ("qwen3:32b", 32.0, "Qwen3 32B"),
         ),
@@ -77,10 +77,10 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
     },
     {
         "max_ram_gb": 24.0,
-        "label": "Qwen3.5 27B",
-        "filename": "Qwen3.5-27B-Q4_K_M.gguf",
-        "url": "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf?download=true",
-        "model_size_mb": 17101,
+        "label": "Qwen3.6 27B",
+        "filename": "Qwen3.6-27B-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+        "model_size_mb": 16817,
         "kv_bytes_per_token": 34816,
     },
     {

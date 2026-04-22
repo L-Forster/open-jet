@@ -31,9 +31,9 @@ setup_recommendations:
       filename: Qwen3.5-9B-Q4_K_M.gguf
       url: https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true
     - max_ram_gb: 24
-      label: Qwen3.5 27B
-      filename: Qwen3.5-27B-Q4_K_M.gguf
-      url: https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-Q4_K_M.gguf?download=true
+      label: Qwen3.6 27B
+      filename: Qwen3.6-27B-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true
 ```
 
 Rows are matched by `max_ram_gb`, and the last row is used as the fallback above the highest configured RAM band.

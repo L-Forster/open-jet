@@ -156,9 +156,14 @@ def _select_direct_model(
     if moe:
         return moe
 
+    dense_budget_mb = (
+        vram_or_ram_budget_mb
+        if has_gpu and vram_mb > 0
+        else max(vram_or_ram_budget_mb, total_ram_mb * 0.9)
+    )
     dense = largest([
         row for row in dense_rows
-        if 0 < _catalog_float(row, "model_size_mb") <= max(vram_or_ram_budget_mb, total_ram_mb * 0.9)
+        if 0 < _catalog_float(row, "model_size_mb") <= dense_budget_mb
     ])
     if dense:
         return dense

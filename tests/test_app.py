@@ -818,8 +818,8 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                     },
                     {
                         "max_ram_gb": 24,
-                        "label": "Qwen3.5 27B",
-                        "filename": "Qwen_Qwen3.5-27B-Q4_K_M.gguf",
+                        "label": "Qwen3.6 27B",
+                        "filename": "Qwen_Qwen3.6-27B-Q4_K_M.gguf",
                         "url": "https://example.invalid/qwen-27b.gguf",
                     },
                 ]
@@ -1045,7 +1045,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="24GB", total_ram_gb=24.0, has_cuda=False))["label"],
-            "Qwen3.5 27B",
+            "Qwen3.6 27B",
         )
 
     def test_recommend_direct_model_allows_moe_catalog_entries_on_gpu(self) -> None:
@@ -1070,7 +1070,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.5 27B")
+        self.assertEqual(recommended["label"], "Qwen3.6 27B")
 
     def test_recommend_direct_model_prioritizes_moe_before_small_dense(self) -> None:
         recommended = recommend_direct_model(
