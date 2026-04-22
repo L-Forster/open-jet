@@ -252,10 +252,10 @@ fi
 echo "Installed open-jet from ${ROOT_DIR}"
 echo "Install mode: editable Python source"
 if [ -n "${INSTALLED_LAUNCHER_DIR}" ]; then
-  echo "Launch with: openjet --setup"
+  echo "Launch with: openjet setup"
 else
   echo "warning: could not install launchers into ${LOCAL_BIN_DIR} or ${SYSTEM_BIN_DIR}"
-  echo "run with: ${VENV_DIR}/bin/openjet --setup"
+  echo "run with: ${VENV_DIR}/bin/openjet setup"
 fi
 
 if [ -n "${INSTALLED_LAUNCHER_DIR}" ]; then
@@ -263,7 +263,7 @@ if [ -n "${INSTALLED_LAUNCHER_DIR}" ]; then
     *":${INSTALLED_LAUNCHER_DIR}:"*) ;;
     *)
       echo "warning: ${INSTALLED_LAUNCHER_DIR} is not on PATH"
-      echo "run with: ${INSTALLED_LAUNCHER_DIR}/openjet --setup"
+      echo "run with: ${INSTALLED_LAUNCHER_DIR}/openjet setup"
       ;;
   esac
 fi
