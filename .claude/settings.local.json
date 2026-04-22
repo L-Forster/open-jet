@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python:*)",
-      "WebSearch",
-      "Bash(wc -l /home/louis/open-jet/src/*.py)"
-    ]
-  }
-}
