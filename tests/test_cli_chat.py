@@ -27,6 +27,65 @@ class CliChatTests(unittest.TestCase):
         launch_tui.assert_called_once_with(force_setup=False)
         run_prompt.assert_not_called()
 
+    def test_turbo_benchmark_command_routes_to_turbo_runner(self) -> None:
+        with patch("src.benchmark.run_turbo_benchmark") as run_turbo, patch("src.cli.launch_tui") as launch_tui:
+            cli_main(
+                [
+                    "turbo",
+                    "benchmark",
+                    "--target-model",
+                    "/models/target.gguf",
+                    "--draft-model",
+                    "/models/draft.gguf",
+                    "--backend-path",
+                    "/opt/llama-server",
+                    "--backend-kind",
+                    "lucebox",
+                    "--context",
+                    "6048",
+                    "--baseline-tok-s",
+                    "30",
+                    "-n",
+                    "400",
+                ]
+            )
+
+        launch_tui.assert_not_called()
+        run_turbo.assert_called_once_with(
+            thinking_enabled=False,
+            n_gen=400,
+            target_model="/models/target.gguf",
+            draft_model="/models/draft.gguf",
+            backend_path="/opt/llama-server",
+            backend_kind="lucebox",
+            context_size=6048,
+            baseline_tok_s=30.0,
+        )
+
+    def test_benchmark_turbo_mode_routes_to_turbo_runner(self) -> None:
+        with patch("src.benchmark.run_turbo_benchmark") as run_turbo, patch("src.cli.launch_tui") as launch_tui:
+            cli_main(["benchmark", "--mode", "turbo"])
+
+        launch_tui.assert_not_called()
+        run_turbo.assert_called_once_with(
+            thinking_enabled=False,
+            n_gen=400,
+            target_model=None,
+            draft_model=None,
+            backend_path=None,
+            backend_kind="auto",
+            context_size=None,
+            baseline_tok_s=None,
+        )
+
+    def test_benchmark_thinking_mode_enables_thinking(self) -> None:
+        with patch("src.benchmark.run_turbo_benchmark") as run_turbo, patch("src.cli.launch_tui") as launch_tui:
+            cli_main(["benchmark", "--mode", "thinking", "-n", "64"])
+
+        launch_tui.assert_not_called()
+        self.assertEqual(run_turbo.call_args.kwargs["thinking_enabled"], True)
+        self.assertEqual(run_turbo.call_args.kwargs["n_gen"], 64)
+
 
 if __name__ == "__main__":
     unittest.main()

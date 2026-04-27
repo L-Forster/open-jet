@@ -346,12 +346,30 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("prompt", nargs=argparse.REMAINDER, help="optional one-shot prompt text")
     subparsers.add_parser("setup", help="run setup wizard before launching the chat UI")
     bench_parser = subparsers.add_parser("benchmark", aliases=("bench",), help="run a model benchmark with the active profile")
+    bench_parser.add_argument("--mode", choices=("standard", "turbo", "thinking"), default="standard", help="benchmark mode (default: standard)")
     bench_parser.add_argument("-p", "--n-prompt", type=int, default=512, help="prompt tokens for pp test (default: 512)")
-    bench_parser.add_argument("-n", "--n-gen", type=int, default=128, help="tokens to generate for tg test (default: 128)")
+    bench_parser.add_argument("-n", "--n-gen", type=int, default=None, help="tokens to generate (default: 128 standard, 400 turbo)")
     bench_parser.add_argument("-r", "--repetitions", type=int, default=5, help="repetitions per test (default: 5)")
     bench_parser.add_argument("-o", "--output", default="md", choices=("md", "csv", "json", "jsonl", "sql"), help="output format (default: md)")
     bench_parser.add_argument("--sweep", action="store_true", help="run single-variable sweeps (gpu layers, batch size, threads)")
+    bench_parser.add_argument("--target-model", help="target GGUF path for turbo/thinking mode")
+    bench_parser.add_argument("--draft-model", help="DFlash draft GGUF path for turbo/thinking mode")
+    bench_parser.add_argument("--backend-path", help="DFlash-capable llama-server path for turbo/thinking mode")
+    bench_parser.add_argument("--backend-kind", choices=("auto", "llama-server", "lucebox"), default="auto", help="turbo backend kind (default: auto)")
+    bench_parser.add_argument("--context", dest="benchmark_context", type=int, help="context size for turbo/thinking mode")
+    bench_parser.add_argument("--baseline-tok-s", type=float, help="previous OpenJet generation tok/s baseline for speedup reporting")
     bench_parser.add_argument("extra", nargs=argparse.REMAINDER, help="extra flags passed directly to the benchmark runner")
+    turbo_parser = subparsers.add_parser("turbo", help="experimental OpenJet Turbo commands")
+    turbo_subparsers = turbo_parser.add_subparsers(dest="turbo_action")
+    turbo_bench_parser = turbo_subparsers.add_parser("benchmark", help="run the experimental DFlash speculative decoding benchmark")
+    turbo_bench_parser.add_argument("-n", "--n-gen", type=int, default=400, help="tokens to generate (default: 400)")
+    turbo_bench_parser.add_argument("--target-model", help="target GGUF path")
+    turbo_bench_parser.add_argument("--draft-model", help="DFlash draft GGUF path")
+    turbo_bench_parser.add_argument("--backend-path", help="DFlash-capable llama-server path")
+    turbo_bench_parser.add_argument("--backend-kind", choices=("auto", "llama-server", "lucebox"), default="auto", help="turbo backend kind (default: auto)")
+    turbo_bench_parser.add_argument("--context", dest="benchmark_context", type=int, help="context size")
+    turbo_bench_parser.add_argument("--baseline-tok-s", type=float, help="previous OpenJet generation tok/s baseline for speedup reporting")
+    turbo_bench_parser.add_argument("--thinking", action="store_true", help="enable Qwen thinking mode for comparison")
     device_parser = subparsers.add_parser("device", aliases=("devices",), help="list and configure persistent device ids")
     device_subparsers = device_parser.add_subparsers(dest="device_action")
     device_subparsers.add_parser("list", help="list discovered devices and current ids")
@@ -516,8 +534,37 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
         return
+    if args.command == "turbo":
+        action = str(getattr(args, "turbo_action", "") or "").strip().lower()
+        if action == "benchmark":
+            from .benchmark import run_turbo_benchmark
+            run_turbo_benchmark(
+                thinking_enabled=bool(getattr(args, "thinking", False)),
+                n_gen=int(args.n_gen),
+                target_model=getattr(args, "target_model", None),
+                draft_model=getattr(args, "draft_model", None),
+                backend_path=getattr(args, "backend_path", None),
+                backend_kind=getattr(args, "backend_kind", None),
+                context_size=getattr(args, "benchmark_context", None),
+                baseline_tok_s=getattr(args, "baseline_tok_s", None),
+            )
+            return
+        raise SystemExit("Usage: open-jet turbo benchmark")
     if args.command in {"benchmark", "bench"}:
-        from .benchmark import run_benchmark, run_benchmark_sweep
+        from .benchmark import run_benchmark, run_benchmark_sweep, run_turbo_benchmark
+        mode = str(getattr(args, "mode", "standard") or "standard").strip().lower()
+        if mode in {"turbo", "thinking"}:
+            run_turbo_benchmark(
+                thinking_enabled=mode == "thinking",
+                n_gen=int(args.n_gen) if args.n_gen is not None else 400,
+                target_model=getattr(args, "target_model", None),
+                draft_model=getattr(args, "draft_model", None),
+                backend_path=getattr(args, "backend_path", None),
+                backend_kind=getattr(args, "backend_kind", None),
+                context_size=getattr(args, "benchmark_context", None),
+                baseline_tok_s=getattr(args, "baseline_tok_s", None),
+            )
+            return
         if args.sweep:
             run_benchmark_sweep(repetitions=args.repetitions)
         else:
@@ -525,7 +572,7 @@ def main(argv: list[str] | None = None) -> None:
             run_benchmark(
                 output_format=args.output,
                 n_prompt=args.n_prompt,
-                n_gen=args.n_gen,
+                n_gen=int(args.n_gen) if args.n_gen is not None else 128,
                 repetitions=args.repetitions,
                 extra_args=extra or None,
             )

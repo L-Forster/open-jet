@@ -7,6 +7,8 @@ openjet
 openjet chat
 openjet chat Explain the repo layout briefly.
 openjet benchmark
+openjet benchmark --mode turbo
+openjet turbo benchmark
 openjet benchmark --sweep
 ```
 
@@ -46,6 +48,11 @@ Benchmark helpers:
 
 ```bash
 openjet benchmark
+openjet benchmark --mode standard
+openjet benchmark --mode turbo
+openjet benchmark --mode thinking
+openjet turbo benchmark
+openjet turbo benchmark --backend-kind lucebox
 openjet benchmark --sweep
 openjet benchmark -p 1024 -n 256 -r 3
 ```

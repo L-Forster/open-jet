@@ -2,18 +2,64 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import time
+from dataclasses import dataclass
 from pathlib import Path
+
+import httpx
 
 from .config import load_config
 from .hardware import detect_hardware_info, read_device_model, recommended_device
 from .setup_memory import _read_gguf_metadata
+
+
+_TURBO_BENCHMARK_PROMPT = (
+    "You are benchmarking local agent generation throughput. Write a compact Python implementation "
+    "of a file-backed task queue with enqueue, claim, complete, retry, and list operations. Include "
+    "the key data structures, locking strategy, and one small usage example. Keep the answer direct."
+)
+_TURBO_DRAFT_MODEL_NAMES = (
+    "dflash-draft-3.6-q8_0.gguf",
+    "Qwen3.6-27B-DFlash-Q8_0.gguf",
+    "qwen3.6-27b-dflash-q8_0.gguf",
+    "dflash-draft-3.6-q4_k_m.gguf",
+    "model.safetensors",
+)
+
+
+@dataclass(frozen=True)
+class TurboBenchmarkSettings:
+    target_model: str
+    draft_model: str
+    backend_path: str
+    backend_kind: str
+    backend_label: str
+    context_size: int
+    draft_context_size: int
+    gpu_layers: int
+    draft_gpu_layers: int
+    batch_size: int
+    ubatch_size: int
+    thinking_enabled: bool
+    baseline_tok_s: float | None
+
+
+@dataclass(frozen=True)
+class TurboBenchmarkTimings:
+    prompt_eval_tok_s: float | None
+    generation_tok_s: float | None
+    prompt_tokens: int | None
+    generation_tokens: int | None
+    raw: dict
 
 
 def _find_llama_binary(cfg: dict, name: str) -> str:
@@ -33,6 +79,101 @@ def _find_llama_binary(cfg: dict, name: str) -> str:
         f"  cd ~/llama.cpp && cmake --build build --target {name}\n"
         f"Or ensure {name} is on your PATH."
     )
+
+
+def _find_llama_server_for_turbo(cfg: dict) -> str:
+    turbo_cfg = cfg.get("turbo") if isinstance(cfg.get("turbo"), dict) else {}
+    candidates = [
+        os.getenv("OPENJET_TURBO_LLAMA_SERVER", "").strip(),
+        str(turbo_cfg.get("llama_server_path") or "").strip(),
+        str(cfg.get("dflash_llama_server_path") or "").strip(),
+        str(cfg.get("llama_server_path") or "").strip(),
+        shutil.which("llama-server") or "",
+        str(Path.home() / "buun-llama-cpp" / "build" / "bin" / ("llama-server.exe" if os.name == "nt" else "llama-server")),
+        str(Path.home() / "llama.cpp" / "build" / "bin" / ("llama-server.exe" if os.name == "nt" else "llama-server")),
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if path.is_file():
+            return str(path)
+    raise FileNotFoundError(
+        "llama-server for DFlash was not found. Build spiritbuun/buun-llama-cpp and set "
+        "`turbo.llama_server_path` in config.yaml or OPENJET_TURBO_LLAMA_SERVER."
+    )
+
+
+def _find_lucebox_backend_for_turbo(cfg: dict) -> str:
+    turbo_cfg = _turbo_cfg(cfg)
+    root_raw = (
+        os.getenv("OPENJET_LUCEBOX_ROOT", "").strip()
+        or str(turbo_cfg.get("lucebox_root") or "").strip()
+    )
+    candidates: list[str] = [
+        os.getenv("OPENJET_LUCEBOX_DFLASH_BIN", "").strip(),
+        str(turbo_cfg.get("lucebox_bin") or "").strip(),
+        str(turbo_cfg.get("lucebox_server_path") or "").strip(),
+    ]
+    roots = [Path(root_raw).expanduser()] if root_raw else []
+    roots.extend([
+        Path.cwd() / "lucebox-hub" / "dflash",
+        Path.home() / "lucebox-hub" / "dflash",
+    ])
+    exe_name = "test_dflash.exe" if os.name == "nt" else "test_dflash"
+    for root in roots:
+        candidates.extend([
+            str(root / "build" / exe_name),
+            str(root / "scripts" / "server.py"),
+        ])
+    for raw in candidates:
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        if path.is_file():
+            return str(path)
+    raise FileNotFoundError(
+        "Lucebox DFlash backend was not found. Clone Luce-Org/lucebox-hub, build dflash, "
+        "then set `turbo.backend_kind: lucebox` and `turbo.lucebox_root`, `turbo.lucebox_bin`, "
+        "or OPENJET_LUCEBOX_DFLASH_BIN."
+    )
+
+
+def _normalize_turbo_backend_kind(value: object, backend_path: str | None = None) -> str:
+    raw = str(value or "auto").strip().lower().replace("_", "-")
+    if raw in {"llama", "llama-server", "spiritbuun", "buun", "buun-llama-cpp"}:
+        return "llama-server"
+    if raw in {"luce", "lucebox", "lucebox-hub", "test-dflash"}:
+        return "lucebox"
+    if raw not in {"", "auto"}:
+        raise SystemExit("turbo backend kind must be one of: auto, llama-server, lucebox")
+    lowered = (backend_path or "").lower().replace("\\", "/")
+    if "lucebox" in lowered or lowered.endswith("/test_dflash") or lowered.endswith("/test_dflash.exe"):
+        return "lucebox"
+    return "llama-server"
+
+
+def _backend_supports_dflash(backend_path: str, *, assume_supported: bool = False) -> bool:
+    if assume_supported:
+        return True
+    try:
+        proc = subprocess.run(
+            [backend_path, "--help"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    help_text = f"{proc.stdout}\n{proc.stderr}".lower()
+    return "dflash" in help_text and ("--spec-type" in help_text or "spec-type" in help_text)
+
+
+def _dflash_backend_label(backend_path: str) -> str:
+    lowered = backend_path.lower()
+    if "buun-llama-cpp" in lowered:
+        return "spiritbuun/buun-llama-cpp"
+    return "DFlash-capable llama-server"
 
 
 def _find_llama_bench(cfg: dict) -> str:
@@ -76,6 +217,30 @@ def _get_gpu_name() -> str | None:
         except (OSError, subprocess.SubprocessError):
             pass
     return None
+
+
+def _get_cuda_driver_summary() -> str | None:
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=5,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not out:
+        return None
+    first = out.splitlines()[0].strip()
+    parts = [part.strip() for part in first.split(",")]
+    if len(parts) >= 3:
+        return f"{parts[0]} ({parts[1]} MiB VRAM, driver {parts[2]})"
+    return first
 
 
 def _resolve_device(cfg: dict) -> str:
@@ -205,6 +370,474 @@ def _print_header(title: str, model_path: str, device: str, gpu_layers: int) -> 
     print(f"RAM:     {hw.total_ram_gb:.1f} GB")
     if hw.vram_mb > 0:
         print(f"VRAM:    {hw.vram_mb:.0f} MB")
+
+
+def _turbo_cfg(cfg: dict) -> dict:
+    raw = cfg.get("turbo")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _cfg_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _cfg_int(value: object, default: int, *, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, parsed)
+
+
+def _resolve_turbo_target_model(cfg: dict, override: str | None = None) -> str:
+    turbo_cfg = _turbo_cfg(cfg)
+    raw = (
+        override
+        or os.getenv("OPENJET_TURBO_TARGET_MODEL", "").strip()
+        or str(turbo_cfg.get("target_model") or "").strip()
+        or str(cfg.get("dflash_target_model") or "").strip()
+        or str(cfg.get("llama_model") or "").strip()
+    )
+    path = Path(raw).expanduser() if raw else Path()
+    if not raw or not path.is_file():
+        raise SystemExit(
+            f"Target model not found: {raw or '(none)'}. Configure `turbo.target_model` "
+            "or use the active `llama_model` profile."
+        )
+    return str(path)
+
+
+def _candidate_draft_model_paths(cfg: dict, target_model: str) -> list[Path]:
+    roots: list[Path] = []
+    target_parent = Path(target_model).expanduser().parent
+    roots.append(target_parent)
+    model_download_path = str(cfg.get("model_download_path") or "").strip()
+    if model_download_path:
+        roots.append(Path(model_download_path).expanduser().parent)
+    roots.extend([
+        Path.cwd() / "models",
+        Path.home() / ".openjet" / "models",
+        Path.home() / "open-jet" / "models",
+    ])
+    candidates: list[Path] = []
+    for root in roots:
+        for name in _TURBO_DRAFT_MODEL_NAMES:
+            candidates.append(root / name)
+    return candidates
+
+
+def _resolve_turbo_draft_model(cfg: dict, target_model: str, override: str | None = None) -> str:
+    turbo_cfg = _turbo_cfg(cfg)
+    explicit = (
+        override
+        or os.getenv("OPENJET_TURBO_DRAFT_MODEL", "").strip()
+        or str(turbo_cfg.get("draft_model") or "").strip()
+        or str(cfg.get("dflash_draft_model") or "").strip()
+    )
+    if explicit:
+        path = Path(explicit).expanduser()
+        if path.is_file():
+            return str(path)
+        if path.is_dir():
+            found = _find_safetensors(path)
+            if found:
+                return str(found)
+        raise SystemExit(
+            f"DFlash draft model not found: {explicit}. Configure `turbo.draft_model` "
+            "with the spiritbuun DFlash GGUF path or Lucebox/z-lab model.safetensors path."
+        )
+    for candidate in _candidate_draft_model_paths(cfg, target_model):
+        if candidate.is_file():
+            return str(candidate)
+    searched = ", ".join(str(path) for path in _candidate_draft_model_paths(cfg, target_model)[:4])
+    raise SystemExit(
+        "DFlash draft model not found. Set `turbo.draft_model` or OPENJET_TURBO_DRAFT_MODEL "
+        f"to spiritbuun/Qwen3.6-27B-DFlash-GGUF, preferably dflash-draft-3.6-q8_0.gguf. Searched: {searched}"
+    )
+
+
+def _find_safetensors(root: Path) -> Path | None:
+    if root.is_file() and root.name.endswith(".safetensors"):
+        return root
+    if not root.is_dir():
+        return None
+    for path in root.rglob("model.safetensors"):
+        return path
+    return None
+
+
+def _load_turbo_settings(
+    cfg: dict,
+    *,
+    thinking_enabled: bool,
+    target_model: str | None = None,
+    draft_model: str | None = None,
+    backend_path: str | None = None,
+    backend_kind: str | None = None,
+    context_size: int | None = None,
+    baseline_tok_s: float | None = None,
+) -> TurboBenchmarkSettings:
+    turbo_cfg = _turbo_cfg(cfg)
+    target = _resolve_turbo_target_model(cfg, target_model)
+    draft = _resolve_turbo_draft_model(cfg, target, draft_model)
+    requested_kind = _normalize_turbo_backend_kind(
+        backend_kind or turbo_cfg.get("backend_kind") or turbo_cfg.get("backend_type"),
+        backend_path,
+    )
+    if backend_path:
+        backend = str(Path(backend_path).expanduser())
+        resolved_kind = _normalize_turbo_backend_kind(backend_kind or requested_kind, backend)
+    elif requested_kind == "lucebox":
+        backend = _find_lucebox_backend_for_turbo(cfg)
+        resolved_kind = "lucebox"
+    else:
+        backend = _find_llama_server_for_turbo(cfg)
+        resolved_kind = "llama-server"
+    if not Path(backend).is_file():
+        raise SystemExit(f"DFlash backend not found: {backend}")
+    assume_supported = bool(turbo_cfg.get("assume_dflash_backend") or os.getenv("OPENJET_ASSUME_DFLASH_BACKEND"))
+    if resolved_kind == "llama-server" and not _backend_supports_dflash(backend, assume_supported=assume_supported):
+        raise SystemExit(
+            "DFlash support was not detected in the configured llama-server. Build "
+            "spiritbuun/buun-llama-cpp with CUDA and set `turbo.llama_server_path` "
+            "or OPENJET_TURBO_LLAMA_SERVER to that binary."
+        )
+    baseline = (
+        baseline_tok_s
+        if baseline_tok_s is not None
+        else _cfg_float(os.getenv("OPENJET_TURBO_BASELINE_TOK_S", ""))
+        or _cfg_float(turbo_cfg.get("baseline_tok_s"))
+        or _cfg_float(cfg.get("benchmark_baseline_tok_s"))
+    )
+    ctx = context_size or _cfg_int(
+        turbo_cfg.get("context_window_tokens", cfg.get("context_window_tokens", 6048)),
+        6048,
+        minimum=512,
+    )
+    return TurboBenchmarkSettings(
+        target_model=target,
+        draft_model=draft,
+        backend_path=backend,
+        backend_kind=resolved_kind,
+        backend_label=str(
+            turbo_cfg.get("backend")
+            or ("Luce-Org/lucebox-hub dflash" if resolved_kind == "lucebox" else _dflash_backend_label(backend))
+        ),
+        context_size=ctx,
+        draft_context_size=_cfg_int(turbo_cfg.get("draft_context_window_tokens", 256), 256, minimum=16),
+        gpu_layers=_cfg_int(turbo_cfg.get("gpu_layers", cfg.get("gpu_layers", 99)), 99, minimum=0),
+        draft_gpu_layers=_cfg_int(
+            turbo_cfg.get("draft_gpu_layers", turbo_cfg.get("gpu_layers", cfg.get("gpu_layers", 99))),
+            99,
+            minimum=0,
+        ),
+        batch_size=_cfg_int(turbo_cfg.get("batch_size", 256), 256, minimum=1),
+        ubatch_size=_cfg_int(turbo_cfg.get("ubatch_size", 64), 64, minimum=1),
+        thinking_enabled=thinking_enabled,
+        baseline_tok_s=baseline,
+    )
+
+
+def _turbo_server_cmd(settings: TurboBenchmarkSettings, *, host: str, port: int) -> list[str]:
+    return [
+        settings.backend_path,
+        "-m",
+        settings.target_model,
+        "-md",
+        settings.draft_model,
+        "--spec-type",
+        "dflash",
+        "-ngl",
+        str(settings.gpu_layers),
+        "-ngld",
+        str(settings.draft_gpu_layers),
+        "-np",
+        "1",
+        "-c",
+        str(settings.context_size),
+        "-cd",
+        str(settings.draft_context_size),
+        "-fa",
+        "on",
+        "-b",
+        str(settings.batch_size),
+        "-ub",
+        str(settings.ubatch_size),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--jinja",
+        "--chat-template-kwargs",
+        json.dumps({"enable_thinking": settings.thinking_enabled}, separators=(",", ":")),
+    ]
+
+
+def _lucebox_paths(settings: TurboBenchmarkSettings) -> tuple[str, str]:
+    backend = Path(settings.backend_path).expanduser()
+    if backend.name == "server.py":
+        root = backend.parent.parent
+        exe_name = "test_dflash.exe" if os.name == "nt" else "test_dflash"
+        return str(backend), str(root / "build" / exe_name)
+    return str(backend.parent.parent / "scripts" / "server.py"), str(backend)
+
+
+def _lucebox_server_cmd(settings: TurboBenchmarkSettings, *, host: str, port: int) -> list[str]:
+    server_script, test_dflash_bin = _lucebox_paths(settings)
+    cmd = [
+        sys.executable,
+        server_script,
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--target",
+        settings.target_model,
+        "--draft",
+        settings.draft_model,
+        "--bin",
+        test_dflash_bin,
+        "--budget",
+        "22",
+        "--max-ctx",
+        str(settings.context_size),
+    ]
+    return cmd
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _server_log_tail(log_path: Path, *, max_chars: int = 6000) -> str:
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(text) <= max_chars:
+        return text.strip()
+    return text[-max_chars:].strip()
+
+
+def _wait_for_turbo_server(proc: subprocess.Popen, base_url: str, log_path: Path, *, timeout_seconds: float = 180.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    with httpx.Client(timeout=2.0) as client:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                detail = _server_log_tail(log_path) or "no server output"
+                raise RuntimeError(f"llama-server exited before becoming ready: {detail}")
+            try:
+                response = client.get(f"{base_url}/health")
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            time.sleep(1.0)
+    detail = _server_log_tail(log_path)
+    raise TimeoutError(f"llama-server did not become ready within {timeout_seconds:.0f}s" + (f": {detail}" if detail else ""))
+
+
+def _wait_for_lucebox_server(proc: subprocess.Popen, base_url: str, log_path: Path, *, timeout_seconds: float = 180.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    with httpx.Client(timeout=2.0) as client:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                detail = _server_log_tail(log_path) or "no server output"
+                raise RuntimeError(f"Lucebox server exited before becoming ready: {detail}")
+            try:
+                response = client.get(f"{base_url}/v1/models")
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            time.sleep(1.0)
+    detail = _server_log_tail(log_path)
+    raise TimeoutError(f"Lucebox server did not become ready within {timeout_seconds:.0f}s" + (f": {detail}" if detail else ""))
+
+
+def _extract_turbo_timings(payload: dict) -> TurboBenchmarkTimings:
+    timings = payload.get("timings")
+    if not isinstance(timings, dict):
+        timings = payload.get("usage", {}).get("timings") if isinstance(payload.get("usage"), dict) else {}
+    if not isinstance(timings, dict):
+        timings = {}
+
+    def _num(*keys: str) -> float | None:
+        for key in keys:
+            value = timings.get(key)
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            return parsed
+        return None
+
+    prompt_tps = _num("prompt_per_second", "prompt_eval_tok_s")
+    generation_tps = _num("predicted_per_second", "generation_tok_s", "eval_tok_s")
+    prompt_tokens = _num("prompt_n", "prompt_tokens", "prompt_eval_count")
+    generation_tokens = _num("predicted_n", "completion_tokens", "eval_count")
+    prompt_ms = _num("prompt_ms", "prompt_eval_ms")
+    generation_ms = _num("predicted_ms", "generation_ms", "eval_ms")
+    if prompt_tps is None and prompt_tokens and prompt_ms and prompt_ms > 0:
+        prompt_tps = prompt_tokens / (prompt_ms / 1000.0)
+    if generation_tps is None and generation_tokens and generation_ms and generation_ms > 0:
+        generation_tps = generation_tokens / (generation_ms / 1000.0)
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    if prompt_tokens is None:
+        prompt_tokens = _cfg_float(usage.get("prompt_tokens"))
+    if generation_tokens is None:
+        generation_tokens = _cfg_float(usage.get("completion_tokens"))
+    return TurboBenchmarkTimings(
+        prompt_eval_tok_s=prompt_tps,
+        generation_tok_s=generation_tps,
+        prompt_tokens=int(prompt_tokens) if prompt_tokens is not None else None,
+        generation_tokens=int(generation_tokens) if generation_tokens is not None else None,
+        raw=payload,
+    )
+
+
+def _request_turbo_completion(base_url: str, *, n_gen: int, thinking_enabled: bool) -> TurboBenchmarkTimings:
+    payload = {
+        "model": "local",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a concise local coding agent benchmarked for generation throughput.",
+            },
+            {"role": "user", "content": _TURBO_BENCHMARK_PROMPT},
+        ],
+        "temperature": 0,
+        "max_tokens": n_gen,
+        "stream": False,
+        "cache_prompt": False,
+        "chat_template_kwargs": {"enable_thinking": thinking_enabled},
+        "reasoning_format": "auto" if thinking_enabled else "none",
+    }
+    started = time.monotonic()
+    with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=30.0)) as client:
+        response = client.post(f"{base_url}/v1/chat/completions", json=payload)
+        response.raise_for_status()
+        data = response.json()
+    timings = _extract_turbo_timings(data)
+    if timings.generation_tok_s is None and timings.generation_tokens:
+        elapsed = max(0.001, time.monotonic() - started)
+        timings = TurboBenchmarkTimings(
+            prompt_eval_tok_s=timings.prompt_eval_tok_s,
+            generation_tok_s=timings.generation_tokens / elapsed,
+            prompt_tokens=timings.prompt_tokens,
+            generation_tokens=timings.generation_tokens,
+            raw=timings.raw,
+        )
+    return timings
+
+
+def _terminate_process(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def _run_turbo_server_benchmark(settings: TurboBenchmarkSettings, *, n_gen: int) -> TurboBenchmarkTimings:
+    host = "127.0.0.1"
+    port = _find_free_port()
+    base_url = f"http://{host}:{port}"
+    if settings.backend_kind == "lucebox":
+        cmd = _lucebox_server_cmd(settings, host=host, port=port)
+        wait_for_server = _wait_for_lucebox_server
+    else:
+        cmd = _turbo_server_cmd(settings, host=host, port=port)
+        wait_for_server = _wait_for_turbo_server
+    env = _bench_env(settings.backend_path)
+    log_path = Path(tempfile.gettempdir()) / f"openjet-turbo-llama-server-{os.getpid()}-{port}.log"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        print(f"Server:  {' '.join(cmd)}")
+        print(f"Log:     {log_path}")
+        sys.stdout.flush()
+        proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_for_server(proc, base_url, log_path)
+            return _request_turbo_completion(base_url, n_gen=n_gen, thinking_enabled=settings.thinking_enabled)
+        finally:
+            _terminate_process(proc)
+
+
+def _format_tok_s(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    return f"{value:.2f}"
+
+
+def run_turbo_benchmark(
+    *,
+    thinking_enabled: bool = False,
+    n_gen: int = 400,
+    target_model: str | None = None,
+    draft_model: str | None = None,
+    backend_path: str | None = None,
+    backend_kind: str | None = None,
+    context_size: int | None = None,
+    baseline_tok_s: float | None = None,
+) -> None:
+    cfg = load_config()
+    hw = detect_hardware_info()
+    cuda_summary = _get_cuda_driver_summary()
+    if not hw.has_cuda:
+        raise SystemExit("CUDA was not detected. DFlash turbo benchmark currently targets CUDA/NVIDIA GPUs.")
+    settings = _load_turbo_settings(
+        cfg,
+        thinking_enabled=thinking_enabled,
+        target_model=target_model,
+        draft_model=draft_model,
+        backend_path=backend_path,
+        backend_kind=backend_kind,
+        context_size=context_size,
+        baseline_tok_s=baseline_tok_s,
+    )
+
+    print(f"{'=' * 60}\nOpenJet Turbo Benchmark (experimental DFlash)\n{'=' * 60}")
+    print("WARNING: DFlash mode is experimental and requires spiritbuun/buun-llama-cpp.")
+    print(f"Hardware:      {hw.label}; RAM={hw.total_ram_gb:.1f} GB; VRAM={hw.vram_mb:.0f} MB")
+    if cuda_summary:
+        print(f"CUDA:          available; {cuda_summary}")
+    else:
+        print("CUDA:          available")
+    board = read_device_model()
+    if board:
+        print(f"Board:         {board}")
+    print(f"Target model:  {Path(settings.target_model).name}")
+    print(f"Draft model:   {Path(settings.draft_model).name}")
+    print(f"Context size:  {settings.context_size}")
+    print(f"Thinking mode: {'on' if settings.thinking_enabled else 'off'}")
+    if settings.thinking_enabled:
+        print("Warning: Qwen thinking mode can collapse DFlash acceptance for this drafter.")
+    print(f"Backend:       {settings.backend_label} ({settings.backend_kind}; {settings.backend_path})")
+    if settings.backend_kind == "lucebox":
+        print("Timing note:   Lucebox server does not expose prompt timing; generation tok/s uses wall-clock completion tokens.")
+    print(f"Generation:    {n_gen} tokens, temperature=0")
+
+    timings = _run_turbo_server_benchmark(settings, n_gen=n_gen)
+    print(f"{'=' * 60}\nResult\n{'=' * 60}")
+    print(f"prompt eval tok/s: {_format_tok_s(timings.prompt_eval_tok_s)}")
+    print(f"generation tok/s:  {_format_tok_s(timings.generation_tok_s)}")
+    if settings.baseline_tok_s and timings.generation_tok_s:
+        print(f"speedup vs baseline: {timings.generation_tok_s / settings.baseline_tok_s:.2f}x")
+    elif settings.baseline_tok_s:
+        print("speedup vs baseline: unavailable")
+    else:
+        print("speedup vs baseline: not provided")
 
 
 def _run_bench(cmd: list[str], env: dict[str, str]) -> None:

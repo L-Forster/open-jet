@@ -282,6 +282,161 @@ class BenchmarkTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     benchmark.run_benchmark_sweep(repetitions=1)
 
+    def test_turbo_server_command_uses_dflash_and_disables_thinking(self) -> None:
+        settings = benchmark.TurboBenchmarkSettings(
+            target_model="/models/Qwen3.6-27B-Q4_K_M.gguf",
+            draft_model="/models/dflash-draft-3.6-q8_0.gguf",
+            backend_path="/opt/buun-llama-cpp/build/bin/llama-server",
+            backend_kind="llama-server",
+            backend_label="spiritbuun/buun-llama-cpp",
+            context_size=6048,
+            draft_context_size=256,
+            gpu_layers=99,
+            draft_gpu_layers=99,
+            batch_size=256,
+            ubatch_size=64,
+            thinking_enabled=False,
+            baseline_tok_s=None,
+        )
+
+        cmd = benchmark._turbo_server_cmd(settings, host="127.0.0.1", port=18080)
+
+        self.assertIn("-md", cmd)
+        self.assertEqual(cmd[cmd.index("-md") + 1], "/models/dflash-draft-3.6-q8_0.gguf")
+        self.assertIn("--spec-type", cmd)
+        self.assertEqual(cmd[cmd.index("--spec-type") + 1], "dflash")
+        self.assertIn("-ngld", cmd)
+        self.assertEqual(cmd[cmd.index("-ngld") + 1], "99")
+        self.assertIn("-cd", cmd)
+        self.assertEqual(cmd[cmd.index("-cd") + 1], "256")
+        self.assertIn("--jinja", cmd)
+        self.assertEqual(cmd[cmd.index("--chat-template-kwargs") + 1], '{"enable_thinking":false}')
+
+    def test_turbo_server_command_can_enable_thinking_mode(self) -> None:
+        settings = benchmark.TurboBenchmarkSettings(
+            target_model="/models/target.gguf",
+            draft_model="/models/draft.gguf",
+            backend_path="/opt/llama-server",
+            backend_kind="llama-server",
+            backend_label="spiritbuun/buun-llama-cpp",
+            context_size=4096,
+            draft_context_size=256,
+            gpu_layers=99,
+            draft_gpu_layers=99,
+            batch_size=256,
+            ubatch_size=64,
+            thinking_enabled=True,
+            baseline_tok_s=None,
+        )
+
+        cmd = benchmark._turbo_server_cmd(settings, host="127.0.0.1", port=18080)
+
+        self.assertEqual(cmd[cmd.index("--chat-template-kwargs") + 1], '{"enable_thinking":true}')
+
+    def test_lucebox_server_command_uses_test_dflash_backend(self) -> None:
+        settings = benchmark.TurboBenchmarkSettings(
+            target_model="/models/Qwen3.6-27B-Q4_K_M.gguf",
+            draft_model="/models/draft/model.safetensors",
+            backend_path="/opt/lucebox-hub/dflash/build/test_dflash",
+            backend_kind="lucebox",
+            backend_label="Luce-Org/lucebox-hub dflash",
+            context_size=6048,
+            draft_context_size=256,
+            gpu_layers=99,
+            draft_gpu_layers=99,
+            batch_size=256,
+            ubatch_size=64,
+            thinking_enabled=False,
+            baseline_tok_s=None,
+        )
+
+        cmd = benchmark._lucebox_server_cmd(settings, host="127.0.0.1", port=18080)
+
+        self.assertTrue(cmd[1].replace("\\", "/").endswith("/opt/lucebox-hub/dflash/scripts/server.py"))
+        self.assertIn("--target", cmd)
+        self.assertEqual(cmd[cmd.index("--target") + 1], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertIn("--draft", cmd)
+        self.assertEqual(cmd[cmd.index("--draft") + 1], "/models/draft/model.safetensors")
+        self.assertIn("--bin", cmd)
+        self.assertTrue(cmd[cmd.index("--bin") + 1].replace("\\", "/").endswith("/opt/lucebox-hub/dflash/build/test_dflash"))
+        self.assertIn("--max-ctx", cmd)
+        self.assertEqual(cmd[cmd.index("--max-ctx") + 1], "6048")
+
+    def test_extract_turbo_timings_reads_llama_server_timings(self) -> None:
+        timings = benchmark._extract_turbo_timings(
+            {
+                "usage": {"prompt_tokens": 100, "completion_tokens": 40},
+                "timings": {
+                    "prompt_n": 100,
+                    "prompt_ms": 250.0,
+                    "predicted_n": 40,
+                    "predicted_ms": 1000.0,
+                },
+            }
+        )
+
+        self.assertEqual(timings.prompt_tokens, 100)
+        self.assertEqual(timings.generation_tokens, 40)
+        self.assertAlmostEqual(timings.prompt_eval_tok_s or 0, 400.0)
+        self.assertAlmostEqual(timings.generation_tok_s or 0, 40.0)
+
+    def test_load_turbo_settings_resolves_models_and_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "Qwen3.6-27B-Q4_K_M.gguf"
+            draft = root / "dflash-draft-3.6-q8_0.gguf"
+            backend_path = root / "llama-server"
+            target.write_bytes(b"GGUF")
+            draft.write_bytes(b"GGUF")
+            backend_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            cfg = {
+                "llama_model": str(target),
+                "llama_server_path": str(backend_path),
+                "context_window_tokens": 4096,
+                "gpu_layers": 42,
+                "turbo": {
+                    "draft_model": str(draft),
+                    "assume_dflash_backend": True,
+                    "baseline_tok_s": 20,
+                },
+            }
+
+            settings = benchmark._load_turbo_settings(cfg, thinking_enabled=False)
+
+        self.assertEqual(settings.target_model, str(target))
+        self.assertEqual(settings.draft_model, str(draft))
+        self.assertEqual(settings.backend_path, str(backend_path))
+        self.assertEqual(settings.backend_kind, "llama-server")
+        self.assertEqual(settings.context_size, 4096)
+        self.assertEqual(settings.gpu_layers, 42)
+        self.assertEqual(settings.baseline_tok_s, 20)
+
+    def test_load_turbo_settings_supports_lucebox_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "Qwen3.6-27B-Q4_K_M.gguf"
+            draft = root / "models" / "draft" / "model.safetensors"
+            backend_path = root / "lucebox-hub" / "dflash" / "build" / "test_dflash"
+            target.write_bytes(b"GGUF")
+            draft.parent.mkdir(parents=True)
+            draft.write_bytes(b"draft")
+            backend_path.parent.mkdir(parents=True)
+            backend_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            cfg = {
+                "llama_model": str(target),
+                "turbo": {
+                    "backend_kind": "lucebox",
+                    "draft_model": str(draft.parent),
+                    "lucebox_bin": str(backend_path),
+                },
+            }
+
+            settings = benchmark._load_turbo_settings(cfg, thinking_enabled=False)
+
+        self.assertEqual(settings.backend_kind, "lucebox")
+        self.assertEqual(settings.draft_model, str(draft))
+        self.assertEqual(settings.backend_path, str(backend_path))
+
 
 if __name__ == "__main__":
     unittest.main()
