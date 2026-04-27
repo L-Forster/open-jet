@@ -431,11 +431,32 @@ class BenchmarkTests(unittest.TestCase):
                 },
             }
 
-            settings = benchmark._load_turbo_settings(cfg, thinking_enabled=False)
+            with patch("src.benchmark._ensure_lucebox_backend", return_value=(backend_path.parent.parent, str(backend_path))):
+                settings = benchmark._load_turbo_settings(cfg, thinking_enabled=False)
 
         self.assertEqual(settings.backend_kind, "lucebox")
         self.assertEqual(settings.draft_model, str(draft))
         self.assertEqual(settings.backend_path, str(backend_path))
+
+    def test_lucebox_backend_autoprovisions_models_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend_path = root / "lucebox-hub" / "dflash" / "build" / "test_dflash"
+            target = root / "lucebox-hub" / "dflash" / "models" / "Qwen3.6-27B-Q4_K_M.gguf"
+            draft = root / "lucebox-hub" / "dflash" / "models" / "draft" / "model.safetensors"
+            backend_path.parent.mkdir(parents=True)
+            backend_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            cfg = {"turbo": {"backend_kind": "lucebox"}}
+
+            with patch("src.benchmark._ensure_lucebox_backend", return_value=(root / "lucebox-hub" / "dflash", str(backend_path))), patch(
+                "src.benchmark._hf_download_file", side_effect=[target, draft]
+            ) as download:
+                settings = benchmark._load_turbo_settings(cfg, thinking_enabled=False)
+
+        self.assertEqual(settings.backend_kind, "lucebox")
+        self.assertEqual(settings.target_model, str(target))
+        self.assertEqual(settings.draft_model, str(draft))
+        self.assertEqual(download.call_count, 2)
 
 
 if __name__ == "__main__":

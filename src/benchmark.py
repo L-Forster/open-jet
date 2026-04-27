@@ -34,6 +34,12 @@ _TURBO_DRAFT_MODEL_NAMES = (
     "dflash-draft-3.6-q4_k_m.gguf",
     "model.safetensors",
 )
+_LUCEBOX_REPO_URL = "https://github.com/Luce-Org/lucebox-hub.git"
+_LUCEBOX_TARGET_REPO = "unsloth/Qwen3.6-27B-GGUF"
+_LUCEBOX_TARGET_FILE = "Qwen3.6-27B-Q4_K_M.gguf"
+_LUCEBOX_DRAFT_REPO = "z-lab/Qwen3.6-27B-DFlash"
+_LUCEBOX_DRAFT_FILE = "model.safetensors"
+_LUCEBOX_PY_DEPS = ("fastapi", "uvicorn", "transformers", "jinja2")
 
 
 @dataclass(frozen=True)
@@ -106,10 +112,7 @@ def _find_llama_server_for_turbo(cfg: dict) -> str:
 
 def _find_lucebox_backend_for_turbo(cfg: dict) -> str:
     turbo_cfg = _turbo_cfg(cfg)
-    root_raw = (
-        os.getenv("OPENJET_LUCEBOX_ROOT", "").strip()
-        or str(turbo_cfg.get("lucebox_root") or "").strip()
-    )
+    root_raw = _lucebox_root_raw(turbo_cfg)
     candidates: list[str] = [
         os.getenv("OPENJET_LUCEBOX_DFLASH_BIN", "").strip(),
         str(turbo_cfg.get("lucebox_bin") or "").strip(),
@@ -137,6 +140,17 @@ def _find_lucebox_backend_for_turbo(cfg: dict) -> str:
         "then set `turbo.backend_kind: lucebox` and `turbo.lucebox_root`, `turbo.lucebox_bin`, "
         "or OPENJET_LUCEBOX_DFLASH_BIN."
     )
+
+
+def _lucebox_root_raw(turbo_cfg: dict) -> str:
+    return (
+        os.getenv("OPENJET_LUCEBOX_ROOT", "").strip()
+        or str(turbo_cfg.get("lucebox_root") or "").strip()
+    )
+
+
+def _default_lucebox_root() -> Path:
+    return Path(".openjet") / "turbo" / "lucebox-hub" / "dflash"
 
 
 def _normalize_turbo_backend_kind(value: object, backend_path: str | None = None) -> str:
@@ -395,6 +409,97 @@ def _cfg_int(value: object, default: int, *, minimum: int = 1) -> int:
     return max(minimum, parsed)
 
 
+def _run_setup_step(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    print(f"Setup:   {' '.join(cmd)}")
+    sys.stdout.flush()
+    try:
+        subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=True)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Required setup command not found: {cmd[0]}") from exc
+    except subprocess.CalledProcessError as exc:
+        where = f" in {cwd}" if cwd else ""
+        raise SystemExit(f"Setup command failed{where}: {' '.join(cmd)}") from exc
+
+
+def _ensure_lucebox_checkout(root: Path) -> None:
+    repo_root = root.parent
+    if (root / "scripts" / "server.py").is_file():
+        return
+    repo_root.parent.mkdir(parents=True, exist_ok=True)
+    if repo_root.exists() and any(repo_root.iterdir()):
+        raise SystemExit(
+            f"Lucebox directory exists but does not look complete: {repo_root}. "
+            "Remove it or set turbo.lucebox_root to a valid lucebox-hub/dflash checkout."
+        )
+    _run_setup_step(["git", "clone", "--recurse-submodules", _LUCEBOX_REPO_URL, str(repo_root)])
+
+
+def _ensure_lucebox_python_deps(root: Path) -> None:
+    marker = root / ".openjet-server-deps-installed"
+    if marker.is_file():
+        return
+    _run_setup_step([sys.executable, "-m", "pip", "install", *_LUCEBOX_PY_DEPS], cwd=root)
+    marker.write_text("ok\n", encoding="utf-8")
+
+
+def _ensure_lucebox_binary(root: Path) -> str:
+    exe_name = "test_dflash.exe" if os.name == "nt" else "test_dflash"
+    binary = root / "build" / exe_name
+    if binary.is_file():
+        return str(binary)
+    if not shutil.which("cmake"):
+        raise SystemExit("cmake is required to build Lucebox DFlash. Install cmake, then rerun `openjet turbo benchmark`.")
+    _run_setup_step(["cmake", "-B", "build", "-S", ".", "-DCMAKE_BUILD_TYPE=Release"], cwd=root)
+    _run_setup_step(["cmake", "--build", "build", "--target", "test_dflash", "-j", str(os.cpu_count() or 4)], cwd=root)
+    if not binary.is_file():
+        raise SystemExit(f"Lucebox build completed but binary was not found: {binary}")
+    return str(binary)
+
+
+def _hf_download_file(repo_id: str, filename: str, local_dir: Path) -> Path:
+    target = local_dir / filename
+    if target.is_file():
+        return target
+    local_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Setup:   downloading {repo_id}/{filename} to {local_dir}")
+    sys.stdout.flush()
+    try:
+        from huggingface_hub import hf_hub_download
+
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
+        )
+        return Path(downloaded)
+    except Exception as exc:
+        raise SystemExit(
+            f"Failed to download {repo_id}/{filename}. If the repo is gated, set HF_TOKEN or download it manually."
+        ) from exc
+
+
+def _ensure_lucebox_target_model(cfg: dict, override: str | None, root: Path) -> str:
+    if override or os.getenv("OPENJET_TURBO_TARGET_MODEL", "").strip() or _turbo_cfg(cfg).get("target_model") or cfg.get("dflash_target_model") or cfg.get("llama_model"):
+        return _resolve_turbo_target_model(cfg, override)
+    return str(_hf_download_file(_LUCEBOX_TARGET_REPO, _LUCEBOX_TARGET_FILE, root / "models"))
+
+
+def _ensure_lucebox_draft_model(cfg: dict, target_model: str, override: str | None, root: Path) -> str:
+    if override or os.getenv("OPENJET_TURBO_DRAFT_MODEL", "").strip() or _turbo_cfg(cfg).get("draft_model") or cfg.get("dflash_draft_model"):
+        return _resolve_turbo_draft_model(cfg, target_model, override)
+    return str(_hf_download_file(_LUCEBOX_DRAFT_REPO, _LUCEBOX_DRAFT_FILE, root / "models" / "draft"))
+
+
+def _ensure_lucebox_backend(cfg: dict) -> tuple[Path, str]:
+    turbo_cfg = _turbo_cfg(cfg)
+    root = Path(_lucebox_root_raw(turbo_cfg)).expanduser() if _lucebox_root_raw(turbo_cfg) else _default_lucebox_root()
+    _ensure_lucebox_checkout(root)
+    _ensure_lucebox_python_deps(root)
+    binary = _ensure_lucebox_binary(root)
+    return root, binary
+
+
 def _resolve_turbo_target_model(cfg: dict, override: str | None = None) -> str:
     turbo_cfg = _turbo_cfg(cfg)
     raw = (
@@ -484,8 +589,6 @@ def _load_turbo_settings(
     baseline_tok_s: float | None = None,
 ) -> TurboBenchmarkSettings:
     turbo_cfg = _turbo_cfg(cfg)
-    target = _resolve_turbo_target_model(cfg, target_model)
-    draft = _resolve_turbo_draft_model(cfg, target, draft_model)
     requested_kind = _normalize_turbo_backend_kind(
         backend_kind or turbo_cfg.get("backend_kind") or turbo_cfg.get("backend_type"),
         backend_path,
@@ -493,12 +596,18 @@ def _load_turbo_settings(
     if backend_path:
         backend = str(Path(backend_path).expanduser())
         resolved_kind = _normalize_turbo_backend_kind(backend_kind or requested_kind, backend)
+        target = _resolve_turbo_target_model(cfg, target_model)
+        draft = _resolve_turbo_draft_model(cfg, target, draft_model)
     elif requested_kind == "lucebox":
-        backend = _find_lucebox_backend_for_turbo(cfg)
+        lucebox_root, backend = _ensure_lucebox_backend(cfg)
         resolved_kind = "lucebox"
+        target = _ensure_lucebox_target_model(cfg, target_model, lucebox_root)
+        draft = _ensure_lucebox_draft_model(cfg, target, draft_model, lucebox_root)
     else:
         backend = _find_llama_server_for_turbo(cfg)
         resolved_kind = "llama-server"
+        target = _resolve_turbo_target_model(cfg, target_model)
+        draft = _resolve_turbo_draft_model(cfg, target, draft_model)
     if not Path(backend).is_file():
         raise SystemExit(f"DFlash backend not found: {backend}")
     assume_supported = bool(turbo_cfg.get("assume_dflash_backend") or os.getenv("OPENJET_ASSUME_DFLASH_BACKEND"))

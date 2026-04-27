@@ -38,7 +38,13 @@ openjet benchmark --mode turbo
 openjet benchmark --mode thinking
 ```
 
-Turbo mode starts a temporary `llama-server`, sends a fixed local-agent coding
+Turbo mode can set up the Lucebox backend itself. With
+`--backend-kind lucebox`, OpenJet will use `.openjet/turbo/lucebox-hub`, clone
+`Luce-Org/lucebox-hub` if needed, build `dflash/build/test_dflash`, install the
+local HTTP server Python dependencies, download the default Qwen3.6 target GGUF
+and z-lab draft when no model paths are configured, then run the benchmark.
+
+The benchmark starts a temporary local server, sends a fixed local-agent coding
 prompt through the OpenAI-compatible API, and prints:
 
 - hardware and CUDA status
@@ -69,13 +75,11 @@ Required setup for `llama-server` mode:
   `llama.cpp`
 - CUDA/NVIDIA GPU, such as RTX 3090-class hardware
 
-Required setup for `lucebox` mode:
+Automatic setup for `lucebox` mode needs:
 
-- clone `https://github.com/Luce-Org/lucebox-hub` with submodules
-- build `lucebox-hub/dflash/build/test_dflash`
-- target GGUF: Qwen3.5/Qwen3.6 27B Q4_K_M-compatible GGUF
-- draft model: z-lab/Lucebox `model.safetensors` draft directory or file
-- install the Lucebox server Python deps (`fastapi`, `uvicorn`, `transformers`, `jinja2`)
+- `git`, `cmake`, a CUDA compiler/toolkit, and an sm_86+ NVIDIA GPU
+- enough disk for the checkout plus target and draft downloads
+- Hugging Face access for gated draft repos; set `HF_TOKEN` first if required
 
 Configuration can live in `config.yaml`:
 
@@ -94,10 +98,18 @@ For Lucebox:
 ```yaml
 turbo:
   backend_kind: lucebox
+  context_window_tokens: 6048
+```
+
+That is enough for the default auto-provisioned path. You can override paths if
+you already have files elsewhere:
+
+```yaml
+turbo:
+  backend_kind: lucebox
   lucebox_root: /home/you/lucebox-hub/dflash
   target_model: /models/Qwen3.6-27B-Q4_K_M.gguf
   draft_model: /home/you/lucebox-hub/dflash/models/draft/model.safetensors
-  context_window_tokens: 6048
 ```
 
 The same values can be provided on the command line:
@@ -115,9 +127,7 @@ openjet turbo benchmark \
 ```bash
 openjet turbo benchmark \
   --backend-kind lucebox \
-  --backend-path /home/you/lucebox-hub/dflash/build/test_dflash \
-  --target-model /models/Qwen3.6-27B-Q4_K_M.gguf \
-  --draft-model /home/you/lucebox-hub/dflash/models/draft/model.safetensors
+  --context 6048
 ```
 
 ## Sweep mode
