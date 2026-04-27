@@ -41,8 +41,9 @@ openjet benchmark --mode thinking
 Turbo mode can set up the Lucebox backend itself. With
 `--backend-kind lucebox`, OpenJet will use `.openjet/turbo/lucebox-hub`, clone
 `Luce-Org/lucebox-hub` if needed, build `dflash/build/test_dflash`, install the
-local HTTP server Python dependencies, download the default Qwen3.6 target GGUF
-and z-lab draft when no model paths are configured, then run the benchmark.
+local HTTP server Python dependencies, reuse the active OpenJet target GGUF,
+download the z-lab draft when no draft path is configured, then run the
+benchmark.
 
 The benchmark starts a temporary local server, sends a fixed local-agent coding
 prompt through the OpenAI-compatible API, and prints:
@@ -78,7 +79,9 @@ Required setup for `llama-server` mode:
 Automatic setup for `lucebox` mode needs:
 
 - `git`, `cmake`, a CUDA compiler/toolkit, and an sm_86+ NVIDIA GPU
-- enough disk for the checkout plus target and draft downloads
+- an existing Qwen3.5/Qwen3.6 27B target GGUF from `openjet setup` or
+  `--target-model`; OpenJet will not download a second target GGUF
+- enough disk for the checkout plus draft download
 - Hugging Face access for gated draft repos; set `HF_TOKEN` first if required
 
 Configuration can live in `config.yaml`:

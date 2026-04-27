@@ -438,25 +438,46 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(settings.draft_model, str(draft))
         self.assertEqual(settings.backend_path, str(backend_path))
 
-    def test_lucebox_backend_autoprovisions_models_when_missing(self) -> None:
+    def test_lucebox_backend_reuses_existing_target_and_downloads_draft_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             backend_path = root / "lucebox-hub" / "dflash" / "build" / "test_dflash"
-            target = root / "lucebox-hub" / "dflash" / "models" / "Qwen3.6-27B-Q4_K_M.gguf"
+            target = root / "models" / "Qwen3.6-27B-Q4_K_M.gguf"
             draft = root / "lucebox-hub" / "dflash" / "models" / "draft" / "model.safetensors"
             backend_path.parent.mkdir(parents=True)
             backend_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"GGUF")
             cfg = {"turbo": {"backend_kind": "lucebox"}}
 
             with patch("src.benchmark._ensure_lucebox_backend", return_value=(root / "lucebox-hub" / "dflash", str(backend_path))), patch(
-                "src.benchmark._hf_download_file", side_effect=[target, draft]
+                "src.benchmark._find_existing_lucebox_target_model", return_value=target
+            ), patch(
+                "src.benchmark._hf_download_file", return_value=draft
             ) as download:
                 settings = benchmark._load_turbo_settings(cfg, thinking_enabled=False)
 
         self.assertEqual(settings.backend_kind, "lucebox")
         self.assertEqual(settings.target_model, str(target))
         self.assertEqual(settings.draft_model, str(draft))
-        self.assertEqual(download.call_count, 2)
+        download.assert_called_once()
+
+    def test_lucebox_backend_refuses_to_download_duplicate_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            backend_path = root / "lucebox-hub" / "dflash" / "build" / "test_dflash"
+            backend_path.parent.mkdir(parents=True)
+            backend_path.write_text("#!/bin/sh\n", encoding="utf-8")
+            cfg = {"turbo": {"backend_kind": "lucebox"}}
+
+            with patch("src.benchmark._ensure_lucebox_backend", return_value=(root / "lucebox-hub" / "dflash", str(backend_path))), patch(
+                "src.benchmark._find_existing_lucebox_target_model", return_value=None
+            ), patch("src.benchmark._hf_download_file") as download:
+                with self.assertRaises(SystemExit) as exc:
+                    benchmark._load_turbo_settings(cfg, thinking_enabled=False)
+
+        self.assertIn("will not download a duplicate target model", str(exc.exception))
+        download.assert_not_called()
 
 
 if __name__ == "__main__":

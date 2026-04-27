@@ -35,7 +35,6 @@ _TURBO_DRAFT_MODEL_NAMES = (
     "model.safetensors",
 )
 _LUCEBOX_REPO_URL = "https://github.com/Luce-Org/lucebox-hub.git"
-_LUCEBOX_TARGET_REPO = "unsloth/Qwen3.6-27B-GGUF"
 _LUCEBOX_TARGET_FILE = "Qwen3.6-27B-Q4_K_M.gguf"
 _LUCEBOX_DRAFT_REPO = "z-lab/Qwen3.6-27B-DFlash"
 _LUCEBOX_DRAFT_FILE = "model.safetensors"
@@ -479,10 +478,37 @@ def _hf_download_file(repo_id: str, filename: str, local_dir: Path) -> Path:
         ) from exc
 
 
+def _find_existing_lucebox_target_model(root: Path) -> Path | None:
+    candidates: list[Path] = []
+    for base in (
+        Path.cwd(),
+        Path.cwd() / "models",
+        Path.home() / ".openjet" / "models",
+        root / "models",
+    ):
+        if base.is_file() and base.suffix.lower() == ".gguf":
+            candidates.append(base)
+            continue
+        if not base.is_dir():
+            continue
+        for pattern in ("*Qwen3.6*27B*.gguf", "*Qwen3.5*27B*.gguf", "*qwen3.6*27b*.gguf", "*qwen3.5*27b*.gguf"):
+            candidates.extend(base.glob(pattern))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _ensure_lucebox_target_model(cfg: dict, override: str | None, root: Path) -> str:
     if override or os.getenv("OPENJET_TURBO_TARGET_MODEL", "").strip() or _turbo_cfg(cfg).get("target_model") or cfg.get("dflash_target_model") or cfg.get("llama_model"):
         return _resolve_turbo_target_model(cfg, override)
-    return str(_hf_download_file(_LUCEBOX_TARGET_REPO, _LUCEBOX_TARGET_FILE, root / "models"))
+    discovered = _find_existing_lucebox_target_model(root)
+    if discovered:
+        return str(discovered)
+    raise SystemExit(
+        "Target GGUF not configured and OpenJet will not download a duplicate target model. "
+        "Run `openjet setup` first, or pass `--target-model /path/to/Qwen3.6-27B-Q4_K_M.gguf`."
+    )
 
 
 def _ensure_lucebox_draft_model(cfg: dict, target_model: str, override: str | None, root: Path) -> str:
