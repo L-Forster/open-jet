@@ -21,6 +21,21 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         direct = recommend_direct_model(hardware)
 
         self.assertEqual(direct["label"], "Qwen3.6 35B A3B")
+        self.assertTrue(direct["llama_cpu_moe"])
+
+    def test_recommend_direct_model_uses_q3_moe_when_unified_memory_needs_system_reserve(self) -> None:
+        hardware = HardwareInfo(
+            label="Apple M-series",
+            total_ram_gb=24.0,
+            has_cuda=False,
+            has_metal=True,
+        )
+
+        direct = recommend_direct_model(hardware)
+
+        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-Q3_K_XL")
+        self.assertEqual(direct["filename"], "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf")
+        self.assertTrue(direct["llama_cpu_moe"])
 
     async def test_ensure_llama_server_installs_prebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -42,6 +42,8 @@ class ConfigNormalizationTests(unittest.TestCase):
                             "active_model_size_mb": 2048,
                             "kv_bytes_per_token": 17408,
                             "unified_memory_only": True,
+                            "llama_cpu_moe": True,
+                            "llama_n_cpu_moe": 12,
                         }
                     ]
                 }
@@ -52,3 +54,5 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(catalog[0]["active_model_size_mb"], 2048.0)
         self.assertEqual(catalog[0]["kv_bytes_per_token"], 17408.0)
         self.assertTrue(catalog[0]["unified_memory_only"])
+        self.assertTrue(catalog[0]["llama_cpu_moe"])
+        self.assertEqual(catalog[0]["llama_n_cpu_moe"], 12)

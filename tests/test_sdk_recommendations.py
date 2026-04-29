@@ -65,10 +65,10 @@ class SDKRecommendationTests(unittest.TestCase):
         )
 
         self.assertEqual(low_vram_gpu.model.label, "Qwen3.5 9B")
-        self.assertEqual(high_vram_gpu.model.label, "Qwen3.6 27B")
-        self.assertEqual(cpu_only.model.label, "Qwen3.6 27B")
+        self.assertEqual(high_vram_gpu.model.label, "Qwen3.6 27B Q4_K_M")
+        self.assertEqual(cpu_only.model.label, "Qwen3.6 27B Q4_K_M")
         self.assertEqual(low_vram_gpu.llama.context_window_tokens, 128807)
-        self.assertEqual(high_vram_gpu.llama.context_window_tokens, 210314)
+        self.assertEqual(high_vram_gpu.llama.context_window_tokens, 208173)
         self.assertEqual(cpu_only.llama.context_window_tokens, 8192)
         self.assertEqual(low_vram_gpu.llama.device, "cuda")
         self.assertEqual(high_vram_gpu.llama.device, "cuda")
@@ -142,7 +142,7 @@ class SDKRecommendationTests(unittest.TestCase):
             hardware_key="rtx_4060_8gb",
         )
 
-        self.assertEqual(len(estimates), 5)
+        self.assertEqual(len(estimates), 8)
         self.assertEqual(estimates[0].hardware_key, "rtx_4060_8gb")
         self.assertTrue(any(item.fits_in_memory for item in estimates))
         self.assertTrue(any(not item.fits_in_memory for item in estimates))
@@ -157,7 +157,7 @@ class SDKRecommendationTests(unittest.TestCase):
         )
 
         self.assertEqual(estimate.context_window_tokens, 8192)
-        self.assertAlmostEqual(estimate.estimated_tokens_per_second, 52.2, places=1)
+        self.assertAlmostEqual(estimate.estimated_tokens_per_second, 52.0, places=1)
         self.assertEqual(estimate.limiting_factor, "memory")
 
     def test_tok_s_registry_profiles_are_exposed_via_sdk(self) -> None:

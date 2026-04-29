@@ -13,8 +13,10 @@ LEGACY_LOG_DIRECTORY = "session_logs"
 
 # Curated, size-banded shortlist used by setup recommendations.
 # Band limit = max param budget in billions for that RAM tier.
-# Disk/RAM sizes (Q4_K_M): 0.6B~523MB, 1.7B~1.4GB, 4B~2.6GB, 8B~5.2GB,
-# 14B~9.3GB, 27B~16.8GB, 32B~20GB, 35B-A3B~24GB, 122B-A10B~81GB.
+# Disk/RAM sizes (Q4_K_M unless noted): 0.6B~523MB, 1.7B~1.4GB, 4B~2.6GB,
+# 8B~5.2GB, 14B~9.3GB, 27B UD-IQ2_XXS~9.4GB, 27B UD-IQ3_XXS~12.0GB,
+# 27B Q4_K_M~16.5GB, 32B~20GB, 35B-A3B UD-Q3_K_XL~16.8GB,
+# 35B-A3B UD-Q4_K_M~22.1GB, 122B-A10B~81GB.
 RECOMMENDED_LLM_BANDS: tuple[tuple[float, tuple[tuple[str, float, str], ...]], ...] = (
     (
         2.0,
@@ -76,11 +78,27 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "kv_bytes_per_token": 17408,
     },
     {
-        "max_ram_gb": 24.0,
-        "label": "Qwen3.6 27B",
+        "max_ram_gb": 12.0,
+        "label": "Qwen3.6 27B UD-IQ2_XXS",
+        "filename": "Qwen3.6-27B-UD-IQ2_XXS.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-UD-IQ2_XXS.gguf?download=true",
+        "model_size_mb": 9626,
+        "kv_bytes_per_token": 34816,
+    },
+    {
+        "max_ram_gb": 16.0,
+        "label": "Qwen3.6 27B UD-IQ3_XXS",
+        "filename": "Qwen3.6-27B-UD-IQ3_XXS.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-UD-IQ3_XXS.gguf?download=true",
+        "model_size_mb": 12288,
+        "kv_bytes_per_token": 34816,
+    },
+    {
+        "max_ram_gb": 20.0,
+        "label": "Qwen3.6 27B Q4_K_M",
         "filename": "Qwen3.6-27B-Q4_K_M.gguf",
-        "url": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
-        "model_size_mb": 16817,
+        "url": "https://huggingface.co/lmstudio-community/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+        "model_size_mb": 16896,
         "kv_bytes_per_token": 34816,
     },
     {
@@ -94,6 +112,18 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "unified_memory_only": True,
     },
     {
+        "max_ram_gb": 24.0,
+        "label": "Qwen3.6 35B A3B UD-Q3_K_XL",
+        "filename": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true",
+        "model_size_mb": 17203,
+        "active_model_size_mb": 3072,
+        "kv_bytes_per_token": 24576,
+        "unified_memory_only": True,
+        "llama_cpu_moe": True,
+        "llama_n_cpu_moe": 0,
+    },
+    {
         "max_ram_gb": 32.0,
         "label": "Qwen3.6 35B A3B",
         "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
@@ -102,6 +132,8 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "active_model_size_mb": 3072,
         "kv_bytes_per_token": 24576,
         "unified_memory_only": True,
+        "llama_cpu_moe": True,
+        "llama_n_cpu_moe": 0,
     },
 )
 
@@ -196,6 +228,15 @@ def setup_direct_model_catalog(cfg: Mapping[str, object] | None = None) -> tuple
                 row[key] = value
         if "unified_memory_only" in item:
             row["unified_memory_only"] = bool(item.get("unified_memory_only"))
+        if "llama_cpu_moe" in item:
+            row["llama_cpu_moe"] = bool(item.get("llama_cpu_moe"))
+        try:
+            llama_n_cpu_moe = int(item.get("llama_n_cpu_moe"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            if llama_n_cpu_moe >= 0:
+                row["llama_n_cpu_moe"] = llama_n_cpu_moe
         parsed.append(row)
 
     if not parsed:

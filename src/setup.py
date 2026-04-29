@@ -19,7 +19,7 @@ from .hardware import (
     recommended_gpu_layers,
 )
 from .model_profiles import default_profile_name
-from .provisioning import MODELS_DIR, recommend_direct_model
+from .provisioning import MODELS_DIR, UNIFIED_MEMORY_SYSTEM_RESERVE_MB, recommend_direct_model
 from .setup_memory import recommend_context_window_for_model, recommend_setup_context_window
 
 if TYPE_CHECKING:
@@ -363,8 +363,8 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
     if "unified_memory_only" in row:
         payload["unified_memory_only"] = bool(row.get("unified_memory_only"))
     if bool(row.get("unified_memory_only")) and row.get("active_model_size_mb") is not None:
-        payload["llama_cpu_moe"] = False
-        payload["llama_n_cpu_moe"] = 0
+        payload["llama_cpu_moe"] = bool(row.get("llama_cpu_moe", True))
+        payload["llama_n_cpu_moe"] = int(row.get("llama_n_cpu_moe", 0) or 0)
     return payload
 
 
@@ -395,6 +395,9 @@ def _recommended_context_for_payload(
     fallback_tokens: int,
     total_vram_mb: float,
 ) -> int:
+    context_vram_mb = total_vram_mb
+    if bool(payload.get("unified_memory_only")):
+        context_vram_mb = max(0.0, total_vram_mb - UNIFIED_MEMORY_SYSTEM_RESERVE_MB)
     if str(payload.get("model_source") or "") == "direct":
         try:
             model_size_mb = float(payload.get("model_size_mb") or 0.0)
@@ -416,14 +419,14 @@ def _recommended_context_for_payload(
                 fallback_tokens=fallback_tokens,
                 model_size_mb=model_size_mb,
                 kv_bytes_per_token=kv_bytes_per_token,
-                total_vram_mb=total_vram_mb,
+                total_vram_mb=context_vram_mb,
             )
     return recommend_setup_context_window(
         runtime="llama_cpp",
         device=device,
         fallback_tokens=fallback_tokens,
         model_refs=_setup_model_refs(payload),
-        total_vram_mb=total_vram_mb,
+        total_vram_mb=context_vram_mb,
     )
 
 
@@ -467,6 +470,18 @@ def build_recommended_payload(
             direct=direct,
         )
     )
+    if str(payload.get("model_source") or "") == "direct":
+        for key in (
+            "model_size_mb",
+            "kv_bytes_per_token",
+            "resident_model_size_mb",
+            "active_model_size_mb",
+            "unified_memory_only",
+            "llama_cpu_moe",
+            "llama_n_cpu_moe",
+        ):
+            if direct.get(key) is not None:
+                payload[key] = direct[key]
 
     llama_model = str(payload.get("llama_model") or "").strip()
     if llama_model:

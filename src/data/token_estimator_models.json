@@ -22,15 +22,37 @@
     "aliases": ["qwen3.5 9b", "qwen3.5-9b-q4_k_m.gguf", "qwen3.5:9b"]
   },
   {
-    "key": "qwen36_27b_q4_k_m",
-    "label": "Qwen3.6 27B",
-    "filename": "Qwen3.6-27B-Q4_K_M.gguf",
+    "key": "qwen36_27b_ud_iq2_xxs",
+    "label": "Qwen3.6 27B UD-IQ2_XXS",
+    "filename": "Qwen3.6-27B-UD-IQ2_XXS.gguf",
     "parameter_count_billion": 27.0,
-    "model_size_mb": 16817.0,
+    "model_size_mb": 9626.0,
     "kv_bytes_per_token": 34816.0,
     "decode_context_tokens": 8192,
     "source_urls": ["https://huggingface.co/unsloth/Qwen3.6-27B-GGUF"],
-    "aliases": ["qwen3.6 27b", "qwen3.6-27b-q4_k_m.gguf", "qwen3.6:27b"]
+    "aliases": ["qwen3.6 27b ud-iq2_xxs", "qwen3.6-27b-ud-iq2_xxs.gguf"]
+  },
+  {
+    "key": "qwen36_27b_ud_iq3_xxs",
+    "label": "Qwen3.6 27B UD-IQ3_XXS",
+    "filename": "Qwen3.6-27B-UD-IQ3_XXS.gguf",
+    "parameter_count_billion": 27.0,
+    "model_size_mb": 12288.0,
+    "kv_bytes_per_token": 34816.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://huggingface.co/unsloth/Qwen3.6-27B-GGUF"],
+    "aliases": ["qwen3.6 27b ud-iq3_xxs", "qwen3.6-27b-ud-iq3_xxs.gguf"]
+  },
+  {
+    "key": "qwen36_27b_q4_k_m",
+    "label": "Qwen3.6 27B Q4_K_M",
+    "filename": "Qwen3.6-27B-Q4_K_M.gguf",
+    "parameter_count_billion": 27.0,
+    "model_size_mb": 16896.0,
+    "kv_bytes_per_token": 34816.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://huggingface.co/lmstudio-community/Qwen3.6-27B-GGUF"],
+    "aliases": ["qwen3.6 27b", "qwen3.6 27b q4_k_m", "qwen3.6-27b-q4_k_m.gguf", "qwen3.6:27b"]
   },
   {
     "key": "gemma4_26b_a4b_q4_k_s",
@@ -42,6 +64,17 @@
     "decode_context_tokens": 8192,
     "source_urls": ["https://huggingface.co/mradermacher/gemma-4-26B-A4B-i1-GGUF"],
     "aliases": ["gemma 4 26b", "gemma-4-26b-a4b.i1-q4_k_s.gguf", "gemma4:26b-a4b"]
+  },
+  {
+    "key": "qwen36_35b_a3b_ud_q3_k_xl",
+    "label": "Qwen3.6 35B A3B UD-Q3_K_XL",
+    "filename": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+    "parameter_count_billion": 35.0,
+    "model_size_mb": 17203.0,
+    "kv_bytes_per_token": 24576.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"],
+    "aliases": ["qwen3.6 35b a3b ud-q3_k_xl", "qwen3.6-35b-a3b-ud-q3_k_xl.gguf"]
   },
   {
     "key": "qwen36_35b_a3b_q4_k_m",

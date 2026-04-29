@@ -47,6 +47,7 @@ LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 LLAMA_CPP_PINNED_REF = "64ac9ab6"
+UNIFIED_MEMORY_SYSTEM_RESERVE_MB = 4096.0
 
 
 def managed_llama_cpp_ref() -> str:
@@ -118,12 +119,22 @@ def _active_model_size_mb(row: Mapping[str, object]) -> float:
 def _select_direct_model(
     model_catalog: tuple[dict[str, object], ...],
     hardware_info: HardwareInfo,
+    *,
+    unified_memory: bool = False,
 ) -> dict[str, object]:
     has_gpu = hardware_info.has_cuda or hardware_info.has_rocm or hardware_info.has_vulkan or hardware_info.has_metal
     total_ram_mb = max(hardware_info.total_ram_gb, 0.0) * 1024.0
+    model_ram_mb = max(
+        0.0,
+        total_ram_mb - (UNIFIED_MEMORY_SYSTEM_RESERVE_MB if unified_memory else 0.0),
+    )
     vram_mb = total_ram_mb if hardware_info.has_metal else max(hardware_info.vram_mb, 0.0)
-    vram_or_ram_budget_mb = (vram_mb if has_gpu and vram_mb > 0 else total_ram_mb) * 0.9
-    combined_budget_mb = (total_ram_mb + (vram_mb if has_gpu and not hardware_info.has_metal else 0.0)) * 0.9
+    if unified_memory:
+        vram_or_ram_budget_mb = model_ram_mb * 0.9
+        combined_budget_mb = model_ram_mb * 0.9
+    else:
+        vram_or_ram_budget_mb = (vram_mb if has_gpu and vram_mb > 0 else total_ram_mb) * 0.9
+        combined_budget_mb = (total_ram_mb + (vram_mb if has_gpu and not hardware_info.has_metal else 0.0)) * 0.9
 
     dense_rows = [row for row in model_catalog if not _is_moe_catalog_row(row)]
     moe_rows = [row for row in model_catalog if _is_moe_catalog_row(row)]
@@ -185,7 +196,7 @@ def recommend_direct_model(
         model_catalog = tuple(
             row for row in model_catalog if not _is_moe_catalog_row(row)
         )
-    selected = _select_direct_model(model_catalog, hardware_info)
+    selected = _select_direct_model(model_catalog, hardware_info, unified_memory=unified_memory)
     filename = str(selected["filename"])
     model_size_mb = float(selected.get("model_size_mb", 0) or 0)
     kv_bytes_per_token = float(selected.get("kv_bytes_per_token", 0) or 0)
@@ -198,6 +209,9 @@ def recommend_direct_model(
         "model_size_mb": model_size_mb,
         "active_model_size_mb": _active_model_size_mb(selected) if _is_moe_catalog_row(selected) else 0.0,
         "kv_bytes_per_token": kv_bytes_per_token,
+        "llama_cpu_moe": bool(selected.get("llama_cpu_moe", False)),
+        "llama_n_cpu_moe": int(selected.get("llama_n_cpu_moe", 0) or 0),
+        "unified_memory_only": bool(selected.get("unified_memory_only", False)),
         "context_window_tokens": _context_window_for_model(
             hardware_info,
             context_model_size_mb,

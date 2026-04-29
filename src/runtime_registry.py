@@ -32,6 +32,8 @@ def create_runtime_client(
         context_window_tokens=int(cfg.get("context_window_tokens", 2048)),
         device=str(cfg.get("device", "auto")),
         gpu_layers=int(cfg.get("gpu_layers", 99)),
+        llama_cpu_moe=bool(cfg.get("llama_cpu_moe", False)),
+        llama_n_cpu_moe=int(cfg.get("llama_n_cpu_moe", 0) or 0),
         airgapped=airgapped_from_cfg(cfg),
         diagnostics_hook=diagnostics_hook,
     )

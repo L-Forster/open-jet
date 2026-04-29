@@ -45,6 +45,8 @@ class LlamaServerClient:
         context_window_tokens: int = 2048,
         device: str = "auto",
         gpu_layers: int = 99,
+        llama_cpu_moe: bool = False,
+        llama_n_cpu_moe: int = 0,
         airgapped: bool = False,
         diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -54,6 +56,8 @@ class LlamaServerClient:
         self.context_window_tokens = max(512, int(context_window_tokens))
         self.device = device.strip().lower() if device else "auto"
         self.gpu_layers = max(0, int(gpu_layers))
+        self.llama_cpu_moe = bool(llama_cpu_moe)
+        self.llama_n_cpu_moe = max(0, int(llama_n_cpu_moe))
         self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=30.0))
@@ -295,6 +299,8 @@ class LlamaServerClient:
                 fit_mode=fit_mode,
                 no_warmup=no_warmup,
                 no_mmap=no_mmap,
+                llama_cpu_moe=self.llama_cpu_moe,
+                llama_n_cpu_moe=self.llama_n_cpu_moe,
             )
             self.gpu_layers = requested_ngl
             self.context_window_tokens = requested_ctx
@@ -311,6 +317,8 @@ class LlamaServerClient:
         fit_mode: str,
         no_warmup: bool,
         no_mmap: bool,
+        llama_cpu_moe: bool = False,
+        llama_n_cpu_moe: int = 0,
     ) -> None:
         # Ensure swap state directory exists for KV cache save/restore.
         slot_save_dir = Path(".openjet/state/swap")
@@ -334,6 +342,10 @@ class LlamaServerClient:
             cmd.extend(["--fit", fit_mode])
         if no_warmup:
             cmd.append("--no-warmup")
+        if llama_cpu_moe:
+            cmd.append("--cpu-moe")
+        elif llama_n_cpu_moe > 0:
+            cmd.extend(["-ncmoe", str(llama_n_cpu_moe)])
         cmd.extend(["--flash-attn", "on", "-ctk", "q8_0", "-ctv", "q8_0"])
         cmd.extend([
             "-b",
@@ -355,6 +367,8 @@ class LlamaServerClient:
             fit_mode=fit_mode,
             no_warmup=no_warmup,
             no_mmap=no_mmap,
+            llama_cpu_moe=llama_cpu_moe,
+            llama_n_cpu_moe=llama_n_cpu_moe,
             cuda_module_loading=env.get("CUDA_MODULE_LOADING", ""),
             ggml_cuda_enable_unified_memory=env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY", ""),
             ggml_cuda_vmm_chunk_mb=env.get("GGML_CUDA_VMM_CHUNK_MB", ""),

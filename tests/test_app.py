@@ -1034,21 +1034,25 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
-    def test_recommend_direct_model_uses_requested_default_q4_bands(self) -> None:
+    def test_recommend_direct_model_uses_requested_default_vram_quant_bands(self) -> None:
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="6GB", total_ram_gb=6.0, has_cuda=False))["label"],
             "Qwen3.5 4B",
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="12GB", total_ram_gb=12.0, has_cuda=False))["label"],
-            "Qwen3.5 9B",
+            "Qwen3.6 27B UD-IQ2_XXS",
+        )
+        self.assertEqual(
+            recommend_direct_model(HardwareInfo(label="16GB", total_ram_gb=16.0, has_cuda=False))["label"],
+            "Qwen3.6 27B UD-IQ3_XXS",
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="24GB", total_ram_gb=24.0, has_cuda=False))["label"],
-            "Qwen3.6 27B",
+            "Qwen3.6 27B Q4_K_M",
         )
 
-    def test_recommend_direct_model_allows_moe_catalog_entries_on_gpu(self) -> None:
+    def test_recommend_direct_model_uses_12gb_27b_quant_on_gpu(self) -> None:
         recommended = recommend_direct_model(
             HardwareInfo(
                 label="CUDA-capable device",
@@ -1058,7 +1062,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertIn(recommended["label"], {"Gemma 4 26B A4B", "Qwen3.6 35B A3B"})
+        self.assertEqual(recommended["label"], "Qwen3.6 27B UD-IQ2_XXS")
 
     def test_recommend_direct_model_prioritizes_large_dense_before_moe(self) -> None:
         recommended = recommend_direct_model(
@@ -1070,9 +1074,9 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.6 27B")
+        self.assertEqual(recommended["label"], "Qwen3.6 27B Q4_K_M")
 
-    def test_recommend_direct_model_prioritizes_moe_before_small_dense(self) -> None:
+    def test_recommend_direct_model_uses_12gb_27b_quant_on_vulkan(self) -> None:
         recommended = recommend_direct_model(
             HardwareInfo(
                 label="RX 6700 XT",
@@ -1083,7 +1087,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.6 35B A3B")
+        self.assertEqual(recommended["label"], "Qwen3.6 27B UD-IQ2_XXS")
 
     async def test_ensure_direct_model_downloads_target_file(self) -> None:
         updates: list[str] = []
@@ -2152,6 +2156,39 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         cmd = create_proc.await_args.args
         self.assertIn("--fit", cmd)
         self.assertEqual(cmd[cmd.index("--fit") + 1], "on")
+
+    async def test_start_once_passes_cpu_moe_to_llama_server(self) -> None:
+        client = LlamaServerClient(model="model.gguf", llama_cpu_moe=True, llama_n_cpu_moe=12)
+
+        class _FakeStream:
+            async def readline(self) -> bytes:
+                await asyncio.sleep(0)
+                return b""
+
+        proc = SimpleNamespace(returncode=None, pid=4321, stderr=_FakeStream())
+
+        async def fake_get(url: str):
+            return SimpleNamespace(status_code=200)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as create_proc:
+            client._http.get = AsyncMock(side_effect=fake_get)  # type: ignore[method-assign]
+            await client._start_once(
+                binary="/usr/bin/llama-server",
+                env={},
+                ngl=99,
+                ctx=6144,
+                batch=2048,
+                ubatch=512,
+                fit_mode="on",
+                no_warmup=False,
+                no_mmap=False,
+                llama_cpu_moe=client.llama_cpu_moe,
+                llama_n_cpu_moe=client.llama_n_cpu_moe,
+            )
+
+        cmd = create_proc.await_args.args
+        self.assertIn("--cpu-moe", cmd)
+        self.assertNotIn("-ncmoe", cmd)
 
 class DebugPromptLoggingTests(unittest.TestCase):
     def test_prepare_turn_context_saves_full_runtime_messages_in_debug_mode(self) -> None:
