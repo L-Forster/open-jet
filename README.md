@@ -1,7 +1,7 @@
 # OpenJet
 
 <div align="center">
-  <img width="100%" alt="OpenJet screenshot" src="https://github.com/user-attachments/assets/660f7969-b38b-4a90-8b2c-ae872105cc13" />
+  <img width="1672" height="941" alt="OpenJet screenshot" src="https://github.com/user-attachments/assets/1a46faf9-b07b-48ca-bb97-dbe2bffd7607" />
 
 ## Claude Code for local LLMs
 
