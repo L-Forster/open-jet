@@ -1,16 +1,24 @@
 # OpenJet
 
-<div align="center">
+<p align="center">
   <img width="1672" height="941" alt="OpenJet screenshot" src="https://github.com/user-attachments/assets/1a46faf9-b07b-48ca-bb97-dbe2bffd7607" />
+</p>
 
-## Claude Code for local LLMs
+<br />
 
-**The easiest and fastest way to get a local coding agent running.**
+<h1 align="center">Claude Code for local LLMs</h1>
 
-OpenJet sets up the local model backend for your hardware and gives you a Claude-Code-style coding agent that can read files, edit code, and run commands fully on your own machine.
+<h3 align="center">
+  The easiest and fastest way to get a local coding agent running.
+</h3>
 
-[Discord](https://discord.com/invite/pspKHtExSa)
-</div>
+<p align="center">
+  OpenJet sets up the local model backend for your hardware and gives you a Claude-Code-style coding agent that can read files, edit code, and run commands fully on your own machine.
+</p>
+
+<p align="center">
+  <a href="https://discord.com/invite/pspKHtExSa">Discord</a>
+</p>
 
 If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config.
 
