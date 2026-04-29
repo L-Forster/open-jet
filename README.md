@@ -12,9 +12,9 @@ OpenJet sets up the local model backend for your hardware and gives you a Claude
 [Discord](https://discord.com/invite/pspKHtExSa) · [X/Twitter](https://x.com/FlouisLF)
 </div>
 
-If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, backends, and config.
+If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config.
 
-If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and a usable coding workflow, OpenJet removes that setup tax.
+If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual coding agent, OpenJet removes that setup tax.
 
 If you are searching for a **Claude Code alternative**, **easy local LLM setup**, **local coding agent**, or **self-hosted coding agent**, that is exactly what OpenJet is built for.
 
