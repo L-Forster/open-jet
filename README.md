@@ -16,7 +16,7 @@ If you are new to local LLMs, OpenJet is the fastest way to get started without 
 
 If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual coding agent, OpenJet removes that setup tax.
 
-If you are searching for a **Claude Code alternative**, **easy local LLM setup**, **local coding agent**, or **self-hosted coding agent**, that is exactly what OpenJet is built for.
+OpenJet is built for people looking for a **Claude Code alternative, easy local LLM setup, or a self-hosted local coding agent.**
 
 ## Install
 
