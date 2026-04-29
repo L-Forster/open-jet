@@ -9,7 +9,7 @@
 
 OpenJet sets up the local model backend for your hardware and gives you a Claude-Code-style coding agent that can read files, edit code, and run commands fully on your own machine.
 
-[Discord](https://discord.com/invite/pspKHtExSa) · [X/Twitter](https://x.com/FlouisLF)
+[Discord](https://discord.com/invite/pspKHtExSa)
 </div>
 
 If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config.
