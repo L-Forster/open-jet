@@ -7,7 +7,7 @@
 
 **The easiest and fastest way to get a local coding agent running.**
 
-OpenJet sets up the local model backend for your hardware and gives you a Claude-Code-style terminal agent that can read files, edit code, and run commands fully on your own machine.
+OpenJet sets up the local model backend for your hardware and gives you a Claude-Code-style coding agent that can read files, edit code, and run commands fully on your own machine.
 
 [Discord](https://discord.com/invite/pspKHtExSa) · [X/Twitter](https://x.com/FlouisLF)
 </div>
