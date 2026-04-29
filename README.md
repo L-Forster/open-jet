@@ -8,15 +8,11 @@
 
 
 </div>
-This is Claude Code for local LLMs. OpenJet handles the model, the runtime, and the setup without having to manually wrangle complex confirgurations. You get a coding agent in your terminal that reads your files, edits your code, runs commands, and stays out of the cloud.
+Claude Code for local LLMs
 
-OpenJet can connect to remote devices, so the agent can run on one device, but execute and write code on another (even if it isn't powerful enough to run the model)
+OpenJet is a unified local agent runtime that combines the inference backend, hardware-aware setup, and coding harness in one system.
 
-OpenJet has three primary surfaces in one repo:
-
-- **CLI + chat TUI** for interactive local agent work
-- **Python SDK** for embedding sessions, hardware profiling, and auto-`llama.cpp` configuration
-- **Benchmarking tools** for running `llama-bench` and sweep comparisons against your active model profile
+It gives you a terminal coding agent that can read files, edit code, run commands, and stay fully on your machine, without manually stitching together llama.cpp, configs, and shell glue.
 
 ## Get started
 
