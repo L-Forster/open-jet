@@ -24,9 +24,10 @@ from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markup import escape
-from rich.rule import Rule
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
+from rich import box
 
 from .airgap import airgapped_from_cfg, set_airgapped
 from .app_rendering import (
@@ -327,6 +328,7 @@ class OpenJetApp:
         self._assistant_status_command: str | None = None
         self._awaiting_approval = False
         self._approval_choice = 0
+        self._auto_accept_code_changes = False
         self._approval_future: asyncio.Future[bool] | None = None
         self._approval_tool_call: ToolCall | None = None
         self._approval_started_at: float | None = None
@@ -356,6 +358,7 @@ class OpenJetApp:
         self._pending_image_paths: list[str] = []
         self._active_turn_device_refs: tuple[str, ...] = ()
         self._last_completed_turn: dict[str, Any] | None = None
+        self._live_prompt_top_printed = False
         self._widgets = {
             "#chat-log": LogView(self.console),
             "#assistant-status": StatusWidget(),
@@ -868,7 +871,7 @@ class OpenJetApp:
             return False
 
         model_name = Path(self._active_model_ref()).name or self._active_model_ref() or "model"
-        log.write(f"  [bold bright_white]Loading {escape(model_name)}...[/]")
+        log.write(f"  {rich_text('Loading', 'chrome_label')} {rich_text(model_name, 'chrome_value')}...")
         status = self.query_one("#assistant-status")
         status.update(f"[bold {ACCENT_GREEN}]loading {escape(model_name)}...[/]")
         status.remove_class("hidden")
@@ -1126,12 +1129,13 @@ class OpenJetApp:
         status.add_class("hidden")
         if self.session_logger:
             self.session_logger.record_runtime_ready(**self._trace_runtime_context())
-        log.write("  [bold bright_white]Ready.[/]")
+        log.write(f"  {rich_text('Ready', 'success')}")
         if self.is_airgapped():
-            log.write("  [bold bright_white]Air-gapped mode is enabled. External network access is blocked.[/]")
+            log.write(f"  {rich_text('Air-gapped', 'chrome_warning')} {rich_text('external network access is blocked', 'muted')}")
         if self.auto_resume:
             self._restore_session_state(log)
         self._restore_harness_state()
+        log.write(self._chrome_status_table())
         log.write("")
         self._render_token_counter()
 
@@ -1194,15 +1198,8 @@ class OpenJetApp:
             self._render_token_counter()
             return
 
-        display_text = stripped if stripped else "[image attachment]"
-        display_as_command = allow_slash_command and display_text.startswith("/")
-        user_header = "Slash Command" if display_as_command else "User"
-        user_text_style = "command" if display_as_command else "muted"
-        log.write(Rule(rich_text(user_header, "user"), style="user"))
-        log.write(f"{rich_text('> ', 'user')}{rich_text(display_text, user_text_style)}")
         for image_path in attached_images:
             log.write(f"  {rich_text('attached image:', 'dim')} {rich_text(image_path, 'muted')}")
-        log.write("")
 
         mentions = _extract_at_mentions(stripped)
         device_refs, mentioned_files = self._split_device_and_file_mentions(mentions)
@@ -1411,7 +1408,7 @@ class OpenJetApp:
     def _render_token_counter(self, draft_text: str = "") -> None:
         counter = self.query_one("#token-counter")
         if not self.agent:
-            counter.update("tokens: 0/0")
+            counter.update("ctx 0 / 0")
             return
         current_fn = getattr(self.agent, "estimated_context_tokens", None)
         current = self._coerce_token_count(current_fn()) if callable(current_fn) else 0
@@ -1436,9 +1433,11 @@ class OpenJetApp:
             prompt_budget = budget.prompt_tokens
         remaining = max(0, prompt_budget - total)
         counter.update(
-            "tokens: "
-            f"{total}/{window} | prompt<= {prompt_budget} | remaining: {remaining} | "
-            f"harness: {self._turn_context_tokens} | overhead: {overhead}"
+            f"ctx {self._format_token_count(total)} / {self._format_token_count(window)} | "
+            f"prompt {self._format_token_count(prompt_budget)} | "
+            f"left {self._format_token_count(remaining)} | "
+            f"harness {self._format_token_count(self._turn_context_tokens)} | "
+            f"overhead {self._format_token_count(overhead)}"
         )
 
     def _format_percent(self, label: str, pct: float | None) -> str:
@@ -1486,6 +1485,109 @@ class OpenJetApp:
         tps = self._current_tps()
         return "tps n/a" if tps is None else f"tps {tps:.1f}"
 
+    @staticmethod
+    def _format_token_count(value: int) -> str:
+        if value >= 1000:
+            rounded = value / 1000.0
+            return f"{rounded:.1f}k" if value < 10000 else f"{round(rounded):.0f}k"
+        return str(value)
+
+    @staticmethod
+    def _shorten_middle(text: str, max_len: int) -> str:
+        compact = " ".join(str(text).split())
+        if len(compact) <= max_len:
+            return compact
+        if max_len <= 8:
+            return compact[:max_len]
+        head = max(3, (max_len - 3) // 2)
+        tail = max(3, max_len - head - 3)
+        return f"{compact[:head]}...{compact[-tail:]}"
+
+    def _workspace_label(self, max_len: int = 34) -> str:
+        path = Path.cwd()
+        try:
+            home = Path.home()
+            label = f"~/{path.relative_to(home).as_posix()}"
+        except ValueError:
+            label = path.as_posix()
+        return self._shorten_middle(label, max_len)
+
+    def _model_label(self, max_len: int = 28) -> str:
+        model_ref = self._active_model_ref()
+        label = Path(model_ref).name or model_ref or "not configured"
+        if label.endswith(".gguf"):
+            label = label[:-5]
+        return self._shorten_middle(label, max_len)
+
+    def _context_compact_label(self) -> str:
+        current_fn = getattr(self.agent, "estimated_context_tokens", None) if self.agent else None
+        current = self._coerce_token_count(current_fn()) if callable(current_fn) else 0
+        window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
+        return f"ctx {self._format_token_count(current)} / {self._format_token_count(window)}"
+
+    def _chrome_status_cells(self) -> list[tuple[str, str, str]]:
+        air_state = "air-gapped" if self.is_airgapped() else "network-ok"
+        air_style = "chrome_warning" if self.is_airgapped() else "chrome_value"
+        return [
+            ("mode", self.harness_state.mode or "chat", "chrome_accent"),
+            ("model", self._model_label(), "chrome_value"),
+            ("backend", DEFAULT_RUNTIME.replace("_", "."), "chrome_value"),
+            ("workspace", self._workspace_label(26), "chrome_value"),
+            ("", "local", "chrome_accent"),
+            ("", air_state, air_style),
+            ("", self._context_compact_label(), "chrome_value"),
+        ]
+
+    def _chrome_status_table(self) -> Table:
+        narrow = self.console.width < 132
+        table = Table(
+            box=box.SQUARE,
+            show_header=False,
+            show_edge=True,
+            expand=False,
+            padding=(0, 1),
+            border_style="chrome_border",
+        )
+        if narrow:
+            net_state = "air-gap" if self.is_airgapped() else "net-ok"
+            net_style = "chrome_warning" if self.is_airgapped() else "chrome_value"
+            cells = [
+                Text("OpenJet", style="chrome_brand_text"),
+                Text(self.harness_state.mode or "chat", style="chrome_accent"),
+                Text(self._model_label(22), style="chrome_value"),
+                Text(DEFAULT_RUNTIME.replace("_", "."), style="chrome_value"),
+                Text(self._workspace_label(20), style="chrome_value"),
+                Text("local", style="chrome_accent"),
+                Text(net_state, style=net_style),
+                Text(self._context_compact_label(), style="chrome_value"),
+            ]
+        else:
+            cells = [Text("OpenJet", style="chrome_brand_text")]
+            for label, value, style in self._chrome_status_cells():
+                if label:
+                    cells.append(Text.assemble((f"{label}: ", "chrome_label"), (str(value), style)))
+                else:
+                    cells.append(Text(str(value), style=style))
+        for _ in cells:
+            table.add_column(no_wrap=True, overflow="ellipsis")
+        table.add_row(*cells)
+        return table
+
+    def _write_section_gap(self, log: LogView) -> None:
+        if log._entries and str(log._entries[-1]).strip():
+            width = max(20, self.console.width - 2)
+            log.write(rich_text("─" * width, "chrome_border"))
+
+    def _write_message_header(self, log: LogView, label: str, style: str) -> None:
+        self._write_section_gap(log)
+        timestamp = time.strftime("%H:%M:%S")
+        log.write(f"{rich_text(label, style)}  {rich_text(timestamp, 'dim')}")
+
+    @staticmethod
+    def _message_body_lines(text: str, *, indent: str = "") -> list[str]:
+        lines = str(text).splitlines() or [""]
+        return [f"{indent}{line}" if line else "" for line in lines]
+
     def _current_tps(self) -> float | None:
         if self._thinking_timer is not None and self._generation_decode_started_at is not None:
             elapsed = time.monotonic() - self._generation_decode_started_at
@@ -1502,20 +1604,16 @@ class OpenJetApp:
             self._power_max_watts = watts
 
     @staticmethod
-    def _toolbar_row(label: str, value: str, *, value_style: str = "toolbar-value") -> str:
+    def _toolbar_cell(label: str, value: str, *, value_style: str = "toolbar-value") -> str:
         return (
-            f"<toolbar-chip> {html.escape(label)} </toolbar-chip> "
+            f"<toolbar-cell> "
+            f"<toolbar-chip>{html.escape(label)}:</toolbar-chip> "
             f"<{value_style}>{html.escape(value)}</{value_style}>"
+            f" </toolbar-cell>"
         )
 
     def _toolbar_text(self) -> HTML:
-        rows: list[str] = []
-        if self.is_airgapped():
-            rows.append(self._toolbar_row("mode", "AIR-GAPPED", value_style="toolbar-warning"))
-        else:
-            rows.append(self._toolbar_row("mode", "LOCAL", value_style="toolbar-accent"))
-        if not self.query_one("#token-counter").hidden and self.query_one("#token-counter").text:
-            rows.append(self._toolbar_row("context", self.query_one("#token-counter").text))
+        detail_parts: list[str] = ["/commands", "@ add context", "ctrl+o open file", "ctrl+c interrupt", "enter send"]
         if self._utilization_visible:
             cpu_pct = self.metrics.read_cpu_percent()
             mem = read_memory_snapshot()
@@ -1526,8 +1624,10 @@ class OpenJetApp:
             cpu_text = self._format_percent("cpu", cpu_pct)
             power_text = self._format_power_text(power_watts, power_pct, battery)
             device_text = str(self.cfg.get("device", "cpu")).upper()
-            rows.append(self._toolbar_row("util", f"{device_text} | {cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}"))
-        return HTML("\n".join(row for row in rows if row))
+            detail_parts.append(f"{device_text} | {cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}")
+        width = max(20, self.console.width)
+        bottom_border = f"<prompt-border>╰{'─' * (width - 2)}╯</prompt-border>\n"
+        return HTML(f"{bottom_border}<toolbar-note>{html.escape('    '.join(detail_parts))}</toolbar-note>")
 
     def _loading_blocks_html(self) -> str:
         phase = int(time.monotonic() * 8) % len(self._SPLASH_BLOCKS)
@@ -1549,36 +1649,78 @@ class OpenJetApp:
             return f"<prompt-status-label> tool </prompt-status-label> <prompt-command>{escaped}</prompt-command>"
         if self._assistant_status_kind == "generating":
             return (
-                f"<prompt-status-label> model </prompt-status-label> "
+                f"<prompt-status-label> OpenJet model </prompt-status-label> "
                 f"{self._loading_blocks_html()} "
                 f"<prompt-splash-text>{escaped}</prompt-splash-text>"
             )
         return f"<prompt-status>{escaped}</prompt-status>"
 
     def _prompt_message(self) -> HTML:
-        status = self.query_one("#assistant-status")
+        width = max(20, self.console.width)
+        top_border = f"<prompt-border>╭{'─' * (width - 2)}╮</prompt-border>\n"
         status_html = ""
-        if not status.hidden and status.text:
-            status_html = f"{self._render_prompt_status_html(status.text)}\n"
-        tip_html = ""
         if self._assistant_status_kind == "generating":
-            tip_html = f"<prompt-tip>{html.escape(self._current_generating_tip())}</prompt-tip>\n"
+            status_html = (
+                f"<prompt-status>{html.escape(self._generating_status_text())}</prompt-status>\n"
+                f"<prompt-tip>{html.escape(self._current_generating_tip())}</prompt-tip>\n"
+            )
         if self.is_airgapped():
             return HTML(
-                f"{status_html}{tip_html}<brand-chip-airgapped> open-jet air-gap </brand-chip-airgapped>"
-                "<prompt-divider-airgapped> //</prompt-divider-airgapped>"
-                "<prompt-airgapped> ></prompt-airgapped>"
+                status_html +
+                top_border +
+                "<prompt-border>│</prompt-border> "
+                "<prompt-divider-airgapped>›</prompt-divider-airgapped><prompt-airgapped> </prompt-airgapped>"
             )
         return HTML(
-            f"{status_html}{tip_html}<brand-chip> open-jet </brand-chip>"
-            "<prompt-divider> //</prompt-divider>"
-            "<prompt> ></prompt>"
+            status_html +
+            top_border +
+            "<prompt-border>│</prompt-border> "
+            "<prompt-divider>›</prompt-divider><prompt> </prompt>"
         )
+
+    def _rprompt_text(self) -> HTML:
+        return HTML("<prompt-border> │</prompt-border>")
+
+    def _print_pre_prompt_status(self) -> None:
+        status = self.query_one("#assistant-status")
+        if self._assistant_status_kind == "generating":
+            return
+        elif not status.hidden and status.text:
+            self.console.print(rich_text(status.text, "status"))
+
+    def _print_prompt_top_border(self) -> None:
+        width = max(20, self.console.width)
+        self.console.print(rich_text(f"╭{'─' * (width - 2)}╮", "chrome_border"))
+        self._live_prompt_top_printed = True
+
+    def _print_submitted_box(self, text: str) -> None:
+        width = max(20, self.console.width)
+        inner = width - 2
+        border = "chrome_border"
+        body_lines = str(text).splitlines() or [""]
+        if self._live_prompt_top_printed:
+            self._live_prompt_top_printed = False
+        else:
+            self.console.print(rich_text(f"╭{'─' * inner}╮", border))
+        for line in body_lines:
+            content = f"› {line}" if line is body_lines[0] else f"  {line}"
+            visible_len = len(content) + 1
+            pad = max(0, inner - 1 - visible_len)
+            self.console.print(
+                f"{rich_text('│', border)} {rich_text(content, 'muted')}{' ' * pad} {rich_text('│', border)}"
+            )
+        self.console.print(rich_text(f"╰{'─' * inner}╯", border))
+        self.console.print()
 
     def _current_generating_tip(self) -> str:
         if self._generation_tip_index < 0:
             return self._GENERATING_TIPS[0]
         return self._GENERATING_TIPS[self._generation_tip_index % len(self._GENERATING_TIPS)]
+
+    @staticmethod
+    def _generating_status_text() -> str:
+        dots = "." * ((int(time.monotonic() * 2) % 3) + 1)
+        return f"Generating{dots}"
 
     def set_utilization_visible(self, visible: bool) -> None:
         self._utilization_visible = bool(visible)
@@ -1858,11 +2000,14 @@ class OpenJetApp:
             if role == "user":
                 text = content_to_plain_text(msg.get("content", ""))
                 if text.strip():
-                    log.write(f"[bold green]> [/]{text}")
+                    self._write_message_header(log, "USER", "user")
+                    for line in self._message_body_lines(text):
+                        log.write(rich_text(line, "muted"))
                     log.write("")
             elif role == "assistant":
                 text = content_to_plain_text(msg.get("content", ""))
                 if text:
+                    self._write_message_header(log, "OPENJET", "assistant")
                     self._write_text_block(log, text)
                 if not msg.get("tool_calls"):
                     log.write("")
@@ -2167,7 +2312,7 @@ class OpenJetApp:
                 async for event in session.stream_existing_turn():
                     if event.kind == SDKEventKind.TEXT:
                         if not assistant_header_written:
-                            log.write(Rule(rich_text("Assistant", "assistant"), style="assistant"))
+                            self._write_message_header(log, "OPENJET", "assistant")
                             assistant_header_written = True
                         text_buf += event.text
                         assistant_turn_text += event.text
@@ -2323,7 +2468,11 @@ class OpenJetApp:
 
     async def _approve_tool_call_via_session(self, tc: ToolCall, log: LogView) -> bool:
         self._active_turn_approval_requests += 1
-        approved = await self._wait_for_tool_approval(tc)
+        approved = (
+            True
+            if self._should_auto_accept_tool_call(tc)
+            else await self._wait_for_tool_approval(tc)
+        )
         decision_ms = None
         if self._approval_started_at is not None:
             decision_ms = round((time.monotonic() - self._approval_started_at) * 1000.0, 2)
@@ -2362,18 +2511,21 @@ class OpenJetApp:
                 self._active_turn_false_positive_commands += 1
             if bool(tool_attrs.get("openjet.tool.shell.hallucinated_command")):
                 self._active_turn_hallucinated_commands += 1
+        needs_confirmation = self.agent.needs_confirmation(tc) if self.agent else False
         if self.session_logger and self._active_turn_id:
             self.session_logger.start_tool_call(
                 turn_id=self._active_turn_id,
                 tool_key=tool_key,
                 tool_name=tc.name,
                 attributes=tool_attrs,
-                needs_confirmation=self.agent.needs_confirmation(tc) if self.agent else False,
+                needs_confirmation=needs_confirmation,
             )
         self._active_turn_tool_attempts += 1
-        log.write(Rule(rich_text(f"Tool: {tc.name}", "tool"), style="tool"))
-        log.write(rich_text(f"{tc.name}:", "tool"))
-        for preview_line in self._tool_preview_lines(tc):
+        self._write_section_gap(log)
+        log.write(f"{rich_text('Activity', 'tool')}  {rich_text(time.strftime('%H:%M:%S'), 'dim')}")
+        log.write(f"  {rich_text(tc.name, 'tool')} {rich_text(format_tool_args(tc), 'muted')}")
+        show_inline_preview = not (needs_confirmation and self._is_code_change_tool_call(tc))
+        for preview_line in self._tool_preview_lines(tc) if show_inline_preview else []:
             if tc.name == "shell":
                 preview_style = "command"
             elif tc.name in {"edit_file", "write_file"} and preview_line[:1] in {"+", "-"}:
@@ -2729,18 +2881,84 @@ class OpenJetApp:
         self._refresh_approval_prompt_selection()
 
     def _write_approval_prompt(self, log: LogView, tc: ToolCall) -> None:
-        log.write(Rule(rich_text("Approval Needed", "warning"), style="warning"))
-        log.write(f"  {rich_text(self._approval_summary_text(tc), 'warning')}")
+        log.write(self._approval_card_header(tc))
+        for line in self._approval_card_preview_lines(tc):
+            log.write(line)
+        log.write(self._approval_card_divider())
         log.write(self._approval_selection_line())
         self._approval_prompt_selection_index = len(log._entries) - 1
+        log.write(self._approval_card_footer())
         log.write("")
+
+    def _approval_card_width(self) -> int:
+        return max(64, min(118, self.console.width - 4))
+
+    def _approval_card_header(self, tc: ToolCall) -> str:
+        title = f" Approval required: {tc.name} "
+        total = self._approval_card_width()
+        rule_len = max(1, total - 3 - len(title))
+        return rich_text(f"╭─{title}{'─' * rule_len}╮", "approval_border")
+
+    def _approval_card_divider(self) -> str:
+        inner = self._approval_card_width() - 2
+        return rich_text(f"├{'─' * inner}┤", "approval_border")
+
+    def _approval_card_footer(self) -> str:
+        inner = self._approval_card_width() - 2
+        return rich_text(f"╰{'─' * inner}╯", "approval_border")
+
+    def _approval_card_line(self, text: str, style: str = "approval_meta") -> str:
+        total = self._approval_card_width()
+        available = max(16, total - 4)
+        clean = str(text).replace("\t", "    ")
+        if len(clean) > available:
+            clean = f"{clean[: available - 1]}…"
+        padded = clean.ljust(available)
+        border = rich_text("│", "approval_border")
+        return f"{border} {rich_text(padded, style)} {border}"
+
+    def _approval_card_preview_lines(self, tc: ToolCall) -> list[str]:
+        lines = [self._approval_card_line(self._approval_summary_text(tc), "approval_title")]
+        preview = self._tool_preview_lines(tc)
+        if preview:
+            lines.append(self._approval_card_line("", "muted"))
+        max_preview_lines = 18
+        for preview_line in preview[:max_preview_lines]:
+            if preview_line[:1] == "+":
+                style = "diff_add"
+            elif preview_line[:1] == "-":
+                style = "diff_remove"
+            else:
+                style = "diff_context"
+            lines.append(self._approval_card_line(preview_line, style))
+        if len(preview) > max_preview_lines:
+            lines.append(self._approval_card_line(f"... ({len(preview) - max_preview_lines} more lines)", "dim"))
+        return lines
 
     def _approval_selection_line(self) -> str:
         approve_style = "approve_selected" if self._approval_choice == 0 else "approve_idle"
         deny_style = "deny_selected" if self._approval_choice == 1 else "deny_idle"
-        approve = rich_text(" Approve ", approve_style)
-        deny = rich_text(" Deny ", deny_style)
-        return f"  {approve} {deny} {rich_text('Tab/←/→ Enter y/n', 'muted')}"
+        auto_state = "on" if self._auto_accept_code_changes else "off"
+        approve_prefix = "> " if self._approval_choice == 0 else "  "
+        deny_prefix = "> " if self._approval_choice == 1 else "  "
+        total = self._approval_card_width()
+        available = max(16, total - 4)
+        border = rich_text("│", "approval_border")
+
+        def _row(content_text: str, content_style: str) -> str:
+            clean = content_text
+            if len(clean) > available:
+                clean = f"{clean[: available - 1]}…"
+            padded = clean.ljust(available)
+            return f"{border} {rich_text(padded, content_style)} {border}"
+
+        approve = _row(f"{approve_prefix}Approve", approve_style)
+        deny = _row(f"{deny_prefix}Deny", deny_style)
+        help_text = _row(
+            f"tab auto-accept code changes: {auto_state}  |  up/down select  |  enter y/n",
+            "muted",
+        )
+        return "\n".join([approve, deny, help_text])
 
     def _set_approval_choice(self, choice: int) -> None:
         normalized = 0 if int(choice) <= 0 else 1
@@ -2752,6 +2970,20 @@ class OpenJetApp:
     def _cycle_approval_choice(self, step: int = 1) -> None:
         self._set_approval_choice((self._approval_choice + step) % 2)
 
+    @staticmethod
+    def _is_code_change_tool_call(tc: ToolCall | None) -> bool:
+        return bool(tc and tc.name in {"edit_file", "write_file"})
+
+    def _should_auto_accept_tool_call(self, tc: ToolCall) -> bool:
+        return self._auto_accept_code_changes and self._is_code_change_tool_call(tc)
+
+    def _toggle_auto_accept_code_changes(self) -> None:
+        self._auto_accept_code_changes = not self._auto_accept_code_changes
+        self._refresh_approval_prompt_selection()
+        if self._auto_accept_code_changes and self._is_code_change_tool_call(self._approval_tool_call):
+            self._approval_choice = 0
+            self._resolve_approval(True)
+
     def _refresh_approval_prompt_selection(self) -> None:
         index = self._approval_prompt_selection_index
         if index is None:
@@ -2761,7 +2993,9 @@ class OpenJetApp:
             return
         selection_line = self._approval_selection_line()
         if self._session and self._session.app:
-            log.refresh_recent_line(index, selection_line, lines_up=2)
+            refreshed = f"{selection_line}\n{self._approval_card_footer()}"
+            lines_up = selection_line.count("\n") + 3
+            log.refresh_recent_line(index, refreshed, lines_up=lines_up)
             return
         log.replace(index, selection_line)
 
@@ -2824,19 +3058,19 @@ class OpenJetApp:
             self.action_stop_generation()
             event.current_buffer.reset()
 
-        @bindings.add("left", filter=awaiting_approval, eager=True)
-        def _left(event) -> None:
+        @bindings.add("up", filter=awaiting_approval, eager=True)
+        def _up(event) -> None:
             self._set_approval_choice(0)
             event.current_buffer.reset()
 
-        @bindings.add("right", filter=awaiting_approval, eager=True)
-        def _right(event) -> None:
+        @bindings.add("down", filter=awaiting_approval, eager=True)
+        def _down(event) -> None:
             self._set_approval_choice(1)
             event.current_buffer.reset()
 
         @bindings.add("tab", filter=awaiting_approval, eager=True)
         def _tab_approval(event) -> None:
-            self._cycle_approval_choice(1)
+            self._toggle_auto_accept_code_changes()
             event.current_buffer.reset()
 
         @bindings.add("y", filter=awaiting_approval, eager=True)
@@ -2883,6 +3117,9 @@ class OpenJetApp:
             key_bindings=self._bindings(),
             style=self._style,
             bottom_toolbar=self._toolbar_text,
+            reserve_space_for_menu=0,
+            rprompt=self._rprompt_text,
+            erase_when_done=True,
         )
         self._toolbar_task = asyncio.create_task(self._toolbar_updater())
         try:
@@ -2896,6 +3133,7 @@ class OpenJetApp:
             with patch_stdout(raw=True):
                 while not self._quit_requested:
                     try:
+                        self._print_pre_prompt_status()
                         text = await self._session.prompt_async(
                             self._prompt_message,
                             enable_suspend=False,
@@ -2903,7 +3141,9 @@ class OpenJetApp:
                     except (EOFError, KeyboardInterrupt):
                         await self.action_quit()
                         break
+                    self._print_submitted_box(text)
                     await self.submit_text(text)
+                    await asyncio.sleep(0)
         finally:
             self._remove_signal_handlers(installed_signals)
             if self._toolbar_task:

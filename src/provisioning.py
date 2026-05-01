@@ -513,7 +513,13 @@ async def _sync_managed_llama_cpp_checkout(
             clear_status()
             raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
     else:
-        rc, out, err = await _run_exec("git", "status", "--porcelain", cwd=LLAMA_CPP_DIR)
+        rc, out, err = await _run_exec(
+            "git",
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            cwd=LLAMA_CPP_DIR,
+        )
         if rc != 0:
             clear_status()
             raise RuntimeError((err or out).strip() or "Failed to inspect llama.cpp checkout.")
@@ -754,11 +760,11 @@ async def _build_llama_server_from_source(
     if rc != 0:
         clear_status()
         raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp")
-    set_status("building llama-server (this may take a few minutes)")
-    log.write("  [dim]Building llama-server (this may take a few minutes)...[/]")
+    set_status("building llama-server and llama-bench (this may take a few minutes)")
+    log.write("  [dim]Building llama-server and llama-bench (this may take a few minutes)...[/]")
     jobs = os.cpu_count() or 4
     rc, tail = await _run_build_with_progress(
-        "cmake", "--build", ".", "--target", "llama-server", f"-j{jobs}",
+        "cmake", "--build", ".", "--target", "llama-server", "--target", "llama-bench", f"-j{jobs}",
         cwd=build_dir,
         set_status=set_status,
         log=log,

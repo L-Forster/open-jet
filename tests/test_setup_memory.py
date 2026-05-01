@@ -256,7 +256,7 @@ class SetupSourceIntegrationTests(unittest.TestCase):
         self.assertIn("/models/demo.gguf", call.kwargs["model_refs"])
         self.assertEqual(call.kwargs["total_vram_mb"], hardware.vram_mb)
 
-    def test_build_recommended_payload_passes_detected_total_vram(self) -> None:
+    def test_build_recommended_payload_uses_direct_catalog_sizing_with_detected_vram(self) -> None:
         hardware = setup_source.HardwareInfo(
             label="CUDA-capable device",
             total_ram_gb=32.0,
@@ -268,14 +268,14 @@ class SetupSourceIntegrationTests(unittest.TestCase):
             setup_source, "_discover_llama_server", return_value="/usr/bin/llama-server",
         ), patch.object(
             setup_source, "recommended_gpu_layers", return_value=99,
-        ), patch.object(
-            setup_source, "recommend_setup_context_window", return_value=12288,
-        ) as recommend_ctx:
+        ), patch.object(setup_source, "recommend_setup_context_window") as recommend_ctx:
             payload = setup_source.build_recommended_payload(
                 hardware_info=hardware,
                 recommended_ctx=6144,
                 current_cfg={},
             )
 
-        self.assertEqual(payload["context_window_tokens"], 12288)
-        self.assertEqual(recommend_ctx.call_args.kwargs["total_vram_mb"], 24576.0)
+        self.assertGreater(payload["context_window_tokens"], 6144)
+        self.assertEqual(payload["model_size_mb"], 16817.0)
+        self.assertEqual(payload["kv_bytes_per_token"], 34816.0)
+        recommend_ctx.assert_not_called()

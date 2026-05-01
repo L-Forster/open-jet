@@ -252,19 +252,20 @@ class LlamaServerClient:
             apply_airgap_env(env, enabled=self.airgapped)
             bin_dir = os.path.dirname(binary)
             env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
-            # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
-            # need physically contiguous pages for large allocations.
-            env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
             env.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
             resolved_device = self._resolve_device()
-            if resolved_device == "cuda" and self._is_jetson_platform():
+            is_jetson = resolved_device == "cuda" and self._is_jetson_platform()
+            if is_jetson:
+                # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
+                # need physically contiguous pages for large allocations.
+                env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
                 # Jetson can fail large unified-memory allocations even when total
                 # RAM is available. A patched llama.cpp build uses these knobs to
                 # back CUDA/VMM buffers with 1 MiB chunks and smaller VA reserves.
                 env.setdefault("GGML_CUDA_VMM_CHUNK_MB", _JETSON_VMM_CHUNK_MB)
                 env.setdefault("GGML_CUDA_VMM_RESERVE_MB", _JETSON_VMM_RESERVE_MB)
-            lfb_mb = await self._prepare_memory_for_launch() if resolved_device == "cuda" else None
+            lfb_mb = await self._prepare_memory_for_launch() if is_jetson else None
             requested_ngl = self.gpu_layers if resolved_device in ("cuda", "vulkan", "rocm", "metal") else 0
             requested_ctx = self.context_window_tokens
             model_path = Path(self.model).expanduser()
@@ -285,7 +286,7 @@ class LlamaServerClient:
                 fit_mode=fit_mode,
                 no_warmup=no_warmup,
                 no_mmap=no_mmap,
-                jetson_platform=self._is_jetson_platform(),
+                jetson_platform=is_jetson,
                 airgapped=self.airgapped,
                 **startup_snapshot,
             )

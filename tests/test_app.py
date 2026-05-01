@@ -7,6 +7,7 @@ import io
 import sys
 import tempfile
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -36,7 +37,14 @@ from src.provisioning import ensure_direct_model, recommend_direct_model
 from src.runtime_protocol import StreamChunk, ToolCall
 from src.sdk import ToolResult
 from src.session_state import ChatArchiveStore, SavedChatEntry, SessionStateStore
-from src.setup import _prompt_choice, _runtime_prompt_options, build_recommended_payload, run_setup_wizard
+from src.setup import (
+    _choice_prompt_html,
+    _hardware_memory_text,
+    _prompt_choice,
+    _runtime_prompt_options,
+    build_recommended_payload,
+    run_setup_wizard,
+)
 
 
 class FakeAgent:
@@ -196,17 +204,26 @@ class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AppStatusTests(unittest.TestCase):
-    def test_prompt_message_includes_generating_status_above_prompt(self) -> None:
+    def test_generating_status_renders_live_and_disappears_after_stop(self) -> None:
         app = OpenJetApp()
-        app._start_thinking()
+        token = app._start_thinking()
 
         prompt = app._prompt_message()
+        toolbar = app._toolbar_text()
 
-        self.assertIn("Generating...", prompt.value)
+        self.assertIn("Generating", prompt.value)
         self.assertIn("Tip: Join Discord for community support", prompt.value)
         self.assertIn("prompt-tip", prompt.value)
-        self.assertIn("prompt-splash-block-", prompt.value)
-        self.assertIn("open-jet", prompt.value)
+        self.assertNotIn("prompt-splash-block-", prompt.value)
+        self.assertIn("<prompt-border>╭", prompt.value)
+        self.assertIn("<prompt-border>│</prompt-border>", prompt.value)
+        self.assertNotIn("Generating...", toolbar.value)
+
+        app._stop_thinking(token)
+        prompt = app._prompt_message()
+
+        self.assertNotIn("Generating", prompt.value)
+        self.assertNotIn("Tip: Join Discord for community support", prompt.value)
 
     def test_generating_tip_advances_per_message_not_time(self) -> None:
         app = OpenJetApp()
@@ -222,6 +239,24 @@ class AppStatusTests(unittest.TestCase):
         self.assertNotEqual(first_tip, second_tip)
         self.assertEqual(first_tip, app._GENERATING_TIPS[0])
         self.assertEqual(second_tip, app._GENERATING_TIPS[1])
+
+    def test_generating_status_text_cycles_dot_suffix(self) -> None:
+        with patch("src.app.time.monotonic", return_value=0.0):
+            self.assertEqual(OpenJetApp._generating_status_text(), "Generating.")
+        with patch("src.app.time.monotonic", return_value=0.5):
+            self.assertEqual(OpenJetApp._generating_status_text(), "Generating..")
+        with patch("src.app.time.monotonic", return_value=1.0):
+            self.assertEqual(OpenJetApp._generating_status_text(), "Generating...")
+
+    def test_pre_prompt_status_does_not_print_generating_to_scrollback(self) -> None:
+        output = io.StringIO()
+        app = OpenJetApp()
+        app.console = Console(file=output, force_terminal=True)
+        app._assistant_status_kind = "generating"
+
+        app._print_pre_prompt_status()
+
+        self.assertEqual(output.getvalue(), "")
 
     def test_init_client_does_not_eagerly_start_runtime(self) -> None:
         app = OpenJetApp()
@@ -322,11 +357,15 @@ class AppStatusTests(unittest.TestCase):
         app._render_approval_bar()
 
         entries = app.query_one("#chat-log")._entries
-        self.assertIn("Approve", str(entries[2]))
-        self.assertIn("Deny", str(entries[2]))
-        self.assertIn("deny_selected", str(entries[2]))
-        self.assertIn("approve_idle", str(entries[2]))
-        self.assertIn("Tab/←/→ Enter y/n", str(entries[2]))
+        selection = str(entries[app._approval_prompt_selection_index])
+        self.assertIn("Approval required: shell", str(entries[0]))
+        self.assertIn("Approve", selection)
+        self.assertIn("Deny", selection)
+        self.assertIn("deny_selected", selection)
+        self.assertIn("approve_idle", selection)
+        self.assertIn("\n", selection)
+        self.assertIn("tab auto-accept code changes: off", selection)
+        self.assertIn("up/down select", selection)
 
     def test_write_approval_prompt_writes_visible_chat_block(self) -> None:
         app = OpenJetApp()
@@ -335,11 +374,14 @@ class AppStatusTests(unittest.TestCase):
         app._write_approval_prompt(app.query_one("#chat-log"), tool_call)
 
         entries = app.query_one("#chat-log")._entries
-        self.assertGreaterEqual(len(entries), 3)
+        selection = str(entries[app._approval_prompt_selection_index])
+        self.assertGreaterEqual(len(entries), 6)
+        self.assertIn("Approval required: edit_file", str(entries[0]))
         self.assertIn("edit_file -> src/app.py", str(entries[1]))
-        self.assertIn("approve_selected", str(entries[2]))
-        self.assertIn("deny_idle", str(entries[2]))
-        self.assertIn("Tab/←/→ Enter y/n", str(entries[2]))
+        self.assertIn("approve_selected", selection)
+        self.assertIn("deny_idle", selection)
+        self.assertIn("tab auto-accept code changes: off", selection)
+        self.assertIn("up/down select", selection)
 
     def test_set_approval_choice_updates_only_selection_line(self) -> None:
         app = OpenJetApp()
@@ -354,6 +396,9 @@ class AppStatusTests(unittest.TestCase):
         app._set_approval_choice(1)
 
         log.refresh_recent_line.assert_called_once()
+        refreshed = log.refresh_recent_line.call_args.args[1]
+        self.assertIn("╰", refreshed)
+        self.assertIn("╯", refreshed)
         app._session.app.invalidate.assert_not_called()
 
     def test_cycle_approval_choice_toggles_between_options(self) -> None:
@@ -374,8 +419,53 @@ class AppStatusTests(unittest.TestCase):
         app._cycle_approval_choice(-1)
         self.assertEqual(app._approval_choice, 1)
 
+    def test_auto_accept_code_changes_only_matches_write_tools(self) -> None:
+        app = OpenJetApp()
+        app._auto_accept_code_changes = True
+
+        self.assertTrue(app._should_auto_accept_tool_call(ToolCall(name="edit_file", arguments={})))
+        self.assertTrue(app._should_auto_accept_tool_call(ToolCall(name="write_file", arguments={})))
+        self.assertFalse(app._should_auto_accept_tool_call(ToolCall(name="shell", arguments={})))
+
+    def test_toggle_auto_accept_accepts_current_code_change(self) -> None:
+        app = OpenJetApp()
+        future: Future[bool] = Future()
+        app._awaiting_approval = True
+        app._approval_tool_call = ToolCall(name="edit_file", arguments={"path": "src/app.py"})
+        app._approval_future = future
+
+        app._toggle_auto_accept_code_changes()
+
+        self.assertTrue(app._auto_accept_code_changes)
+        self.assertTrue(future.done())
+        self.assertTrue(future.result())
+
 
 class AppInputTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_async_erases_submitted_prompt_echo(self) -> None:
+        app = OpenJetApp()
+        app._quit_requested = True
+
+        with patch("src.app.PromptSession") as prompt_session, patch.object(
+            app, "_startup_sequence", AsyncMock()
+        ):
+            await app.run_async()
+
+        self.assertTrue(prompt_session.call_args.kwargs["erase_when_done"])
+        self.assertIn("│", prompt_session.call_args.kwargs["rprompt"]().value)
+        self.assertNotIn("input_processors", prompt_session.call_args.kwargs)
+
+    async def test_run_async_exits_without_printing_prompt_top_border_when_already_quit(self) -> None:
+        app = OpenJetApp()
+        app._quit_requested = True
+
+        with patch("src.app.PromptSession"), patch.object(app, "_startup_sequence", AsyncMock()), patch.object(
+            app, "_print_prompt_top_border"
+        ) as print_top_border:
+            await app.run_async()
+
+        print_top_border.assert_not_called()
+
     async def test_submit_text_while_awaiting_approval_prompts_for_confirmation(self) -> None:
         app = OpenJetApp()
         app._awaiting_approval = True
@@ -441,7 +531,7 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
         maybe_handle.assert_not_awaited()
         self.assertEqual(app.agent.messages[-1]["content"], "/spoken literal")
         entries = app.query_one("#chat-log")._entries
-        self.assertTrue(any("User" in str(entry) for entry in entries))
+        self.assertTrue(any("USER" in str(entry) for entry in entries))
         self.assertFalse(any("Slash Command" in str(entry) for entry in entries))
 
     def test_status_cli_does_not_import_tui_surface(self) -> None:
@@ -783,6 +873,41 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["setup_missing_runtime"])
         self.assertIn("model_download_url", payload)
         self.assertIn("model_download_path", payload)
+        self.assertIn("model_size_mb", payload)
+        self.assertIn("kv_bytes_per_token", payload)
+
+    def test_build_recommended_payload_uses_direct_model_sizing_for_context(self) -> None:
+        hardware = HardwareInfo(
+            label="RTX 3090",
+            total_ram_gb=15.6,
+            has_cuda=True,
+            vram_mb=24576.0,
+        )
+        with patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup._discover_llama_server", return_value="/usr/bin/llama-server"
+        ), patch("src.setup.recommended_gpu_layers", return_value=99):
+            payload = build_recommended_payload(
+                hardware_info=hardware,
+                recommended_ctx=6144,
+                current_cfg={},
+            )
+
+        self.assertEqual(payload["model_source"], "direct")
+        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M.gguf"))
+        self.assertGreater(int(payload["context_window_tokens"]), 6144)
+
+    def test_choice_prompt_wraps_long_detail_lines(self) -> None:
+        long_detail = " ".join(["runtime=llama_cpp,"] + ["segment"] * 30)
+        rendered = str(
+            _choice_prompt_html(
+                "Setup mode",
+                [("Use recommended setup", "recommended")],
+                selected_index=0,
+                detail=long_detail,
+            )
+        )
+
+        self.assertGreater(rendered.count("<style fg='ansibrightblack'>"), 1)
 
     def test_build_recommended_payload_stays_local_first_even_with_api_key_env(self) -> None:
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
@@ -990,6 +1115,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 "filename": "selected-moe.gguf",
                 "url": "https://huggingface.co/example/selected-moe-GGUF/resolve/main/selected-moe.gguf",
                 "model_size_mb": 22630,
+                "active_model_size_mb": 12288,
                 "kv_bytes_per_token": 24576,
                 "unified_memory_only": True,
             },
@@ -1034,6 +1160,30 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
+    def test_hardware_memory_text_separates_system_ram_and_vram(self) -> None:
+        text = _hardware_memory_text(
+            HardwareInfo(
+                label="RTX 3090",
+                total_ram_gb=15.6,
+                has_cuda=True,
+                vram_mb=24576.0,
+            )
+        )
+
+        self.assertEqual(text, "system RAM 15.6 GB; VRAM 24.0 GB")
+
+    def test_hardware_memory_text_marks_missing_vram_query(self) -> None:
+        text = _hardware_memory_text(
+            HardwareInfo(
+                label="CUDA-capable device",
+                total_ram_gb=15.6,
+                has_cuda=True,
+                vram_mb=0.0,
+            )
+        )
+
+        self.assertEqual(text, "system RAM 15.6 GB; VRAM unavailable")
+
     def test_recommend_direct_model_uses_requested_default_vram_quant_bands(self) -> None:
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="6GB", total_ram_gb=6.0, has_cuda=False))["label"],

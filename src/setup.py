@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import textwrap
 from html import escape as html_escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from prompt_toolkit import PromptSession
 
 ACCENT_GREEN = "#88D83F"
+PROMPT_WRAP_WIDTH = 88
 
 
 def discover_model_files() -> list[str]:
@@ -77,13 +79,24 @@ def _choice_prompt_html(
 ) -> Any:
     from prompt_toolkit.formatted_text import HTML
 
+    width = max(40, min(PROMPT_WRAP_WIDTH, shutil.get_terminal_size((PROMPT_WRAP_WIDTH, 24)).columns))
     lines = [f"<style fg='{accent_color}' bold='true'>{html_escape(title)}</style>"]
     if detail:
-        lines.append(f"<style fg='ansibrightblack'>{html_escape(detail)}</style>")
+        for wrapped in textwrap.wrap(str(detail), width=width, break_long_words=False, break_on_hyphens=False):
+            lines.append(f"<style fg='ansibrightblack'>{html_escape(wrapped)}</style>")
     for idx, (label, _value) in enumerate(options):
         marker = "›" if idx == selected_index else " "
         style = f" fg='{accent_color}' bold='true'" if idx == selected_index else ""
-        lines.append(f"{marker} <style{style}>{idx + 1}. {html_escape(str(label))}</style>")
+        prefix = f"{marker} {idx + 1}. "
+        wrapped_label = textwrap.wrap(
+            str(label),
+            width=max(20, width - len(prefix)),
+            break_long_words=False,
+            break_on_hyphens=False,
+        ) or [""]
+        for line_index, wrapped in enumerate(wrapped_label):
+            rendered_prefix = prefix if line_index == 0 else " " * len(prefix)
+            lines.append(f"{rendered_prefix}<style{style}>{html_escape(wrapped)}</style>")
     return HTML("\n".join(lines) + "\n\nchoice> ")
 
 
@@ -298,7 +311,7 @@ def _runtime_prompt_options(
 
 def _recommended_summary(payload: Mapping[str, object]) -> str:
     model_source = str(payload.get("model_source") or "local")
-    model_ref = str(payload.get("llama_model") or "").strip()
+    model_ref = str(payload.get("llama_model") or payload.get("model_download_path") or "").strip()
     model_text = model_ref or "missing"
     notes: list[str] = []
     if payload.get("setup_missing_runtime"):
@@ -311,6 +324,27 @@ def _recommended_summary(payload: Mapping[str, object]) -> str:
         f"device={payload.get('device', 'auto')}, ctx={payload.get('context_window_tokens', '?')}, "
         f"gpu_layers={payload.get('gpu_layers', 0)}{note_suffix}"
     )
+
+
+def _hardware_memory_text(hardware_info: HardwareInfo) -> str:
+    parts: list[str] = []
+    if hardware_info.total_ram_gb > 0:
+        parts.append(f"system RAM {hardware_info.total_ram_gb:.1f} GB")
+    else:
+        parts.append("system RAM unknown")
+
+    has_gpu = (
+        hardware_info.has_cuda
+        or hardware_info.has_rocm
+        or hardware_info.has_vulkan
+        or hardware_info.has_metal
+    )
+    if has_gpu:
+        if hardware_info.vram_mb > 0:
+            parts.append(f"VRAM {hardware_info.vram_mb / 1024.0:.1f} GB")
+        elif not hardware_info.has_metal:
+            parts.append("VRAM unavailable")
+    return "; ".join(parts)
 
 
 def _recommended_local_payload(
@@ -340,12 +374,17 @@ def _recommended_local_payload(
             "model_source": "local",
             "llama_model": model_path,
         }
-    return {
+    payload = {
         "model_source": "direct",
         "model_download_url": str(direct["url"]),
         "model_download_path": str(direct["target_path"]),
         "setup_missing_model": True,
+        "model_profile_name": str(direct.get("label") or Path(str(direct.get("filename") or "")).stem),
     }
+    for key in ("model_size_mb", "kv_bytes_per_token", "resident_model_size_mb", "active_model_size_mb"):
+        if direct.get(key) is not None:
+            payload[key] = direct[key]
+    return payload
 
 
 def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
@@ -525,9 +564,9 @@ async def run_setup_wizard(
     recommended_ctx: int,
     current_cfg: Mapping[str, object] | None = None,
 ) -> dict | None:
-    ram_text = f"{hardware_info.total_ram_gb:.1f} GB RAM" if hardware_info.total_ram_gb > 0 else "RAM unknown"
+    memory_text = _hardware_memory_text(hardware_info)
     console.print(f"[bold {ACCENT_GREEN}]open-jet setup[/]")
-    console.print(f"[dim]Detected hardware: {escape(hardware_info.label)} ({escape(ram_text)})[/]")
+    console.print(f"[dim]Detected hardware: {escape(hardware_info.label)} ({escape(memory_text)})[/]")
     console.print("[dim]Setup is local-only: pick or download a GGUF and compile llama.cpp when needed.[/]")
 
     recommended_payload = build_recommended_payload(
@@ -554,7 +593,7 @@ async def run_setup_wizard(
         return recommended_payload
 
     hardware_options = [
-        (f"Use detected hardware ({hardware_info.label}, {ram_text})", "auto"),
+        (f"Use detected hardware ({hardware_info.label}, {memory_text})", "auto"),
         ("Pick hardware profile manually", "other"),
     ]
     default_hardware = (

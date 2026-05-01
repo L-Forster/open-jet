@@ -89,7 +89,6 @@ def _bench_env(bench_bin: str) -> dict[str, str]:
     env = os.environ.copy()
     bin_dir = os.path.dirname(bench_bin)
     env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
-    env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
     env.setdefault("CUDA_MODULE_LOADING", "LAZY")
     return env
 
@@ -455,7 +454,7 @@ def run_benchmark_sweep(*, repetitions: int = 3) -> None:
     # GPU layer offloading
     if device != "cpu":
         step = max(1, gpu_layers // 8)
-        ngl_vals = list(range(0, gpu_layers, step))
+        ngl_vals = list(range(step, gpu_layers, step))
         if ngl_vals[-1] != gpu_layers:
             ngl_vals.append(gpu_layers)
         ngl_csv = ",".join(str(v) for v in ngl_vals)
