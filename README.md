@@ -5,7 +5,7 @@
 ![Terminal-Bench 2.0](https://img.shields.io/badge/Terminal--Bench%202.0-59.3-blue)
 
 <p align="center">
-  <img width="1672" height="941" alt="OpenJet screenshot" src="https://github.com/user-attachments/assets/1a46faf9-b07b-48ca-bb97-dbe2bffd7607" />
+  <img width="1672" height="941" alt="OpenJet screenshot" src="[https://github.com/user-attachments/assets/1a46faf9-b07b-48ca-bb97-dbe2bffd7607](https://github.com/user-attachments/assets/86343463-cd76-4152-ab4d-a9f6c97a4295)" />
 </p>
 
 <br />
