@@ -32,23 +32,23 @@ OpenJet is built for people looking for a **Claude Code alternative, easy local 
 
 ## Install
 
-### macOS / Linux
+### Recommended
 
 ```bash
-curl -fsSL https://www.openjet.dev/install.sh | bash
-```
-
-### Windows
-
-```bat
-curl -L https://www.openjet.dev/install.bat -o install.bat && install.bat
-```
-
-After install:
-
-```bash
+pipx install open-jet
 openjet setup
 ```
+
+If you do not use `pipx`, install with Python directly:
+
+```bash
+python -m pip install --user open-jet
+openjet setup
+```
+
+The PyPI package is `open-jet`; the installed command is `openjet`.
+
+Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14GB+ VRAM.
 
 Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
 
