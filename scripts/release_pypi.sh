@@ -22,6 +22,46 @@ if ! command -v auditwheel >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ "$TARGET" == "pypi" ]]; then
+  python - <<'PY'
+from __future__ import annotations
+
+import json
+import re
+import urllib.request
+from pathlib import Path
+
+project = "open-jet"
+pyproject = Path("pyproject.toml")
+text = pyproject.read_text(encoding="utf-8")
+match = re.search(r'(?m)^version = "([^"]+)"$', text)
+if not match:
+    raise SystemExit("Could not find project version in pyproject.toml")
+
+local_version = match.group(1)
+with urllib.request.urlopen(f"https://pypi.org/pypi/{project}/json", timeout=20) as response:
+    latest_version = json.load(response)["info"]["version"]
+
+
+def parse_version(version: str) -> tuple[int, int, int]:
+    parts = version.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        raise SystemExit(f"Expected simple MAJOR.MINOR.PATCH version, got {version!r}")
+    return tuple(int(part) for part in parts)
+
+
+local = parse_version(local_version)
+latest = parse_version(latest_version)
+if local <= latest:
+    next_version = f"{latest[0]}.{latest[1]}.{latest[2] + 1}"
+    text = text[: match.start(1)] + next_version + text[match.end(1) :]
+    pyproject.write_text(text, encoding="utf-8")
+    print(f"Bumped {project} version: {local_version} -> {next_version}")
+else:
+    print(f"Using existing {project} version: {local_version}")
+PY
+fi
+
 python scripts/sync_pypi_readme.py
 
 python -m pip install --upgrade "build" "twine" "Cython>=3.0" "setuptools>=68,<80" "wheel"
