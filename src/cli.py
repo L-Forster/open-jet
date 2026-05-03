@@ -358,6 +358,10 @@ def build_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("--backend-kind", choices=("auto", "llama-server", "lucebox"), default="auto", help="turbo backend kind (default: auto)")
     bench_parser.add_argument("--context", dest="benchmark_context", type=int, help="context size for turbo/thinking mode")
     bench_parser.add_argument("--baseline-tok-s", type=float, help="previous OpenJet generation tok/s baseline for speedup reporting")
+    bench_parser.add_argument("--prefill-compression", choices=("off", "auto", "always"), help="PFlash prefill compression mode for Lucebox")
+    bench_parser.add_argument("--prefill-threshold", type=int, help="token threshold for PFlash auto mode")
+    bench_parser.add_argument("--prefill-keep-ratio", type=float, help="source token keep ratio for PFlash")
+    bench_parser.add_argument("--prefill-drafter", help="Qwen3-0.6B BF16 GGUF path for PFlash")
     bench_parser.add_argument("extra", nargs=argparse.REMAINDER, help="extra flags passed directly to the benchmark runner")
     turbo_parser = subparsers.add_parser("turbo", help="experimental OpenJet Turbo commands")
     turbo_subparsers = turbo_parser.add_subparsers(dest="turbo_action")
@@ -369,6 +373,10 @@ def build_parser() -> argparse.ArgumentParser:
     turbo_bench_parser.add_argument("--backend-kind", choices=("auto", "llama-server", "lucebox"), default="auto", help="turbo backend kind (default: auto)")
     turbo_bench_parser.add_argument("--context", dest="benchmark_context", type=int, help="context size")
     turbo_bench_parser.add_argument("--baseline-tok-s", type=float, help="previous OpenJet generation tok/s baseline for speedup reporting")
+    turbo_bench_parser.add_argument("--prefill-compression", choices=("off", "auto", "always"), help="PFlash prefill compression mode for Lucebox")
+    turbo_bench_parser.add_argument("--prefill-threshold", type=int, help="token threshold for PFlash auto mode")
+    turbo_bench_parser.add_argument("--prefill-keep-ratio", type=float, help="source token keep ratio for PFlash")
+    turbo_bench_parser.add_argument("--prefill-drafter", help="Qwen3-0.6B BF16 GGUF path for PFlash")
     turbo_bench_parser.add_argument("--thinking", action="store_true", help="enable Qwen thinking mode for comparison")
     device_parser = subparsers.add_parser("device", aliases=("devices",), help="list and configure persistent device ids")
     device_subparsers = device_parser.add_subparsers(dest="device_action")
@@ -547,6 +555,10 @@ def main(argv: list[str] | None = None) -> None:
                 backend_kind=getattr(args, "backend_kind", None),
                 context_size=getattr(args, "benchmark_context", None),
                 baseline_tok_s=getattr(args, "baseline_tok_s", None),
+                prefill_compression=getattr(args, "prefill_compression", None),
+                prefill_threshold=getattr(args, "prefill_threshold", None),
+                prefill_keep_ratio=getattr(args, "prefill_keep_ratio", None),
+                prefill_drafter=getattr(args, "prefill_drafter", None),
             )
             return
         raise SystemExit("Usage: open-jet turbo benchmark")
@@ -563,6 +575,10 @@ def main(argv: list[str] | None = None) -> None:
                 backend_kind=getattr(args, "backend_kind", None),
                 context_size=getattr(args, "benchmark_context", None),
                 baseline_tok_s=getattr(args, "baseline_tok_s", None),
+                prefill_compression=getattr(args, "prefill_compression", None),
+                prefill_threshold=getattr(args, "prefill_threshold", None),
+                prefill_keep_ratio=getattr(args, "prefill_keep_ratio", None),
+                prefill_drafter=getattr(args, "prefill_drafter", None),
             )
             return
         if args.sweep:

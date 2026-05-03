@@ -362,6 +362,40 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("--max-ctx", cmd)
         self.assertEqual(cmd[cmd.index("--max-ctx") + 1], "6048")
 
+    def test_lucebox_server_command_enables_pflash_prefill(self) -> None:
+        settings = benchmark.TurboBenchmarkSettings(
+            target_model="/models/Qwen3.6-27B-Q4_K_M.gguf",
+            draft_model="/models/draft/model.safetensors",
+            backend_path="/opt/lucebox-hub/dflash/build/test_dflash",
+            backend_kind="lucebox",
+            backend_label="Luce-Org/lucebox-hub dflash",
+            context_size=8192,
+            draft_context_size=256,
+            gpu_layers=99,
+            draft_gpu_layers=99,
+            batch_size=256,
+            ubatch_size=64,
+            thinking_enabled=False,
+            baseline_tok_s=None,
+            prefill_compression="auto",
+            prefill_threshold=4096,
+            prefill_keep_ratio=0.02,
+            prefill_drafter="/models/Qwen3-0.6B-BF16.gguf",
+        )
+
+        cmd = benchmark._lucebox_server_cmd(settings, host="127.0.0.1", port=18080)
+
+        self.assertIn("--prefill-compression", cmd)
+        self.assertEqual(cmd[cmd.index("--prefill-compression") + 1], "auto")
+        self.assertIn("--prefill-threshold", cmd)
+        self.assertEqual(cmd[cmd.index("--prefill-threshold") + 1], "4096")
+        self.assertIn("--prefill-keep-ratio", cmd)
+        self.assertEqual(cmd[cmd.index("--prefill-keep-ratio") + 1], "0.02")
+        self.assertIn("--prefill-drafter", cmd)
+        self.assertEqual(cmd[cmd.index("--prefill-drafter") + 1], "/models/Qwen3-0.6B-BF16.gguf")
+        self.assertIn("--fa-window", cmd)
+        self.assertEqual(cmd[cmd.index("--fa-window") + 1], "0")
+
     def test_extract_turbo_timings_reads_llama_server_timings(self) -> None:
         timings = benchmark._extract_turbo_timings(
             {
@@ -379,6 +413,28 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(timings.generation_tokens, 40)
         self.assertAlmostEqual(timings.prompt_eval_tok_s or 0, 400.0)
         self.assertAlmostEqual(timings.generation_tok_s or 0, 40.0)
+
+    def test_lucebox_binary_build_enables_bsa_for_pflash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binary = root / "build" / ("test_dflash.exe" if benchmark.os.name == "nt" else "test_dflash")
+
+            def fake_setup(cmd, *, cwd=None, env=None):
+                if cmd[:3] == ["cmake", "--build", "build"]:
+                    binary.parent.mkdir(parents=True, exist_ok=True)
+                    binary.write_text("binary", encoding="utf-8")
+
+            with patch("src.benchmark.shutil.which", return_value="/usr/bin/cmake"), patch(
+                "src.benchmark._run_setup_step", side_effect=fake_setup
+            ) as setup:
+                result = benchmark._ensure_lucebox_binary(root, enable_pflash=True, cuda_architectures="86")
+
+        self.assertEqual(result, str(binary))
+        configure_cmd = setup.call_args_list[0].args[0]
+        build_cmd = setup.call_args_list[1].args[0]
+        self.assertIn("-DDFLASH27B_ENABLE_BSA=ON", configure_cmd)
+        self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=86", configure_cmd)
+        self.assertIn("test_flashprefill_kernels", build_cmd)
 
     def test_load_turbo_settings_resolves_models_and_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -426,6 +482,7 @@ class BenchmarkTests(unittest.TestCase):
                 "llama_model": str(target),
                 "turbo": {
                     "backend_kind": "lucebox",
+                    "prefill_compression": "off",
                     "draft_model": str(draft.parent),
                     "lucebox_bin": str(backend_path),
                 },
@@ -454,12 +511,15 @@ class BenchmarkTests(unittest.TestCase):
                 "src.benchmark._find_existing_lucebox_target_model", return_value=target
             ), patch(
                 "src.benchmark._hf_download_file", return_value=draft
-            ) as download:
+            ) as download, patch(
+                "src.benchmark._ensure_lucebox_prefill_drafter", return_value=str(root / "lucebox-hub" / "dflash" / "models" / "Qwen3-0.6B-BF16.gguf")
+            ):
                 settings = benchmark._load_turbo_settings(cfg, thinking_enabled=False)
 
         self.assertEqual(settings.backend_kind, "lucebox")
         self.assertEqual(settings.target_model, str(target))
         self.assertEqual(settings.draft_model, str(draft))
+        self.assertEqual(settings.prefill_compression, "auto")
         download.assert_called_once()
 
     def test_lucebox_backend_refuses_to_download_duplicate_target(self) -> None:

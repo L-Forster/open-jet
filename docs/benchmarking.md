@@ -41,9 +41,9 @@ openjet benchmark --mode thinking
 Turbo mode can set up the Lucebox backend itself. With
 `--backend-kind lucebox`, OpenJet will use `.openjet/turbo/lucebox-hub`, clone
 `Luce-Org/lucebox-hub` if needed, build `dflash/build/test_dflash`, install the
-local HTTP server Python dependencies, reuse the active OpenJet target GGUF,
-download the z-lab draft when no draft path is configured, then run the
-benchmark.
+local HTTP server Python dependencies, build PFlash with BSA, reuse the active
+OpenJet target GGUF, download the z-lab draft when no draft path is configured,
+prepare the Qwen3-0.6B BF16 GGUF prefill drafter, then run the benchmark.
 
 The benchmark starts a temporary local server, sends a fixed local-agent coding
 prompt through the OpenAI-compatible API, and prints:
@@ -53,6 +53,7 @@ prompt through the OpenAI-compatible API, and prints:
 - context size
 - thinking mode on/off
 - backend path
+- PFlash prefill mode, threshold, keep ratio, and drafter
 - prompt eval tok/s
 - generation tok/s
 - speedup versus a provided baseline
@@ -81,7 +82,7 @@ Automatic setup for `lucebox` mode needs:
 - `git`, `cmake`, a CUDA compiler/toolkit, and an sm_86+ NVIDIA GPU
 - an existing Qwen3.5/Qwen3.6 27B target GGUF from `openjet setup` or
   `--target-model`; OpenJet will not download a second target GGUF
-- enough disk for the checkout plus draft download
+- enough disk for the checkout, DFlash draft, and Qwen3-0.6B drafter conversion
 - Hugging Face access for gated draft repos; set `HF_TOKEN` first if required
 
 Configuration can live in `config.yaml`:
@@ -101,7 +102,10 @@ For Lucebox:
 ```yaml
 turbo:
   backend_kind: lucebox
-  context_window_tokens: 6048
+  context_window_tokens: 8192
+  prefill_compression: auto
+  prefill_threshold: 4096
+  prefill_keep_ratio: 0.05
 ```
 
 That is enough for the default auto-provisioned path. You can override paths if
@@ -113,6 +117,7 @@ turbo:
   lucebox_root: /home/you/lucebox-hub/dflash
   target_model: /models/Qwen3.6-27B-Q4_K_M.gguf
   draft_model: /home/you/lucebox-hub/dflash/models/draft/model.safetensors
+  prefill_drafter: /home/you/lucebox-hub/dflash/models/Qwen3-0.6B-BF16.gguf
 ```
 
 The same values can be provided on the command line:
@@ -130,7 +135,10 @@ openjet turbo benchmark \
 ```bash
 openjet turbo benchmark \
   --backend-kind lucebox \
-  --context 6048
+  --context 8192 \
+  --prefill-compression auto \
+  --prefill-threshold 4096 \
+  --prefill-keep-ratio 0.05
 ```
 
 ## Sweep mode

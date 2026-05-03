@@ -38,7 +38,19 @@ _LUCEBOX_REPO_URL = "https://github.com/Luce-Org/lucebox-hub.git"
 _LUCEBOX_TARGET_FILE = "Qwen3.6-27B-Q4_K_M.gguf"
 _LUCEBOX_DRAFT_REPO = "z-lab/Qwen3.6-27B-DFlash"
 _LUCEBOX_DRAFT_FILE = "model.safetensors"
-_LUCEBOX_PY_DEPS = ("fastapi", "uvicorn", "transformers", "jinja2")
+_LUCEBOX_PREFILL_DRAFTER_REPO = "Qwen/Qwen3-0.6B"
+_LUCEBOX_PREFILL_DRAFTER_FILE = "Qwen3-0.6B-BF16.gguf"
+_LUCEBOX_PY_DEPS = (
+    "fastapi",
+    "uvicorn",
+    "transformers",
+    "jinja2",
+    "numpy",
+    "protobuf",
+    "safetensors",
+    "sentencepiece",
+    "tqdm",
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +68,13 @@ class TurboBenchmarkSettings:
     ubatch_size: int
     thinking_enabled: bool
     baseline_tok_s: float | None
+    prefill_compression: str = "off"
+    prefill_threshold: int = 4096
+    prefill_keep_ratio: float = 0.05
+    prefill_drafter: str | None = None
+    prefill_drafter_tokenizer: str = _LUCEBOX_PREFILL_DRAFTER_REPO
+    prefill_alpha: float = 0.85
+    prefill_cuda_architectures: str = "86"
 
 
 @dataclass(frozen=True)
@@ -408,6 +427,38 @@ def _cfg_int(value: object, default: int, *, minimum: int = 1) -> int:
     return max(minimum, parsed)
 
 
+def _cfg_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _cfg_str(value: object, default: str = "") -> str:
+    text = str(value or "").strip()
+    return text or default
+
+
+def _normalize_prefill_compression(value: object, *, default: str = "auto") -> str:
+    raw = str(value or default).strip().lower()
+    if raw not in {"off", "auto", "always"}:
+        raise SystemExit("prefill compression must be one of: off, auto, always")
+    return raw
+
+
+def _configured_prefill_compression(turbo_cfg: dict, override: str | None = None) -> str:
+    raw: object = override or turbo_cfg.get("prefill_compression")
+    if raw is None and "pflash" in turbo_cfg:
+        raw = "auto" if _cfg_bool(turbo_cfg.get("pflash"), default=True) else "off"
+    return _normalize_prefill_compression(raw, default="auto")
+
+
 def _run_setup_step(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     print(f"Setup:   {' '.join(cmd)}")
     sys.stdout.flush()
@@ -433,25 +484,42 @@ def _ensure_lucebox_checkout(root: Path) -> None:
     _run_setup_step(["git", "clone", "--recurse-submodules", _LUCEBOX_REPO_URL, str(repo_root)])
 
 
+def _ensure_lucebox_submodules(root: Path) -> None:
+    if not (root / ".git").exists() and not (root.parent / ".git").exists():
+        return
+    _run_setup_step(["git", "submodule", "update", "--init", "--recursive"], cwd=root)
+
+
 def _ensure_lucebox_python_deps(root: Path) -> None:
-    marker = root / ".openjet-server-deps-installed"
+    marker = root / ".openjet-server-deps-pflash-installed"
     if marker.is_file():
         return
     _run_setup_step([sys.executable, "-m", "pip", "install", *_LUCEBOX_PY_DEPS], cwd=root)
     marker.write_text("ok\n", encoding="utf-8")
 
 
-def _ensure_lucebox_binary(root: Path) -> str:
+def _ensure_lucebox_binary(root: Path, *, enable_pflash: bool, cuda_architectures: str) -> str:
     exe_name = "test_dflash.exe" if os.name == "nt" else "test_dflash"
     binary = root / "build" / exe_name
-    if binary.is_file():
+    marker = root / ".openjet-pflash-build" if enable_pflash else root / ".openjet-dflash-build"
+    if binary.is_file() and marker.is_file():
         return str(binary)
     if not shutil.which("cmake"):
         raise SystemExit("cmake is required to build Lucebox DFlash. Install cmake, then rerun `openjet turbo benchmark`.")
-    _run_setup_step(["cmake", "-B", "build", "-S", ".", "-DCMAKE_BUILD_TYPE=Release"], cwd=root)
-    _run_setup_step(["cmake", "--build", "build", "--target", "test_dflash", "-j", str(os.cpu_count() or 4)], cwd=root)
+    cmake_cmd = ["cmake", "-B", "build", "-S", ".", "-DCMAKE_BUILD_TYPE=Release"]
+    if enable_pflash:
+        cmake_cmd.extend([
+            f"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}",
+            "-DDFLASH27B_ENABLE_BSA=ON",
+        ])
+    _run_setup_step(cmake_cmd, cwd=root)
+    targets = ["test_dflash"]
+    if enable_pflash:
+        targets.append("test_flashprefill_kernels")
+    _run_setup_step(["cmake", "--build", "build", "--target", *targets, "-j", str(os.cpu_count() or 4)], cwd=root)
     if not binary.is_file():
         raise SystemExit(f"Lucebox build completed but binary was not found: {binary}")
+    marker.write_text(f"pflash={int(enable_pflash)}\ncuda_architectures={cuda_architectures}\n", encoding="utf-8")
     return str(binary)
 
 
@@ -476,6 +544,34 @@ def _hf_download_file(repo_id: str, filename: str, local_dir: Path) -> Path:
         raise SystemExit(
             f"Failed to download {repo_id}/{filename}. If the repo is gated, set HF_TOKEN or download it manually."
         ) from exc
+
+
+def _convert_lucebox_prefill_drafter(root: Path, source_dir: Path, output_path: Path) -> Path:
+    if output_path.is_file():
+        return output_path
+    converter = root / "deps" / "llama.cpp" / "convert_hf_to_gguf.py"
+    if not converter.is_file():
+        raise SystemExit(f"llama.cpp GGUF converter was not found: {converter}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    gguf_py = root / "deps" / "llama.cpp" / "gguf-py"
+    env["PYTHONPATH"] = f"{gguf_py}{os.pathsep}" + env.get("PYTHONPATH", "")
+    _run_setup_step(
+        [
+            sys.executable,
+            str(converter),
+            str(source_dir),
+            "--outtype",
+            "bf16",
+            "--outfile",
+            str(output_path),
+        ],
+        cwd=root,
+        env=env,
+    )
+    if not output_path.is_file():
+        raise SystemExit(f"PFlash drafter conversion completed but output was not found: {output_path}")
+    return output_path
 
 
 def _find_existing_lucebox_target_model(root: Path) -> Path | None:
@@ -517,12 +613,36 @@ def _ensure_lucebox_draft_model(cfg: dict, target_model: str, override: str | No
     return str(_hf_download_file(_LUCEBOX_DRAFT_REPO, _LUCEBOX_DRAFT_FILE, root / "models" / "draft"))
 
 
-def _ensure_lucebox_backend(cfg: dict) -> tuple[Path, str]:
+def _ensure_lucebox_prefill_drafter(cfg: dict, root: Path, override: str | None = None) -> str:
+    turbo_cfg = _turbo_cfg(cfg)
+    raw = (
+        override
+        or os.getenv("OPENJET_LUCEBOX_PREFILL_DRAFTER", "").strip()
+        or str(turbo_cfg.get("prefill_drafter") or turbo_cfg.get("pflash_drafter") or "").strip()
+    )
+    if raw:
+        path = Path(raw).expanduser()
+        if path.is_file():
+            return str(path)
+        raise SystemExit(f"PFlash drafter GGUF not found: {raw}")
+    output_path = root / "models" / _LUCEBOX_PREFILL_DRAFTER_FILE
+    if output_path.is_file():
+        return str(output_path)
+    source_dir = root / "models" / "drafter"
+    _hf_download_file(_LUCEBOX_PREFILL_DRAFTER_REPO, "model.safetensors", source_dir)
+    _hf_download_file(_LUCEBOX_PREFILL_DRAFTER_REPO, "tokenizer.json", source_dir)
+    return str(_convert_lucebox_prefill_drafter(root, source_dir, output_path))
+
+
+def _ensure_lucebox_backend(cfg: dict, *, prefill_compression: str | None = None) -> tuple[Path, str]:
     turbo_cfg = _turbo_cfg(cfg)
     root = Path(_lucebox_root_raw(turbo_cfg)).expanduser() if _lucebox_root_raw(turbo_cfg) else _default_lucebox_root()
+    pflash_enabled = _configured_prefill_compression(turbo_cfg, prefill_compression) != "off"
+    cuda_architectures = _cfg_str(turbo_cfg.get("pflash_cuda_architectures"), "86")
     _ensure_lucebox_checkout(root)
+    _ensure_lucebox_submodules(root)
     _ensure_lucebox_python_deps(root)
-    binary = _ensure_lucebox_binary(root)
+    binary = _ensure_lucebox_binary(root, enable_pflash=pflash_enabled, cuda_architectures=cuda_architectures)
     return root, binary
 
 
@@ -613,8 +733,13 @@ def _load_turbo_settings(
     backend_kind: str | None = None,
     context_size: int | None = None,
     baseline_tok_s: float | None = None,
+    prefill_compression: str | None = None,
+    prefill_threshold: int | None = None,
+    prefill_keep_ratio: float | None = None,
+    prefill_drafter: str | None = None,
 ) -> TurboBenchmarkSettings:
     turbo_cfg = _turbo_cfg(cfg)
+    requested_prefill_compression = _configured_prefill_compression(turbo_cfg, prefill_compression)
     requested_kind = _normalize_turbo_backend_kind(
         backend_kind or turbo_cfg.get("backend_kind") or turbo_cfg.get("backend_type"),
         backend_path,
@@ -622,10 +747,13 @@ def _load_turbo_settings(
     if backend_path:
         backend = str(Path(backend_path).expanduser())
         resolved_kind = _normalize_turbo_backend_kind(backend_kind or requested_kind, backend)
+        if resolved_kind == "lucebox":
+            backend_obj = Path(backend)
+            lucebox_root = backend_obj.parent.parent if backend_obj.name != "server.py" else backend_obj.parent.parent
         target = _resolve_turbo_target_model(cfg, target_model)
         draft = _resolve_turbo_draft_model(cfg, target, draft_model)
     elif requested_kind == "lucebox":
-        lucebox_root, backend = _ensure_lucebox_backend(cfg)
+        lucebox_root, backend = _ensure_lucebox_backend(cfg, prefill_compression=requested_prefill_compression)
         resolved_kind = "lucebox"
         target = _ensure_lucebox_target_model(cfg, target_model, lucebox_root)
         draft = _ensure_lucebox_draft_model(cfg, target, draft_model, lucebox_root)
@@ -651,9 +779,21 @@ def _load_turbo_settings(
         or _cfg_float(cfg.get("benchmark_baseline_tok_s"))
     )
     ctx = context_size or _cfg_int(
-        turbo_cfg.get("context_window_tokens", cfg.get("context_window_tokens", 6048)),
-        6048,
+        turbo_cfg.get("context_window_tokens", cfg.get("context_window_tokens", 8192 if resolved_kind == "lucebox" else 6048)),
+        8192 if resolved_kind == "lucebox" else 6048,
         minimum=512,
+    )
+    if resolved_kind != "lucebox":
+        requested_prefill_compression = "off"
+    resolved_prefill_drafter = None
+    if resolved_kind == "lucebox" and requested_prefill_compression != "off":
+        resolved_prefill_drafter = _ensure_lucebox_prefill_drafter(cfg, lucebox_root, prefill_drafter)
+    keep_ratio = (
+        prefill_keep_ratio
+        if prefill_keep_ratio is not None
+        else _cfg_float(turbo_cfg.get("prefill_keep_ratio"))
+        or _cfg_float(turbo_cfg.get("pflash_keep_ratio"))
+        or 0.05
     )
     return TurboBenchmarkSettings(
         target_model=target,
@@ -676,6 +816,18 @@ def _load_turbo_settings(
         ubatch_size=_cfg_int(turbo_cfg.get("ubatch_size", 64), 64, minimum=1),
         thinking_enabled=thinking_enabled,
         baseline_tok_s=baseline,
+        prefill_compression=requested_prefill_compression,
+        prefill_threshold=prefill_threshold
+        if prefill_threshold is not None
+        else _cfg_int(turbo_cfg.get("prefill_threshold", turbo_cfg.get("pflash_threshold", 4096)), 4096, minimum=1),
+        prefill_keep_ratio=max(0.001, min(1.0, float(keep_ratio))),
+        prefill_drafter=resolved_prefill_drafter,
+        prefill_drafter_tokenizer=_cfg_str(
+            turbo_cfg.get("prefill_drafter_tokenizer", turbo_cfg.get("pflash_drafter_tokenizer")),
+            _LUCEBOX_PREFILL_DRAFTER_REPO,
+        ),
+        prefill_alpha=_cfg_float(turbo_cfg.get("prefill_alpha", turbo_cfg.get("pflash_alpha"))) or 0.85,
+        prefill_cuda_architectures=_cfg_str(turbo_cfg.get("pflash_cuda_architectures"), "86"),
     )
 
 
@@ -743,6 +895,23 @@ def _lucebox_server_cmd(settings: TurboBenchmarkSettings, *, host: str, port: in
         "--max-ctx",
         str(settings.context_size),
     ]
+    if settings.prefill_compression != "off":
+        if not settings.prefill_drafter:
+            raise SystemExit("PFlash prefill is enabled but no prefill drafter GGUF was configured.")
+        cmd.extend([
+            "--fa-window",
+            "0",
+            "--prefill-compression",
+            settings.prefill_compression,
+            "--prefill-threshold",
+            str(settings.prefill_threshold),
+            "--prefill-keep-ratio",
+            f"{settings.prefill_keep_ratio:g}",
+            "--prefill-drafter",
+            settings.prefill_drafter,
+            "--prefill-drafter-tokenizer",
+            settings.prefill_drafter_tokenizer,
+        ])
     return cmd
 
 
@@ -839,7 +1008,46 @@ def _extract_turbo_timings(payload: dict) -> TurboBenchmarkTimings:
     )
 
 
-def _request_turbo_completion(base_url: str, *, n_gen: int, thinking_enabled: bool) -> TurboBenchmarkTimings:
+def _pflash_benchmark_prompt(settings: TurboBenchmarkSettings) -> str:
+    target_words = min(
+        max(settings.prefill_threshold + 512, int(settings.context_size * 0.75)),
+        max(1, settings.context_size - 512),
+        131072,
+    )
+    if target_words <= 0:
+        return _TURBO_BENCHMARK_PROMPT
+    needle = "OPENJET_PFLASH_NEEDLE: prefill compression must preserve sparse long-context retrieval."
+    parts = [
+        "You are benchmarking CUDA speculative prefill for a local coding agent.",
+        "Retain important details across a long synthetic repository trace.",
+        needle,
+    ]
+    i = 0
+    while len(" ".join(parts).split()) < target_words:
+        parts.append(
+            f"Trace chunk {i}: file=src/module_{i % 37}.py symbol=worker_{i % 113} "
+            f"status={'changed' if i % 5 == 0 else 'unchanged'} checksum={i * 7919 % 104729}. "
+            "The code path loads configuration, validates device state, schedules tool work, "
+            "and records latency observations for later comparison."
+        )
+        i += 1
+    parts.append("In the answer, mention OPENJET_PFLASH_NEEDLE and summarize the queue implementation plan.")
+    return " ".join(parts)
+
+
+def _benchmark_prompt_for_settings(settings: TurboBenchmarkSettings) -> str:
+    if settings.backend_kind == "lucebox" and settings.prefill_compression != "off":
+        return _pflash_benchmark_prompt(settings)
+    return _TURBO_BENCHMARK_PROMPT
+
+
+def _request_turbo_completion(
+    base_url: str,
+    *,
+    n_gen: int,
+    thinking_enabled: bool,
+    prompt: str,
+) -> TurboBenchmarkTimings:
     payload = {
         "model": "local",
         "messages": [
@@ -847,7 +1055,7 @@ def _request_turbo_completion(base_url: str, *, n_gen: int, thinking_enabled: bo
                 "role": "system",
                 "content": "You are a concise local coding agent benchmarked for generation throughput.",
             },
-            {"role": "user", "content": _TURBO_BENCHMARK_PROMPT},
+            {"role": "user", "content": prompt},
         ],
         "temperature": 0,
         "max_tokens": n_gen,
@@ -896,6 +1104,10 @@ def _run_turbo_server_benchmark(settings: TurboBenchmarkSettings, *, n_gen: int)
         cmd = _turbo_server_cmd(settings, host=host, port=port)
         wait_for_server = _wait_for_turbo_server
     env = _bench_env(settings.backend_path)
+    if settings.backend_kind == "lucebox" and settings.prefill_compression != "off":
+        env["DFLASH_FP_USE_BSA"] = "1"
+        env["DFLASH_FP_ALPHA"] = f"{settings.prefill_alpha:g}"
+        env["DFLASH27B_FA_WINDOW"] = "0"
     log_path = Path(tempfile.gettempdir()) / f"openjet-turbo-llama-server-{os.getpid()}-{port}.log"
     with log_path.open("w", encoding="utf-8") as log_file:
         print(f"Server:  {' '.join(cmd)}")
@@ -904,7 +1116,12 @@ def _run_turbo_server_benchmark(settings: TurboBenchmarkSettings, *, n_gen: int)
         proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT, text=True)
         try:
             wait_for_server(proc, base_url, log_path)
-            return _request_turbo_completion(base_url, n_gen=n_gen, thinking_enabled=settings.thinking_enabled)
+            return _request_turbo_completion(
+                base_url,
+                n_gen=n_gen,
+                thinking_enabled=settings.thinking_enabled,
+                prompt=_benchmark_prompt_for_settings(settings),
+            )
         finally:
             _terminate_process(proc)
 
@@ -925,6 +1142,10 @@ def run_turbo_benchmark(
     backend_kind: str | None = None,
     context_size: int | None = None,
     baseline_tok_s: float | None = None,
+    prefill_compression: str | None = None,
+    prefill_threshold: int | None = None,
+    prefill_keep_ratio: float | None = None,
+    prefill_drafter: str | None = None,
 ) -> None:
     cfg = load_config()
     hw = detect_hardware_info()
@@ -940,10 +1161,14 @@ def run_turbo_benchmark(
         backend_kind=backend_kind,
         context_size=context_size,
         baseline_tok_s=baseline_tok_s,
+        prefill_compression=prefill_compression,
+        prefill_threshold=prefill_threshold,
+        prefill_keep_ratio=prefill_keep_ratio,
+        prefill_drafter=prefill_drafter,
     )
 
     print(f"{'=' * 60}\nOpenJet Turbo Benchmark (experimental DFlash)\n{'=' * 60}")
-    print("WARNING: DFlash mode is experimental and requires spiritbuun/buun-llama-cpp.")
+    print("WARNING: DFlash/PFlash mode is experimental and backend-specific.")
     print(f"Hardware:      {hw.label}; RAM={hw.total_ram_gb:.1f} GB; VRAM={hw.vram_mb:.0f} MB")
     if cuda_summary:
         print(f"CUDA:          available; {cuda_summary}")
@@ -961,6 +1186,16 @@ def run_turbo_benchmark(
     print(f"Backend:       {settings.backend_label} ({settings.backend_kind}; {settings.backend_path})")
     if settings.backend_kind == "lucebox":
         print("Timing note:   Lucebox server does not expose prompt timing; generation tok/s uses wall-clock completion tokens.")
+        print(
+            "PFlash:        "
+            f"{settings.prefill_compression}"
+            + (
+                f" threshold={settings.prefill_threshold} keep_ratio={settings.prefill_keep_ratio:g} "
+                f"drafter={Path(settings.prefill_drafter).name if settings.prefill_drafter else 'none'}"
+                if settings.prefill_compression != "off"
+                else ""
+            )
+        )
     print(f"Generation:    {n_gen} tokens, temperature=0")
 
     timings = _run_turbo_server_benchmark(settings, n_gen=n_gen)

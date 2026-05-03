@@ -45,6 +45,14 @@ class CliChatTests(unittest.TestCase):
                     "6048",
                     "--baseline-tok-s",
                     "30",
+                    "--prefill-compression",
+                    "always",
+                    "--prefill-threshold",
+                    "4096",
+                    "--prefill-keep-ratio",
+                    "0.02",
+                    "--prefill-drafter",
+                    "/models/Qwen3-0.6B-BF16.gguf",
                     "-n",
                     "400",
                 ]
@@ -60,6 +68,10 @@ class CliChatTests(unittest.TestCase):
             backend_kind="lucebox",
             context_size=6048,
             baseline_tok_s=30.0,
+            prefill_compression="always",
+            prefill_threshold=4096,
+            prefill_keep_ratio=0.02,
+            prefill_drafter="/models/Qwen3-0.6B-BF16.gguf",
         )
 
     def test_benchmark_turbo_mode_routes_to_turbo_runner(self) -> None:
@@ -76,6 +88,10 @@ class CliChatTests(unittest.TestCase):
             backend_kind="auto",
             context_size=None,
             baseline_tok_s=None,
+            prefill_compression=None,
+            prefill_threshold=None,
+            prefill_keep_ratio=None,
+            prefill_drafter=None,
         )
 
     def test_benchmark_thinking_mode_enables_thinking(self) -> None:
