@@ -38,3 +38,6 @@ hello_world.py
 
 testfile
 .local-scripts/
+*.gguf
+.codex
+MEMORY.md

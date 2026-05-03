@@ -123,9 +123,21 @@ from .theme import PROMPT_STYLE, RICH_THEME, rich_text
 from .tool_executor import format_tool_args, get_swap_manager, set_swap_manager
 
 
+OPENJET_API_INPUT_DOLLARS_PER_MILLION_TOKENS = 5
+OPENJET_API_OUTPUT_DOLLARS_PER_MILLION_TOKENS = 25
+
+
 def _format_error(exc: Exception) -> str:
     text = str(exc).strip()
     return text or f"{type(exc).__name__} (no message)"
+
+
+def _format_openjet_api_spend(prompt_tokens: int, completion_tokens: int) -> str:
+    dollars = (
+        (prompt_tokens * OPENJET_API_INPUT_DOLLARS_PER_MILLION_TOKENS)
+        + (completion_tokens * OPENJET_API_OUTPUT_DOLLARS_PER_MILLION_TOKENS)
+    ) / 1_000_000
+    return f"${dollars:.2f}"
 
 
 def _open_jet_version() -> str:
@@ -453,9 +465,10 @@ class OpenJetApp:
         log = self.query_one("#chat-log")
         prompt_tokens = self._session_prompt_tokens
         completion_tokens = self._session_completion_tokens
+        api_spend = _format_openjet_api_spend(prompt_tokens, completion_tokens)
         log.write(
             f"[bold]Saved with OpenJet[/] "
-            f"{prompt_tokens:,} input tokens • {completion_tokens:,} output tokens • $0 API Cost"
+            f"{prompt_tokens:,} input tokens • {completion_tokens:,} output tokens • {api_spend} API Cost"
         )
         log.write(f"[dim]{self._SETUP_SUCCESS_MESSAGE}[/]")
         log.write("")
@@ -488,7 +501,12 @@ class OpenJetApp:
             return []
 
         installed: list[signal.Signals] = []
-        for sig in (signal.SIGINT, signal.SIGTSTP):
+        signals = [signal.SIGINT]
+        suspend_signal = getattr(signal, "SIGTSTP", None)
+        if suspend_signal is not None:
+            signals.append(suspend_signal)
+
+        for sig in signals:
             try:
                 loop.add_signal_handler(sig, callback)
             except (NotImplementedError, RuntimeError, ValueError):
@@ -2286,6 +2304,7 @@ class OpenJetApp:
         assistant_turn_text = ""
         assistant_header_written = False
         assistant_in_code_block = False
+        reasoning_buf = ""
         overflow_condense_attempted = False
         self._turn_active = True
         thinking_token = self._start_thinking()
@@ -2331,12 +2350,30 @@ class OpenJetApp:
                             )
                             log.write(rendered)
                     elif event.kind == SDKEventKind.REASONING:
+                        if not assistant_header_written:
+                            self._write_message_header(log, "OPENJET", "assistant")
+                            assistant_header_written = True
+                        reasoning_buf += event.text
+                        while "\n" in reasoning_buf:
+                            line, reasoning_buf = reasoning_buf.split("\n", 1)
+                            rendered, assistant_in_code_block = self._format_assistant_output_line(
+                                line,
+                                in_code_block=assistant_in_code_block,
+                            )
+                            log.write(rendered)
                         snippet = " ".join(event.text.split())
                         if snippet:
                             buf = (getattr(self, "_reasoning_tail", "") + " " + snippet).strip()
                             self._reasoning_tail = snippet if len(buf) > 120 else buf
                             self._render_assistant_status()
                     elif event.kind == SDKEventKind.TOOL_REQUEST and event.tool_call:
+                        if reasoning_buf:
+                            rendered, assistant_in_code_block = self._format_assistant_output_line(
+                                reasoning_buf,
+                                in_code_block=assistant_in_code_block,
+                            )
+                            log.write(rendered)
+                            reasoning_buf = ""
                         if text_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
                                 text_buf,
@@ -2373,6 +2410,13 @@ class OpenJetApp:
                         should_retry = True
                         break
                     elif event.kind == SDKEventKind.ERROR:
+                        if reasoning_buf:
+                            rendered, assistant_in_code_block = self._format_assistant_output_line(
+                                reasoning_buf,
+                                in_code_block=assistant_in_code_block,
+                            )
+                            log.write(rendered)
+                            reasoning_buf = ""
                         if not overflow_condense_attempted and self._is_context_overflow_error(event.text):
                             result = await self.agent.condense_context(force=True)
                             log.write(f"  {rich_text(result, 'status')}")
@@ -2393,6 +2437,13 @@ class OpenJetApp:
                         self._finish_turn_trace(success=False, status="agent_error", error=event.text)
                         return
                     elif event.kind == SDKEventKind.DONE:
+                        if reasoning_buf:
+                            rendered, assistant_in_code_block = self._format_assistant_output_line(
+                                reasoning_buf,
+                                in_code_block=assistant_in_code_block,
+                            )
+                            log.write(rendered)
+                            reasoning_buf = ""
                         if text_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
                                 text_buf,

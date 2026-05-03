@@ -1512,6 +1512,17 @@ class AppQuitTests(unittest.TestCase):
         self.assertTrue(asyncio.iscoroutine(scheduled))
         scheduled.close()
 
+    def test_install_quit_signal_handlers_skips_missing_suspend_signal(self) -> None:
+        loop = Mock()
+        platform_signal = SimpleNamespace(SIGINT="SIGINT")
+        callback = Mock()
+
+        with patch("src.app.asyncio.get_running_loop", return_value=loop), patch("src.app.signal", platform_signal):
+            installed = OpenJetApp._install_quit_signal_handlers(callback)
+
+        self.assertEqual(installed, ["SIGINT"])
+        loop.add_signal_handler.assert_called_once_with("SIGINT", callback)
+
 
 class AppQuitAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_action_quit_writes_paid_api_equivalent_token_summary(self) -> None:
@@ -1528,7 +1539,7 @@ class AppQuitAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         entries = app.query_one("#chat-log")._entries
         self.assertTrue(any("Saved with OpenJet" in str(entry) for entry in entries))
-        self.assertTrue(any("1,234 input tokens • 56 output tokens • $0 API Cost" in str(entry) for entry in entries))
+        self.assertTrue(any("1,234 input tokens • 56 output tokens • $0.01 API Cost" in str(entry) for entry in entries))
         self.assertTrue(any("Setup complete. Join the Discord" in str(entry) for entry in entries))
         app.client.close.assert_awaited_once()
         app.session_logger.stop.assert_awaited_once()

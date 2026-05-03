@@ -88,17 +88,6 @@ def _extract_reasoning_tool_calls(reasoning_text: str) -> list[ToolCall]:
     return tool_calls
 
 
-def _extract_reasoning_display_text(reasoning_text: str) -> str:
-    if not reasoning_text.strip():
-        return ""
-    visible = reasoning_text
-    marker = re.search(r"<tool_call>\s*", visible, flags=re.IGNORECASE)
-    if marker:
-        visible = visible[: marker.start()]
-    visible = visible.strip()
-    return visible
-
-
 async def stream_openai_chat(
     http: httpx.AsyncClient,
     *,
@@ -211,11 +200,6 @@ async def stream_openai_chat(
 
             if not tool_calls and reasoning_buf:
                 tool_calls = _extract_reasoning_tool_calls(reasoning_buf)
-
-            if tool_calls and not saw_text and reasoning_buf:
-                display_text = _extract_reasoning_display_text(reasoning_buf)
-                if display_text:
-                    yield StreamChunk(text=display_text)
 
             yield StreamChunk(tool_calls=tool_calls, done=True)
             return

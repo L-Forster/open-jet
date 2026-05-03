@@ -78,6 +78,8 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunks[-1].tool_calls[0].name, "grep")
         self.assertEqual(chunks[-1].tool_calls[0].arguments, {"pattern": "feature vector"})
         self.assertIn("tools", http.last_payload or {})
+        self.assertTrue(any(chunk.reasoning for chunk in chunks))
+        self.assertFalse(any(chunk.text for chunk in chunks[:-1]))
 
     async def test_stream_openai_chat_prefers_explicit_tool_calls_over_reasoning_markup(self) -> None:
         http = _FakeHTTPClient(
