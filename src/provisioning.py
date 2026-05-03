@@ -54,6 +54,57 @@ def managed_llama_cpp_ref() -> str:
     ref = os.environ.get("OPENJET_LLAMA_CPP_REF", "").strip()
     return ref or LLAMA_CPP_PINNED_REF
 
+
+def cmake_install_command() -> str:
+    if sys.platform == "win32":
+        return "python -m pip install cmake"
+    if sys.platform == "darwin":
+        return "brew install cmake"
+    if _linux_os_id() == "arch":
+        return "sudo pacman -S cmake"
+    return "sudo apt install cmake"
+
+
+def missing_cmake_message() -> str:
+    return (
+        "cmake not found on PATH. "
+        f"Install CMake with `{cmake_install_command()}`, then rerun `openjet setup`."
+    )
+
+
+def _linux_os_id() -> str:
+    if sys.platform != "linux":
+        return ""
+    try:
+        for line in Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+            if line.startswith("ID="):
+                return line.split("=", 1)[1].strip().strip('"').lower()
+    except OSError:
+        return ""
+    return ""
+
+
+def cuda_toolkit_available() -> bool:
+    if shutil.which("nvcc") is not None:
+        return True
+    return any(os.environ.get(name) for name in ("CUDA_PATH", "CUDA_HOME"))
+
+
+def cuda_toolkit_install_command() -> str:
+    if sys.platform == "win32":
+        return "install the NVIDIA CUDA Toolkit from https://developer.nvidia.com/cuda-downloads"
+    if _linux_os_id() == "arch":
+        return "sudo pacman -S cuda"
+    return "sudo apt install nvidia-cuda-toolkit"
+
+
+def missing_cuda_toolkit_message() -> str:
+    return (
+        "CUDA Toolkit not found. "
+        f"{cuda_toolkit_install_command()}, then rerun `openjet setup`."
+    )
+
+
 def _context_window_for_model(
     hardware_info: HardwareInfo,
     model_size_mb: float,
@@ -473,19 +524,47 @@ def _llama_cmake_args(hardware_info: HardwareInfo) -> list[str]:
     return args
 
 
-def _needs_rebuild(hardware_info: HardwareInfo, existing_binary: str) -> bool:
+def _needs_rebuild(hardware_info: HardwareInfo, existing_binary: str, *, device: str | None = None) -> bool:
     """Check if the existing llama-server needs rebuilding for GPU support."""
-    if not hardware_info.has_vulkan and not hardware_info.has_cuda:
+    desired_device = (device or "").strip().lower()
+    if desired_device == "cpu":
+        return False
+    if not desired_device:
+        desired_device = "cuda" if hardware_info.has_cuda else "vulkan" if hardware_info.has_vulkan else "cpu"
+    if desired_device not in {"cuda", "vulkan"}:
         return False
     try:
         ldd_output = os.popen(f"ldd {shlex.quote(existing_binary)} 2>/dev/null").read().lower()
     except Exception:
         return False
-    if hardware_info.has_cuda and "libcuda" not in ldd_output:
+    if desired_device == "cuda" and "libcuda" not in ldd_output:
         return True
-    if hardware_info.has_vulkan and not hardware_info.has_cuda and "libvulkan" not in ldd_output:
+    if desired_device == "vulkan" and "libvulkan" not in ldd_output:
         return True
     return False
+
+
+def _managed_source_llama_server_path() -> Path:
+    build_bin = LLAMA_CPP_DIR / "build" / "bin"
+    direct = build_bin / LLAMA_SERVER_EXE_NAME
+    if direct.is_file():
+        return direct
+    for config_name in ("Release", "RelWithDebInfo", "MinSizeRel", "Debug"):
+        candidate = build_bin / config_name / LLAMA_SERVER_EXE_NAME
+        if candidate.is_file():
+            return candidate
+    matches = sorted(build_bin.glob(f"**/{LLAMA_SERVER_EXE_NAME}"))
+    if matches:
+        return matches[0]
+    return direct
+
+
+def _llama_build_command(jobs: int) -> list[str]:
+    command = ["cmake", "--build", "."]
+    if sys.platform == "win32":
+        command.extend(["--config", "Release"])
+    command.extend(["--target", "llama-server", "--target", "llama-bench", f"-j{jobs}"])
+    return command
 
 
 async def _sync_managed_llama_cpp_checkout(
@@ -548,25 +627,47 @@ def _prebuilt_asset_candidates(hardware_info: HardwareInfo) -> list[str]:
     `llama-<tag>-bin-<os>-<variant>-<arch>.zip`. We match by substring so the
     logic stays robust to minor naming churn.
 
-    Returns an empty list when no prebuilt covers this host (e.g. Linux CUDA or
-    Jetson), which causes the caller to fall back to a source build.
+    Returns an empty list when no prebuilt covers this host (e.g. Jetson), which
+    causes the caller to fall back to a source build.
     """
     machine = platform.machine().lower()
     if sys.platform == "darwin":
         if machine in {"arm64", "aarch64"} or _darwin_sysctl("hw.optional.arm64") == "1":
             return ["bin-macos-arm64.tar.gz"]
         return ["bin-macos-x64.tar.gz"]
-    if sys.platform.startswith("linux"):
-        if hardware_info.has_cuda:
-            # Linux CUDA is not distributed as a release asset; build from source.
-            return []
+    if sys.platform == "win32":
         if machine in {"x86_64", "amd64"}:
+            if hardware_info.has_cuda:
+                return ["bin-win-cuda-13.1-x64", "bin-win-cuda-12.4-x64"]
             if hardware_info.has_vulkan:
+                return ["bin-win-vulkan-x64"]
+            return ["bin-win-cpu-x64"]
+        if machine in {"arm64", "aarch64"}:
+            return ["bin-win-cpu-arm64"]
+    if sys.platform.startswith("linux"):
+        if machine in {"x86_64", "amd64"}:
+            if hardware_info.has_cuda or hardware_info.has_vulkan:
                 return ["bin-ubuntu-vulkan-x64"]
             return ["bin-ubuntu-x64"]
+        if hardware_info.has_cuda:
+            # Jetson/Linux CUDA has no official release asset; build from source.
+            return []
         if machine in {"aarch64", "arm64"}:
             return ["bin-ubuntu-arm64"]
     return []
+
+
+def _prebuilt_runtime_device(hardware_info: HardwareInfo) -> str | None:
+    machine = platform.machine().lower()
+    if sys.platform.startswith("linux") and machine in {"x86_64", "amd64"} and hardware_info.has_cuda:
+        return "vulkan"
+    if sys.platform == "win32" and hardware_info.has_cuda:
+        return "cuda"
+    if sys.platform == "darwin" and hardware_info.has_metal:
+        return "metal"
+    if hardware_info.has_vulkan:
+        return "vulkan"
+    return None
 
 
 def _installed_llama_server_tag() -> str | None:
@@ -687,7 +788,7 @@ async def _install_prebuilt_llama_server(
     *,
     log: Any,
     set_status: Callable[[str], None],
-) -> tuple[Path, str] | None:
+) -> tuple[Path, str, str | None] | None:
     candidates = _prebuilt_asset_candidates(hardware_info)
     if not candidates:
         return None
@@ -725,7 +826,7 @@ async def _install_prebuilt_llama_server(
             return None
     LLAMA_CPP_TAG_FILE.write_text(tag, encoding="utf-8")
     log.write(f"[bold bright_white]llama-server {tag} installed.[/]")
-    return installed, tag
+    return installed, tag, _prebuilt_runtime_device(hardware_info)
 
 
 async def _build_llama_server_from_source(
@@ -737,7 +838,9 @@ async def _build_llama_server_from_source(
     clear_status: Callable[[], None],
 ) -> tuple[Path, str]:
     if shutil.which("cmake") is None:
-        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet setup`.")
+        raise RuntimeError(missing_cmake_message())
+    if hardware_info.has_cuda and not cuda_toolkit_available():
+        raise RuntimeError(missing_cuda_toolkit_message())
     if rebuilding:
         set_status("rebuilding llama-server for GPU support")
         log.write("[bold bright_white]Rebuilding llama-server for GPU support...[/]")
@@ -764,7 +867,7 @@ async def _build_llama_server_from_source(
     log.write("  [dim]Building llama-server and llama-bench (this may take a few minutes)...[/]")
     jobs = os.cpu_count() or 4
     rc, tail = await _run_build_with_progress(
-        "cmake", "--build", ".", "--target", "llama-server", "--target", "llama-bench", f"-j{jobs}",
+        *_llama_build_command(jobs),
         cwd=build_dir,
         set_status=set_status,
         log=log,
@@ -774,7 +877,7 @@ async def _build_llama_server_from_source(
         raise RuntimeError(tail.strip() or "Failed to build llama-server")
     log.write("[bold bright_white]llama-server built successfully.[/]")
 
-    built = LLAMA_CPP_DIR / "build" / "bin" / LLAMA_SERVER_EXE_NAME
+    built = _managed_source_llama_server_path()
     if not built.is_file():
         raise RuntimeError("llama-server build completed but binary was not found.")
     return built, synced_ref
@@ -788,26 +891,32 @@ async def ensure_llama_server(
     set_status: Callable[[str], None],
     clear_status: Callable[[], None],
 ) -> dict[str, Any]:
+    prebuilt_device = _prebuilt_runtime_device(hardware_info)
+    desired_device = prebuilt_device or str(setup_result.get("device") or "").strip().lower() or None
     # Cache hit: managed binary + tag file present and binary doesn't need a GPU rebuild.
-    if LLAMA_SERVER_BIN.is_file() and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN)):
+    if LLAMA_SERVER_BIN.is_file() and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN), device=desired_device):
         cached_tag = _installed_llama_server_tag()
         if cached_tag:
             merged = dict(setup_result)
             merged["llama_server_path"] = str(LLAMA_SERVER_BIN)
             merged["setup_missing_runtime"] = False
             merged["llama_cpp_ref"] = cached_tag
+            if prebuilt_device:
+                merged["device"] = prebuilt_device
             return merged
 
     # Legacy source-built binary on PATH or at the old location that still works.
     existing = current_llama_server_path()
-    managed_source_binary = LLAMA_CPP_DIR / "build" / "bin" / LLAMA_SERVER_EXE_NAME
+    managed_source_binary = _managed_source_llama_server_path()
     existing_is_source_managed = (
         existing is not None and Path(existing).resolve() == managed_source_binary.resolve()
     )
-    if existing and not existing_is_source_managed and not _needs_rebuild(hardware_info, existing):
+    if existing and not existing_is_source_managed and not _needs_rebuild(hardware_info, existing, device=desired_device):
         merged = dict(setup_result)
         merged["llama_server_path"] = existing
         merged["setup_missing_runtime"] = False
+        if prebuilt_device:
+            merged["device"] = prebuilt_device
         return merged
 
     rebuilding = existing is not None
@@ -819,11 +928,13 @@ async def ensure_llama_server(
     )
     if prebuilt is not None:
         clear_status()
-        installed_path, tag = prebuilt
+        installed_path, tag, runtime_device = prebuilt
         merged = dict(setup_result)
         merged["llama_server_path"] = str(installed_path)
         merged["setup_missing_runtime"] = False
         merged["llama_cpp_ref"] = tag
+        if runtime_device:
+            merged["device"] = runtime_device
         return merged
 
     if sys.platform == "darwin":

@@ -20,6 +20,7 @@ from .hardware import (
     recommended_gpu_layers,
 )
 from .model_profiles import default_profile_name
+from .llama_server import _find_built_llama_binary
 from .provisioning import MODELS_DIR, UNIFIED_MEMORY_SYSTEM_RESERVE_MB, recommend_direct_model
 from .setup_memory import recommend_context_window_for_model, recommend_setup_context_window
 
@@ -51,8 +52,8 @@ def _discover_llama_server() -> str | None:
     if found:
         return found
     exe_name = "llama-server.exe" if os.name == "nt" else "llama-server"
-    candidate = Path.home() / "llama.cpp" / "build" / "bin" / exe_name
-    if candidate.is_file():
+    candidate = _find_built_llama_binary(exe_name)
+    if candidate is not None:
         return str(candidate)
     return None
 

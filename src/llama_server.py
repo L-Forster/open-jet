@@ -21,15 +21,28 @@ _FRAGMENTED_LFB_MB = 64
 _JETSON_VMM_CHUNK_MB = "1"
 _JETSON_VMM_RESERVE_MB = "4096"
 _LLAMA_SERVER_EXE_NAME = "llama-server.exe" if os.name == "nt" else "llama-server"
+_FULL_OFFLOAD_GPU_LAYERS = 99
+
+
+def _find_built_llama_binary(name: str) -> Path | None:
+    build_bin = Path.home() / "llama.cpp" / "build" / "bin"
+    direct = build_bin / name
+    if direct.is_file():
+        return direct
+    for config_name in ("Release", "RelWithDebInfo", "MinSizeRel", "Debug"):
+        candidate = build_bin / config_name / name
+        if candidate.is_file():
+            return candidate
+    matches = sorted(build_bin.glob(f"**/{name}"))
+    return matches[0] if matches else None
 
 
 def _find_llama_server() -> str:
     path = shutil.which("llama-server")
     if path:
         return path
-    from pathlib import Path
-    candidate = Path.home() / "llama.cpp" / "build" / "bin" / _LLAMA_SERVER_EXE_NAME
-    if candidate.is_file():
+    candidate = _find_built_llama_binary(_LLAMA_SERVER_EXE_NAME)
+    if candidate is not None:
         return str(candidate)
     raise FileNotFoundError("llama-server not found on PATH or ~/llama.cpp/build/bin/")
 
@@ -112,10 +125,13 @@ class LlamaServerClient:
     def _maximize_gpu_clocks() -> None:
         """Pin GPU and EMC clocks to maximum frequency on Jetson."""
         import subprocess
-        result = subprocess.run(
-            ["sudo", "-n", "jetson_clocks"],
-            timeout=5, capture_output=True,
-        )
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "jetson_clocks"],
+                timeout=5, capture_output=True,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return
         if result.returncode != 0:
             # Fallback: write directly to GPU devfreq sysfs.
             gpu_devfreq = Path("/sys/devices/platform/bus@0/17000000.gpu/devfreq/17000000.gpu")
@@ -174,6 +190,8 @@ class LlamaServerClient:
 
     @classmethod
     def _largest_free_block_mb(cls) -> float | None:
+        if os.name != "posix" or not hasattr(os, "sysconf"):
+            return None
         try:
             buddyinfo = Path("/proc/buddyinfo").read_text(encoding="utf-8")
         except OSError:
@@ -228,6 +246,12 @@ class LlamaServerClient:
         # enough to warrant the small-footprint startup path.
         return (2048, 512, "on", False, False)
 
+    @staticmethod
+    def _should_disable_mmap_for_launch(*, device: str, gpu_layers: int, existing_no_mmap: bool) -> bool:
+        if existing_no_mmap:
+            return True
+        return device in {"cuda", "rocm", "vulkan"} and gpu_layers >= _FULL_OFFLOAD_GPU_LAYERS
+
     async def _prepare_memory_for_launch(self) -> float | None:
         lfb_mb = self._largest_free_block_mb()
         for _ in range(3):
@@ -245,8 +269,6 @@ class LlamaServerClient:
             assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
             await self._stop_server()
             await self._cleanup_stale_inference_processes()
-            self._ensure_jetson_clocks_sudoers()
-            self._maximize_gpu_clocks()
             binary = _find_llama_server()
             env = os.environ.copy()
             apply_airgap_env(env, enabled=self.airgapped)
@@ -257,6 +279,8 @@ class LlamaServerClient:
             resolved_device = self._resolve_device()
             is_jetson = resolved_device == "cuda" and self._is_jetson_platform()
             if is_jetson:
+                self._ensure_jetson_clocks_sudoers()
+                self._maximize_gpu_clocks()
                 # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
                 # need physically contiguous pages for large allocations.
                 env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"
@@ -274,6 +298,11 @@ class LlamaServerClient:
                 if model_max_context is not None and model_max_context > 0:
                     requested_ctx = min(requested_ctx, model_max_context)
             batch, ubatch, fit_mode, no_warmup, no_mmap = self._startup_profile_for_lfb(lfb_mb)
+            no_mmap = self._should_disable_mmap_for_launch(
+                device=resolved_device,
+                gpu_layers=requested_ngl,
+                existing_no_mmap=no_mmap,
+            )
             startup_snapshot = self._memory_snapshot() if resolved_device == "cuda" else {}
             self._emit_diagnostic(
                 "runtime_llama_starting",
@@ -506,11 +535,17 @@ class LlamaServerClient:
         await asyncio.sleep(0.6)
 
     def _find_stale_inference_pids(self) -> list[int]:
+        if os.name != "posix" or not hasattr(os, "getuid"):
+            return []
+        proc_dir = Path("/proc")
+        if not proc_dir.is_dir():
+            return []
+
         stale: list[int] = []
         uid = os.getuid()
         current_pid = os.getpid()
 
-        for entry in Path("/proc").iterdir():
+        for entry in proc_dir.iterdir():
             if not entry.name.isdigit():
                 continue
             pid = int(entry.name)

@@ -106,7 +106,16 @@ def _llama_git_output(cwd: Path, *args: str) -> str | None:
 
 def _sync_managed_llama_cpp_after_update() -> str | None:
     from .hardware import detect_hardware_info
-    from .provisioning import LLAMA_CPP_DIR, _llama_cmake_args, _needs_rebuild, managed_llama_cpp_ref
+    from .provisioning import (
+        LLAMA_CPP_DIR,
+        _llama_build_command,
+        _llama_cmake_args,
+        _needs_rebuild,
+        cuda_toolkit_available,
+        managed_llama_cpp_ref,
+        missing_cmake_message,
+        missing_cuda_toolkit_message,
+    )
 
     git_dir = LLAMA_CPP_DIR / ".git"
     if not git_dir.is_dir():
@@ -132,7 +141,9 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     if current_ref == target_ref and not needs_rebuild:
         return None
     if shutil.which("cmake") is None:
-        raise RuntimeError("cmake not found on PATH. Install CMake, e.g. `brew install cmake`, then rerun `openjet setup`.")
+        raise RuntimeError(missing_cmake_message())
+    if hardware_info.has_cuda and not cuda_toolkit_available():
+        raise RuntimeError(missing_cuda_toolkit_message())
 
     try:
         subprocess.run(
@@ -153,7 +164,7 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
             check=True,
         )
         subprocess.run(
-            ["cmake", "--build", ".", "--target", "llama-server", "-j4"],
+            _llama_build_command(4),
             cwd=build_dir,
             check=True,
         )

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .config import load_config
 from .hardware import detect_hardware_info, read_device_model, recommended_device
+from .llama_server import _find_built_llama_binary
 from .setup_memory import _read_gguf_metadata
 
 
@@ -25,8 +26,8 @@ def _find_llama_binary(cfg: dict, name: str) -> str:
     path = shutil.which(name)
     if path:
         return path
-    candidate = Path.home() / "llama.cpp" / "build" / "bin" / name
-    if candidate.is_file():
+    candidate = _find_built_llama_binary(name)
+    if candidate is not None:
         return str(candidate)
     raise FileNotFoundError(
         f"{name} not found. Build it with:\n"
