@@ -21,7 +21,7 @@ from .hardware import (
 )
 from .model_profiles import default_profile_name
 from .llama_server import _find_built_llama_binary
-from .provisioning import MODELS_DIR, UNIFIED_MEMORY_SYSTEM_RESERVE_MB, recommend_direct_model
+from .provisioning import MODELS_DIR, OPENJET_HOME, UNIFIED_MEMORY_SYSTEM_RESERVE_MB, recommend_direct_model
 from .setup_memory import recommend_context_window_for_model, recommend_setup_context_window
 
 if TYPE_CHECKING:
@@ -37,6 +37,11 @@ def discover_model_files() -> list[str]:
         Path.cwd() / "models",
         Path.home() / "Downloads",
         Path.home() / "models",
+        Path(__file__).resolve().parent.parent / "models",
+        Path.home() / "open-jet" / "models",
+        Path.home() / "openjet" / "models",
+        MODELS_DIR,
+        OPENJET_HOME,
     ]
     found: set[str] = set()
     for root in roots:
@@ -375,6 +380,15 @@ def _recommended_local_payload(
             "model_source": "local",
             "llama_model": model_path,
         }
+    recommended_filename = str(direct.get("filename") or "").strip()
+    recommended_target = Path(str(direct.get("target_path") or "")).expanduser()
+    if recommended_target and recommended_target.is_file():
+        return {"model_source": "local", "llama_model": str(recommended_target)}
+    if recommended_filename:
+        for candidate in (*model_files, *saved_model_files):
+            candidate_path = Path(candidate).expanduser()
+            if candidate_path.name == recommended_filename and candidate_path.is_file():
+                return {"model_source": "local", "llama_model": str(candidate_path)}
     payload = {
         "model_source": "direct",
         "model_download_url": str(direct["url"]),

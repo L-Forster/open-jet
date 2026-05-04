@@ -20,6 +20,41 @@ from .theme import rich_text
 from .tool_executor import format_tool_args
 
 
+_DIFF_KIND_STYLES = {
+    "add": ("diff_lineno_add", "diff_add_marker", "diff_add_body"),
+    "remove": ("diff_lineno_remove", "diff_remove_marker", "diff_remove_body"),
+    "context": ("diff_lineno_context", "diff_context", "diff_context"),
+}
+_DIFF_MARKERS = {"add": "+", "remove": "-", "context": " "}
+
+
+def render_diff_row(row: dict, *, body_width: int | None = None) -> str:
+    """Render a diff row dict as a Rich-markup string.
+
+    Format: `  {lineno:>5} {marker} {body}`. Line number gets its own style;
+    the marker and body share a background-highlighted style so the change
+    stands out. If `body_width` is given, the body is padded/truncated to
+    that visible width so the highlight fills a fixed column.
+    """
+    kind = row.get("kind", "context")
+    lineno_style, marker_style, body_style = _DIFF_KIND_STYLES.get(kind, _DIFF_KIND_STYLES["context"])
+    marker = _DIFF_MARKERS.get(kind, " ")
+    lineno = str(row.get("lineno", ""))
+    body = str(row.get("body", "")).replace("\t", "    ")
+    if body_width is not None:
+        if len(body) > body_width:
+            body = body[: max(0, body_width - 1)] + "…"
+        body = body.ljust(body_width)
+    return (
+        "  "
+        + rich_text(f"{lineno:>5}", lineno_style)
+        + " "
+        + rich_text(marker, marker_style)
+        + " "
+        + rich_text(body, body_style)
+    )
+
+
 def _read_file_or_empty(path: str) -> str:
     try:
         return Path(path).read_text(encoding="utf-8", errors="replace") if path else ""
@@ -27,10 +62,16 @@ def _read_file_or_empty(path: str) -> str:
         return ""
 
 
-def _diff_preview(old: str, new: str, *, context: int = DIFF_CONTEXT_LINES) -> list[str]:
+def _diff_preview(old: str, new: str, *, context: int = DIFF_CONTEXT_LINES) -> list[dict]:
+    """Compute a unified diff as structured rows.
+
+    Each row is {"kind": "add"|"remove"|"context", "lineno": str, "body": str}.
+    Renderers turn rows into styled output (line-number column + body with
+    background highlight).
+    """
     if old == new:
         return []
-    out: list[str] = []
+    rows: list[dict] = []
     old_no = new_no = 0
     for raw in difflib.unified_diff(old.splitlines(), new.splitlines(), n=context, lineterm=""):
         if raw.startswith(("--- ", "+++ ")):
@@ -41,12 +82,43 @@ def _diff_preview(old: str, new: str, *, context: int = DIFF_CONTEXT_LINES) -> l
             continue
         prefix, body = raw[:1], raw[1:]
         if prefix == "+":
-            out.append(f"+{new_no:>4} + {body}"); new_no += 1
+            rows.append({"kind": "add", "lineno": str(new_no), "body": body})
+            new_no += 1
         elif prefix == "-":
-            out.append(f"-{old_no:>4} - {body}"); old_no += 1
+            rows.append({"kind": "remove", "lineno": str(old_no), "body": body})
+            old_no += 1
         else:
-            out.append(f" {new_no:>4}   {body}"); old_no += 1; new_no += 1
-    return out
+            rows.append({"kind": "context", "lineno": str(new_no), "body": body})
+            old_no += 1
+            new_no += 1
+    return rows
+
+
+def _patch_diff_rows(path: str, patch: str) -> list[dict]:
+    """Apply a SEARCH/REPLACE patch in-memory to produce diff rows.
+
+    Falls back to a raw search/replace block dump if the file is unreadable
+    or the patch can't be applied (so the user still sees what's proposed).
+    """
+    from .executor import _apply_search_replace_blocks, _parse_search_replace_blocks
+
+    old = _read_file_or_empty(path)
+    if old:
+        try:
+            new, _, _ = _apply_search_replace_blocks(old, patch)
+            return _diff_preview(old, new)
+        except Exception:
+            pass
+    rows: list[dict] = []
+    try:
+        for search_text, replace_text in _parse_search_replace_blocks(patch):
+            for line in search_text.splitlines():
+                rows.append({"kind": "remove", "lineno": "", "body": line})
+            for line in replace_text.splitlines():
+                rows.append({"kind": "add", "lineno": "", "body": line})
+    except Exception:
+        pass
+    return rows
 
 
 def format_assistant_output_line(line: str, *, in_code_block: bool) -> tuple[object, bool]:
@@ -194,7 +266,12 @@ def approval_summary_text(tc: ToolCall) -> str:
     return f"{tc.name} -> {format_tool_args(tc)}"
 
 
-def tool_preview_lines(tc: ToolCall) -> list[str]:
+def tool_preview_lines(tc: ToolCall) -> list:
+    """Return preview entries: meta lines as `str`, diff entries as `dict`.
+
+    Diff dicts have shape `{"kind": "add"|"remove"|"context", "lineno": str, "body": str}`.
+    Renderers must handle both forms.
+    """
     if tc.name == "shell":
         command = str(tc.arguments.get("command", "")).strip()
         timeout_seconds = tc.arguments.get("timeout_seconds")
@@ -222,11 +299,26 @@ def tool_preview_lines(tc: ToolCall) -> list[str]:
         return [f"path: {path}", f"bytes: {len(new)}", *_diff_preview(old, new)]
     if tc.name == "edit_file":
         path = str(tc.arguments.get("path", "")).strip()
-        old_str = tc.arguments.get("old_string") or ""
-        new_str = tc.arguments.get("new_string") or ""
-        src = _read_file_or_empty(path)
-        new_src = src.replace(old_str, new_str, 1) if isinstance(old_str, str) and old_str else src
-        return [f"path: {path}", *_diff_preview(src, new_src)]
+        patch = str(tc.arguments.get("patch", "")).strip()
+        if patch:
+            return [f"path: {path}", *_patch_diff_rows(path, patch)]
+        old_string = tc.arguments.get("old_string")
+        new_string = tc.arguments.get("new_string")
+        if isinstance(old_string, str) and isinstance(new_string, str):
+            old = _read_file_or_empty(path)
+            if old and old_string in old:
+                if tc.arguments.get("replace_all"):
+                    new = old.replace(old_string, new_string)
+                else:
+                    new = old.replace(old_string, new_string, 1)
+                return [f"path: {path}", *_diff_preview(old, new)]
+            rows: list[dict] = []
+            for line in old_string.splitlines():
+                rows.append({"kind": "remove", "lineno": "", "body": line})
+            for line in new_string.splitlines():
+                rows.append({"kind": "add", "lineno": "", "body": line})
+            return [f"path: {path}", *rows]
+        return [f"path: {path}"]
     if tc.name == "memory":
         return [f"scope: {str(tc.arguments.get('scope', '')).strip()}", f"action: {str(tc.arguments.get('action', '')).strip()}"]
     if tc.name == "exit_plan_mode":

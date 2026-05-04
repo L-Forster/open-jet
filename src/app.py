@@ -36,6 +36,7 @@ from .app_rendering import (
     format_command_status_label,
     format_tool_output_line,
     lexer_for_path as _lexer_for_path,
+    render_diff_row,
     render_markdown_inline_segments,
     tool_preview_lines,
     tool_result_lexer as _tool_result_lexer,
@@ -267,6 +268,10 @@ class OpenJetApp:
         "Setup complete. Join the Discord to discuss models and hardware configs: "
         f"{_DISCORD_INVITE_URL}"
     )
+    _EXIT_DISCORD_MESSAGE = (
+        "Join the Discord community for feedback and to see what other people are "
+        f"building with OpenJet: {_DISCORD_INVITE_URL}"
+    )
     _GENERATING_TIPS = (
         f"Tip: Join Discord for community support {_DISCORD_INVITE_URL}",
         "Tip: Use /model to switch saved model presets without rerunning setup.",
@@ -345,6 +350,8 @@ class OpenJetApp:
         self._approval_tool_call: ToolCall | None = None
         self._approval_started_at: float | None = None
         self._approval_prompt_selection_index: int | None = None
+        self._approval_card_start_index: int | None = None
+        self._approval_preview_expanded = False
         self.commands = SlashCommandHandler(self, banner=BANNER)
         self.completion = CompletionEngine(
             [
@@ -470,7 +477,7 @@ class OpenJetApp:
             f"[bold]Saved with OpenJet[/] "
             f"{prompt_tokens:,} input tokens • {completion_tokens:,} output tokens • {api_spend} API Cost"
         )
-        log.write(f"[dim]{self._SETUP_SUCCESS_MESSAGE}[/]")
+        log.write(f"[dim]{self._EXIT_DISCORD_MESSAGE}[/]")
         log.write("")
 
     def _write_setup_success_message(self, log: LogView) -> None:
@@ -2577,12 +2584,10 @@ class OpenJetApp:
         log.write(f"  {rich_text(tc.name, 'tool')} {rich_text(format_tool_args(tc), 'muted')}")
         show_inline_preview = not (needs_confirmation and self._is_code_change_tool_call(tc))
         for preview_line in self._tool_preview_lines(tc) if show_inline_preview else []:
-            if tc.name == "shell":
-                preview_style = "command"
-            elif tc.name in {"edit_file", "write_file"} and preview_line[:1] in {"+", "-"}:
-                preview_style = "diff_add" if preview_line[0] == "+" else "diff_remove"
-            else:
-                preview_style = "muted"
+            if isinstance(preview_line, dict):
+                log.write(f"  {render_diff_row(preview_line)}")
+                continue
+            preview_style = "command" if tc.name == "shell" else "muted"
             log.write(f"  {rich_text(preview_line, preview_style)}")
         active_status_tokens[tool_key] = self._start_tool_status(tc)
 
@@ -2904,6 +2909,8 @@ class OpenJetApp:
         self._approval_tool_call = tc
         self._approval_started_at = time.monotonic()
         self._approval_prompt_selection_index = None
+        self._approval_card_start_index = None
+        self._approval_preview_expanded = False
         self._approval_future = asyncio.get_running_loop().create_future()
         self._assistant_status_kind = None
         self._assistant_status_command = None
@@ -2920,6 +2927,8 @@ class OpenJetApp:
             self._approval_future = None
             self._approval_started_at = None
             self._approval_prompt_selection_index = None
+            self._approval_card_start_index = None
+            self._approval_preview_expanded = False
             bar.add_class("hidden")
             bar.update("")
 
@@ -2932,6 +2941,7 @@ class OpenJetApp:
         self._refresh_approval_prompt_selection()
 
     def _write_approval_prompt(self, log: LogView, tc: ToolCall) -> None:
+        self._approval_card_start_index = len(log._entries)
         log.write(self._approval_card_header(tc))
         for line in self._approval_card_preview_lines(tc):
             log.write(line)
@@ -2940,6 +2950,36 @@ class OpenJetApp:
         self._approval_prompt_selection_index = len(log._entries) - 1
         log.write(self._approval_card_footer())
         log.write("")
+
+    def _redraw_approval_card(self) -> None:
+        if not self._awaiting_approval or not self._approval_tool_call:
+            return
+        log = self.query_one("#chat-log")
+        start = self._approval_card_start_index
+        if start is None or start > len(log._entries):
+            return
+        old_entries = log._entries[start:]
+        old_rows = sum(str(e).count("\n") + 1 for e in old_entries)
+        tc = self._approval_tool_call
+        new_entries: list[object] = [self._approval_card_header(tc)]
+        new_entries.extend(self._approval_card_preview_lines(tc))
+        new_entries.append(self._approval_card_divider())
+        new_entries.append(self._approval_selection_line())
+        sel_idx = start + len(new_entries) - 1
+        new_entries.append(self._approval_card_footer())
+        new_entries.append("")
+        log._entries = log._entries[:start] + new_entries
+        self._approval_prompt_selection_index = sel_idx
+        stream = log.console.file
+        if old_rows > 0:
+            stream.write(f"\x1b[{old_rows}A\r\x1b[J")
+            stream.flush()
+        for entry in new_entries:
+            log.console.print(entry)
+
+    def _toggle_approval_preview_expanded(self) -> None:
+        self._approval_preview_expanded = not self._approval_preview_expanded
+        self._redraw_approval_card()
 
     def _approval_card_width(self) -> int:
         return max(64, min(118, self.console.width - 4))
@@ -2968,22 +3008,28 @@ class OpenJetApp:
         border = rich_text("│", "approval_border")
         return f"{border} {rich_text(padded, style)} {border}"
 
+    def _approval_card_diff_row(self, row: dict) -> str:
+        total = self._approval_card_width()
+        available = max(16, total - 4)
+        # render_diff_row layout consumes: 2 gutter + 5 lineno + 1 + 1 marker + 1 = 10 chars
+        body_width = max(0, available - 10)
+        border = rich_text("│", "approval_border")
+        return f"{border} {render_diff_row(row, body_width=body_width)} {border}"
+
     def _approval_card_preview_lines(self, tc: ToolCall) -> list[str]:
         lines = [self._approval_card_line(self._approval_summary_text(tc), "approval_title")]
         preview = self._tool_preview_lines(tc)
         if preview:
             lines.append(self._approval_card_line("", "muted"))
-        max_preview_lines = 18
-        for preview_line in preview[:max_preview_lines]:
-            if preview_line[:1] == "+":
-                style = "diff_add"
-            elif preview_line[:1] == "-":
-                style = "diff_remove"
+        max_preview_lines = 9999 if self._approval_preview_expanded else 18
+        for entry in preview[:max_preview_lines]:
+            if isinstance(entry, dict):
+                lines.append(self._approval_card_diff_row(entry))
             else:
-                style = "diff_context"
-            lines.append(self._approval_card_line(preview_line, style))
+                lines.append(self._approval_card_line(str(entry), "approval_meta"))
         if len(preview) > max_preview_lines:
-            lines.append(self._approval_card_line(f"... ({len(preview) - max_preview_lines} more lines)", "dim"))
+            hidden = len(preview) - max_preview_lines
+            lines.append(self._approval_card_line(f"... ({hidden} more lines — shift+tab to expand)", "dim"))
         return lines
 
     def _approval_selection_line(self) -> str:
@@ -3005,8 +3051,9 @@ class OpenJetApp:
 
         approve = _row(f"{approve_prefix}Approve", approve_style)
         deny = _row(f"{deny_prefix}Deny", deny_style)
+        expand_state = "collapse" if self._approval_preview_expanded else "expand"
         help_text = _row(
-            f"tab auto-accept code changes: {auto_state}  |  up/down select  |  enter y/n",
+            f"tab auto-accept: {auto_state}  |  shift+tab {expand_state}  |  up/down select  |  enter to confirm",
             "muted",
         )
         return "\n".join([approve, deny, help_text])
@@ -3124,16 +3171,9 @@ class OpenJetApp:
             self._toggle_auto_accept_code_changes()
             event.current_buffer.reset()
 
-        @bindings.add("y", filter=awaiting_approval, eager=True)
-        def _yes(event) -> None:
-            self._approval_choice = 0
-            self._resolve_approval(True)
-            event.current_buffer.reset()
-
-        @bindings.add("n", filter=awaiting_approval, eager=True)
-        def _no(event) -> None:
-            self._approval_choice = 1
-            self._resolve_approval(False)
+        @bindings.add("s-tab", filter=awaiting_approval, eager=True)
+        def _expand_preview(event) -> None:
+            self._toggle_approval_preview_expanded()
             event.current_buffer.reset()
 
         @bindings.add("enter", filter=awaiting_approval, eager=True)
