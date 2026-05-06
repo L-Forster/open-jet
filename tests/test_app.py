@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import yaml
 from rich.console import Console
 from rich.syntax import Syntax
 from rich.text import Text
@@ -364,7 +365,7 @@ class AppStatusTests(unittest.TestCase):
         self.assertIn("deny_selected", selection)
         self.assertIn("approve_idle", selection)
         self.assertIn("\n", selection)
-        self.assertIn("tab auto-accept code changes: off", selection)
+        self.assertIn("tab auto-accept: off", selection)
         self.assertIn("up/down select", selection)
 
     def test_write_approval_prompt_writes_visible_chat_block(self) -> None:
@@ -380,7 +381,7 @@ class AppStatusTests(unittest.TestCase):
         self.assertIn("edit_file -> src/app.py", str(entries[1]))
         self.assertIn("approve_selected", selection)
         self.assertIn("deny_idle", selection)
-        self.assertIn("tab auto-accept code changes: off", selection)
+        self.assertIn("tab auto-accept: off", selection)
         self.assertIn("up/down select", selection)
 
     def test_set_approval_choice_updates_only_selection_line(self) -> None:
@@ -1554,7 +1555,7 @@ class AppResumeStateTests(unittest.TestCase):
     def test_persist_session_state_writes_live_chat_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            state_path = root / ".openjet" / "state" / "session_state.json"
+            state_path = root / ".openjet" / "state" / "session_state.yaml"
 
             app = OpenJetApp()
             app.state_store = SessionStateStore(path=state_path, enabled=True)
@@ -1571,8 +1572,8 @@ class AppResumeStateTests(unittest.TestCase):
 
             app.persist_session_state(reason="user_message")
 
-            saved = json.loads(state_path.read_text(encoding="utf-8"))
-            archived = json.loads(
+            saved = yaml.safe_load(state_path.read_text(encoding="utf-8"))
+            archived = yaml.safe_load(
                 app.chat_archive.live_state_path("chat123").read_text(encoding="utf-8")
             )
             self.assertEqual(saved["chat_id"], "chat123")
@@ -1583,7 +1584,7 @@ class AppResumeStateTests(unittest.TestCase):
     def test_list_resume_candidates_prefers_resume_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            state_path = root / ".openjet" / "state" / "session_state.json"
+            state_path = root / ".openjet" / "state" / "session_state.yaml"
             app = OpenJetApp()
             app.state_store = SessionStateStore(path=state_path, enabled=True)
             app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
@@ -1610,7 +1611,7 @@ class AppResumeStateTests(unittest.TestCase):
             entries = app.list_resume_candidates()
 
             self.assertEqual(len(entries), 1)
-            self.assertEqual(entries[0].state_path.name, "resume_state.json")
+            self.assertEqual(entries[0].state_path.name, "resume_state.yaml")
             self.assertTrue(entries[0].kv_cache_available)
 
 
@@ -1618,7 +1619,7 @@ class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_persist_resumable_session_state_saves_checkpoint_and_kv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            state_path = root / ".openjet" / "state" / "session_state.json"
+            state_path = root / ".openjet" / "state" / "session_state.yaml"
             app = OpenJetApp()
             app.state_store = SessionStateStore(path=state_path, enabled=True)
             app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
@@ -1640,7 +1641,7 @@ class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_restore_saved_chat_restores_kv_cache_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            state_path = root / ".openjet" / "state" / "session_state.json"
+            state_path = root / ".openjet" / "state" / "session_state.yaml"
             app = OpenJetApp()
             app.state_store = SessionStateStore(path=state_path, enabled=True)
             app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
@@ -1692,7 +1693,7 @@ class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_restore_saved_chat_resets_runtime_when_model_differs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            state_path = root / ".openjet" / "state" / "session_state.json"
+            state_path = root / ".openjet" / "state" / "session_state.yaml"
             app = OpenJetApp()
             app.state_store = SessionStateStore(path=state_path, enabled=True)
             app.chat_archive = ChatArchiveStore.from_session_state_path(state_path, enabled=True)
@@ -1744,7 +1745,7 @@ class SlashResumeCommandTests(unittest.IsolatedAsyncioTestCase):
         app.agent = SimpleNamespace(messages=[{"role": "system", "content": "system"}])
         entry = SavedChatEntry(
             chat_id="chat123",
-            state_path=Path("/tmp/resume_state.json"),
+            state_path=Path("/tmp/resume_state.yaml"),
             saved_at=100.0,
             reason="assistant_turn_done",
             preview="hello world",
@@ -2370,9 +2371,9 @@ class DebugPromptLoggingTests(unittest.TestCase):
                 with patch("src.app.read_memory_snapshot", return_value=None):
                     app._prepare_turn_context()
 
-                saved = json.loads((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-1.messages.json").read_text(encoding="utf-8"))
-                context_saved = json.loads((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-1.context.json").read_text(encoding="utf-8"))
-                latest = json.loads((root / ".openjet" / "state" / "debug_prompts" / "latest.messages.json").read_text(encoding="utf-8"))
+                saved = yaml.safe_load((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-1.messages.yaml").read_text(encoding="utf-8"))
+                context_saved = yaml.safe_load((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-1.context.yaml").read_text(encoding="utf-8"))
+                latest = yaml.safe_load((root / ".openjet" / "state" / "debug_prompts" / "latest.messages.yaml").read_text(encoding="utf-8"))
             finally:
                 os.chdir(previous_cwd)
 
@@ -2413,10 +2414,10 @@ class DebugPromptLoggingTests(unittest.TestCase):
                     app._active_turn_id = "turn-debug-2"
                     app._prepare_turn_context()
 
-                first = json.loads((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-1.messages.json").read_text(encoding="utf-8"))
-                second = json.loads((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-2.messages.json").read_text(encoding="utf-8"))
-                latest = json.loads((root / ".openjet" / "state" / "debug_prompts" / "latest.messages.json").read_text(encoding="utf-8"))
-                latest_context = json.loads((root / ".openjet" / "state" / "debug_prompts" / "latest.context.json").read_text(encoding="utf-8"))
+                first = yaml.safe_load((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-1.messages.yaml").read_text(encoding="utf-8"))
+                second = yaml.safe_load((root / ".openjet" / "state" / "debug_prompts" / "turn-debug-2.messages.yaml").read_text(encoding="utf-8"))
+                latest = yaml.safe_load((root / ".openjet" / "state" / "debug_prompts" / "latest.messages.yaml").read_text(encoding="utf-8"))
+                latest_context = yaml.safe_load((root / ".openjet" / "state" / "debug_prompts" / "latest.context.yaml").read_text(encoding="utf-8"))
             finally:
                 os.chdir(previous_cwd)
 

@@ -20,14 +20,16 @@ class ExecutorToolFilteringTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "session_state.json").write_text("input feature vector elements\n", encoding="utf-8")
+            (root / "session_state.yaml").write_text("input feature vector elements\n", encoding="utf-8")
             (root / "session_logs").mkdir()
             (root / "session_logs" / "turn-1.json").write_text("input feature vector elements\n", encoding="utf-8")
 
             result = asyncio.run(grep_files("input feature vector", path=str(root), ignore_case=True))
 
-        self.assertIn("src/model.py", result)
+        self.assertIn("model.py", result)
         self.assertNotIn(".openjet", result)
         self.assertNotIn("session_state.json", result)
+        self.assertNotIn("session_state.yaml", result)
         self.assertNotIn("session_logs", result)
 
     def test_glob_ignores_internal_state_paths_by_default(self) -> None:
@@ -52,6 +54,7 @@ class ExecutorToolFilteringTests(unittest.TestCase):
             (root / ".openjet").mkdir()
             (root / "session_logs").mkdir()
             (root / "session_state.json").write_text("{}", encoding="utf-8")
+            (root / "session_state.yaml").write_text("{}\n", encoding="utf-8")
 
             result = asyncio.run(list_directory(str(root)))
 
@@ -59,6 +62,7 @@ class ExecutorToolFilteringTests(unittest.TestCase):
         self.assertNotIn(".openjet/", result)
         self.assertNotIn("session_logs/", result)
         self.assertNotIn("session_state.json", result)
+        self.assertNotIn("session_state.yaml", result)
 
 
 if __name__ == "__main__":

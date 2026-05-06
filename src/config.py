@@ -6,10 +6,9 @@ from typing import Any, Mapping
 import yaml
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
-DEFAULT_SESSION_STATE_PATH = ".openjet/state/session_state.json"
+DEFAULT_SESSION_STATE_PATH = ".openjet/state/session_state.yaml"
 DEFAULT_LOG_DIRECTORY = ".openjet/state/sessions"
-LEGACY_SESSION_STATE_PATH = "session_state.json"
-LEGACY_LOG_DIRECTORY = "session_logs"
+ROOT_LOG_DIRECTORY = "session_logs"
 
 # Curated, size-banded shortlist used by setup recommendations.
 # Band limit = max param budget in billions for that RAM tier.
@@ -98,7 +97,8 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.6 27B Q4_K_M",
         "filename": "Qwen3.6-27B-Q4_K_M.gguf",
         "url": "https://huggingface.co/lmstudio-community/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
-        "model_size_mb": 16896,
+        "model_size_mb": 16817,
+        "resident_model_size_mb": 16896,
         "kv_bytes_per_token": 34816,
     },
     {
@@ -165,22 +165,24 @@ def save_config(cfg: dict) -> None:
 
 def normalize_config(cfg: dict) -> dict:
     normalized = dict(cfg or {})
-    legacy_exact_keys = {"runtime", "model", "ollama_model", "recommended_llm"}
-    legacy_prefixes = ("openai_compatible_", "openrouter_")
+    removed_exact_keys = {"runtime", "model", "ollama_model", "recommended_llm"}
+    removed_prefixes = ("openai_compatible_", "openrouter_")
     for key in list(normalized):
-        if key in legacy_exact_keys or any(key.startswith(prefix) for prefix in legacy_prefixes):
+        if key in removed_exact_keys or any(key.startswith(prefix) for prefix in removed_prefixes):
             normalized.pop(key, None)
 
     state_cfg = dict(normalized.get("state") or {})
     state_path = str(state_cfg.get("path", "")).strip()
-    if not state_path or state_path == LEGACY_SESSION_STATE_PATH:
+    if not state_path:
         state_cfg["path"] = DEFAULT_SESSION_STATE_PATH
+    elif Path(state_path).suffix.lower() == ".json":
+        state_cfg["path"] = str(Path(state_path).with_suffix(".yaml")).replace("\\", "/")
     if state_cfg:
         normalized["state"] = state_cfg
 
     log_cfg = dict(normalized.get("logging") or {})
     log_dir = str(log_cfg.get("directory", "")).strip()
-    if not log_dir or log_dir == LEGACY_LOG_DIRECTORY:
+    if not log_dir or log_dir == ROOT_LOG_DIRECTORY:
         log_cfg["directory"] = DEFAULT_LOG_DIRECTORY
     if log_cfg:
         normalized["logging"] = log_cfg

@@ -416,5 +416,5 @@ def recommend_setup_context_window(
         kv_bytes_per_token=kv_bpt,
         model_max_context=model_max_context,
         total_vram_mb=total_vram_mb,
-        free_memory_mb=_detect_free_memory_mb(device),
+        free_memory_mb=None if total_vram_mb is not None else _detect_free_memory_mb(device),
     )

@@ -663,7 +663,7 @@ _DEFAULT_GLOB_IGNORE = {
     "dist", "build", ".eggs", "*.egg-info",
 }
 _DEFAULT_TOOL_STATE_DIRS = {".openjet", "session_logs"}
-_DEFAULT_TOOL_STATE_FILES = {"session_state.json"}
+_DEFAULT_TOOL_STATE_FILES = {"session_state.json", "session_state.yaml"}
 
 _MAX_GLOB_RESULTS = 200
 

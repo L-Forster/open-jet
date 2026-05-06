@@ -251,7 +251,7 @@ def recommend_direct_model(
     filename = str(selected["filename"])
     model_size_mb = float(selected.get("model_size_mb", 0) or 0)
     kv_bytes_per_token = float(selected.get("kv_bytes_per_token", 0) or 0)
-    context_model_size_mb = _active_model_size_mb(selected) if _is_moe_catalog_row(selected) else model_size_mb
+    context_model_size_mb = _active_model_size_mb(selected)
     return {
         "label": str(selected["label"]),
         "filename": filename,
@@ -839,8 +839,6 @@ async def _build_llama_server_from_source(
 ) -> tuple[Path, str]:
     if shutil.which("cmake") is None:
         raise RuntimeError(missing_cmake_message())
-    if hardware_info.has_cuda and not cuda_toolkit_available():
-        raise RuntimeError(missing_cuda_toolkit_message())
     if rebuilding:
         set_status("rebuilding llama-server for GPU support")
         log.write("[bold bright_white]Rebuilding llama-server for GPU support...[/]")
@@ -874,7 +872,9 @@ async def _build_llama_server_from_source(
     )
     clear_status()
     if rc != 0:
-        raise RuntimeError(tail.strip() or "Failed to build llama-server")
+        built = _managed_source_llama_server_path()
+        if not built.is_file():
+            raise RuntimeError(tail.strip() or "Failed to build llama-server")
     log.write("[bold bright_white]llama-server built successfully.[/]")
 
     built = _managed_source_llama_server_path()
@@ -928,7 +928,11 @@ async def ensure_llama_server(
     )
     if prebuilt is not None:
         clear_status()
-        installed_path, tag, runtime_device = prebuilt
+        if len(prebuilt) == 2:
+            installed_path, tag = prebuilt
+            runtime_device = prebuilt_device
+        else:
+            installed_path, tag, runtime_device = prebuilt
         merged = dict(setup_result)
         merged["llama_server_path"] = str(installed_path)
         merged["setup_missing_runtime"] = False

@@ -276,8 +276,15 @@ def update_state_for_user_message(
     chosen_mode = mode or state.mode
     mentioned_files = [path for path in (files or []) if path]
     preserve_plan_mode = bool(state.plan_mode and not state.plan_approved)
+    current_active = active_todo(state)
+    is_follow_up = (
+        not preserve_plan_mode
+        and current_active is not None
+        and text.strip().lower() in {"continue", "keep going", "carry on", "resume"}
+        and (not mentioned_files or set(mentioned_files) <= set(state.files_in_play))
+    )
     next_state = HarnessState.from_dict(state.to_dict())
-    if preserve_plan_mode:
+    if preserve_plan_mode or is_follow_up:
         next_state.goal = next_state.goal or text.strip()
     else:
         next_state.goal = text.strip()
@@ -285,10 +292,10 @@ def update_state_for_user_message(
     next_state.stage = None
     next_state.plan_mode = preserve_plan_mode
     next_state.plan_approved = False if preserve_plan_mode else True
-    next_state.plan_summary = next_state.plan_summary if preserve_plan_mode else ""
+    next_state.plan_summary = next_state.plan_summary if preserve_plan_mode or is_follow_up else ""
     next_state.preferred_skills = next_state.preferred_skills[:]
-    next_state.files_in_play = _merge_files(next_state.files_in_play, mentioned_files) if preserve_plan_mode else mentioned_files
-    if preserve_plan_mode:
+    next_state.files_in_play = _merge_files(next_state.files_in_play, mentioned_files) if preserve_plan_mode or is_follow_up else mentioned_files
+    if preserve_plan_mode or is_follow_up:
         next_state.todos = _clone_todos(next_state.todos)
         next_state.active_todo_id = active_todo(next_state).id if active_todo(next_state) else None
         next_state.next_action = active_todo(next_state).title if active_todo(next_state) else "Await the next user instruction."
@@ -304,6 +311,18 @@ def update_state_for_user_message(
         next_state.verification_next_command = ""
         next_state.next_action = ""
         next_state.failure_count_for_active_step = 0
+        if chosen_mode in {"code", "debug", "review"} and mentioned_files:
+            next_state.todos = [
+                TodoItem(
+                    id="inspect",
+                    content=f"Inspect {', '.join(mentioned_files)}",
+                    status="in_progress",
+                    kind="inspect",
+                    files=list(mentioned_files),
+                )
+            ]
+            next_state.active_todo_id = "inspect"
+            next_state.next_action = next_state.todos[0].title
     next_state.stage = infer_stage(next_state)
     next_state.updated_at = time.time()
     return next_state
@@ -395,6 +414,18 @@ def build_turn_context(
 
     remaining = max(0, budget.docs_budget - state_summary_tokens)
     if remaining <= 0:
+        for candidate in _candidate_docs(root, state, effective_window, policy=policy):
+            candidate_decisions.append(
+                asdict(
+                    HarnessDocDecision(
+                        layer=candidate.layer,
+                        label=candidate.label,
+                        token_count=candidate.token_count,
+                        admitted=False,
+                        skipped_reason="exceeds_remaining_global_budget",
+                    )
+                )
+            )
         return HarnessContext(
             messages=messages,
             state_summary=state_summary,
@@ -415,7 +446,18 @@ def build_turn_context(
     }
     stop_after_global_floor = False
 
-    for candidate in _candidate_docs(root, state, effective_window, policy=policy):
+    candidates = _candidate_docs(root, state, effective_window, policy=policy)
+    admission_candidates = list(candidates)
+    if policy.compact_state_rendering:
+        admission_candidates.sort(key=lambda candidate: 0 if candidate.label.startswith("[stage:") else 1)
+    if state.last_verification or state.verification_required:
+        admission_candidates.sort(
+            key=lambda candidate: (
+                0 if candidate.label.startswith("[stage:") else 1 if candidate.label == "recent-context" else 2
+            )
+        )
+
+    for candidate in admission_candidates:
         if not candidate.body.strip():
             candidate_decisions.append(
                 asdict(
@@ -646,6 +688,14 @@ def update_state_after_turn(
             command=str(verification.get("command", "")) or None,
         )
 
+    active_before_progress = active_todo(next_state)
+    if saw_read and active_before_progress is not None and active_before_progress.kind == "inspect":
+        next_state = complete_todo(next_state, active_before_progress.id)
+
+    active_before_write = active_todo(next_state)
+    if saw_write and active_before_write is not None and active_before_write.kind in {"change", "fix"}:
+        next_state = complete_todo(next_state, active_before_write.id)
+
     if saw_write and next_state.verification_enabled:
         next_state = mark_verification_pending(next_state)
 
@@ -656,6 +706,9 @@ def update_state_after_turn(
 
     if verification and verification.get("ok"):
         next_state.verification_required = False
+        active_after_verification = active_todo(next_state)
+        if active_after_verification is not None and active_after_verification.kind == "verify":
+            next_state = complete_todo(next_state, active_after_verification.id)
 
     active = active_todo(next_state)
     next_state.stage = infer_stage(next_state)
@@ -883,7 +936,7 @@ def record_verification_skip(
 
 
 def verification_gate_message(state: HarnessState) -> str | None:
-    if not state.verification_enabled or not state.verification_required:
+    if not getattr(state, "verification_enabled", True) or not getattr(state, "verification_required", False):
         return None
     command = str(state.verification_next_command or "").strip()
     suffix = f" Run or propose `{command}` if it is still valid." if command else ""
@@ -897,8 +950,15 @@ def verification_gate_message(state: HarnessState) -> str | None:
 def pre_edit_gate_message(state: HarnessState, *, tool_name: str) -> str | None:
     if tool_name not in {"edit_file", "write_file"}:
         return None
-    if state.plan_mode and not state.plan_approved:
+    if getattr(state, "plan_mode", False) and not getattr(state, "plan_approved", True):
         return "Plan mode is active. Stay read-only until the plan is approved."
+    active = active_todo(state)
+    if active is None:
+        if str(state.last_action.get("type", "")).strip() in {"read_file", "load_file", "glob", "grep", "list_directory"}:
+            return None
+        return "No in-progress todo is active. Create or activate an in-progress todo before editing."
+    if active.kind == "inspect":
+        return "Inspect the target area before editing. Use read/search tools first, then retry the edit."
     return None
 
 
@@ -912,7 +972,7 @@ def quality_gate_messages(state: HarnessState) -> list[dict[str, str]]:
                 "content": "QUALITY GATE\n" + verification_message,
             }
         )
-    if state.plan_mode and not state.plan_approved:
+    if getattr(state, "plan_mode", False) and not getattr(state, "plan_approved", True):
         messages.append(
             {
                 "role": "system",
@@ -929,7 +989,7 @@ def quality_gate_doc_labels(state: HarnessState) -> list[str]:
     labels: list[str] = []
     if verification_gate_message(state):
         labels.append("[quality-gate]")
-    if state.plan_mode and not state.plan_approved:
+    if getattr(state, "plan_mode", False) and not getattr(state, "plan_approved", True):
         labels.append("[plan-gate]")
     return labels
 
@@ -951,7 +1011,7 @@ def allowed_tools_for_state(state: HarnessState | None) -> set[str]:
     if state is None:
         return allowed_tools_for_mode(None)
     allowed = allowed_tools_for_mode(state.mode)
-    if state.plan_mode and not state.plan_approved:
+    if (state.plan_mode or infer_stage(state) == "plan") and not state.plan_approved:
         return {
             name
             for name in allowed
@@ -1016,7 +1076,9 @@ def infer_stage(state: HarnessState) -> str:
         return "verify"
     active = active_step(state)
     if active is None:
-        return "implement" if state.mode == "code" else str(state.mode or "chat")
+        if state.files_in_play:
+            return "implement"
+        return "implement" if state.mode in {"code", "debug"} else str(state.mode or "chat")
     if active.kind == "inspect":
         return "review" if state.mode == "review" else "implement"
     if active.kind in {"change", "fix"}:
@@ -1158,6 +1220,8 @@ def _file_context_docs(index: Any, state: HarnessState) -> list[tuple[str, str]]
 
 
 def _recent_context_docs(state: HarnessState) -> list[tuple[str, str, str]]:
+    if not state.last_action and not state.last_verification and not state.verification_required:
+        return []
     lines = ["RECENT TASK CONTEXT"]
     if state.last_action:
         lines.append(f"Last action: {_compact_json(state.last_action)}")

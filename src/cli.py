@@ -392,6 +392,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    if argv:
+        normalized_argv = list(argv)
+        command = str(normalized_argv[0]).strip().lower()
+        if command == "status":
+            normalized_argv = ["--status", *normalized_argv[1:]]
+        elif command == "update":
+            normalized_argv = ["--update", *normalized_argv[1:]]
+        elif command == "context":
+            normalized_argv = ["--context", *normalized_argv[1:]]
+        argv = normalized_argv
     args = build_parser().parse_args(argv)
 
     if getattr(args, "version", False):

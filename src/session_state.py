@@ -2,21 +2,34 @@
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from .multimodal import content_to_plain_text
+
+
+class _PromptStateDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_str(dumper: yaml.SafeDumper, data: str) -> yaml.nodes.ScalarNode:
+    style = "|" if "\n" in data else None
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_PromptStateDumper.add_representer(str, _represent_str)
 
 
 def _load_payload(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     except Exception:
         return None
     if not isinstance(payload, dict):
@@ -27,7 +40,15 @@ def _load_payload(path: Path) -> dict[str, Any] | None:
 def _save_payload(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    serialized = yaml.dump(
+        payload,
+        Dumper=_PromptStateDumper,
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+        width=120,
+    )
+    temp.write_text(serialized, encoding="utf-8")
     temp.replace(path)
 
 
@@ -143,10 +164,10 @@ class ChatArchiveStore:
         return uuid.uuid4().hex
 
     def live_state_path(self, chat_id: str) -> Path:
-        return self.root / _normalize_chat_id(chat_id) / "session_state.json"
+        return self.root / _normalize_chat_id(chat_id) / "session_state.yaml"
 
     def resume_state_path(self, chat_id: str) -> Path:
-        return self.root / _normalize_chat_id(chat_id) / "resume_state.json"
+        return self.root / _normalize_chat_id(chat_id) / "resume_state.yaml"
 
     def kv_cache_path(self, chat_id: str) -> Path:
         return self.root.parent / "swap" / f"resume_{_normalize_chat_id(chat_id)}.bin"

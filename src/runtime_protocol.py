@@ -8,9 +8,10 @@ from typing import AsyncIterator
 import httpx
 
 from .runtime_limits import estimate_tokens
-from .tools.registry import runtime_tool_schemas
+from .tools.registry import all_tool_names, runtime_tool_schemas
 
 TOOLS = runtime_tool_schemas()
+TOOL_NAMES = frozenset(all_tool_names())
 
 
 @dataclass
@@ -31,6 +32,8 @@ class StreamChunk:
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 _FUNCTION_BLOCK_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)\s*</function>", re.IGNORECASE | re.DOTALL)
 _PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.IGNORECASE | re.DOTALL)
+_TOOL_CALL_MARKER = "<tool_call"
+_TOOL_CALL_MARKER_OVERLAP = len(_TOOL_CALL_MARKER) - 1
 
 
 def tool_schema_token_estimate() -> int:
@@ -66,17 +69,17 @@ def _coerce_reasoning_parameter(raw: str) -> object:
     return value
 
 
-def _extract_reasoning_tool_calls(reasoning_text: str) -> list[ToolCall]:
+def _extract_xml_tool_calls(text: str) -> list[ToolCall]:
     tool_calls: list[ToolCall] = []
-    if not reasoning_text.strip():
+    if not text.strip():
         return tool_calls
 
-    for block in _TOOL_CALL_BLOCK_RE.findall(reasoning_text):
+    for block in _TOOL_CALL_BLOCK_RE.findall(text):
         match = _FUNCTION_BLOCK_RE.search(block)
         if not match:
             continue
         name = match.group(1).strip()
-        if not name:
+        if not name or name not in TOOL_NAMES:
             continue
         arguments: dict[str, object] = {}
         for param_name, param_value in _PARAMETER_BLOCK_RE.findall(match.group(2)):
@@ -112,7 +115,9 @@ async def stream_openai_chat(
     tool_name_by_index: dict[int, str] = {}
     tool_args_by_index: dict[int, str] = {}
     reasoning_buf = ""
-    saw_text = False
+    content_buf = ""
+    text_emit_buffer = ""
+    saw_content_tool_markup = False
 
     async with http.stream(
         "POST",
@@ -153,8 +158,25 @@ async def stream_openai_chat(
 
             text = delta.get("content", "") or ""
             if text:
-                saw_text = True
-                yield StreamChunk(text=text)
+                content_buf += text
+                if not use_tools:
+                    yield StreamChunk(text=text)
+                elif saw_content_tool_markup:
+                    pass
+                else:
+                    text_emit_buffer += text
+                    marker_index = text_emit_buffer.lower().find(_TOOL_CALL_MARKER)
+                    if marker_index >= 0:
+                        visible = text_emit_buffer[:marker_index]
+                        if visible:
+                            yield StreamChunk(text=visible)
+                        text_emit_buffer = ""
+                        saw_content_tool_markup = True
+                    elif len(text_emit_buffer) > _TOOL_CALL_MARKER_OVERLAP:
+                        visible = text_emit_buffer[:-_TOOL_CALL_MARKER_OVERLAP]
+                        text_emit_buffer = text_emit_buffer[-_TOOL_CALL_MARKER_OVERLAP:]
+                        if visible:
+                            yield StreamChunk(text=visible)
 
             reasoning_text = delta.get("reasoning_content", "") or ""
             if reasoning_text:
@@ -177,6 +199,10 @@ async def stream_openai_chat(
             if finish_reason is None:
                 continue
 
+            if use_tools and not saw_content_tool_markup and text_emit_buffer:
+                yield StreamChunk(text=text_emit_buffer)
+                text_emit_buffer = ""
+
             tool_calls: list[ToolCall] = []
             for idx in sorted(tool_name_by_index):
                 name = tool_name_by_index.get(idx, "")
@@ -198,8 +224,11 @@ async def stream_openai_chat(
                     )
                 )
 
-            if not tool_calls and reasoning_buf:
-                tool_calls = _extract_reasoning_tool_calls(reasoning_buf)
+            if use_tools and not tool_calls and content_buf:
+                tool_calls = _extract_xml_tool_calls(content_buf)
+
+            if use_tools and not tool_calls and reasoning_buf:
+                tool_calls = _extract_xml_tool_calls(reasoning_buf)
 
             yield StreamChunk(tool_calls=tool_calls, done=True)
             return

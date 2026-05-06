@@ -8,7 +8,7 @@ src/*.c
 src/*.so
 src/*.pyd
 benchmark_results/
-
+bin/
 # Runtime/session state
 session_logs/
 session_state.json

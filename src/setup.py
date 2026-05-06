@@ -381,9 +381,6 @@ def _recommended_local_payload(
             "llama_model": model_path,
         }
     recommended_filename = str(direct.get("filename") or "").strip()
-    recommended_target = Path(str(direct.get("target_path") or "")).expanduser()
-    if recommended_target and recommended_target.is_file():
-        return {"model_source": "local", "llama_model": str(recommended_target)}
     if recommended_filename:
         for candidate in (*model_files, *saved_model_files):
             candidate_path = Path(candidate).expanduser()

@@ -50,6 +50,26 @@ The PyPI package is `open-jet`; the installed command is `openjet`.
 
 Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14GB+ VRAM.
 
+### Recommended hardware and models
+
+**General (any GPU/RAM — no `unified_memory_only` flag):**
+
+| RAM | Model | max_ram_gb |
+|---|---|---|
+| < 6 GB | Qwen3.5 4B | 6.0 |
+| < 12 GB | Qwen3.5 9B | 12.0 |
+| < 12 GB | Qwen3.6 27B UD-IQ2_XXS | 12.0 |
+| < 16 GB | Qwen3.6 27B UD-IQ3_XXS | 16.0 |
+| < 20 GB | Qwen3.6 27B Q4_K_M | 20.0 |
+
+**Unified memory only (`unified_memory_only: True`, `llama_cpu_moe: True`):**
+
+| RAM | Model | max_ram_gb |
+|---|---|---|
+| < 24 GB | Gemma 4 26B A4B | 24.0 |
+| < 24 GB | Qwen3.6 35B A3B UD-Q3_K_XL | 24.0 |
+| < 32 GB | Qwen3.6 35B A3B UD-Q4_K_M | 32.0 |
+
 Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
 
 Then run:
@@ -86,7 +106,7 @@ from openjet.sdk import OpenJetSession, recommend_hardware_config
 | --- | --- | --- | --- | --- | --- |
 | OpenJet | Built in: install + `openjet setup` | Yes: model discovery/download + `llama.cpp` config | Yes | Full TUI | Yes: global + project memory |
 | Aider | Manual: choose API, local endpoint, or provider config | No | No | Terminal chat | No persistent agent memory |
-| Cline | Manual: extension/CLI plus provider, Ollama, or LM Studio config | No | No | Editor-first; CLI available | Yes: Memory Bank/rules |
+| Cline | Manual: extension/CLI plus provider or local model config | No | No | Editor-first; CLI available | Yes: Memory Bank/rules |
 | OpenCode | Manual: install CLI plus provider/local model config | No | No | Full TUI | Sessions/config persist |
 
 ## What you get

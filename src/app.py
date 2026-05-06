@@ -269,7 +269,7 @@ class OpenJetApp:
         f"{_DISCORD_INVITE_URL}"
     )
     _EXIT_DISCORD_MESSAGE = (
-        "Join the Discord community for feedback and to see what other people are "
+        "Setup complete. Join the Discord community for feedback and to see what other people are "
         f"building with OpenJet: {_DISCORD_INVITE_URL}"
     )
     _GENERATING_TIPS = (
@@ -309,7 +309,7 @@ class OpenJetApp:
         self.focused: object | None = None
         state_cfg = self.cfg.get("state", {})
         self.state_store = SessionStateStore(
-            path=Path(state_cfg.get("path", ".openjet/state/session_state.json")),
+            path=Path(state_cfg.get("path", ".openjet/state/session_state.yaml")),
             enabled=bool(state_cfg.get("enabled", True)),
         )
         self.chat_archive = ChatArchiveStore.from_session_state_path(
@@ -1253,6 +1253,10 @@ class OpenJetApp:
                 mode=self.harness_state.mode,
             )
         await self._load_mentioned_files_into_context(mentioned_files, log)
+        self._write_message_header(log, "USER", "user")
+        for line in self._message_body_lines(history_text):
+            log.write(rich_text(line, "muted"))
+        log.write("")
         self.agent.messages.append({"role": "user", "content": build_user_content(processed_text, attached_images)})
         self.persist_session_state(reason="user_message")
         self._render_token_counter()
@@ -1847,17 +1851,17 @@ class OpenJetApp:
 
     def list_resume_candidates(self) -> list[SavedChatEntry]:
         entries = self.chat_archive.list_chats()
-        legacy = self.state_store.load()
-        if legacy:
-            legacy_entry = build_saved_chat_entry(
-                chat_id=str(legacy.get("chat_id") or "legacy"),
-                payload=legacy,
+        root_state = self.state_store.load()
+        if root_state:
+            root_entry = build_saved_chat_entry(
+                chat_id=str(root_state.get("chat_id") or "root"),
+                payload=root_state,
                 state_path=self.state_store.path,
                 uses_resume_checkpoint=False,
                 kv_cache_available=False,
             )
-            if legacy_entry is not None and not any(entry.chat_id == legacy_entry.chat_id for entry in entries):
-                entries.append(legacy_entry)
+            if root_entry is not None and not any(entry.chat_id == root_entry.chat_id for entry in entries):
+                entries.append(root_entry)
         entries.sort(key=lambda entry: (entry.saved_at, str(entry.state_path)), reverse=True)
         return entries
 
@@ -1957,7 +1961,6 @@ class OpenJetApp:
         if not self.client:
             return "Saved chat loaded into the transcript only."
 
-        # Legacy KV cache restore for checkpoints saved before this change.
         mismatch_note = ""
         if kv_cache_available:
             saved_runtime = str(state.get("runtime") or "").strip()
@@ -1995,7 +1998,7 @@ class OpenJetApp:
             return False
         default_chat_id = self._chat_session_id if state_path == self.state_store.path else state_path.parent.name
         chat_id = str(state.get("chat_id") or default_chat_id or self._chat_session_id).strip()
-        uses_resume_checkpoint = state_path.name == "resume_state.json"
+        uses_resume_checkpoint = state_path.stem == "resume_state"
         kv_cache_available = uses_resume_checkpoint and self.chat_archive.kv_cache_path(chat_id).exists()
         runtime_note = await self._restore_runtime_for_saved_chat(
             state,
@@ -2569,7 +2572,8 @@ class OpenJetApp:
                 self._active_turn_false_positive_commands += 1
             if bool(tool_attrs.get("openjet.tool.shell.hallucinated_command")):
                 self._active_turn_hallucinated_commands += 1
-        needs_confirmation = self.agent.needs_confirmation(tc) if self.agent else False
+        needs_confirmation_fn = getattr(self.agent, "needs_confirmation", None) if self.agent else None
+        needs_confirmation = bool(needs_confirmation_fn(tc)) if callable(needs_confirmation_fn) else False
         if self.session_logger and self._active_turn_id:
             self.session_logger.start_tool_call(
                 turn_id=self._active_turn_id,

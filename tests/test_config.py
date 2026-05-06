@@ -6,10 +6,10 @@ from src.config import DEFAULT_LOG_DIRECTORY, DEFAULT_SESSION_STATE_PATH, normal
 
 
 class ConfigNormalizationTests(unittest.TestCase):
-    def test_normalize_config_migrates_legacy_root_paths(self) -> None:
+    def test_normalize_config_converts_root_state_path_to_yaml(self) -> None:
         cfg = {
             "logging": {"directory": "session_logs", "enabled": True},
-            "state": {"path": "session_state.json", "enabled": True},
+            "state": {"enabled": True},
         }
 
         normalized = normalize_config(cfg)
@@ -17,7 +17,7 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["logging"]["directory"], DEFAULT_LOG_DIRECTORY)
         self.assertEqual(normalized["state"]["path"], DEFAULT_SESSION_STATE_PATH)
 
-    def test_normalize_config_preserves_non_legacy_custom_paths(self) -> None:
+    def test_normalize_config_converts_custom_json_state_paths_to_yaml(self) -> None:
         cfg = {
             "logging": {"directory": "custom/logs", "enabled": True},
             "state": {"path": "custom/state.json", "enabled": True},
@@ -26,7 +26,7 @@ class ConfigNormalizationTests(unittest.TestCase):
         normalized = normalize_config(cfg)
 
         self.assertEqual(normalized["logging"]["directory"], "custom/logs")
-        self.assertEqual(normalized["state"]["path"], "custom/state.json")
+        self.assertEqual(normalized["state"]["path"], "custom/state.yaml")
 
     def test_setup_direct_model_catalog_preserves_optional_metadata(self) -> None:
         catalog = setup_direct_model_catalog(
