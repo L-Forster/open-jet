@@ -53,6 +53,7 @@ class LlamaServerClient:
     def __init__(
         self,
         model: str,
+        binary: str | None = None,
         host: str = "127.0.0.1",
         port: int = 18080,
         context_window_tokens: int = 2048,
@@ -64,6 +65,7 @@ class LlamaServerClient:
         diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.model = model
+        self.binary = str(binary or "").strip() or None
         self.host = host
         self.port = port
         self.context_window_tokens = max(512, int(context_window_tokens))
@@ -269,7 +271,7 @@ class LlamaServerClient:
             assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
             await self._stop_server()
             await self._cleanup_stale_inference_processes()
-            binary = _find_llama_server()
+            binary = self.binary or _find_llama_server()
             env = os.environ.copy()
             apply_airgap_env(env, enabled=self.airgapped)
             bin_dir = os.path.dirname(binary)

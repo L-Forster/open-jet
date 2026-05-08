@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.hardware import HardwareInfo
-from src.provisioning import ensure_llama_server, recommend_direct_model
+from src.provisioning import _llama_cmake_args, _patch_mtp_checkout, ensure_llama_server, recommend_direct_model
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
@@ -36,6 +36,44 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-Q3_K_XL")
         self.assertEqual(direct["filename"], "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf")
         self.assertTrue(direct["llama_cpu_moe"])
+
+    def test_llama_cmake_args_honor_selected_vulkan_on_cuda_host(self) -> None:
+        hardware = HardwareInfo(
+            label="RTX 3090",
+            total_ram_gb=64.0,
+            has_cuda=True,
+            has_vulkan=True,
+            vram_mb=24576.0,
+        )
+
+        args = _llama_cmake_args(hardware, device="vulkan")
+
+        self.assertIn("-DGGML_VULKAN=ON", args)
+        self.assertNotIn("-DGGML_CUDA=ON", args)
+
+    def test_patch_mtp_checkout_removes_vulkan_spv_namespace_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            llama_dir = Path(tmp) / "llama.cpp"
+            source = llama_dir / "ggml" / "src" / "ggml-vulkan" / "ggml-vulkan.cpp"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "std::vector<uint32_t> spv;\n"
+                "spv.assign(words, words + count);\n"
+                "uint32_t opcode = spv[pos] & spv::OpCodeMask;\n"
+                "spv.insert(spv.begin() + pos, item.begin(), item.end());\n"
+                "use(spv.size(), spv.data());\n",
+                encoding="utf-8",
+            )
+
+            with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir):
+                _patch_mtp_checkout("pull/22673/head")
+
+            patched = source.read_text(encoding="utf-8")
+
+        self.assertIn("std::vector<uint32_t> patched_spv;", patched)
+        self.assertIn("namespace openjet_spv", patched)
+        self.assertIn("patched_spv[pos] & openjet_spv::OpCodeMask", patched)
+        self.assertIn("patched_spv.insert(patched_spv.begin()", patched)
 
     async def test_ensure_llama_server_installs_prebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -90,6 +128,11 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             log = Mock()
             hardware = HardwareInfo(label="Jetson Orin Nano", total_ram_gb=8.0, has_cuda=True)
 
+            async def fake_build_progress(*_args, **_kwargs):
+                built.parent.mkdir(parents=True, exist_ok=True)
+                built.write_text("binary", encoding="utf-8")
+                return 0, ""
+
             with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
                 "src.provisioning.BIN_DIR", bin_dir
             ), patch(
@@ -107,6 +150,9 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             ) as sync_checkout, patch(
                 "src.provisioning._run_exec",
                 AsyncMock(return_value=(0, "", "")),
+            ), patch(
+                "src.provisioning._run_build_with_progress",
+                AsyncMock(side_effect=fake_build_progress),
             ):
                 payload = await ensure_llama_server(
                     {},
@@ -120,3 +166,61 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["llama_server_path"], str(built))
         self.assertFalse(payload["setup_missing_runtime"])
         sync_checkout.assert_awaited_once()
+
+    async def test_ensure_llama_server_builds_mtp_runtime_for_mtp_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            llama_dir = Path(tmp) / "llama.cpp"
+            built = llama_dir / "build" / "bin" / "llama-server"
+            built.parent.mkdir(parents=True)
+            built.write_text("binary", encoding="utf-8")
+            bin_dir = Path(tmp) / "bin"
+            old_prebuilt = bin_dir / "llama-server"
+            old_prebuilt.parent.mkdir(parents=True)
+            old_prebuilt.write_text("old", encoding="utf-8")
+            tag_file = bin_dir / "llama-server.tag"
+            tag_file.write_text("b9999", encoding="utf-8")
+
+            log = Mock()
+            hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
+
+            async def fake_build_progress(*_args, **_kwargs):
+                built.parent.mkdir(parents=True, exist_ok=True)
+                built.write_text("binary", encoding="utf-8")
+                return 0, ""
+
+            with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
+                "src.provisioning.BIN_DIR", bin_dir
+            ), patch(
+                "src.provisioning.LLAMA_SERVER_BIN", old_prebuilt
+            ), patch(
+                "src.provisioning.LLAMA_CPP_TAG_FILE", tag_file
+            ), patch(
+                "src.provisioning.current_llama_server_path", return_value="/usr/bin/llama-server"
+            ), patch(
+                "src.provisioning._install_prebuilt_llama_server",
+                AsyncMock(),
+            ) as install_prebuilt, patch(
+                "src.provisioning._sync_managed_llama_cpp_checkout",
+                AsyncMock(return_value="pull/22673/head"),
+            ) as sync_checkout, patch(
+                "src.provisioning._run_exec",
+                AsyncMock(return_value=(0, "", "")),
+            ), patch(
+                "src.provisioning._run_build_with_progress",
+                AsyncMock(side_effect=fake_build_progress),
+            ):
+                payload = await ensure_llama_server(
+                    {
+                        "llama_cpp_ref": "b9072",
+                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                    },
+                    hardware_info=hardware,
+                    log=log,
+                    set_status=lambda _message: None,
+                    clear_status=lambda: None,
+                )
+
+        self.assertEqual(payload["llama_cpp_ref"], "pull/22673/head")
+        self.assertEqual(payload["llama_server_path"], str(built))
+        install_prebuilt.assert_not_awaited()
+        self.assertEqual(sync_checkout.await_args.kwargs["target_ref"], "pull/22673/head")

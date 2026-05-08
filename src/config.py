@@ -97,6 +97,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.6 27B Q4_K_M MTP",
         "filename": "Qwen3.6-27B-Q4_K_M-mtp.gguf",
         "url": "https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M-mtp.gguf?download=true",
+        "llama_cpp_ref": "pull/22673/head",
         "model_size_mb": 16817,
         "resident_model_size_mb": 16896,
         "kv_bytes_per_token": 34816,

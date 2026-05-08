@@ -1709,12 +1709,18 @@ class OpenJetApp:
         return f"<prompt-status>{escaped}</prompt-status>"
 
     def _prompt_message(self) -> HTML:
+        top_border = ""
+        if self._assistant_status_kind == "generating":
+            width = max(20, self.console.width)
+            top_border = f"<prompt-border>╭{'─' * (width - 2)}╮</prompt-border>\n"
         if self.is_airgapped():
             return HTML(
+                top_border +
                 "<prompt-border>│</prompt-border> "
                 "<prompt-divider-airgapped>›</prompt-divider-airgapped><prompt-airgapped> </prompt-airgapped>"
             )
         return HTML(
+            top_border +
             "<prompt-border>│</prompt-border> "
             "<prompt-divider>›</prompt-divider><prompt> </prompt>"
         )
@@ -1727,6 +1733,7 @@ class OpenJetApp:
         if self._assistant_status_kind == "generating":
             self.console.print(rich_text(self._generating_status_text(), "status"))
             self.console.print(rich_text(self._current_generating_tip(), "muted"))
+            return
         elif not status.hidden and status.text:
             self.console.print(rich_text(status.text, "status"))
         width = max(20, self.console.width)

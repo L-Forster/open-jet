@@ -32,6 +32,7 @@ from src.llama_server import (
     _JETSON_VMM_CHUNK_MB,
     _JETSON_VMM_RESERVE_MB,
 )
+from src.model_profiles import sync_active_model_profile
 from src.device_sources import DeviceSource
 from src.peripherals import Observation, ObservationModality, PeripheralDevice, PeripheralKind, PeripheralTransport
 from src.provisioning import ensure_direct_model, recommend_direct_model
@@ -1963,6 +1964,21 @@ class AppToolHandlingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CliCommandTests(unittest.TestCase):
+    def test_sync_active_model_profile_preserves_mtp_runtime_ref(self) -> None:
+        cfg = {
+            "active_model_profile": "mtp",
+            "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+            "llama_server_path": "/home/louis/llama.cpp/build/bin/llama-server",
+            "llama_cpp_ref": "pull/22673/head",
+            "llama_mtp": True,
+            "model_source": "local",
+        }
+
+        sync_active_model_profile(cfg)
+
+        self.assertEqual(cfg["model_profiles"][0]["llama_cpp_ref"], "pull/22673/head")
+        self.assertTrue(cfg["model_profiles"][0]["llama_mtp"])
+
     def test_format_model_profiles_summary_lists_active_profile(self) -> None:
         text = _format_model_profiles_summary(
             {

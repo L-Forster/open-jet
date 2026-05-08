@@ -53,12 +53,48 @@ LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 LLAMA_CPP_PINNED_REF = "64ac9ab6"
+LLAMA_CPP_MTP_REF = "pull/22673/head"
 UNIFIED_MEMORY_SYSTEM_RESERVE_MB = 4096.0
 
 
 def managed_llama_cpp_ref() -> str:
     ref = os.environ.get("OPENJET_LLAMA_CPP_REF", "").strip()
     return ref or LLAMA_CPP_PINNED_REF
+
+
+def _normalized_llama_cpp_ref(ref: str) -> str:
+    stripped = str(ref or "").strip()
+    if stripped in {"mtp", "qwen-mtp", "qwen3.6-mtp"}:
+        return LLAMA_CPP_MTP_REF
+    return stripped
+
+
+def _is_mtp_llama_cpp_ref(ref: str) -> bool:
+    normalized = _normalized_llama_cpp_ref(ref).lower()
+    return normalized in {LLAMA_CPP_MTP_REF, "refs/pull/22673/head", "mtp-pr"}
+
+
+def _model_path_looks_mtp(value: object) -> bool:
+    stem = Path(str(value or "")).name.lower()
+    return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", stem))
+
+
+def _setup_uses_mtp_model(setup_result: Mapping[str, Any]) -> bool:
+    if bool(setup_result.get("llama_mtp")):
+        return True
+    for key in ("llama_model", "model_download_path", "filename", "model_profile_name"):
+        if _model_path_looks_mtp(setup_result.get(key)):
+            return True
+    return False
+
+
+def _llama_cpp_ref_for_setup(setup_result: Mapping[str, Any]) -> str:
+    if _setup_uses_mtp_model(setup_result):
+        return LLAMA_CPP_MTP_REF
+    explicit = _normalized_llama_cpp_ref(str(setup_result.get("llama_cpp_ref") or ""))
+    if explicit:
+        return explicit
+    return managed_llama_cpp_ref()
 
 
 def cmake_install_command() -> str:
@@ -268,6 +304,8 @@ def recommend_direct_model(
         "kv_bytes_per_token": kv_bytes_per_token,
         "llama_cpu_moe": bool(selected.get("llama_cpu_moe", False)),
         "llama_n_cpu_moe": int(selected.get("llama_n_cpu_moe", 0) or 0),
+        "llama_cpp_ref": str(selected.get("llama_cpp_ref") or ""),
+        "llama_mtp": _model_path_looks_mtp(filename) or bool(selected.get("llama_mtp", False)),
         "unified_memory_only": bool(selected.get("unified_memory_only", False)),
         "context_window_tokens": _context_window_for_model(
             hardware_info,
@@ -556,13 +594,16 @@ async def _run_hf_cli_download(
     return proc.returncode or 0, out, err
 
 
-def _llama_cmake_args(hardware_info: HardwareInfo) -> list[str]:
+def _llama_cmake_args(hardware_info: HardwareInfo, *, device: str | None = None) -> list[str]:
     args = ["cmake", ".."]
-    if hardware_info.has_cuda:
+    selected_device = (device or "").strip().lower()
+    if not selected_device or selected_device == "auto":
+        selected_device = "cuda" if hardware_info.has_cuda else "vulkan" if hardware_info.has_vulkan else ""
+    if selected_device == "cuda" and hardware_info.has_cuda:
         args.append("-DGGML_CUDA=ON")
         if is_jetson_label(hardware_info.label):
             args.append("-DCMAKE_CUDA_ARCHITECTURES=87")
-    elif hardware_info.has_vulkan:
+    elif selected_device == "vulkan" and (hardware_info.has_vulkan or hardware_info.has_cuda):
         args.append("-DGGML_VULKAN=ON")
     return args
 
@@ -610,13 +651,56 @@ def _llama_build_command(jobs: int) -> list[str]:
     return command
 
 
+def _patch_mtp_checkout(target_ref: str) -> None:
+    if not _is_mtp_llama_cpp_ref(target_ref):
+        return
+    vulkan_source = LLAMA_CPP_DIR / "ggml" / "src" / "ggml-vulkan" / "ggml-vulkan.cpp"
+    try:
+        text = vulkan_source.read_text(encoding="utf-8")
+    except OSError:
+        return
+    constants = (
+        "namespace openjet_spv {\n"
+        "static constexpr uint32_t OpCodeMask = 0xffffu;\n"
+        "static constexpr uint32_t WordCountShift = 16u;\n"
+        "static constexpr uint32_t OpExtension = 10u;\n"
+        "static constexpr uint32_t OpEntryPoint = 15u;\n"
+        "static constexpr uint32_t OpExecutionMode = 16u;\n"
+        "static constexpr uint32_t OpCapability = 17u;\n"
+        "static constexpr uint32_t OpExecutionModeId = 331u;\n"
+        "static constexpr uint32_t ExecutionModeRoundingModeRTE = 4462u;\n"
+        "static constexpr uint32_t CapabilityRoundingModeRTE = 4462u;\n"
+        "}\n"
+    )
+    patched = text
+    if "namespace openjet_spv {" not in patched:
+        if "#include <vector>\n" in patched:
+            patched = patched.replace("#include <vector>\n", f"#include <vector>\n\n{constants}", 1)
+        else:
+            patched = constants + patched
+    patched = patched.replace("spv::", "openjet_spv::")
+    patched = patched.replace("std::vector<uint32_t> spv;", "std::vector<uint32_t> patched_spv;")
+    for old, new in (
+        ("spv.assign", "patched_spv.assign"),
+        ("spv.size()", "patched_spv.size()"),
+        ("spv[pos", "patched_spv[pos"),
+        ("spv.insert", "patched_spv.insert"),
+        ("spv.begin()", "patched_spv.begin()"),
+        ("spv.data()", "patched_spv.data()"),
+    ):
+        patched = patched.replace(old, new)
+    if patched != text:
+        vulkan_source.write_text(patched, encoding="utf-8")
+
+
 async def _sync_managed_llama_cpp_checkout(
     *,
+    target_ref: str | None = None,
     log: Any,
     set_status: Callable[[str], None],
     clear_status: Callable[[], None],
 ) -> str:
-    target_ref = managed_llama_cpp_ref()
+    target_ref = _normalized_llama_cpp_ref(target_ref or managed_llama_cpp_ref())
     repo_exists = (LLAMA_CPP_DIR / ".git").is_dir()
 
     if not repo_exists and LLAMA_CPP_DIR.exists():
@@ -646,8 +730,21 @@ async def _sync_managed_llama_cpp_checkout(
             clear_status()
             raise RuntimeError((err or out).strip() or "Failed to inspect llama.cpp checkout.")
         if out.strip():
-            clear_status()
-            raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
+            dirty_paths = {line[3:].strip() for line in out.splitlines() if len(line) >= 4}
+            if _is_mtp_llama_cpp_ref(target_ref) and dirty_paths == {"ggml/src/ggml-vulkan/ggml-vulkan.cpp"}:
+                rc, reset_out, reset_err = await _run_exec(
+                    "git",
+                    "checkout",
+                    "--",
+                    "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+                    cwd=LLAMA_CPP_DIR,
+                )
+                if rc != 0:
+                    clear_status()
+                    raise RuntimeError((reset_err or reset_out).strip() or "Failed to reset managed llama.cpp MTP patch.")
+            else:
+                clear_status()
+                raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
 
     set_status("fetching llama.cpp")
     log.write("  [dim]Fetching llama.cpp refs...[/]")
@@ -656,10 +753,19 @@ async def _sync_managed_llama_cpp_checkout(
         clear_status()
         raise RuntimeError((err or out).strip() or "Failed to fetch llama.cpp")
 
-    rc, out, err = await _run_exec("git", "checkout", "--detach", target_ref, cwd=LLAMA_CPP_DIR)
+    checkout_ref = target_ref
+    if _is_mtp_llama_cpp_ref(target_ref):
+        rc, out, err = await _run_exec("git", "fetch", "origin", "+pull/22673/head:mtp-pr", cwd=LLAMA_CPP_DIR)
+        if rc != 0:
+            clear_status()
+            raise RuntimeError((err or out).strip() or "Failed to fetch llama.cpp MTP PR.")
+        checkout_ref = "mtp-pr"
+
+    rc, out, err = await _run_exec("git", "checkout", "--detach", checkout_ref, cwd=LLAMA_CPP_DIR)
     if rc != 0:
         clear_status()
         raise RuntimeError((err or out).strip() or f"Failed to checkout llama.cpp ref {target_ref}.")
+    _patch_mtp_checkout(target_ref)
     return target_ref
 
 
@@ -800,6 +906,9 @@ def _extract_archive(archive_path: Path, dest: Path) -> None:
 def _install_from_archive(archive_path: Path) -> Path:
     """Extract a llama.cpp release archive, copy binaries into BIN_DIR, return llama-server path."""
     BIN_DIR.mkdir(parents=True, exist_ok=True)
+    for entry in BIN_DIR.glob("llama-*"):
+        if entry.is_file():
+            entry.unlink()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         _extract_archive(archive_path, tmp)
@@ -875,6 +984,8 @@ async def _install_prebuilt_llama_server(
 async def _build_llama_server_from_source(
     *,
     hardware_info: HardwareInfo,
+    device: str | None = None,
+    target_ref: str | None = None,
     rebuilding: bool,
     log: Any,
     set_status: Callable[[str], None],
@@ -889,18 +1000,19 @@ async def _build_llama_server_from_source(
         set_status("provisioning llama-server")
         log.write("[bold bright_white]Provisioning llama-server...[/]")
     synced_ref = await _sync_managed_llama_cpp_checkout(
+        target_ref=target_ref,
         log=log,
         set_status=set_status,
         clear_status=clear_status,
     )
 
     build_dir = LLAMA_CPP_DIR / "build"
-    if rebuilding and build_dir.exists():
+    if build_dir.exists():
         shutil.rmtree(build_dir)
     build_dir.mkdir(parents=True, exist_ok=True)
     set_status("configuring llama.cpp")
     log.write("  [dim]Configuring build...[/]")
-    rc, out, err = await _run_exec(*_llama_cmake_args(hardware_info), cwd=build_dir)
+    rc, out, err = await _run_exec(*_llama_cmake_args(hardware_info, device=device), cwd=build_dir)
     if rc != 0:
         clear_status()
         raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp")
@@ -936,8 +1048,14 @@ async def ensure_llama_server(
 ) -> dict[str, Any]:
     prebuilt_device = _prebuilt_runtime_device(hardware_info)
     desired_device = prebuilt_device or str(setup_result.get("device") or "").strip().lower() or None
+    required_ref = _llama_cpp_ref_for_setup(setup_result)
+    requires_mtp_runtime = _setup_uses_mtp_model(setup_result) or _is_mtp_llama_cpp_ref(required_ref)
     # Cache hit: managed binary + tag file present and binary doesn't need a GPU rebuild.
-    if LLAMA_SERVER_BIN.is_file() and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN), device=desired_device):
+    if (
+        not requires_mtp_runtime
+        and LLAMA_SERVER_BIN.is_file()
+        and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN), device=desired_device)
+    ):
         cached_tag = _installed_llama_server_tag()
         if cached_tag:
             merged = dict(setup_result)
@@ -954,7 +1072,12 @@ async def ensure_llama_server(
     existing_is_source_managed = (
         existing is not None and Path(existing).resolve() == managed_source_binary.resolve()
     )
-    if existing and not existing_is_source_managed and not _needs_rebuild(hardware_info, existing, device=desired_device):
+    if (
+        not requires_mtp_runtime
+        and existing
+        and not existing_is_source_managed
+        and not _needs_rebuild(hardware_info, existing, device=desired_device)
+    ):
         merged = dict(setup_result)
         merged["llama_server_path"] = existing
         merged["setup_missing_runtime"] = False
@@ -964,11 +1087,13 @@ async def ensure_llama_server(
 
     rebuilding = existing is not None
 
-    prebuilt = await _install_prebuilt_llama_server(
-        hardware_info,
-        log=log,
-        set_status=set_status,
-    )
+    prebuilt = None
+    if not requires_mtp_runtime:
+        prebuilt = await _install_prebuilt_llama_server(
+            hardware_info,
+            log=log,
+            set_status=set_status,
+        )
     if prebuilt is not None:
         clear_status()
         if len(prebuilt) == 2:
@@ -989,6 +1114,8 @@ async def ensure_llama_server(
 
     built, synced_ref = await _build_llama_server_from_source(
         hardware_info=hardware_info,
+        device=desired_device,
+        target_ref=required_ref,
         rebuilding=rebuilding,
         log=log,
         set_status=set_status,

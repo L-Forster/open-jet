@@ -29,6 +29,7 @@ def create_runtime_client(
         raise ValueError("Missing model for llama.cpp runtime (`llama_model`).")
     return LlamaServerClient(
         model=model,
+        binary=str(cfg.get("llama_server_path") or "") or None,
         context_window_tokens=int(cfg.get("context_window_tokens", 2048)),
         device=str(cfg.get("device", "auto")),
         gpu_layers=int(cfg.get("gpu_layers", 99)),
