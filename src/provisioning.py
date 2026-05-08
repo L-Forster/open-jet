@@ -702,9 +702,8 @@ async def _sync_managed_llama_cpp_checkout(
     target_ref = _normalized_llama_cpp_ref(target_ref or managed_llama_cpp_ref())
     repo_exists = (LLAMA_CPP_DIR / ".git").is_dir()
 
-    if LLAMA_CPP_DIR.exists():
+    if not repo_exists and LLAMA_CPP_DIR.exists():
         shutil.rmtree(LLAMA_CPP_DIR)
-        repo_exists = False
 
     if not repo_exists:
         set_status("cloning llama.cpp")
@@ -718,6 +717,10 @@ async def _sync_managed_llama_cpp_checkout(
         if rc != 0:
             clear_status()
             raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
+
+    if repo_exists:
+        await _run_exec("git", "reset", "--hard", "HEAD", cwd=LLAMA_CPP_DIR)
+        await _run_exec("git", "clean", "-fd", cwd=LLAMA_CPP_DIR)
 
     set_status("fetching llama.cpp")
     log.write("  [dim]Fetching llama.cpp refs...[/]")

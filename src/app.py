@@ -1139,6 +1139,10 @@ class OpenJetApp:
             self.cfg.setdefault("gpu_layers", recommended_gpu_layers(str(self.cfg.get("device", "auto"))))
             save_config(self.cfg)
 
+        resolved = await self._materialize_setup_model(dict(self.cfg), log)
+        self._persist_setup_result(resolved)
+        save_config(self.cfg)
+
         active_model = self._active_model_ref()
         model_name = Path(active_model).name or active_model
         log.write(f"  [bold bright_white]Loading {escape(model_name)}...[/]")
