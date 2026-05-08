@@ -952,13 +952,6 @@ def pre_edit_gate_message(state: HarnessState, *, tool_name: str) -> str | None:
         return None
     if getattr(state, "plan_mode", False) and not getattr(state, "plan_approved", True):
         return "Plan mode is active. Stay read-only until the plan is approved."
-    active = active_todo(state)
-    if active is None:
-        if str(state.last_action.get("type", "")).strip() in {"read_file", "load_file", "glob", "grep", "list_directory"}:
-            return None
-        return "No in-progress todo is active. Create or activate an in-progress todo before editing."
-    if active.kind == "inspect":
-        return "Inspect the target area before editing. Use read/search tools first, then retry the edit."
     return None
 
 

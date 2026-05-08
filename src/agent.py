@@ -21,6 +21,7 @@ from .tools.registry import confirmation_required_tool_names
 class ActionKind(Enum):
     TEXT = auto()         # plain text token to display
     REASONING = auto()    # streamed chain-of-thought token (status line)
+    TOOL_ARGS_DELTA = auto() # streamed hidden tool-call output for token metrics
     CONDENSE = auto()     # internal request to condense context
     TOOL_REQUEST = auto() # model wants to run a tool — needs approval
     TOOL_RESULT = auto()  # result after tool execution
@@ -196,6 +197,9 @@ class Agent:
 
                     if chunk.reasoning:
                         yield AgentEvent(kind=ActionKind.REASONING, text=chunk.reasoning)
+
+                    if chunk.tool_args_delta:
+                        yield AgentEvent(kind=ActionKind.TOOL_ARGS_DELTA, text=chunk.tool_args_delta)
 
                     if chunk.tool_calls:
                         pending_tool_calls.extend(chunk.tool_calls)

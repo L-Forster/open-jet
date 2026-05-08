@@ -367,6 +367,7 @@ class OpenJetApp:
         self._power_max_watts: float | None = None
         self._generation_started_at: float | None = None
         self._generation_decode_started_at: float | None = None
+        self._generation_decode_last_token_at: float | None = None
         self._generation_tokens_streamed = 0
         self._generation_decode_tokens_streamed = 0
         self._generation_tip_index = -1
@@ -1257,10 +1258,6 @@ class OpenJetApp:
                 mode=self.harness_state.mode,
             )
         await self._load_mentioned_files_into_context(mentioned_files, log)
-        self._write_message_header(log, "USER", "user")
-        for line in self._message_body_lines(history_text):
-            log.write(rich_text(line, "muted"))
-        log.write("")
         self.agent.messages.append({"role": "user", "content": build_user_content(processed_text, attached_images)})
         self.persist_session_state(reason="user_message")
         self._render_token_counter()
@@ -1359,7 +1356,9 @@ class OpenJetApp:
             "path": result.path,
             "estimated_tokens": result.estimated_tokens,
             "loaded_tokens": result.returned_tokens,
+            "token_budget": result.token_budget,
             "truncated": result.truncated,
+            "content": result.content,
         }
         if result.path not in self.harness_state.files_in_play:
             self.harness_state.files_in_play.append(result.path)
@@ -1417,7 +1416,9 @@ class OpenJetApp:
             "path": result.path,
             "estimated_tokens": result.estimated_tokens,
             "loaded_tokens": result.returned_tokens,
+            "token_budget": result.token_budget,
             "truncated": result.truncated,
+            "content": result.content,
             "kind": "skill",
             "name": normalized,
         }
@@ -1622,11 +1623,27 @@ class OpenJetApp:
         return [f"{indent}{line}" if line else "" for line in lines]
 
     def _current_tps(self) -> float | None:
-        if self._thinking_timer is not None and self._generation_decode_started_at is not None:
-            elapsed = time.monotonic() - self._generation_decode_started_at
+        if (
+            self._thinking_timer is not None
+            and self._generation_decode_started_at is not None
+            and self._generation_decode_tokens_streamed > 0
+        ):
+            end = self._generation_decode_last_token_at or time.monotonic()
+            elapsed = end - self._generation_decode_started_at
             if elapsed > 0:
                 return self._generation_decode_tokens_streamed / elapsed
         return self._last_generation_tps
+
+    def _record_generation_output_tokens(self, tokens: int) -> None:
+        if tokens <= 0:
+            return
+        now = time.monotonic()
+        if self._generation_decode_started_at is None:
+            self._generation_decode_started_at = now
+        self._generation_decode_tokens_streamed += tokens
+        self._generation_decode_last_token_at = now
+        self._generation_tokens_streamed += tokens
+        self._active_turn_generation_tokens += tokens
 
     def _update_power_minmax(self, watts: float | None) -> None:
         if watts is None:
@@ -1692,24 +1709,12 @@ class OpenJetApp:
         return f"<prompt-status>{escaped}</prompt-status>"
 
     def _prompt_message(self) -> HTML:
-        width = max(20, self.console.width)
-        top_border = f"<prompt-border>╭{'─' * (width - 2)}╮</prompt-border>\n"
-        status_html = ""
-        if self._assistant_status_kind == "generating":
-            status_html = (
-                f"<prompt-status>{html.escape(self._generating_status_text())}</prompt-status>\n"
-                f"<prompt-tip>{html.escape(self._current_generating_tip())}</prompt-tip>\n"
-            )
         if self.is_airgapped():
             return HTML(
-                status_html +
-                top_border +
                 "<prompt-border>│</prompt-border> "
                 "<prompt-divider-airgapped>›</prompt-divider-airgapped><prompt-airgapped> </prompt-airgapped>"
             )
         return HTML(
-            status_html +
-            top_border +
             "<prompt-border>│</prompt-border> "
             "<prompt-divider>›</prompt-divider><prompt> </prompt>"
         )
@@ -1720,9 +1725,21 @@ class OpenJetApp:
     def _print_pre_prompt_status(self) -> None:
         status = self.query_one("#assistant-status")
         if self._assistant_status_kind == "generating":
-            return
+            self.console.print(rich_text(self._generating_status_text(), "status"))
+            self.console.print(rich_text(self._current_generating_tip(), "muted"))
         elif not status.hidden and status.text:
             self.console.print(rich_text(status.text, "status"))
+        width = max(20, self.console.width)
+        border = "chrome_border"
+        timestamp = time.strftime("%H:%M:%S")
+        header_visible = 3 + len("USER  ") + len(timestamp) + 1 + 1
+        dashes = max(0, width - header_visible)
+        self.console.print(
+            f"{rich_text('╭─ ', border)}"
+            f"{rich_text('USER', 'user')}  {rich_text(timestamp, 'dim')}"
+            f"{rich_text(' ' + '─' * dashes + '╮', border)}"
+        )
+        self._live_prompt_top_printed = True
 
     def _print_prompt_top_border(self) -> None:
         width = max(20, self.console.width)
@@ -1737,7 +1754,14 @@ class OpenJetApp:
         if self._live_prompt_top_printed:
             self._live_prompt_top_printed = False
         else:
-            self.console.print(rich_text(f"╭{'─' * inner}╮", border))
+            timestamp = time.strftime("%H:%M:%S")
+            header_visible = 3 + len("USER  ") + len(timestamp) + 1 + 1
+            dashes = max(0, width - header_visible)
+            self.console.print(
+                f"{rich_text('╭─ ', border)}"
+                f"{rich_text('USER', 'user')}  {rich_text(timestamp, 'dim')}"
+                f"{rich_text(' ' + '─' * dashes + '╮', border)}"
+            )
         for line in body_lines:
             content = f"› {line}" if line is body_lines[0] else f"  {line}"
             visible_len = len(content) + 1
@@ -1833,7 +1857,78 @@ class OpenJetApp:
         self._chat_session_id = self.chat_archive.new_chat_id()
         self._last_completed_turn = None
 
+    @staticmethod
+    def _loaded_context_ref(content: object) -> tuple[str, str] | None:
+        text = str(content or "")
+        if not text.startswith(("User-loaded file context:\n", "User-loaded skill context:\n")):
+            return None
+        head, sep, body = text.partition("\ncontent:\n")
+        if not sep:
+            return None
+        fields: dict[str, str] = {}
+        for line in head.splitlines()[1:]:
+            key, field_sep, value = line.partition(":")
+            if field_sep:
+                fields[key.strip()] = value.strip()
+        path = fields.get("path", "")
+        if text.startswith("User-loaded skill context:\n"):
+            name = fields.get("name", "")
+            key = f"skill:{name}" if name else f"skill:{path}"
+        else:
+            key = path
+        return (key, body) if key else None
+
+    @staticmethod
+    def _loaded_context_message(entry: dict[str, Any]) -> str:
+        kind = str(entry.get("kind", "file") or "file")
+        content = str(entry.get("content", ""))
+        lines = [
+            "User-loaded skill context:" if kind == "skill" else "User-loaded file context:",
+        ]
+        if kind == "skill":
+            lines.append(f"name: {entry.get('name', '')}")
+        lines.extend(
+            [
+                f"path: {entry.get('path', '')}",
+                f"tokens_estimated: {entry.get('estimated_tokens', 0)}",
+                f"tokens_loaded: {entry.get('loaded_tokens', 0)}",
+                f"token_budget: {entry.get('token_budget', 0)}",
+                f"truncated: {'yes' if entry.get('truncated') else 'no'}",
+                "content:",
+                content,
+            ]
+        )
+        return "\n".join(str(line) for line in lines)
+
+    def _session_payload_messages_and_files(self) -> tuple[list[dict], dict[str, dict]]:
+        loaded_files = {
+            str(key): dict(value)
+            for key, value in self.loaded_files.items()
+            if isinstance(value, dict)
+        }
+        messages: list[dict] = []
+        for msg in self.agent.messages if self.agent else []:
+            if not isinstance(msg, dict):
+                continue
+            copied = dict(msg)
+            ref = self._loaded_context_ref(copied.get("content"))
+            if ref is not None and copied.get("role") == "system":
+                key, content = ref
+                entry = dict(loaded_files.get(key, {}))
+                entry.setdefault("path", key.removeprefix("skill:"))
+                entry["content"] = content
+                loaded_files[key] = entry
+                copied["content"] = (
+                    "User-loaded context reference:\n"
+                    f"key: {key}\n"
+                    f"path: {entry.get('path', '')}\n"
+                    "content: loaded_files"
+                )
+            messages.append(copied)
+        return messages, loaded_files
+
     def _build_session_payload(self, *, reason: str) -> dict[str, Any]:
+        messages, loaded_files = self._session_payload_messages_and_files()
         return {
             "version": 2,
             "saved_at": time.time(),
@@ -1845,9 +1940,9 @@ class OpenJetApp:
             "model_ref": self._active_model_ref(),
             "device": self.cfg.get("device", "auto"),
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
-            "messages": self.agent.messages if self.agent else [],
+            "messages": messages,
             "completed_turn": self._last_completed_turn,
-            "loaded_files": self.loaded_files,
+            "loaded_files": loaded_files,
             "harness_state": self.harness_state.to_dict(),
             "token_usage": {
                 "prompt_tokens": self._session_prompt_tokens,
@@ -1876,6 +1971,8 @@ class OpenJetApp:
         messages = state.get("messages")
         if not isinstance(messages, list) or not messages:
             return None
+        loaded_files = state.get("loaded_files")
+        loaded_files = loaded_files if isinstance(loaded_files, dict) else {}
         valid_messages: list[dict] = []
         for msg in messages:
             if not isinstance(msg, dict):
@@ -1883,6 +1980,17 @@ class OpenJetApp:
             role = msg.get("role")
             if not isinstance(role, str):
                 continue
+            if role == "system" and isinstance(msg.get("content"), str):
+                key = ""
+                for line in str(msg.get("content", "")).splitlines():
+                    name, sep, value = line.partition(":")
+                    if sep and name.strip() == "key":
+                        key = value.strip()
+                        break
+                entry = loaded_files.get(key)
+                if key and isinstance(entry, dict) and "content" in entry:
+                    msg = dict(msg)
+                    msg["content"] = self._loaded_context_message(entry)
             if "content" in msg and not is_supported_message_content(msg.get("content")):
                 continue
             valid_messages.append(msg)
@@ -2353,12 +2461,7 @@ class OpenJetApp:
                         text_buf += event.text
                         assistant_turn_text += event.text
                         tokens = estimate_tokens(event.text)
-                        self._generation_tokens_streamed += tokens
-                        if tokens > 0:
-                            if self._generation_decode_started_at is None:
-                                self._generation_decode_started_at = time.monotonic()
-                            self._generation_decode_tokens_streamed += tokens
-                        self._active_turn_generation_tokens += tokens
+                        self._record_generation_output_tokens(tokens)
                         while "\n" in text_buf:
                             line, text_buf = text_buf.split("\n", 1)
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
@@ -2383,6 +2486,9 @@ class OpenJetApp:
                             buf = (getattr(self, "_reasoning_tail", "") + " " + snippet).strip()
                             self._reasoning_tail = snippet if len(buf) > 120 else buf
                             self._render_assistant_status()
+                    elif event.kind == SDKEventKind.TOOL_ARGS_DELTA:
+                        tokens = estimate_tokens(event.text)
+                        self._record_generation_output_tokens(tokens)
                     elif event.kind == SDKEventKind.TOOL_REQUEST and event.tool_call:
                         if reasoning_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
@@ -2602,6 +2708,55 @@ class OpenJetApp:
             log.write(f"  {rich_text(preview_line, preview_style)}")
         active_status_tokens[tool_key] = self._start_tool_status(tc)
 
+    def _refresh_loaded_file_after_write(self, tc: ToolCall) -> None:
+        if tc.name not in {"write_file", "edit_file"} or not isinstance(tc.arguments, dict) or not self.agent:
+            return
+        path_text = str(tc.arguments.get("path", "")).strip()
+        if not path_text:
+            return
+        try:
+            target = Path(path_text).expanduser().resolve()
+        except OSError:
+            return
+        match_key = None
+        match_entry: dict[str, Any] | None = None
+        for key, value in self.loaded_files.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                loaded_path = Path(str(value.get("path", key))).expanduser().resolve()
+            except OSError:
+                continue
+            if loaded_path == target:
+                match_key = key
+                match_entry = value
+                break
+        if match_key is None or match_entry is None:
+            return
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        estimated = estimate_tokens(content)
+        token_budget = self._coerce_token_count(match_entry.get("token_budget")) or estimated
+        loaded_content = content
+        truncated = False
+        if token_budget > 0 and estimated > token_budget:
+            keep_chars = max(256, int(len(content) * (token_budget / max(1, estimated))))
+            loaded_content = content[:keep_chars].rstrip() + "\n...[loaded file truncated after edit]..."
+            truncated = True
+        match_entry["content"] = loaded_content
+        match_entry["estimated_tokens"] = estimated
+        match_entry["loaded_tokens"] = estimate_tokens(loaded_content)
+        match_entry["truncated"] = truncated
+        context_text = self._loaded_context_message(match_entry)
+        for msg in self.agent.messages:
+            if not isinstance(msg, dict) or msg.get("role") != "system":
+                continue
+            ref = self._loaded_context_ref(msg.get("content"))
+            if ref and ref[0] == match_key:
+                msg["content"] = context_text
+
     def _record_tool_result(
         self,
         tool_result: SDKToolResult,
@@ -2617,6 +2772,7 @@ class OpenJetApp:
         duration_ms = meta.get("duration_ms")
         if tool_result.ok:
             self._active_turn_tool_successes += 1
+            self._refresh_loaded_file_after_write(tc)
         if meta.get("swapped") and not meta.get("swap_restore_ok", True):
             log.write(f"  {rich_text('KV cache restore failed after swap — re-prompting context', 'warning')}")
         if status == "disallowed":
@@ -2817,6 +2973,7 @@ class OpenJetApp:
         self._reasoning_tail = ""
         self._generation_started_at = time.monotonic()
         self._generation_decode_started_at = None
+        self._generation_decode_last_token_at = None
         self._generation_tokens_streamed = 0
         self._generation_decode_tokens_streamed = 0
         self._generation_tip_index = (self._generation_tip_index + 1) % len(self._GENERATING_TIPS)
@@ -2834,12 +2991,17 @@ class OpenJetApp:
     def _stop_thinking(self, token: int | None = None) -> None:
         if token is not None and token != self._thinking_token:
             return
-        if self._generation_decode_started_at is not None:
-            elapsed = time.monotonic() - self._generation_decode_started_at
-            if elapsed > 0 and self._generation_decode_tokens_streamed > 0:
+        if (
+            self._generation_decode_started_at is not None
+            and self._generation_decode_last_token_at is not None
+            and self._generation_decode_tokens_streamed > 0
+        ):
+            elapsed = self._generation_decode_last_token_at - self._generation_decode_started_at
+            if elapsed > 0:
                 self._last_generation_tps = self._generation_decode_tokens_streamed / elapsed
         self._generation_started_at = None
         self._generation_decode_started_at = None
+        self._generation_decode_last_token_at = None
         self._thinking_timer = None
         self._assistant_status_kind = None
         self._assistant_status_command = None

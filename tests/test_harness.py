@@ -992,6 +992,42 @@ class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent.messages[-1]["role"], "tool")
         self.assertEqual(agent.messages[-1]["tool_call_id"], tool_call.id)
 
+    async def test_run_turn_streams_tool_args_delta_before_tool_request(self) -> None:
+        tool_call = ToolCall(name="read_file", arguments={"path": "README.md"}, id="call-1")
+        client = FakeRuntimeClient(
+            [
+                StreamChunk(tool_args_delta="read_file"),
+                StreamChunk(tool_args_delta='{"path":"README.md"}', tool_calls=[tool_call]),
+            ]
+        )
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        agent.add_user_message("inspect README")
+
+        events = [event async for event in agent.run_turn()]
+
+        self.assertEqual(
+            [event.kind for event in events],
+            [ActionKind.TOOL_ARGS_DELTA, ActionKind.TOOL_ARGS_DELTA, ActionKind.TOOL_REQUEST],
+        )
+        self.assertEqual(events[0].text, "read_file")
+        self.assertEqual(events[1].text, '{"path":"README.md"}')
+
+    async def test_session_forwards_tool_args_delta(self) -> None:
+        tool_call = ToolCall(name="read_file", arguments={"path": "README.md"}, id="call-1")
+        client = FakeRuntimeClient([StreamChunk(tool_args_delta='{"path":"README.md"}', tool_calls=[tool_call])])
+        agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
+        agent.add_user_message("inspect README")
+        session = OpenJetSession(agent, allowed_tools=())
+
+        events = []
+        async for event in session.stream_existing_turn():
+            events.append(event)
+            if event.kind == SDKEventKind.TOOL_REQUEST:
+                break
+
+        self.assertEqual([event.kind for event in events], [SDKEventKind.TOOL_ARGS_DELTA, SDKEventKind.TOOL_REQUEST])
+        self.assertEqual(events[0].text, '{"path":"README.md"}')
+
     async def test_run_turn_retries_empty_completion_after_tool_result(self) -> None:
         tool_call = ToolCall(name="read_file", arguments={"path": "README.md"}, id="call-1")
         client = RecordingRuntimeClient(
@@ -1320,46 +1356,6 @@ class SDKSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state_box["state"].plan_mode)
         self.assertFalse(state_box["state"].plan_approved)
         self.assertEqual(state_box["state"].plan_summary, tool_call.arguments["plan_summary"])
-
-    async def test_edit_tool_is_blocked_until_inspection_happens(self) -> None:
-        tool_call = ToolCall(name="edit_file", arguments={"path": "src/harness.py", "find": "x", "replace": "y"})
-        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
-        state = update_state_for_user_message(HarnessState(), "Implement a harness change", mode="code", files=["src/harness.py"])
-        state_box = {"state": state}
-        session = OpenJetSession(
-            agent,
-            harness_state_getter=lambda: state_box["state"],
-            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
-        )
-
-        result = await session._handle_tool_call(tool_call)
-
-        self.assertIsNotNone(result)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.meta.get("status"), "blocked_by_harness")
-        self.assertIn("Inspect the target area", result.output)
-
-    async def test_edit_tool_is_blocked_without_an_active_todo(self) -> None:
-        tool_call = ToolCall(name="edit_file", arguments={"path": "src/harness.py", "find": "x", "replace": "y"})
-        agent = Agent(client=SequencedRuntimeClient([]), system_prompt="system", context_window_tokens=4096)
-        state = HarnessState(
-            mode="code",
-            todos=[TodoItem(id="t1", content="Inspect file", status="pending", kind="inspect")],
-            active_todo_id=None,
-        )
-        state_box = {"state": state}
-        session = OpenJetSession(
-            agent,
-            harness_state_getter=lambda: state_box["state"],
-            harness_state_setter=lambda updated: state_box.__setitem__("state", updated),
-        )
-
-        result = await session._handle_tool_call(tool_call)
-
-        self.assertIsNotNone(result)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.meta.get("status"), "blocked_by_harness")
-        self.assertIn("in-progress todo", result.output)
 
     async def test_edit_tool_reaches_normal_approval_after_inspection(self) -> None:
         tool_call = ToolCall(name="edit_file", arguments={"path": "src/harness.py", "find": "x", "replace": "y"})

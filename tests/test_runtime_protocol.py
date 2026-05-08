@@ -77,7 +77,8 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(chunks[-1].tool_calls), 1)
         self.assertEqual(chunks[-1].tool_calls[0].name, "grep")
         self.assertEqual(chunks[-1].tool_calls[0].arguments, {"pattern": "feature vector"})
-        self.assertIn("tools", http.last_payload or {})
+        self.assertNotIn("tools", http.last_payload or {})
+        self.assertIn("<tool_guidelines>", str((http.last_payload or {})["messages"][0]["content"]))
         self.assertTrue(any(chunk.reasoning for chunk in chunks))
         self.assertFalse(any(chunk.text for chunk in chunks[:-1]))
 
@@ -106,6 +107,7 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunks[-1].tool_calls[0].name, "read_file")
         self.assertEqual(chunks[-1].tool_calls[0].arguments, {"path": "README.md"})
         self.assertFalse(any("<tool_call>" in chunk.text for chunk in chunks))
+        self.assertIn("<tool_call>", "".join(chunk.tool_args_delta for chunk in chunks))
 
     async def test_stream_openai_chat_extracts_multiple_qwen3_coder_xml_parameters(self) -> None:
         http = _FakeHTTPClient(
@@ -232,7 +234,7 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("".join(chunk.text for chunk in chunks), "hello world")
         self.assertEqual(chunks[-1].tool_calls, [])
 
-    async def test_stream_openai_chat_prefers_explicit_tool_calls_over_reasoning_markup(self) -> None:
+    async def test_stream_openai_chat_uses_xml_tool_calls_not_native_tool_calls(self) -> None:
         http = _FakeHTTPClient(
             [
                 'data: {"choices":[{"finish_reason":null,"index":0,"delta":{"reasoning_content":"<tool_call><function=grep><parameter=pattern>wrong</parameter></function></tool_call>","tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\\"path\\":\\"README.md\\"}"}}]}}]}',
@@ -254,5 +256,28 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(chunks[-1].done)
         self.assertEqual(len(chunks[-1].tool_calls), 1)
-        self.assertEqual(chunks[-1].tool_calls[0].name, "read_file")
-        self.assertEqual(chunks[-1].tool_calls[0].arguments, {"path": "README.md"})
+        self.assertEqual(chunks[-1].tool_calls[0].name, "grep")
+        self.assertEqual(chunks[-1].tool_calls[0].arguments, {"pattern": "wrong"})
+
+    async def test_stream_openai_chat_ignores_native_tool_calls_without_xml(self) -> None:
+        http = _FakeHTTPClient(
+            [
+                'data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\\"path\\":\\"index.html\\""}}]}}]}',
+                'data: {"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}',
+                "data: [DONE]",
+            ]
+        )
+
+        chunks = [
+            chunk
+            async for chunk in stream_openai_chat(
+                http,
+                base_url="http://127.0.0.1:8080",
+                model="local",
+                messages=[{"role": "user", "content": "Write a file"}],
+                use_tools=True,
+            )
+        ]
+
+        self.assertTrue(chunks[-1].done)
+        self.assertEqual(chunks[-1].tool_calls, [])

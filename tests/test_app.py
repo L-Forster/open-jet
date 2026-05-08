@@ -653,6 +653,24 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tps, 30.0)
 
+    def test_record_generation_output_tokens_counts_first_tool_delta(self) -> None:
+        app = OpenJetApp()
+        app._thinking_timer = True
+
+        with patch("src.app.time.monotonic", side_effect=[100.0, 102.0]):
+            app._record_generation_output_tokens(10)
+            app._record_generation_output_tokens(30)
+
+        self.assertEqual(app._generation_decode_tokens_streamed, 40)
+        self.assertEqual(app._generation_tokens_streamed, 40)
+        self.assertEqual(app._active_turn_generation_tokens, 40)
+        self.assertEqual(app._last_generation_tps, None)
+
+        with patch("src.app.time.monotonic", return_value=102.0):
+            tps = app._current_tps()
+
+        self.assertEqual(tps, 20.0)
+
     def test_remaining_prompt_tokens_reserves_runtime_overhead_when_requested(self) -> None:
         app = OpenJetApp()
         app.agent = FakeBudgetAgent(estimated=600, overhead=300, prompt_tokens=1400)
@@ -1628,11 +1646,24 @@ class AppResumeStateTests(unittest.TestCase):
             app.agent = SimpleNamespace(
                 messages=[
                     {"role": "system", "content": "system"},
+                    {
+                        "role": "system",
+                        "content": (
+                            "User-loaded file context:\n"
+                            "path: src/app.py\n"
+                            "tokens_estimated: 3\n"
+                            "tokens_loaded: 3\n"
+                            "token_budget: 10\n"
+                            "truncated: no\n"
+                            "content:\n"
+                            "print('loaded')"
+                        ),
+                    },
                     {"role": "user", "content": "hello"},
                 ]
             )
             app.client = SimpleNamespace(context_window_tokens=4096)
-            app.loaded_files = {"src/app.py": {"path": "src/app.py"}}
+            app.loaded_files = {"src/app.py": {"path": "src/app.py", "content": "print('loaded')"}}
 
             app.persist_session_state(reason="user_message")
 
@@ -1644,6 +1675,8 @@ class AppResumeStateTests(unittest.TestCase):
             self.assertEqual(saved["reason"], "user_message")
             self.assertEqual(archived["chat_id"], "chat123")
             self.assertEqual(archived["loaded_files"]["src/app.py"]["path"], "src/app.py")
+            self.assertEqual(archived["loaded_files"]["src/app.py"]["content"], "print('loaded')")
+            self.assertNotIn("print('loaded')", "\n".join(str(msg.get("content", "")) for msg in archived["messages"]))
 
     def test_list_resume_candidates_prefers_resume_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1677,6 +1710,42 @@ class AppResumeStateTests(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0].state_path.name, "resume_state.yaml")
             self.assertTrue(entries[0].kv_cache_available)
+
+    def test_validated_session_messages_rehydrates_loaded_file_references(self) -> None:
+        app = OpenJetApp()
+        app.agent = SimpleNamespace(system_prompt="system")
+        state = {
+            "messages": [
+                {"role": "system", "content": "system"},
+                {
+                    "role": "system",
+                    "content": (
+                        "User-loaded context reference:\n"
+                        "key: src/app.py\n"
+                        "path: src/app.py\n"
+                        "content: loaded_files"
+                    ),
+                },
+                {"role": "user", "content": "hello"},
+            ],
+            "loaded_files": {
+                "src/app.py": {
+                    "path": "src/app.py",
+                    "estimated_tokens": 3,
+                    "loaded_tokens": 3,
+                    "token_budget": 10,
+                    "truncated": False,
+                    "content": "print('loaded')",
+                }
+            },
+        }
+
+        messages = app._validated_session_messages(state)
+
+        self.assertIsNotNone(messages)
+        assert messages is not None
+        self.assertIn("User-loaded file context:", str(messages[1]["content"]))
+        self.assertIn("print('loaded')", str(messages[1]["content"]))
 
 
 class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
@@ -1848,6 +1917,49 @@ class AppToolHandlingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(event["tool"], "list_directory")
         render_counter.assert_called_once()
+
+    async def test_record_tool_result_refreshes_loaded_file_after_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "demo.py"
+            path.write_text("print('after')\n", encoding="utf-8")
+            app = OpenJetApp()
+            app.agent = SimpleNamespace(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "User-loaded file context:\n"
+                            f"path: {path}\n"
+                            "tokens_estimated: 2\n"
+                            "tokens_loaded: 2\n"
+                            "token_budget: 100\n"
+                            "truncated: no\n"
+                            "content:\n"
+                            "print('before')"
+                        ),
+                    }
+                ]
+            )
+            app.loaded_files = {
+                str(path): {
+                    "path": str(path),
+                    "estimated_tokens": 2,
+                    "loaded_tokens": 2,
+                    "token_budget": 100,
+                    "truncated": False,
+                    "content": "print('before')",
+                }
+            }
+            tool_result = ToolResult(
+                tool_call=ToolCall(name="write_file", arguments={"path": str(path), "content": "print('after')\n"}),
+                output="Wrote file",
+                meta={"ok": True, "status": "completed"},
+            )
+
+            app._record_tool_result(tool_result, app.query_one("#chat-log"), {})
+
+            self.assertEqual(app.loaded_files[str(path)]["content"], "print('after')\n")
+            self.assertIn("print('after')", app.agent.messages[0]["content"])
 
 
 class CliCommandTests(unittest.TestCase):

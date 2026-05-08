@@ -41,6 +41,7 @@ ApprovalHandler = Callable[[ToolCall], bool | Awaitable[bool]]
 class SDKEventKind(Enum):
     TEXT = auto()
     REASONING = auto()
+    TOOL_ARGS_DELTA = auto()
     TOOL_REQUEST = auto()
     TOOL_RESULT = auto()
     CONDENSE = auto()
@@ -514,6 +515,9 @@ class OpenJetSession:
                     continue
                 if event.kind == ActionKind.REASONING:
                     yield SDKEvent(kind=SDKEventKind.REASONING, text=event.text)
+                    continue
+                if event.kind == ActionKind.TOOL_ARGS_DELTA:
+                    yield SDKEvent(kind=SDKEventKind.TOOL_ARGS_DELTA, text=event.text)
                     continue
                 if event.kind == ActionKind.TOOL_REQUEST and event.tool_call:
                     pending_tool_calls.append(event.tool_call)
