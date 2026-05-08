@@ -162,7 +162,7 @@ class PersistentMemoryFileTests(unittest.IsolatedAsyncioTestCase):
             with patch("src.config.load_config", return_value={}):
                 prompt = await build_system_prompt("", root)
 
-        self.assertIn("You are OpenJet, a local terminal AI assistant.", prompt)
+        self.assertIn("You are Qwen, created by Alibaba Cloud. You are a helpful assistant.", prompt)
         self.assertIn("Be concise, direct, and practical.", prompt)
 
     async def test_build_system_prompt_omits_memory_update_policy_text(self) -> None:

@@ -37,6 +37,12 @@ def _fmt_size(nbytes: int) -> str:
     return f"{nbytes / (1 << 10):.0f} KB"
 
 
+def _fmt_mb_size(mb: float) -> str:
+    if mb >= 1024:
+        return f"{mb / 1024.0:.1f} GB"
+    return f"{mb:.0f} MB"
+
+
 OPENJET_HOME = openjet_install_root()
 MODELS_DIR = OPENJET_HOME / "models"
 BIN_DIR = OPENJET_HOME / "bin"
@@ -415,6 +421,42 @@ def _hf_cli_command() -> list[str]:
     )
 
 
+def pending_direct_model_download_summary(setup_result: Mapping[str, Any]) -> str | None:
+    if str(setup_result.get("model_source", "local")) != "direct":
+        return None
+    target_raw = str(setup_result.get("model_download_path") or "").strip()
+    if not target_raw:
+        return None
+    target_path = Path(target_raw).expanduser()
+    if target_path.is_file():
+        return None
+    name = target_path.name or "model"
+    try:
+        model_size_mb = float(setup_result.get("model_size_mb") or 0.0)
+    except (TypeError, ValueError):
+        model_size_mb = 0.0
+    if model_size_mb > 0:
+        return f"Requires model download after restart: {name} ({_fmt_mb_size(model_size_mb)})."
+    return f"Requires model download after restart: {name}."
+
+
+def _clear_old_model_files(model_dir: Path, target_path: Path, *, log: Any) -> int:
+    if not model_dir.is_dir():
+        return 0
+    removed = 0
+    target_resolved = target_path.resolve(strict=False)
+    for candidate in sorted(model_dir.glob("*.gguf")):
+        if candidate.resolve(strict=False) == target_resolved:
+            continue
+        if not candidate.is_file():
+            continue
+        candidate.unlink()
+        removed += 1
+    if removed:
+        log.write(f"  [dim]Removed {removed} old model file{'s' if removed != 1 else ''} from {model_dir}.[/]")
+    return removed
+
+
 async def _run_hf_cli_download(
     *,
     repo_id: str,
@@ -426,6 +468,7 @@ async def _run_hf_cli_download(
     env = dict(os.environ)
     env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     env.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+    env.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
     cmd = [
         *_hf_cli_command(),
         repo_id,
@@ -969,8 +1012,9 @@ async def ensure_direct_model(
         return setup_result
 
     url = str(setup_result.get("model_download_url") or "").strip()
-    target_path = Path(str(setup_result.get("model_download_path") or "").strip()).expanduser()
-    if not url or not str(target_path):
+    target_raw = str(setup_result.get("model_download_path") or "").strip()
+    target_path = Path(target_raw).expanduser()
+    if not url or not target_raw:
         raise RuntimeError("Direct model provisioning is missing a download URL or target path.")
     if target_path.is_file():
         merged = dict(setup_result)
@@ -987,6 +1031,7 @@ async def ensure_direct_model(
     repo_id, revision, filename = parsed
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
+    _clear_old_model_files(target_path.parent, target_path, log=log)
     set_status(f"downloading {target_path.name}")
     log.write(f"[bold bright_white]Downloading {target_path.name} with Hugging Face fast transfer...[/]")
     last_progress_pct = -1

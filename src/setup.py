@@ -393,7 +393,12 @@ def _recommended_local_payload(
         "setup_missing_model": True,
         "model_profile_name": str(direct.get("label") or Path(str(direct.get("filename") or "")).stem),
     }
-    for key in ("model_size_mb", "kv_bytes_per_token", "resident_model_size_mb", "active_model_size_mb"):
+    for key in (
+        "model_size_mb",
+        "kv_bytes_per_token",
+        "resident_model_size_mb",
+        "active_model_size_mb",
+    ):
         if direct.get(key) is not None:
             payload[key] = direct[key]
     return payload
@@ -408,7 +413,12 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
         "setup_missing_model": True,
         "model_profile_name": str(row.get("label") or "").strip() or Path(filename).stem,
     }
-    for key in ("model_size_mb", "kv_bytes_per_token", "resident_model_size_mb", "active_model_size_mb"):
+    for key in (
+        "model_size_mb",
+        "kv_bytes_per_token",
+        "resident_model_size_mb",
+        "active_model_size_mb",
+    ):
         if row.get(key) is not None:
             payload[key] = row[key]
     if "unified_memory_only" in row:

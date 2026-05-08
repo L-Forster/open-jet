@@ -7,6 +7,16 @@ from .recommendations import (
     RecommendedModel,
     recommend_hardware_config,
 )
+from .fix import (
+    FixEstimate,
+    FixFinding,
+    FixReport,
+    RuntimeObservation,
+    RuntimeProcess,
+    detect_runtime_processes,
+    fix,
+    format_fix_report,
+)
 from .tok_s import (
     HardwarePerformanceProfile,
     ModelPerformanceProfile,
@@ -33,6 +43,11 @@ __all__ = [
     "OpenJetSession",
     "RecommendedLlamaConfig",
     "RecommendedModel",
+    "FixEstimate",
+    "FixFinding",
+    "FixReport",
+    "RuntimeObservation",
+    "RuntimeProcess",
     "SDKEvent",
     "SDKEventKind",
     "SDKResponse",
@@ -42,6 +57,7 @@ __all__ = [
     "ToolResult",
     "build_token_generation_workload",
     "create_agent",
+    "detect_runtime_processes",
     "estimate_token_generation_speed_for_profiles",
     "estimate_recommended_token_generation_speed",
     "estimate_token_generation_speed",
@@ -50,5 +66,7 @@ __all__ = [
     "get_model_performance_profile",
     "list_hardware_performance_profiles",
     "list_model_performance_profiles",
+    "fix",
+    "format_fix_report",
     "recommend_hardware_config",
 ]

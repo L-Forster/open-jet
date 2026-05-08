@@ -352,6 +352,11 @@ def build_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("-o", "--output", default="md", choices=("md", "csv", "json", "jsonl", "sql"), help="output format (default: md)")
     bench_parser.add_argument("--sweep", action="store_true", help="run single-variable sweeps (gpu layers, batch size, threads)")
     bench_parser.add_argument("extra", nargs=argparse.REMAINDER, help="extra flags passed directly to the benchmark runner")
+    fix_parser = subparsers.add_parser("fix", help="diagnose the running local LLM runtime against OpenJet's setup target")
+    fix_parser.add_argument("backend", nargs="?", help="runtime backend to inspect, e.g. llama.cpp, ollama, vllm, or mlx")
+    fix_parser.add_argument("--no-probe", action="store_true", help="skip the live decode probe against the running runtime")
+    fix_parser.add_argument("--prefill-tok-s", type=float, default=None, help="observed prefill tokens/sec to include in estimates")
+    fix_parser.add_argument("--decode-tok-s", type=float, default=None, help="observed decode tokens/sec to include in estimates")
     device_parser = subparsers.add_parser("device", aliases=("devices",), help="list and configure persistent device ids")
     device_subparsers = device_parser.add_subparsers(dest="device_action")
     device_subparsers.add_parser("list", help="list discovered devices and current ids")
@@ -539,6 +544,21 @@ def main(argv: list[str] | None = None) -> None:
                 repetitions=args.repetitions,
                 extra_args=extra or None,
             )
+        return
+    if args.command == "fix":
+        from .sdk import fix as sdk_fix, format_fix_report
+
+        print(
+            format_fix_report(
+                sdk_fix(
+                    str(args.backend) if getattr(args, "backend", None) else None,
+                    cfg=load_config(),
+                    run_probe=not bool(getattr(args, "no_probe", False)),
+                    observed_prefill_tok_s=getattr(args, "prefill_tok_s", None),
+                    observed_decode_tok_s=getattr(args, "decode_tok_s", None),
+                )
+            )
+        )
         return
     force_setup = bool(args.command == "setup")
     launch_tui(force_setup=force_setup)

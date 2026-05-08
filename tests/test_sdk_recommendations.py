@@ -65,8 +65,8 @@ class SDKRecommendationTests(unittest.TestCase):
         )
 
         self.assertEqual(low_vram_gpu.model.label, "Qwen3.5 9B")
-        self.assertEqual(high_vram_gpu.model.label, "Qwen3.6 27B Q4_K_M")
-        self.assertEqual(cpu_only.model.label, "Qwen3.6 27B Q4_K_M")
+        self.assertEqual(high_vram_gpu.model.label, "Qwen3.6 27B Q4_K_M MTP")
+        self.assertEqual(cpu_only.model.label, "Qwen3.6 27B Q4_K_M MTP")
         self.assertEqual(low_vram_gpu.llama.context_window_tokens, 128807)
         self.assertEqual(high_vram_gpu.llama.context_window_tokens, 208173)
         self.assertEqual(cpu_only.llama.context_window_tokens, 8192)
@@ -136,6 +136,19 @@ class SDKRecommendationTests(unittest.TestCase):
         self.assertEqual(estimate.hardware_key, "intel_core_i9_14900k")
         self.assertEqual(estimate.context_window_tokens, 3072)
         self.assertEqual(estimate.hardware_memory_mb, 8192.0)
+
+    def test_estimate_recommended_token_generation_speed_falls_back_for_generic_cuda_label(self) -> None:
+        estimate = estimate_recommended_token_generation_speed(
+            {
+                "total_ram_gb": 32.0,
+                "gpu": "cuda",
+                "label": "CUDA-capable device",
+                "vram_mb": 24576.0,
+            }
+        )
+
+        self.assertEqual(estimate.hardware_key, "rtx_3090_24gb")
+        self.assertGreater(estimate.estimated_tokens_per_second, 0.0)
 
     def test_estimate_token_generation_speeds_for_hardware_returns_all_models(self) -> None:
         estimates = estimate_token_generation_speeds_for_hardware(

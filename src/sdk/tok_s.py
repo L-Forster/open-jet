@@ -12,6 +12,11 @@ from ..provisioning import recommend_direct_model
 _BYTES_PER_MB = 1024.0 * 1024.0
 _KV_CACHE_Q8_0_BYTES_PER_ELEMENT = 34.0 / 32.0
 
+# Multi-token prediction (MTP) speculative decoding speedup applied to OpenJet's
+# projected decode tok/s. Measured ~2x on Qwen3.6 27B (33 tok/s -> 69 tok/s on
+# RTX 3090). Used for "would use" projections only, not the raw spec math.
+MTP_DECODE_SPEEDUP = 2.0
+
 
 @dataclass(frozen=True)
 class HardwarePerformanceProfile:
@@ -155,6 +160,7 @@ def estimate_token_generation_speed(
     model_key: str,
     context_window_tokens: int | None = None,
     hardware_memory_gb: float | None = None,
+    decode_speedup: float = 1.0,
 ) -> TokenGenerationEstimate:
     hardware = get_hardware_performance_profile(hardware_key)
     model = get_model_performance_profile(model_key)
@@ -163,6 +169,7 @@ def estimate_token_generation_speed(
         model=model,
         context_window_tokens=context_window_tokens,
         hardware_memory_gb=hardware_memory_gb,
+        decode_speedup=decode_speedup,
     )
 
 
@@ -172,6 +179,7 @@ def estimate_token_generation_speed_for_profiles(
     model: ModelPerformanceProfile,
     context_window_tokens: int | None = None,
     hardware_memory_gb: float | None = None,
+    decode_speedup: float = 1.0,
 ) -> TokenGenerationEstimate:
     workload = build_token_generation_workload(
         hardware=hardware,
@@ -189,6 +197,8 @@ def estimate_token_generation_speed_for_profiles(
     else:
         limiting_factor = "compute" if compute_bound <= bandwidth_bound else "memory"
         estimated = min(compute_bound, bandwidth_bound)
+    if decode_speedup > 1.0:
+        estimated *= float(decode_speedup)
 
     return TokenGenerationEstimate(
         hardware_key=workload.hardware_key,
@@ -257,6 +267,7 @@ def estimate_recommended_token_generation_speed(
     hardware_profile: str = "auto",
     hardware_override: str = "",
     cfg: Mapping[str, object] | None = None,
+    decode_speedup: float = MTP_DECODE_SPEEDUP,
 ) -> TokenGenerationEstimate:
     detected = _coerce_hardware_info(hardware)
     effective = effective_hardware_info(
@@ -285,6 +296,7 @@ def estimate_recommended_token_generation_speed(
         model_key=model_key,
         context_window_tokens=int(direct.get("context_window_tokens", 0) or 0) or None,
         hardware_memory_gb=_device_memory_budget_gb(effective, device=device),
+        decode_speedup=decode_speedup,
     )
 
 
@@ -321,9 +333,12 @@ def resolve_hardware_profile_key(
         raise ValueError(f"No token estimator hardware profile for override: {hardware_override}")
 
     device = recommended_device_for_hardware(hardware_profile, detected, hardware_override or None)
+    memory_gb = effective.total_ram_gb if device in {"cpu", "metal"} else effective.vram_mb / 1024.0
+    if memory_gb <= 0:
+        memory_gb = effective.total_ram_gb
     return _resolve_hardware_key_by_label_and_memory(
         label=effective.label,
-        memory_gb=effective.total_ram_gb if device == "cpu" else effective.vram_mb / 1024.0,
+        memory_gb=memory_gb,
         device=device,
     )
 
@@ -354,6 +369,16 @@ def _resolve_hardware_key_by_label_and_memory(*, label: str, memory_gb: float, d
         if normalized_label in labels:
             matched.append(row)
     if not matched:
+        same_device = [
+            row for row in _load_hardware_registry()
+            if _normalize_key(str(row["device"])) == normalized_device
+        ]
+        if same_device:
+            closest = min(
+                same_device,
+                key=lambda row: abs(float(row.get("memory_gb", 0.0) or 0.0) - float(memory_gb)),
+            )
+            return str(closest["key"])
         raise ValueError(f"No token estimator hardware profile for label={label!r} device={device!r}")
     exact = [
         row for row in matched

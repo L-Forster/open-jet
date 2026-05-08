@@ -14,7 +14,7 @@ class CommandSpec:
 
 
 COMMANDS: tuple[CommandSpec, ...] = (
-    CommandSpec(name="help", description="Show command help", aliases=("commands", "?")),
+    CommandSpec(name="help", description="Show command help", aliases=("cmds", "commands", "?")),
     CommandSpec(name="exit", description="Quit the app", aliases=("quit",)),
     CommandSpec(
         name="clear",
