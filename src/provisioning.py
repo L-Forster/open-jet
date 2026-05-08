@@ -693,6 +693,32 @@ def _patch_mtp_checkout(target_ref: str) -> None:
         vulkan_source.write_text(patched, encoding="utf-8")
 
 
+async def _clean_generated_mtp_patch() -> None:
+    rc, out, err = await _run_exec(
+        "git",
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        cwd=LLAMA_CPP_DIR,
+    )
+    if rc != 0:
+        raise RuntimeError((err or out).strip() or "Failed to inspect llama.cpp checkout.")
+    dirty_paths = {line[3:].strip() for line in out.splitlines() if len(line) >= 4}
+    if not dirty_paths:
+        return
+    if dirty_paths != {"ggml/src/ggml-vulkan/ggml-vulkan.cpp"}:
+        raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
+    rc, reset_out, reset_err = await _run_exec(
+        "git",
+        "checkout",
+        "--",
+        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        cwd=LLAMA_CPP_DIR,
+    )
+    if rc != 0:
+        raise RuntimeError((reset_err or reset_out).strip() or "Failed to reset managed llama.cpp MTP patch.")
+
+
 async def _sync_managed_llama_cpp_checkout(
     *,
     target_ref: str | None = None,
@@ -719,32 +745,11 @@ async def _sync_managed_llama_cpp_checkout(
             clear_status()
             raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
     else:
-        rc, out, err = await _run_exec(
-            "git",
-            "status",
-            "--porcelain",
-            "--untracked-files=no",
-            cwd=LLAMA_CPP_DIR,
-        )
-        if rc != 0:
+        try:
+            await _clean_generated_mtp_patch()
+        except RuntimeError as exc:
             clear_status()
-            raise RuntimeError((err or out).strip() or "Failed to inspect llama.cpp checkout.")
-        if out.strip():
-            dirty_paths = {line[3:].strip() for line in out.splitlines() if len(line) >= 4}
-            if _is_mtp_llama_cpp_ref(target_ref) and dirty_paths == {"ggml/src/ggml-vulkan/ggml-vulkan.cpp"}:
-                rc, reset_out, reset_err = await _run_exec(
-                    "git",
-                    "checkout",
-                    "--",
-                    "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
-                    cwd=LLAMA_CPP_DIR,
-                )
-                if rc != 0:
-                    clear_status()
-                    raise RuntimeError((reset_err or reset_out).strip() or "Failed to reset managed llama.cpp MTP patch.")
-            else:
-                clear_status()
-                raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
+            raise exc
 
     set_status("fetching llama.cpp")
     log.write("  [dim]Fetching llama.cpp refs...[/]")
@@ -1006,31 +1011,35 @@ async def _build_llama_server_from_source(
         clear_status=clear_status,
     )
 
-    build_dir = LLAMA_CPP_DIR / "build"
-    if build_dir.exists():
-        shutil.rmtree(build_dir)
-    build_dir.mkdir(parents=True, exist_ok=True)
-    set_status("configuring llama.cpp")
-    log.write("  [dim]Configuring build...[/]")
-    rc, out, err = await _run_exec(*_llama_cmake_args(hardware_info, device=device), cwd=build_dir)
-    if rc != 0:
+    try:
+        build_dir = LLAMA_CPP_DIR / "build"
+        if build_dir.exists():
+            shutil.rmtree(build_dir)
+        build_dir.mkdir(parents=True, exist_ok=True)
+        set_status("configuring llama.cpp")
+        log.write("  [dim]Configuring build...[/]")
+        rc, out, err = await _run_exec(*_llama_cmake_args(hardware_info, device=device), cwd=build_dir)
+        if rc != 0:
+            clear_status()
+            raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp")
+        set_status("building llama-server and llama-bench (this may take a few minutes)")
+        log.write("  [dim]Building llama-server and llama-bench (this may take a few minutes)...[/]")
+        jobs = os.cpu_count() or 4
+        rc, tail = await _run_build_with_progress(
+            *_llama_build_command(jobs),
+            cwd=build_dir,
+            set_status=set_status,
+            log=log,
+        )
         clear_status()
-        raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp")
-    set_status("building llama-server and llama-bench (this may take a few minutes)")
-    log.write("  [dim]Building llama-server and llama-bench (this may take a few minutes)...[/]")
-    jobs = os.cpu_count() or 4
-    rc, tail = await _run_build_with_progress(
-        *_llama_build_command(jobs),
-        cwd=build_dir,
-        set_status=set_status,
-        log=log,
-    )
-    clear_status()
-    if rc != 0:
-        built = _managed_source_llama_server_path()
-        if not built.is_file():
-            raise RuntimeError(tail.strip() or "Failed to build llama-server")
-    log.write("[bold bright_white]llama-server built successfully.[/]")
+        if rc != 0:
+            built = _managed_source_llama_server_path()
+            if not built.is_file():
+                raise RuntimeError(tail.strip() or "Failed to build llama-server")
+        log.write("[bold bright_white]llama-server built successfully.[/]")
+    finally:
+        if _is_mtp_llama_cpp_ref(synced_ref):
+            await _clean_generated_mtp_patch()
 
     built = _managed_source_llama_server_path()
     if not built.is_file():
