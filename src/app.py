@@ -170,14 +170,87 @@ class LogView:
     def __init__(self, console: Console) -> None:
         self.console = console
         self._entries: list[object] = []
+        self._entry_rows: list[int] = []
+        self._ephemeral_rows = 0
+
+    def _row_count(self, content: object) -> int:
+        if content is None or content == "":
+            return 1
+        lines = self.console.render_lines(content, self.console.options, pad=False)
+        return max(1, len(lines))
 
     def write(self, content: object, **_: object) -> "LogView":
         self._entries.append(content)
+        self._entry_rows.append(self._row_count(content))
         self.console.print(content)
         return self
 
+    def write_thought(self, block: dict) -> None:
+        self._entries.append(("__thought__", block))
+        rows = self._print_thought(block)
+        self._entry_rows.append(rows)
+
+    def _print_thought(self, block: dict) -> int:
+        idx = block["index"]
+        dur = block["duration"]
+        if block.get("expanded"):
+            header = rich_text(f"  ▾ Thought {idx} ({dur:.1f}s) — ctrl+t to collapse", "dim")
+            self.console.print(header)
+            rows = self._row_count(header)
+            for line in str(block["text"]).splitlines() or [""]:
+                body = rich_text(f"    {line}" if line else "", "dim")
+                self.console.print(body)
+                rows += self._row_count(body)
+            return rows
+        head = rich_text(f"Thought {idx} ({dur:.1f}s)", "dim")
+        line = f"  {rich_text('▸', 'muted')} {head} {rich_text('— ctrl+t to expand', 'muted')}"
+        self.console.print(line)
+        return self._row_count(line)
+
+    def rewrite_from_index(self, start_idx: int) -> None:
+        if start_idx < 0 or start_idx >= len(self._entries):
+            return
+        rows_to_clear = sum(self._entry_rows[start_idx:])
+        stream = self.console.file
+        if rows_to_clear > 0:
+            stream.write(f"\x1b[{rows_to_clear}A")
+            stream.write("\x1b[J")
+            stream.flush()
+        new_rows: list[int] = []
+        for entry in self._entries[start_idx:]:
+            if isinstance(entry, tuple) and entry and entry[0] == "__thought__":
+                new_rows.append(self._print_thought(entry[1]))
+            else:
+                self.console.print(entry)
+                new_rows.append(self._row_count(entry))
+        self._entry_rows[start_idx:] = new_rows
+
+    def write_ephemeral(self, content: object) -> None:
+        rendered = self.console.render_lines(content, self.console.options, pad=False)
+        self.console.print(content)
+        self._ephemeral_rows += max(1, len(rendered))
+
+    def _erase_ephemeral(self) -> None:
+        if self._ephemeral_rows <= 0:
+            return
+        stream = self.console.file
+        for _ in range(self._ephemeral_rows):
+            stream.write("\x1b[1A\x1b[2K")
+        stream.write("\r")
+        stream.flush()
+        self._ephemeral_rows = 0
+
+    def commit_ephemeral(self, replacement: object) -> None:
+        self._erase_ephemeral()
+        self.write(replacement)
+
+    def discard_ephemeral(self) -> None:
+        self._erase_ephemeral()
+
     def clear(self) -> None:
         self._entries.clear()
+        self._entry_rows.clear()
+        self._ephemeral_rows = 0
 
     def replace(self, index: int, content: object) -> None:
         self._entries[index] = content
@@ -372,6 +445,11 @@ class OpenJetApp:
         self._generation_decode_tokens_streamed = 0
         self._generation_tip_index = -1
         self._last_generation_tps: float | None = None
+        self._thought_blocks: list[dict[str, Any]] = []
+        self._active_thought_text: str = ""
+        self._active_thought_started_at: float | None = None
+        self._active_thought_lines: list[str] = []
+        self._active_thought_first_entry_idx: int | None = None
         self._session_prompt_tokens = 0
         self._session_completion_tokens = 0
         self._session_runtime_requests = 0
@@ -480,6 +558,19 @@ class OpenJetApp:
         )
         log.write(f"[dim]{self._EXIT_DISCORD_MESSAGE}[/]")
         log.write("")
+        self._update_lifetime_totals(prompt_tokens, completion_tokens, api_spend)
+
+    def _update_lifetime_totals(self, prompt_tokens: int, completion_tokens: int, api_spend: str) -> None:
+        import json
+        totals_path = Path(__file__).resolve().parent.parent / "totals.json"
+        totals = {"input_tokens": 0, "output_tokens": 0, "api_cost_usd": 0.0, "sessions": 0}
+        if totals_path.exists():
+            totals.update(json.loads(totals_path.read_text()))
+        totals["input_tokens"] += prompt_tokens
+        totals["output_tokens"] += completion_tokens
+        totals["api_cost_usd"] = round(totals["api_cost_usd"] + float(api_spend.lstrip("$")), 2)
+        totals["sessions"] += 1
+        totals_path.write_text(json.dumps(totals, indent=2))
 
     def _write_setup_success_message(self, log: LogView) -> None:
         log.write(f"[dim]{self._SETUP_SUCCESS_MESSAGE}[/]")
@@ -1626,6 +1717,45 @@ class OpenJetApp:
         lines = str(text).splitlines() or [""]
         return [f"{indent}{line}" if line else "" for line in lines]
 
+    def _expand_last_thought(self) -> None:
+        if not self._thought_blocks:
+            return
+        block = self._thought_blocks[-1]
+        block["expanded"] = not block.get("expanded", False)
+        log = self.query_one("#chat-log")
+        target_idx = -1
+        for i, entry in enumerate(log._entries):
+            if isinstance(entry, tuple) and entry and entry[0] == "__thought__" and entry[1] is block:
+                target_idx = i
+        if target_idx < 0:
+            return
+        log.rewrite_from_index(target_idx)
+        if self._session and self._session.app:
+            self._session.app.invalidate()
+
+    def _finalize_active_thought(self, log: "LogView") -> None:
+        if not self._active_thought_text and self._active_thought_started_at is None:
+            return
+        text = self._active_thought_text.strip()
+        first_idx = self._active_thought_first_entry_idx
+        if not text:
+            self._active_thought_text = ""
+            self._active_thought_started_at = None
+            self._active_thought_lines = []
+            self._active_thought_first_entry_idx = None
+            return
+        duration = 0.0
+        if self._active_thought_started_at is not None:
+            duration = max(0.0, time.monotonic() - self._active_thought_started_at)
+        idx = len(self._thought_blocks) + 1
+        block = {"text": text, "duration": duration, "index": idx, "expanded": False}
+        self._thought_blocks.append(block)
+        log.write_thought(block)
+        self._active_thought_text = ""
+        self._active_thought_started_at = None
+        self._active_thought_lines = []
+        self._active_thought_first_entry_idx = None
+
     def _current_tps(self) -> float | None:
         if (
             self._thinking_timer is not None
@@ -1735,8 +1865,8 @@ class OpenJetApp:
     def _print_pre_prompt_status(self) -> None:
         status = self.query_one("#assistant-status")
         if self._assistant_status_kind == "generating":
-            self.console.print(rich_text(self._generating_status_text(), "status"))
             self.console.print(rich_text(self._current_generating_tip(), "muted"))
+            self.console.print(rich_text(self._generating_status_text(), "status"))
             return
         elif not status.hidden and status.text:
             self.console.print(rich_text(status.text, "status"))
@@ -2466,6 +2596,9 @@ class OpenJetApp:
 
                 async for event in session.stream_existing_turn():
                     if event.kind == SDKEventKind.TEXT:
+                        if self._active_thought_text or self._active_thought_started_at is not None:
+                            reasoning_buf = ""
+                            self._finalize_active_thought(log)
                         if not assistant_header_written:
                             self._write_message_header(log, "OPENJET", "assistant")
                             assistant_header_written = True
@@ -2484,14 +2617,14 @@ class OpenJetApp:
                         if not assistant_header_written:
                             self._write_message_header(log, "OPENJET", "assistant")
                             assistant_header_written = True
+                        if self._active_thought_started_at is None:
+                            self._active_thought_started_at = time.monotonic()
+                            self._active_thought_first_entry_idx = len(log._entries)
+                        self._active_thought_text += event.text
                         reasoning_buf += event.text
                         while "\n" in reasoning_buf:
                             line, reasoning_buf = reasoning_buf.split("\n", 1)
-                            rendered, assistant_in_code_block = self._format_assistant_output_line(
-                                line,
-                                in_code_block=assistant_in_code_block,
-                            )
-                            log.write(rendered)
+                            log.write(rich_text(line, "dim"))
                         snippet = " ".join(event.text.split())
                         if snippet:
                             buf = (getattr(self, "_reasoning_tail", "") + " " + snippet).strip()
@@ -2501,13 +2634,9 @@ class OpenJetApp:
                         tokens = estimate_tokens(event.text)
                         self._record_generation_output_tokens(tokens)
                     elif event.kind == SDKEventKind.TOOL_REQUEST and event.tool_call:
-                        if reasoning_buf:
-                            rendered, assistant_in_code_block = self._format_assistant_output_line(
-                                reasoning_buf,
-                                in_code_block=assistant_in_code_block,
-                            )
-                            log.write(rendered)
+                        if self._active_thought_text or self._active_thought_started_at is not None:
                             reasoning_buf = ""
+                            self._finalize_active_thought(log)
                         if text_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
                                 text_buf,
@@ -2544,13 +2673,9 @@ class OpenJetApp:
                         should_retry = True
                         break
                     elif event.kind == SDKEventKind.ERROR:
-                        if reasoning_buf:
-                            rendered, assistant_in_code_block = self._format_assistant_output_line(
-                                reasoning_buf,
-                                in_code_block=assistant_in_code_block,
-                            )
-                            log.write(rendered)
+                        if self._active_thought_text or self._active_thought_started_at is not None:
                             reasoning_buf = ""
+                            self._finalize_active_thought(log)
                         if not overflow_condense_attempted and self._is_context_overflow_error(event.text):
                             result = await self.agent.condense_context(force=True)
                             log.write(f"  {rich_text(result, 'status')}")
@@ -2571,13 +2696,9 @@ class OpenJetApp:
                         self._finish_turn_trace(success=False, status="agent_error", error=event.text)
                         return
                     elif event.kind == SDKEventKind.DONE:
-                        if reasoning_buf:
-                            rendered, assistant_in_code_block = self._format_assistant_output_line(
-                                reasoning_buf,
-                                in_code_block=assistant_in_code_block,
-                            )
-                            log.write(rendered)
+                        if self._active_thought_text or self._active_thought_started_at is not None:
                             reasoning_buf = ""
+                            self._finalize_active_thought(log)
                         if text_buf:
                             rendered, assistant_in_code_block = self._format_assistant_output_line(
                                 text_buf,
@@ -3367,6 +3488,11 @@ class OpenJetApp:
 
         @bindings.add("enter", filter=generating)
         def _enter_generation(event) -> None:
+            event.current_buffer.reset()
+
+        @bindings.add("c-t")
+        def _expand_thought(event) -> None:
+            self._expand_last_thought()
             event.current_buffer.reset()
 
         @bindings.add("enter")

@@ -293,6 +293,7 @@ async def stream_openai_chat(
                 args_part = fn.get("arguments")
                 if isinstance(args_part, str) and args_part:
                     structured_tool_args[idx] = structured_tool_args.get(idx, "") + args_part
+                    yield StreamChunk(tool_args_delta=args_part)
 
             if finish_reason is None:
                 continue
