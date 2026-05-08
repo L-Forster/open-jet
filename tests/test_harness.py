@@ -856,7 +856,7 @@ class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(int(event["prompt_tokens"]) > 0 for event in runtime_events))
         self.assertTrue(all(int(event["completion_tokens"]) > 0 for event in runtime_events))
 
-    async def test_condense_context_keeps_most_recent_user_message(self) -> None:
+    async def test_condense_context_summarizes_current_turn_without_replaying_latest_user(self) -> None:
         client = FakeRuntimeClient([StreamChunk(text="summary text")])
         agent = Agent(client=client, system_prompt="system", context_window_tokens=4096)
         agent.messages = [
@@ -872,15 +872,23 @@ class AgentTurnContextTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Context condensed automatically.", message)
         self.assertIn("target<=", message)
-        self.assertIn("kept_latest_user=yes", message)
+        self.assertIn("kept_latest_user=no", message)
+        self.assertIsNotNone(client.last_messages)
+        condense_prompt = str(client.last_messages[-1]["content"])
+        self.assertIn("CURRENT TURN HANDOFF", condense_prompt)
+        self.assertIn("Latest user request: latest question", condense_prompt)
+        self.assertIn("Work after latest user request:", condense_prompt)
+        self.assertIn("assistant: tool planning", condense_prompt)
+        self.assertIn("tool result: tool result", condense_prompt)
+        self.assertIn("NEXT ACTION must say what should happen next for this same message turn", condense_prompt)
         self.assertEqual(agent.messages[0]["role"], "system")
         self.assertEqual(agent.messages[1]["role"], "system")
-        self.assertEqual(agent.messages[2]["role"], "user")
-        self.assertEqual(agent.messages[2]["content"], "latest question")
+        self.assertEqual(len(agent.messages), 2)
+        self.assertIn("summary text", agent.messages[1]["content"])
         report = agent.last_condense_report()
         self.assertIsNotNone(report)
         assert report is not None
-        self.assertTrue(report.kept_latest_user)
+        self.assertFalse(report.kept_latest_user)
 
     async def test_condense_context_includes_source_trail_in_saved_summary(self) -> None:
         client = FakeRuntimeClient([StreamChunk(text="GOAL:\ninspect training\nKEY FINDINGS:\n- found config")])

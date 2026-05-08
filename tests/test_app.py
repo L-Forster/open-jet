@@ -205,6 +205,38 @@ class AgentTraceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AppStatusTests(unittest.TestCase):
+    def test_toolbar_uses_compact_command_and_context_hints(self) -> None:
+        app = OpenJetApp()
+        app.agent = FakeBudgetAgent(estimated=1234)
+        app.client = SimpleNamespace(context_window_tokens=4096)
+
+        toolbar = app._toolbar_text().value
+
+        self.assertIn("/cmds", toolbar)
+        self.assertIn("ctx 1.2k/4.1k", toolbar)
+        self.assertIn("ctrl+c interrupt", toolbar)
+        self.assertNotIn("/commands", toolbar)
+        self.assertNotIn("ctrl+o open file", toolbar)
+        self.assertNotIn("enter send", toolbar)
+
+    def test_toolbar_omits_power_when_unavailable(self) -> None:
+        app = OpenJetApp()
+        app._utilization_visible = True
+        app.metrics = SimpleNamespace(
+            read_cpu_percent=lambda: 12.0,
+            read_battery_metrics=lambda: None,
+            read_power_metrics=lambda: (None, None),
+        )
+
+        toolbar = app._toolbar_text().value
+
+        self.assertNotIn("pwr n/a", toolbar)
+
+    def test_cmds_alias_opens_help(self) -> None:
+        app = OpenJetApp()
+
+        self.assertEqual(app.commands.resolve_command("cmds"), "help")
+
     def test_generating_status_renders_live_and_disappears_after_stop(self) -> None:
         app = OpenJetApp()
         token = app._start_thinking()
@@ -894,7 +926,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(payload["model_source"], "direct")
-        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M.gguf"))
+        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M-mtp.gguf"))
         self.assertGreater(int(payload["context_window_tokens"]), 6144)
 
     def test_choice_prompt_wraps_long_detail_lines(self) -> None:
@@ -1200,7 +1232,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="24GB", total_ram_gb=24.0, has_cuda=False))["label"],
-            "Qwen3.6 27B Q4_K_M",
+            "Qwen3.6 27B Q4_K_M MTP",
         )
 
     def test_recommend_direct_model_uses_12gb_27b_quant_on_gpu(self) -> None:
@@ -1225,7 +1257,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.6 27B Q4_K_M")
+        self.assertEqual(recommended["label"], "Qwen3.6 27B Q4_K_M MTP")
 
     def test_recommend_direct_model_uses_12gb_27b_quant_on_vulkan(self) -> None:
         recommended = recommend_direct_model(
@@ -1275,6 +1307,38 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(text.startswith("downloading model.gguf") for text in updates))
         self.assertTrue(any("50%" in str(call.args[0]) for call in log.write.call_args_list))
         download.assert_awaited_once()
+
+    async def test_ensure_direct_model_clears_old_gguf_files_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            old_model = model_dir / "old.gguf"
+            old_model.write_bytes(b"old")
+            unrelated = model_dir / "notes.txt"
+            unrelated.write_text("keep", encoding="utf-8")
+            target = model_dir / "new.gguf"
+            payload = {
+                "model_source": "direct",
+                "model_download_url": "https://huggingface.co/example/test-GGUF/resolve/main/new.gguf?download=true",
+                "model_download_path": str(target),
+                "setup_missing_model": True,
+            }
+
+            async def fake_download(**kwargs):
+                Path(kwargs["local_dir"], "new.gguf").write_bytes(b"new")
+                return 0, "", ""
+
+            with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download):
+                resolved = await ensure_direct_model(
+                    payload,
+                    log=Mock(),
+                    set_status=lambda _text: None,
+                    clear_status=lambda: None,
+                )
+
+            self.assertFalse(old_model.exists())
+            self.assertTrue(unrelated.exists())
+            self.assertEqual(target.read_bytes(), b"new")
+            self.assertEqual(resolved["llama_model"], str(target))
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):

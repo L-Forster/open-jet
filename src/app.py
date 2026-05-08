@@ -109,7 +109,7 @@ from .model_profiles import (
 from .memory_reflection import build_recorded_turn_payload, reflect_agent_persistent_memory
 from .observation import ObservationStore
 from .persistent_memory import build_system_prompt
-from .provisioning import provision_setup_artifacts
+from .provisioning import pending_direct_model_download_summary, provision_setup_artifacts
 from .skills_registry import resolve_skill_path
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
@@ -279,7 +279,7 @@ class OpenJetApp:
         "Tip: Use /resume to reload a saved chat checkpoint into the runtime.",
         "Tip: Use /mode to switch between chat, code, review, debug, and status workflows.",
         "Tip: Use /skill list to see available skills, then /skill load <name> to pin one.",
-        "Tip: Use /help or /commands to list the built-in slash commands.",
+        "Tip: Use /help or /cmds to list the built-in slash commands.",
         "Tip: Use /load <path> to load a file into context.",
         "Tip: Use /status to inspect runtime memory and context state.",
         "Tip: Use /clear to reset chat and flush the KV cache.",
@@ -1029,6 +1029,10 @@ class OpenJetApp:
             return
         if update is None:
             return
+        detail_lines = [f"Newer commit available: {update.local_short} -> {update.remote_short}"]
+        model_download_summary = pending_direct_model_download_summary(self.cfg)
+        if model_download_summary:
+            detail_lines.append(model_download_summary)
         selected = await _prompt_choice(
             self._new_detached_prompt_session(),
             self.console,
@@ -1037,7 +1041,7 @@ class OpenJetApp:
                 (f"Pull {update.remote}/{update.branch} and restart open-jet", "install"),
                 ("Skip for now", "skip"),
             ],
-            detail=f"Newer commit available: {update.local_short} -> {update.remote_short}",
+            detail=" ".join(detail_lines),
         )
         if selected != "install":
             if self.session_logger:
@@ -1504,7 +1508,7 @@ class OpenJetApp:
                 base += f" {minmax}"
             return base
         if watts is None:
-            return f"pwr n/a{(' ' + minmax) if minmax else ''}"
+            return minmax
         base = f"pwr {pct:4.1f}% ({watts:.1f}W)" if pct is not None else f"pwr {watts:.1f}W"
         if minmax:
             base += f" {minmax}"
@@ -1552,7 +1556,7 @@ class OpenJetApp:
         current_fn = getattr(self.agent, "estimated_context_tokens", None) if self.agent else None
         current = self._coerce_token_count(current_fn()) if callable(current_fn) else 0
         window = self.client.context_window_tokens if self.client else int(self.cfg.get("context_window_tokens", 2048))
-        return f"ctx {self._format_token_count(current)} / {self._format_token_count(window)}"
+        return f"ctx {self._format_token_count(current)}/{self._format_token_count(window)}"
 
     def _chrome_status_cells(self) -> list[tuple[str, str, str]]:
         air_state = "air-gapped" if self.is_airgapped() else "network-ok"
@@ -1642,7 +1646,7 @@ class OpenJetApp:
         )
 
     def _toolbar_text(self) -> HTML:
-        detail_parts: list[str] = ["/commands", "@ add context", "ctrl+o open file", "ctrl+c interrupt", "enter send"]
+        detail_parts: list[str] = ["/cmds", "@ add context", self._context_compact_label(), "ctrl+c interrupt"]
         if self._utilization_visible:
             cpu_pct = self.metrics.read_cpu_percent()
             mem = read_memory_snapshot()
@@ -1653,7 +1657,10 @@ class OpenJetApp:
             cpu_text = self._format_percent("cpu", cpu_pct)
             power_text = self._format_power_text(power_watts, power_pct, battery)
             device_text = str(self.cfg.get("device", "cpu")).upper()
-            detail_parts.append(f"{device_text} | {cpu_text} | {mem_text} | {self._format_tps_text()} | {power_text}")
+            metrics_parts = [device_text, cpu_text, mem_text, self._format_tps_text()]
+            if power_text:
+                metrics_parts.append(power_text)
+            detail_parts.append(" | ".join(metrics_parts))
         width = max(20, self.console.width)
         bottom_border = f"<prompt-border>╰{'─' * (width - 2)}╯</prompt-border>\n"
         return HTML(f"{bottom_border}<toolbar-note>{html.escape('    '.join(detail_parts))}</toolbar-note>")

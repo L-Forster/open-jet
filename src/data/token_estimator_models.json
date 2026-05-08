@@ -51,8 +51,18 @@
     "model_size_mb": 16896.0,
     "kv_bytes_per_token": 34816.0,
     "decode_context_tokens": 8192,
-    "source_urls": ["https://huggingface.co/lmstudio-community/Qwen3.6-27B-GGUF"],
-    "aliases": ["qwen3.6 27b", "qwen3.6 27b q4_k_m", "qwen3.6-27b-q4_k_m.gguf", "qwen3.6:27b"]
+    "source_urls": [
+      "https://huggingface.co/lmstudio-community/Qwen3.6-27B-GGUF",
+      "https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF"
+    ],
+    "aliases": [
+      "qwen3.6 27b",
+      "qwen3.6 27b q4_k_m",
+      "qwen3.6 27b q4_k_m mtp",
+      "qwen3.6-27b-q4_k_m.gguf",
+      "qwen3.6-27b-q4_k_m-mtp.gguf",
+      "qwen3.6:27b"
+    ]
   },
   {
     "key": "gemma4_26b_a4b_q4_k_s",

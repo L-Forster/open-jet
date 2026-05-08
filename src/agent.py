@@ -355,7 +355,6 @@ class Agent:
         provenance_tokens = estimate_tokens(provenance_note) if provenance_note else 0
         target_cap = max(96, self.condense_target_tokens - min(provenance_tokens, max(96, self.condense_target_tokens // 2)))
         target_tokens = max(96, min(target_cap, total_before // 2))
-        latest_user = self._latest_user_message()
         try:
             summary = await self._summarize_text(transcript, target_tokens=target_tokens)
         except Exception as exc:
@@ -368,8 +367,6 @@ class Agent:
         summary_tokens = estimate_tokens(summary)
         summary_msg = {"role": "system", "content": self._compose_condensed_context(summary, provenance_note)}
         self.messages = [self.messages[0], summary_msg]
-        if latest_user is not None:
-            self.messages.append(latest_user)
 
         total_after = self._estimated_context_tokens(include_turn_context=True)
         tighter_summary_used = False
@@ -386,8 +383,6 @@ class Agent:
                     self.messages[0],
                     {"role": "system", "content": self._compose_condensed_context(tighter_summary, provenance_note)},
                 ]
-                if latest_user is not None:
-                    self.messages.append(latest_user)
                 total_after = self._estimated_context_tokens(include_turn_context=True)
 
         report = CondenseReport(
@@ -398,7 +393,7 @@ class Agent:
             target_tokens=target_tokens,
             summary_tokens=summary_tokens,
             tighter_summary_used=tighter_summary_used,
-            kept_latest_user=latest_user is not None,
+            kept_latest_user=False,
             forced=force,
         )
         self._last_condense_report = report
@@ -553,13 +548,6 @@ class Agent:
                 return role
         return None
 
-    def _latest_user_message(self) -> dict | None:
-        for msg in reversed(self.messages):
-            if str(msg.get("role", "")) != "user":
-                continue
-            return {"role": "user", "content": msg.get("content", "")}
-        return None
-
     def _estimated_context_tokens(self, *, include_turn_context: bool = True) -> int:
         total = 0
         message_sets = [self.messages]
@@ -677,7 +665,67 @@ class Agent:
             text = self._compact_history_text(content_to_plain_text(msg.get("content", "")))
             if text:
                 lines.append(f"{role}: {text}")
+        current_turn = self._current_turn_handoff(older_messages)
+        if current_turn:
+            lines.extend(["", current_turn])
         return "\n".join(lines)
+
+    def _current_turn_handoff(self, older_messages: list[dict]) -> str:
+        latest_user_index = None
+        for index in range(len(older_messages) - 1, -1, -1):
+            if str(older_messages[index].get("role", "")).lower() == "user":
+                latest_user_index = index
+                break
+        if latest_user_index is None:
+            return ""
+
+        latest_user = self._compact_history_text(
+            content_to_plain_text(older_messages[latest_user_index].get("content", "")),
+            max_len=260,
+        )
+        turn_messages = older_messages[latest_user_index + 1 :]
+        lines = [
+            "CURRENT TURN HANDOFF",
+            f"Latest user request: {latest_user or '<empty>'}",
+        ]
+        if not turn_messages:
+            lines.append("Work after latest user request: none yet")
+        else:
+            lines.append("Work after latest user request:")
+            lines.extend(f"- {line}" for line in self._turn_action_lines(turn_messages)[-8:])
+        lines.append(
+            "Summarize this as in-progress context. NEXT ACTION must say what should happen next for this same message turn."
+        )
+        return "\n".join(lines)
+
+    def _turn_action_lines(self, messages: list[dict]) -> list[str]:
+        pending_tool_calls: list[tuple[str | None, str]] = []
+        action_lines: list[str] = []
+        for msg in messages:
+            role = str(msg.get("role", "")).lower()
+            if role == "assistant":
+                text = self._compact_history_text(content_to_plain_text(msg.get("content", "")), max_len=180)
+                if text:
+                    action_lines.append(f"assistant: {text}")
+                tool_calls = msg.get("tool_calls")
+                if isinstance(tool_calls, list):
+                    for raw_tool_call in tool_calls:
+                        tool_id, descriptor = self._tool_call_descriptor(raw_tool_call)
+                        pending_tool_calls.append((tool_id, descriptor))
+                        action_lines.append(f"tool call: {descriptor}")
+                continue
+            if role == "tool":
+                descriptor = self._consume_pending_tool_descriptor(
+                    pending_tool_calls,
+                    str(msg.get("tool_call_id", "")).strip() or None,
+                )
+                snapshot = self._tool_result_snapshot(content_to_plain_text(msg.get("content", "")), descriptor)
+                action_lines.append(f"tool result: {descriptor}; {'; '.join(snapshot[:2])}")
+                continue
+            text = self._compact_history_text(content_to_plain_text(msg.get("content", "")), max_len=180)
+            if text:
+                action_lines.append(f"{role}: {text}")
+        return action_lines
 
     def _compose_condensed_context(self, summary: str, provenance_note: str) -> str:
         parts = ["Condensed conversation context:"]
@@ -855,6 +903,9 @@ class Agent:
             f"Keep key facts, constraints, decisions, and learned findings. Target under {target_tokens} tokens.\n"
             "Use this exact structure:\n"
             "GOAL:\n"
+            "CURRENT TURN:\n"
+            "- latest user request\n"
+            "- work already done after that request\n"
             "KEY FINDINGS:\n"
             "- include concrete facts already learned\n"
             "- when a fact came from a tool or file, cite it inline like [source: read_file path=src/train.py]\n"
@@ -862,6 +913,7 @@ class Agent:
             "- list the important files, commands, or tool outputs already inspected\n"
             "OPEN QUESTIONS:\n"
             "NEXT ACTION:\n"
+            "- say what should happen next for this same message turn\n"
             "Do not restart exploration that has already happened. Preserve source provenance. Return only the summary."
         )
         messages = [

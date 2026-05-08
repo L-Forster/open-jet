@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 
@@ -209,6 +211,55 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         install_release.assert_not_called()
         self.assertFalse(app._quit_requested)
+
+    async def test_maybe_prompt_for_startup_update_detail_includes_pending_model_download_size(self) -> None:
+        app = OpenJetApp()
+        app.cfg["airgapped"] = False
+        app.cfg["logging"] = {"enabled": False}
+        update = RepoUpdateInfo(
+            remote="origin",
+            branch="master",
+            local_commit="1111111222222333333444444555555666666777",
+            remote_commit="aaaaaaa222222333333444444555556666666777",
+        )
+
+        async def immediate_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app.cfg.update(
+                {
+                    "model_source": "direct",
+                    "model_download_path": str(Path(tmp) / "new-model.gguf"),
+                    "model_size_mb": 5816,
+                }
+            )
+            with patch.object(app_module, "_open_jet_version", return_value="0.3.0"), patch.object(
+                app_module.asyncio,
+                "to_thread",
+                side_effect=immediate_to_thread,
+            ), patch.object(
+                app_module,
+                "available_update",
+                return_value=update,
+            ), patch.object(
+                app,
+                "_new_detached_prompt_session",
+                return_value=Mock(),
+            ), patch.object(
+                app_module,
+                "_prompt_choice",
+                AsyncMock(return_value="skip"),
+            ) as prompt_choice, patch.object(
+                app_module,
+                "install_update",
+            ):
+                await app._maybe_prompt_for_startup_update(app.query_one("#chat-log"))
+
+        self.assertIn(
+            "Newer commit available: 1111111 -> aaaaaaa Requires model download after restart: new-model.gguf (5.7 GB).",
+            prompt_choice.await_args.kwargs["detail"],
+        )
 
     async def test_maybe_prompt_for_startup_update_install_updates_and_quits_for_restart(self) -> None:
         app = OpenJetApp()
