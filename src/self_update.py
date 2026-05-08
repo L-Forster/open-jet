@@ -123,12 +123,6 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     if sys.platform == "darwin":
         return None
 
-    status = _has_tracked_changes(LLAMA_CPP_DIR)
-    if status is None:
-        raise RuntimeError("Failed to inspect managed llama.cpp checkout before update.")
-    if status:
-        raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
-
     target_ref = managed_llama_cpp_ref()
     current_ref = _llama_git_output(LLAMA_CPP_DIR, "rev-parse", "HEAD")
     if current_ref is None:
@@ -146,11 +140,8 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
         raise RuntimeError(missing_cuda_toolkit_message())
 
     try:
-        subprocess.run(
-            ["git", "fetch", "--tags", "--prune", "origin"],
-            cwd=LLAMA_CPP_DIR,
-            check=True,
-        )
+        shutil.rmtree(LLAMA_CPP_DIR)
+        subprocess.run(["git", "clone", "https://github.com/ggerganov/llama.cpp.git", str(LLAMA_CPP_DIR)], check=True)
         subprocess.run(
             ["git", "checkout", "--detach", target_ref],
             cwd=LLAMA_CPP_DIR,

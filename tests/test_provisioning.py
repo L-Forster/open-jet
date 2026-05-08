@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.hardware import HardwareInfo
-from src.provisioning import _llama_cmake_args, _patch_mtp_checkout, ensure_llama_server, recommend_direct_model
+from src.provisioning import _llama_cmake_args, ensure_llama_server, recommend_direct_model
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
@@ -50,30 +50,6 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("-DGGML_VULKAN=ON", args)
         self.assertNotIn("-DGGML_CUDA=ON", args)
-
-    def test_patch_mtp_checkout_removes_vulkan_spv_namespace_shadow(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            llama_dir = Path(tmp) / "llama.cpp"
-            source = llama_dir / "ggml" / "src" / "ggml-vulkan" / "ggml-vulkan.cpp"
-            source.parent.mkdir(parents=True)
-            source.write_text(
-                "std::vector<uint32_t> spv;\n"
-                "spv.assign(words, words + count);\n"
-                "uint32_t opcode = spv[pos] & spv::OpCodeMask;\n"
-                "spv.insert(spv.begin() + pos, item.begin(), item.end());\n"
-                "use(spv.size(), spv.data());\n",
-                encoding="utf-8",
-            )
-
-            with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir):
-                _patch_mtp_checkout("pull/22673/head")
-
-            patched = source.read_text(encoding="utf-8")
-
-        self.assertIn("std::vector<uint32_t> patched_spv;", patched)
-        self.assertIn("namespace openjet_spv", patched)
-        self.assertIn("patched_spv[pos] & openjet_spv::OpCodeMask", patched)
-        self.assertIn("patched_spv.insert(patched_spv.begin()", patched)
 
     async def test_ensure_llama_server_installs_prebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -224,3 +200,50 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["llama_server_path"], str(built))
         install_prebuilt.assert_not_awaited()
         self.assertEqual(sync_checkout.await_args.kwargs["target_ref"], "pull/22673/head")
+
+    async def test_ensure_llama_server_reuses_matching_source_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            llama_dir = Path(tmp) / "llama.cpp"
+            built = llama_dir / "build" / "bin" / "llama-server"
+            built.parent.mkdir(parents=True)
+            built.write_text("binary", encoding="utf-8")
+            (llama_dir / "build" / "openjet-llama-server.json").write_text(
+                '{"device": "cuda", "ref": "pull/22673/head"}',
+                encoding="utf-8",
+            )
+            bin_dir = Path(tmp) / "bin"
+            log = Mock()
+            hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
+
+            with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
+                "src.provisioning.BIN_DIR", bin_dir
+            ), patch(
+                "src.provisioning.LLAMA_SERVER_BIN", bin_dir / "llama-server"
+            ), patch(
+                "src.provisioning.LLAMA_CPP_TAG_FILE", bin_dir / "llama-server.tag"
+            ), patch(
+                "src.provisioning._needs_rebuild", return_value=False
+            ), patch(
+                "src.provisioning.current_llama_server_path", return_value="/usr/bin/llama-server"
+            ), patch(
+                "src.provisioning._install_prebuilt_llama_server",
+                AsyncMock(),
+            ) as install_prebuilt, patch(
+                "src.provisioning._build_llama_server_from_source",
+                AsyncMock(),
+            ) as build_source:
+                payload = await ensure_llama_server(
+                    {
+                        "device": "cuda",
+                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                    },
+                    hardware_info=hardware,
+                    log=log,
+                    set_status=lambda _message: None,
+                    clear_status=lambda: None,
+                )
+
+        self.assertEqual(payload["llama_cpp_ref"], "pull/22673/head")
+        self.assertEqual(payload["llama_server_path"], str(built))
+        install_prebuilt.assert_not_awaited()
+        build_source.assert_not_awaited()

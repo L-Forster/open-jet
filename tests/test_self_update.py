@@ -4,7 +4,13 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from src.self_update import RepoUpdateInfo, _has_tracked_changes, _install_command, available_update, update_from_latest_release
+from src.self_update import (
+    RepoUpdateInfo,
+    _has_tracked_changes,
+    _install_command,
+    available_update,
+    update_from_latest_release,
+)
 
 
 class SelfUpdateTests(unittest.TestCase):

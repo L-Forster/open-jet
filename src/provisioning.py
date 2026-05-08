@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import os
 import platform
 import re
@@ -643,80 +644,52 @@ def _managed_source_llama_server_path() -> Path:
     return direct
 
 
+def _source_build_tag_path() -> Path:
+    return LLAMA_CPP_DIR / "build" / "openjet-llama-server.json"
+
+
+def _source_build_tag() -> dict[str, str]:
+    try:
+        raw = _source_build_tag_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items()}
+
+
+def _write_source_build_tag(*, ref: str, device: str | None) -> None:
+    tag_path = _source_build_tag_path()
+    tag_path.parent.mkdir(parents=True, exist_ok=True)
+    tag_path.write_text(
+        json.dumps({"ref": ref, "device": (device or "auto").strip().lower() or "auto"}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _source_build_matches(
+    *,
+    hardware_info: HardwareInfo,
+    required_ref: str,
+    desired_device: str | None,
+) -> bool:
+    binary = _managed_source_llama_server_path()
+    if not binary.is_file():
+        return False
+    tag = _source_build_tag()
+    desired = (desired_device or "auto").strip().lower() or "auto"
+    if tag.get("ref") != required_ref or tag.get("device") != desired:
+        return False
+    return not _needs_rebuild(hardware_info, str(binary), device=desired_device)
+
+
 def _llama_build_command(jobs: int) -> list[str]:
     command = ["cmake", "--build", "."]
     if sys.platform == "win32":
         command.extend(["--config", "Release"])
     command.extend(["--target", "llama-server", "--target", "llama-bench", f"-j{jobs}"])
     return command
-
-
-def _patch_mtp_checkout(target_ref: str) -> None:
-    if not _is_mtp_llama_cpp_ref(target_ref):
-        return
-    vulkan_source = LLAMA_CPP_DIR / "ggml" / "src" / "ggml-vulkan" / "ggml-vulkan.cpp"
-    try:
-        text = vulkan_source.read_text(encoding="utf-8")
-    except OSError:
-        return
-    constants = (
-        "namespace openjet_spv {\n"
-        "static constexpr uint32_t OpCodeMask = 0xffffu;\n"
-        "static constexpr uint32_t WordCountShift = 16u;\n"
-        "static constexpr uint32_t OpExtension = 10u;\n"
-        "static constexpr uint32_t OpEntryPoint = 15u;\n"
-        "static constexpr uint32_t OpExecutionMode = 16u;\n"
-        "static constexpr uint32_t OpCapability = 17u;\n"
-        "static constexpr uint32_t OpExecutionModeId = 331u;\n"
-        "static constexpr uint32_t ExecutionModeRoundingModeRTE = 4462u;\n"
-        "static constexpr uint32_t CapabilityRoundingModeRTE = 4462u;\n"
-        "}\n"
-    )
-    patched = text
-    if "namespace openjet_spv {" not in patched:
-        if "#include <vector>\n" in patched:
-            patched = patched.replace("#include <vector>\n", f"#include <vector>\n\n{constants}", 1)
-        else:
-            patched = constants + patched
-    patched = patched.replace("spv::", "openjet_spv::")
-    patched = patched.replace("std::vector<uint32_t> spv;", "std::vector<uint32_t> patched_spv;")
-    for old, new in (
-        ("spv.assign", "patched_spv.assign"),
-        ("spv.size()", "patched_spv.size()"),
-        ("spv[pos", "patched_spv[pos"),
-        ("spv.insert", "patched_spv.insert"),
-        ("spv.begin()", "patched_spv.begin()"),
-        ("spv.data()", "patched_spv.data()"),
-    ):
-        patched = patched.replace(old, new)
-    if patched != text:
-        vulkan_source.write_text(patched, encoding="utf-8")
-
-
-async def _clean_generated_mtp_patch() -> None:
-    rc, out, err = await _run_exec(
-        "git",
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
-        cwd=LLAMA_CPP_DIR,
-    )
-    if rc != 0:
-        raise RuntimeError((err or out).strip() or "Failed to inspect llama.cpp checkout.")
-    dirty_paths = {line[3:].strip() for line in out.splitlines() if len(line) >= 4}
-    if not dirty_paths:
-        return
-    if dirty_paths != {"ggml/src/ggml-vulkan/ggml-vulkan.cpp"}:
-        raise RuntimeError("Cannot update managed llama.cpp checkout with local changes. Commit or stash them first.")
-    rc, reset_out, reset_err = await _run_exec(
-        "git",
-        "checkout",
-        "--",
-        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
-        cwd=LLAMA_CPP_DIR,
-    )
-    if rc != 0:
-        raise RuntimeError((reset_err or reset_out).strip() or "Failed to reset managed llama.cpp MTP patch.")
 
 
 async def _sync_managed_llama_cpp_checkout(
@@ -729,8 +702,9 @@ async def _sync_managed_llama_cpp_checkout(
     target_ref = _normalized_llama_cpp_ref(target_ref or managed_llama_cpp_ref())
     repo_exists = (LLAMA_CPP_DIR / ".git").is_dir()
 
-    if not repo_exists and LLAMA_CPP_DIR.exists():
-        raise RuntimeError(f"{LLAMA_CPP_DIR} exists but is not a git checkout.")
+    if LLAMA_CPP_DIR.exists():
+        shutil.rmtree(LLAMA_CPP_DIR)
+        repo_exists = False
 
     if not repo_exists:
         set_status("cloning llama.cpp")
@@ -744,12 +718,6 @@ async def _sync_managed_llama_cpp_checkout(
         if rc != 0:
             clear_status()
             raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
-    else:
-        try:
-            await _clean_generated_mtp_patch()
-        except RuntimeError as exc:
-            clear_status()
-            raise exc
 
     set_status("fetching llama.cpp")
     log.write("  [dim]Fetching llama.cpp refs...[/]")
@@ -770,7 +738,6 @@ async def _sync_managed_llama_cpp_checkout(
     if rc != 0:
         clear_status()
         raise RuntimeError((err or out).strip() or f"Failed to checkout llama.cpp ref {target_ref}.")
-    _patch_mtp_checkout(target_ref)
     return target_ref
 
 
@@ -1011,39 +978,36 @@ async def _build_llama_server_from_source(
         clear_status=clear_status,
     )
 
-    try:
-        build_dir = LLAMA_CPP_DIR / "build"
-        if build_dir.exists():
-            shutil.rmtree(build_dir)
-        build_dir.mkdir(parents=True, exist_ok=True)
-        set_status("configuring llama.cpp")
-        log.write("  [dim]Configuring build...[/]")
-        rc, out, err = await _run_exec(*_llama_cmake_args(hardware_info, device=device), cwd=build_dir)
-        if rc != 0:
-            clear_status()
-            raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp")
-        set_status("building llama-server and llama-bench (this may take a few minutes)")
-        log.write("  [dim]Building llama-server and llama-bench (this may take a few minutes)...[/]")
-        jobs = os.cpu_count() or 4
-        rc, tail = await _run_build_with_progress(
-            *_llama_build_command(jobs),
-            cwd=build_dir,
-            set_status=set_status,
-            log=log,
-        )
+    build_dir = LLAMA_CPP_DIR / "build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    set_status("configuring llama.cpp")
+    log.write("  [dim]Configuring build...[/]")
+    rc, out, err = await _run_exec(*_llama_cmake_args(hardware_info, device=device), cwd=build_dir)
+    if rc != 0:
         clear_status()
-        if rc != 0:
-            built = _managed_source_llama_server_path()
-            if not built.is_file():
-                raise RuntimeError(tail.strip() or "Failed to build llama-server")
-        log.write("[bold bright_white]llama-server built successfully.[/]")
-    finally:
-        if _is_mtp_llama_cpp_ref(synced_ref):
-            await _clean_generated_mtp_patch()
+        raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp")
+    set_status("building llama-server and llama-bench (this may take a few minutes)")
+    log.write("  [dim]Building llama-server and llama-bench (this may take a few minutes)...[/]")
+    jobs = os.cpu_count() or 4
+    rc, tail = await _run_build_with_progress(
+        *_llama_build_command(jobs),
+        cwd=build_dir,
+        set_status=set_status,
+        log=log,
+    )
+    clear_status()
+    if rc != 0:
+        built = _managed_source_llama_server_path()
+        if not built.is_file():
+            raise RuntimeError(tail.strip() or "Failed to build llama-server")
+    log.write("[bold bright_white]llama-server built successfully.[/]")
 
     built = _managed_source_llama_server_path()
     if not built.is_file():
         raise RuntimeError("llama-server build completed but binary was not found.")
+    _write_source_build_tag(ref=synced_ref, device=device)
     return built, synced_ref
 
 
@@ -1056,9 +1020,22 @@ async def ensure_llama_server(
     clear_status: Callable[[], None],
 ) -> dict[str, Any]:
     prebuilt_device = _prebuilt_runtime_device(hardware_info)
-    desired_device = prebuilt_device or str(setup_result.get("device") or "").strip().lower() or None
     required_ref = _llama_cpp_ref_for_setup(setup_result)
     requires_mtp_runtime = _setup_uses_mtp_model(setup_result) or _is_mtp_llama_cpp_ref(required_ref)
+    configured_device = str(setup_result.get("device") or "").strip().lower() or None
+    desired_device = configured_device or None
+    if not requires_mtp_runtime:
+        desired_device = prebuilt_device or desired_device
+    if _source_build_matches(
+        hardware_info=hardware_info,
+        required_ref=required_ref,
+        desired_device=desired_device,
+    ):
+        merged = dict(setup_result)
+        merged["llama_server_path"] = str(_managed_source_llama_server_path())
+        merged["setup_missing_runtime"] = False
+        merged["llama_cpp_ref"] = required_ref
+        return merged
     # Cache hit: managed binary + tag file present and binary doesn't need a GPU rebuild.
     if (
         not requires_mtp_runtime
