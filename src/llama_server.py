@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 
 from .airgap import apply_airgap_env, assert_endpoint_allowed
+from .app_paths import openjet_install_root
 from .runtime_protocol import StreamChunk, stream_openai_chat
 from .setup_memory import _max_context_tokens_from_gguf
 
@@ -25,7 +26,7 @@ _FULL_OFFLOAD_GPU_LAYERS = 99
 
 
 def _find_built_llama_binary(name: str) -> Path | None:
-    build_bin = Path.home() / "llama.cpp" / "build" / "bin"
+    build_bin = openjet_install_root() / "llama.cpp" / "build" / "bin"
     direct = build_bin / name
     if direct.is_file():
         return direct
@@ -44,7 +45,7 @@ def _find_llama_server() -> str:
     candidate = _find_built_llama_binary(_LLAMA_SERVER_EXE_NAME)
     if candidate is not None:
         return str(candidate)
-    raise FileNotFoundError("llama-server not found on PATH or ~/llama.cpp/build/bin/")
+    raise FileNotFoundError("llama-server not found on PATH or <openjet>/llama.cpp/build/bin/")
 
 
 class LlamaServerClient:

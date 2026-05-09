@@ -47,7 +47,7 @@ def _fmt_mb_size(mb: float) -> str:
 OPENJET_HOME = openjet_install_root()
 MODELS_DIR = OPENJET_HOME / "models"
 BIN_DIR = OPENJET_HOME / "bin"
-LLAMA_CPP_DIR = Path.home() / "llama.cpp"
+LLAMA_CPP_DIR = OPENJET_HOME / "llama.cpp"
 LLAMA_SERVER_EXE_NAME = "llama-server.exe" if sys.platform == "win32" else "llama-server"
 LLAMA_SERVER_BIN = BIN_DIR / LLAMA_SERVER_EXE_NAME
 LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
@@ -320,7 +320,7 @@ def current_llama_server_path() -> str | None:
     found = shutil.which("llama-server")
     if found:
         return found
-    fallback = Path.home() / "llama.cpp" / "build" / "bin" / LLAMA_SERVER_EXE_NAME
+    fallback = LLAMA_CPP_DIR / "build" / "bin" / LLAMA_SERVER_EXE_NAME
     if fallback.is_file():
         return str(fallback)
     if LLAMA_SERVER_BIN.is_file():

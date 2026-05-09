@@ -31,7 +31,7 @@ def _find_llama_binary(cfg: dict, name: str) -> str:
         return str(candidate)
     raise FileNotFoundError(
         f"{name} not found. Build it with:\n"
-        f"  cd ~/llama.cpp && cmake --build build --target {name}\n"
+        f"  cd $OPENJET/llama.cpp && cmake --build build --target {name}\n"
         f"Or ensure {name} is on your PATH."
     )
 
@@ -43,7 +43,7 @@ def _find_llama_bench(cfg: dict) -> str:
         pass
     raise FileNotFoundError(
         "llama-bench not found. Build it with:\n"
-        "  cd ~/llama.cpp && cmake --build build --target llama-bench\n"
+        "  cd $OPENJET/llama.cpp && cmake --build build --target llama-bench\n"
         "Or ensure llama-bench is on your PATH."
     )
 
