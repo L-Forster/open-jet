@@ -20,7 +20,7 @@ RICH_THEME = Theme(
         "dim": "#8a928c",
         "warning": "bold #facc15",
         "error": "bold #fca5a5",
-        "success": "bold #9be7b2",
+        "success": "bold white",
         "diff_add": "#7ee09a",
         "diff_remove": "#ef4444",
         "diff_add_body": "#dcfce7 on #14361e",
@@ -43,7 +43,7 @@ RICH_THEME = Theme(
         "chrome_border": "#4a514d",
         "chrome_label": "bold #a3aaa5",
         "chrome_value": "#e5e7eb",
-        "chrome_accent": "bold #9be7b2",
+        "chrome_accent": "bold white",
         "chrome_warning": "bold #fde68a",
     }
 )
