@@ -14,6 +14,9 @@ from .model_profiles import list_model_profiles, sync_active_model_profile
 from .peripherals.system import device_discovery_hint
 from .runtime_registry import RUNTIME_LABEL, active_model_ref
 from .self_update import update_from_latest_release
+from .skills.registry import SkillRegistry
+from .skills.tools import skill_view
+from .skills.validate import create_skill_scaffold, format_diagnostics, validate_all, validate_skill
 from .surfaces import launch_tui
 from .surfaces.command_specs import COMMANDS
 from .workflows import (
@@ -136,6 +139,37 @@ def _format_workflow_show(spec) -> str:
         spec.body.strip() or "(empty workflow body)",
     ]
     return "\n".join(lines)
+
+
+def _format_skill_list(root: Path) -> str:
+    skills = SkillRegistry(root).list()
+    if not skills:
+        return "No skills discovered."
+    lines = ["Discovered skills:"]
+    for skill in skills:
+        lines.append(
+            f"- {skill.name}: {skill.description} | source={skill.source_kind} | "
+            f"format={skill.format} | dir={skill.source_label}"
+        )
+    return "\n".join(lines)
+
+
+def _format_skill_validate(root: Path, name: str) -> str:
+    result = validate_skill(root, name)
+    status = "valid" if result.ok else "invalid"
+    path = f"\nPath: {result.path}" if result.path else ""
+    return f"Skill {name}: {status}{path}\n{format_diagnostics(result.diagnostics)}"
+
+
+def _format_skill_doctor(root: Path) -> str:
+    registry = SkillRegistry(root)
+    result = registry.discover(include_invalid=True, include_unsupported=True)
+    validation = validate_all(root)
+    lines = [
+        f"Skills discovered: {len(result.skills)} active, {len(result.all_skills)} total candidates.",
+        format_diagnostics(validation.diagnostics),
+    ]
+    return "\n".join(line for line in lines if line)
 
 
 def _format_single_workflow_status(spec, status: WorkflowStatus | None) -> str:
@@ -367,6 +401,19 @@ def build_parser() -> argparse.ArgumentParser:
     device_on_parser.add_argument("device_id", help="current device id")
     device_off_parser = device_subparsers.add_parser("off", help="disable a device")
     device_off_parser.add_argument("device_id", help="current device id")
+    skill_parser = subparsers.add_parser("skill", aliases=("skills",), help="list, view, create, and validate OpenJet skills")
+    skill_subparsers = skill_parser.add_subparsers(dest="skill_action")
+    skill_subparsers.add_parser("list", help="list discovered skills")
+    skill_view_parser = skill_subparsers.add_parser("view", help="show a skill SKILL.md or legacy skill body")
+    skill_view_parser.add_argument("name", help="skill name")
+    skill_view_parser.add_argument("file_path", nargs="?", help="optional file path under a standard skill directory")
+    skill_create_parser = skill_subparsers.add_parser("create", help="scaffold a standard Agent Skills directory")
+    skill_create_parser.add_argument("name", help="new skill name")
+    skill_validate_parser = skill_subparsers.add_parser("validate", help="validate a discovered skill")
+    skill_validate_parser.add_argument("name", help="skill name")
+    skill_subparsers.add_parser("doctor", help="show skill discovery diagnostics")
+    from .mcp_support.cli import add_mcp_subparser
+    add_mcp_subparser(subparsers)
     workflow_parser = subparsers.add_parser("workflow", help="run Markdown-defined workflows over the shared device backend")
     workflow_subparsers = workflow_parser.add_subparsers(dest="workflow_action")
     workflow_subparsers.add_parser("list", help="list discovered workflow Markdown files")
@@ -458,6 +505,35 @@ def main(argv: list[str] | None = None) -> None:
         except ValueError as exc:
             raise SystemExit(str(exc))
         raise SystemExit("Usage: open-jet device [list|add <existing_id> <new_id>|on <id>|off <id>]")
+    if args.command in {"skill", "skills"}:
+        root = _workflow_root()
+        action = str(getattr(args, "skill_action", "") or "list").strip().lower()
+        try:
+            if action == "list":
+                print(_format_skill_list(root))
+                return
+            if action == "view":
+                payload = skill_view(str(args.name), file_path=getattr(args, "file_path", None), root=root)
+                print(str(payload["content"]).rstrip())
+                return
+            if action == "create":
+                skill_root = create_skill_scaffold(root, str(args.name))
+                print(f"Created skill {args.name} at {skill_root}")
+                return
+            if action == "validate":
+                print(_format_skill_validate(root, str(args.name)))
+                return
+            if action == "doctor":
+                print(_format_skill_doctor(root))
+                return
+        except ValueError as exc:
+            raise SystemExit(str(exc))
+        raise SystemExit("Usage: open-jet skill [list|view <name> [file_path]|create <name>|validate <name>|doctor]")
+    if args.command == "mcp":
+        from .mcp_support.cli import run_mcp_cli
+
+        run_mcp_cli(args)
+        return
     if args.command == "workflow":
         root = _workflow_root()
         action = str(getattr(args, "workflow_action", "") or "list").strip().lower()

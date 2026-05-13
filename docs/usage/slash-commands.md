@@ -20,6 +20,7 @@
 - `/air-gapped [status|true|false]` control air-gapped mode
 - `/mode [chat|code|review|debug|status]` set harness mode
 - `/plan [status|on|approve|reject]` inspect or control read-only plan mode
+- `/mcp status` show configured MCP server status
 - `/skill [status|list|clear|load <name[,name...]>|<name[,name...]>]` inspect, load into the current chat, and pin harness skills
 - `/skills [status|list|clear|load <name[,name...]>|<name[,name...]>]` alias for `/skill`
 - `/todo [status|clear]` inspect or clear the current todo ledger

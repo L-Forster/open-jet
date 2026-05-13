@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,8 @@ from .peripherals import PeripheralKind, PeripheralTransport
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import update_persistent_memory
 from .runtime_protocol import ToolCall
+from .skills.tools import skill_view as _skill_view
+from .skills.tools import skills_list as _skills_list
 from .tools.registry import bind_tool_executor, get_tool_spec
 
 if TYPE_CHECKING:
@@ -127,6 +130,11 @@ def format_tool_args(tool_call: ToolCall) -> str:
             return " ".join(part for part in (action, location, scope) if part)
         case "read_file" | "write_file" | "load_file" | "edit_file":
             return str(args.get("path", str(args)))
+        case "skill_view":
+            file_path = str(args.get("file_path", "") or "").strip()
+            return f"{args.get('name')}/{file_path}" if file_path else str(args.get("name", str(args)))
+        case "skills_list":
+            return "available skills"
         case "glob" | "grep":
             return str(args.get("pattern", str(args)))
         case "list_directory":
@@ -707,6 +715,24 @@ def _device_list_result(args: dict[str, Any]) -> ToolExecutionResult:
     return ToolExecutionResult(output=text, meta=meta)
 
 
+def _skills_list_result(args: dict[str, Any]) -> ToolExecutionResult:
+    del args
+    payload = _skills_list(root=Path.cwd())
+    return ToolExecutionResult(
+        output=json.dumps(payload, ensure_ascii=False, indent=2),
+        meta={"ok": True, "count": len(payload.get("skills", []))},
+    )
+
+
+def _skill_view_result(args: dict[str, Any]) -> ToolExecutionResult:
+    name = _str_arg(args, "name", required=True, allow_empty=False)
+    payload = _skill_view(name or "", file_path=_str_arg(args, "file_path"), root=Path.cwd())
+    return ToolExecutionResult(
+        output=f"{payload['path']}\ncontent:\n{payload['content']}",
+        meta={"ok": True, "name": payload["name"], "path": payload["path"], "format": payload["format"]},
+    )
+
+
 def _bind_tool_executors() -> None:
     bind_tool_executor("shell", _shell_result)
     bind_tool_executor("system_info", _system_info_result)
@@ -717,6 +743,8 @@ def _bind_tool_executors() -> None:
     bind_tool_executor("gpio_read", lambda args: _device_tool_result("gpio_read", args))
     bind_tool_executor("microphone_set_enabled", _microphone_set_enabled_result)
     bind_tool_executor("read_file", _read_file_result)
+    bind_tool_executor("skills_list", _skills_list_result)
+    bind_tool_executor("skill_view", _skill_view_result)
     bind_tool_executor("memory", _memory_result)
     bind_tool_executor("todo_write", _control_tool_result)
     bind_tool_executor("todo_complete", _control_tool_result)

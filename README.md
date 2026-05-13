@@ -135,6 +135,8 @@ An agent in your terminal that can actually do useful work:
 - **Connect to devices**  
   Cameras, microphones, GPIO, and remote devices for edge and embedded workflows
 
+- **Connect MCP tools** - optionally expose trusted MCP server tools through OpenJet's normal tool registry
+
 - **Use the Python SDK**  
   Automate the same runtime from scripts and external apps
 
@@ -185,6 +187,8 @@ Everything runs on your machine.
 ### CLI + chat TUI
 - [Usage: CLI](docs/usage/cli.md)
 - [Usage: Slash commands](docs/usage/slash-commands.md)
+- [Usage: Skills](docs/usage/skills.md)
+- [Usage: MCP](docs/usage/mcp.md)
 - [Usage: Device sources](docs/usage/device-sources.md)
 - [Usage: Workflow harness](docs/usage/workflow-harness.md)
 - [Usage: Session state and logging](docs/usage/session-state-and-logging.md)

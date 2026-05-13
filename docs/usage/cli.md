@@ -64,6 +64,29 @@ openjet device off <id>
 
 Run `openjet device list` first. Use the current id shown on the left as `<existing_id>` if you want to rename a device for chat.
 
+MCP server helpers:
+
+```bash
+openjet mcp list
+openjet mcp test <server>
+openjet mcp add-stdio <name> -- <command> [args...]
+openjet mcp remove <server>
+```
+
+MCP is disabled by default. These helpers read layered MCP config from `~/.openjet/mcp.yaml`, `.openjet/mcp.yaml`, and legacy `config.yaml` entries. `add-stdio` and `remove` write the project `.openjet/mcp.yaml`. See [mcp.md](mcp.md).
+
+Skill helpers:
+
+```bash
+openjet skill list
+openjet skill view <name> [file_path]
+openjet skill create <name>
+openjet skill validate <name>
+openjet skill doctor
+```
+
+Skills are loaded from `.openjet/skills`, `.agents/skills`, `~/.openjet/skills`, `~/.agents/skills`, and bundled install skills. `create` writes project skills to `.openjet/skills`. See [skills.md](skills.md).
+
 Backend workflow commands:
 
 ```bash

@@ -36,6 +36,11 @@ dependencies = [
     "tiktoken>=0.7",
 ]
 
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.0",
+]
+
 [project.urls]
 Homepage = "https://openjet.dev/"
 Website = "https://openjet.dev/"

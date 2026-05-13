@@ -259,10 +259,10 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunks[-1].tool_calls[0].name, "grep")
         self.assertEqual(chunks[-1].tool_calls[0].arguments, {"pattern": "wrong"})
 
-    async def test_stream_openai_chat_ignores_native_tool_calls_without_xml(self) -> None:
+    async def test_stream_openai_chat_extracts_native_tool_calls_without_xml(self) -> None:
         http = _FakeHTTPClient(
             [
-                'data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\\"path\\":\\"index.html\\""}}]}}]}',
+                'data: {"choices":[{"finish_reason":null,"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"write_file","arguments":"{\\"path\\":\\"index.html\\"}"}}]}}]}',
                 'data: {"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}',
                 "data: [DONE]",
             ]
@@ -280,4 +280,7 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         self.assertTrue(chunks[-1].done)
-        self.assertEqual(chunks[-1].tool_calls, [])
+        self.assertEqual(len(chunks[-1].tool_calls), 1)
+        self.assertEqual(chunks[-1].tool_calls[0].name, "write_file")
+        self.assertEqual(chunks[-1].tool_calls[0].arguments, {"path": "index.html"})
+        self.assertEqual(chunks[-1].tool_calls[0].id, "call_1")

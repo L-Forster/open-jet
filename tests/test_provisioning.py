@@ -20,7 +20,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         direct = recommend_direct_model(hardware)
 
-        self.assertEqual(direct["label"], "Qwen3.6 35B A3B")
+        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-Q3_K_XL")
         self.assertTrue(direct["llama_cpu_moe"])
 
     def test_recommend_direct_model_uses_q3_moe_when_unified_memory_needs_system_reserve(self) -> None:
@@ -33,8 +33,8 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         direct = recommend_direct_model(hardware)
 
-        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-Q3_K_XL")
-        self.assertEqual(direct["filename"], "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf")
+        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-IQ2_XXS")
+        self.assertEqual(direct["filename"], "Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf")
         self.assertTrue(direct["llama_cpu_moe"])
 
     def test_llama_cmake_args_honor_selected_vulkan_on_cuda_host(self) -> None:

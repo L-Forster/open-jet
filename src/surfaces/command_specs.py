@@ -68,6 +68,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(name="edit-model", description="Edit a saved model preset: /edit-model [name]"),
     CommandSpec(name="mode", description="Show or set harness mode: /mode [chat|code|review|debug|status]; shell stays approval-gated in chat"),
     CommandSpec(name="plan", description="Inspect or control plan mode: /plan [status|on|approve|reject]"),
+    CommandSpec(name="mcp", description="Show MCP server status: /mcp status"),
     CommandSpec(name="skills", description="Alias for /skill [status|list|clear|load <name[,name...]>|<name[,name...]>]"),
     CommandSpec(name="skill", description="Inspect, load, or pin harness skills: /skill [status|list|clear|load <name[,name...]>|<name[,name...]>]"),
     CommandSpec(name="todo", description="Inspect or clear the todo ledger: /todo [status|clear]"),

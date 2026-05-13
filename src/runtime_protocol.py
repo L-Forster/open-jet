@@ -4,29 +4,68 @@ import html
 import json
 import re
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterator, Sequence
 
 import httpx
 
 from .runtime_limits import estimate_tokens
 from .tools.registry import all_tool_names, runtime_tool_schemas
 
-TOOLS = runtime_tool_schemas()
-TOOL_NAMES = frozenset(all_tool_names())
-TOOL_PARAM_TYPES = {
-    str(function.get("name", "")).strip(): {
-        str(param_name): str(spec.get("type", "")).strip()
-        for param_name, spec in (
-            (function.get("parameters", {}) if isinstance(function, dict) else {}).get("properties", {})
-            if isinstance((function.get("parameters", {}) if isinstance(function, dict) else {}).get("properties", {}), dict)
-            else {}
-        ).items()
-        if isinstance(spec, dict)
-    }
-    for tool in TOOLS
-    for function in [tool.get("function", {}) if isinstance(tool, dict) else {}]
-    if isinstance(function, dict) and str(function.get("name", "")).strip()
-}
+
+def current_tools() -> list[dict[str, object]]:
+    return runtime_tool_schemas()
+
+
+def current_tool_names() -> frozenset[str]:
+    return frozenset(all_tool_names())
+
+
+def current_tool_param_types() -> dict[str, dict[str, str]]:
+    param_types: dict[str, dict[str, str]] = {}
+    for tool in current_tools():
+        function = tool.get("function", {}) if isinstance(tool, dict) else {}
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name", "")).strip()
+        if not name:
+            continue
+        parameters = function.get("parameters", {})
+        properties = parameters.get("properties", {}) if isinstance(parameters, dict) else {}
+        if not isinstance(properties, dict):
+            param_types[name] = {}
+            continue
+        param_types[name] = {
+            str(param_name): str(spec.get("type", "")).strip()
+            for param_name, spec in properties.items()
+            if isinstance(spec, dict)
+        }
+    return param_types
+
+
+class _DynamicTools(Sequence[dict[str, object]]):
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        return iter(current_tools())
+
+    def __len__(self) -> int:
+        return len(current_tools())
+
+    def __getitem__(self, index):
+        return current_tools()[index]
+
+
+class _DynamicToolNames:
+    def __contains__(self, name: object) -> bool:
+        return str(name) in current_tool_names()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(current_tool_names())
+
+    def __len__(self) -> int:
+        return len(current_tool_names())
+
+
+TOOLS: Sequence[dict[str, object]] = _DynamicTools()
+TOOL_NAMES = _DynamicToolNames()
 
 
 def tool_guidelines_xml() -> str:
@@ -35,7 +74,7 @@ def tool_guidelines_xml() -> str:
         "  <format><tool_call><function=tool_name><parameter=parameter_name>value</parameter></function></tool_call></format>",
         "  <tools>",
     ]
-    for tool in TOOLS:
+    for tool in current_tools():
         function = tool.get("function", {}) if isinstance(tool, dict) else {}
         if not isinstance(function, dict):
             continue
@@ -62,7 +101,39 @@ def tool_guidelines_xml() -> str:
     return "\n".join(lines)
 
 
-TOOL_GUIDELINES_XML = tool_guidelines_xml()
+class _DynamicGuidelinesXml:
+    def __str__(self) -> str:
+        return tool_guidelines_xml()
+
+    def __repr__(self) -> str:
+        return repr(str(self))
+
+    def __contains__(self, item: object) -> bool:
+        return str(item) in str(self)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(str(self))
+
+    def __len__(self) -> int:
+        return len(str(self))
+
+    def __bool__(self) -> bool:
+        return bool(str(self))
+
+    def __eq__(self, other: object) -> bool:
+        return str(self) == str(other)
+
+    def __add__(self, other: object) -> str:
+        return str(self) + str(other)
+
+    def __radd__(self, other: object) -> str:
+        return str(other) + str(self)
+
+    def __getattr__(self, name: str):
+        return getattr(str(self), name)
+
+
+TOOL_GUIDELINES_XML = _DynamicGuidelinesXml()
 
 
 @dataclass
@@ -90,24 +161,28 @@ _TOOL_CALL_MARKER_OVERLAP = len(_TOOL_CALL_MARKER) - 1
 
 
 def tool_schema_token_estimate() -> int:
-    return estimate_tokens(TOOL_GUIDELINES_XML)
+    return estimate_tokens(tool_guidelines_xml())
 
 
 def _messages_with_tool_guidelines(messages: list[dict]) -> list[dict]:
+    guidelines = tool_guidelines_xml()
     if not messages:
-        return [{"role": "system", "content": TOOL_GUIDELINES_XML}]
+        return [{"role": "system", "content": guidelines}]
     first = messages[0]
     if isinstance(first, dict) and first.get("role") == "system":
         merged = dict(first)
-        merged["content"] = f"{first.get('content', '')}\n\n{TOOL_GUIDELINES_XML}".strip()
+        merged["content"] = f"{first.get('content', '')}\n\n{guidelines}".strip()
         return [merged, *messages[1:]]
-    return [{"role": "system", "content": TOOL_GUIDELINES_XML}, *messages]
+    return [{"role": "system", "content": guidelines}, *messages]
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
+    tool_names = current_tool_names()
+    tool_param_types = current_tool_param_types()
+
     def coerce(tool_name: str, param_name: str, raw: str) -> object:
         value = html.unescape(raw.strip())
-        param_type = TOOL_PARAM_TYPES.get(tool_name, {}).get(param_name, "")
+        param_type = tool_param_types.get(tool_name, {}).get(param_name, "")
         if param_type == "integer" and re.fullmatch(r"-?\d+", value):
             return int(value)
         if param_type == "boolean" and value.lower() in {"true", "false"}:
@@ -125,7 +200,7 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
         function_match = _FUNCTION_BLOCK_RE.search(block)
         if function_match:
             name = function_match.group(1).strip()
-            if not name or name not in TOOL_NAMES:
+            if not name or name not in tool_names:
                 continue
             arguments: dict[str, object] = {}
             for param_name, param_value in _PARAMETER_BLOCK_RE.findall(function_match.group(2)):
@@ -136,7 +211,7 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
             tool_calls.append(ToolCall(name=name, arguments=arguments))
             continue
 
-        json_call = _parse_json_tool_call(block, TOOL_NAMES)
+        json_call = _parse_json_tool_call(block, tool_names)
         if json_call is not None:
             tool_calls.append(json_call)
 
@@ -146,7 +221,7 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
         if any(s <= start < e for s, e in consumed_spans):
             continue
         tail = text[open_match.end():]
-        json_call = _parse_json_tool_call(tail, TOOL_NAMES)
+        json_call = _parse_json_tool_call(tail, tool_names)
         if json_call is not None:
             tool_calls.append(json_call)
     return tool_calls
@@ -209,7 +284,6 @@ async def stream_openai_chat(
     structured_tool_args: dict[int, str] = {}
     structured_tool_names: dict[int, str] = {}
     structured_tool_ids: dict[int, str] = {}
-
     async with http.stream(
         "POST",
         f"{base_url}/v1/chat/completions",
@@ -280,7 +354,10 @@ async def stream_openai_chat(
             for tc in delta.get("tool_calls", []) or []:
                 if not isinstance(tc, dict):
                     continue
-                idx = int(tc.get("index", 0))
+                try:
+                    idx = int(tc.get("index", len(structured_tool_names)))
+                except (TypeError, ValueError):
+                    idx = len(structured_tool_names)
                 tc_id = tc.get("id")
                 if isinstance(tc_id, str) and tc_id:
                     structured_tool_ids[idx] = tc_id
@@ -303,21 +380,22 @@ async def stream_openai_chat(
                 text_emit_buffer = ""
 
             tool_calls = parse_tool_calls(f"{content_buf}\n{reasoning_buf}") if use_tools else []
-            for idx in sorted(structured_tool_names):
-                name = structured_tool_names.get(idx, "").strip()
-                if not name or name not in TOOL_NAMES:
-                    continue
-                args_raw = structured_tool_args.get(idx, "")
-                if args_raw:
-                    try:
-                        args = json.loads(args_raw)
-                    except json.JSONDecodeError:
-                        args = {"raw": args_raw}
-                else:
-                    args = {}
-                if not isinstance(args, dict):
-                    args = {"value": args}
-                tool_calls.append(ToolCall(name=name, arguments=args, id=structured_tool_ids.get(idx)))
-
+            if use_tools and not tool_calls:
+                tool_names = current_tool_names()
+                for idx in sorted(structured_tool_names):
+                    name = structured_tool_names.get(idx, "").strip()
+                    if not name or name not in tool_names:
+                        continue
+                    args_raw = structured_tool_args.get(idx, "")
+                    if args_raw:
+                        try:
+                            args = json.loads(args_raw)
+                        except json.JSONDecodeError:
+                            args = {"raw": args_raw}
+                    else:
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {"value": args}
+                    tool_calls.append(ToolCall(name=name, arguments=args, id=structured_tool_ids.get(idx)))
             yield StreamChunk(tool_calls=tool_calls, done=True)
             return

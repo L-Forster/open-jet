@@ -992,11 +992,13 @@ def normalize_skill_name(name: str) -> str:
 
 
 def allowed_tools_for_mode(mode: str | None) -> set[str]:
-    allowed = set(CONFIRMATION_GATED_TOOLS)
+    allowed = set(confirmation_required_tool_names())
     if mode:
-        return allowed | set(TOOL_BUNDLES.get(str(mode).strip().lower(), set()))
+        return allowed | set(tool_bundle_names_for_mode(str(mode).strip().lower()))
     for bundle in TOOL_BUNDLES.values():
         allowed |= set(bundle)
+    for tool_mode in TOOL_MODES:
+        allowed |= set(tool_bundle_names_for_mode(tool_mode))
     return allowed
 
 
@@ -1005,10 +1007,24 @@ def allowed_tools_for_state(state: HarnessState | None) -> set[str]:
         return allowed_tools_for_mode(None)
     allowed = allowed_tools_for_mode(state.mode)
     if (state.plan_mode or infer_stage(state) == "plan") and not state.plan_approved:
+        read_device_tools = set(tool_names_with_tag("device")) & set(tool_names_with_tag("read"))
         return {
             name
             for name in allowed
-            if name in {"read_file", "load_file", "glob", "grep", "list_directory", "system_info", "todo_write", "exit_plan_mode", *READ_DEVICE_TOOLS}
+            if name
+            in {
+                "read_file",
+                "load_file",
+                "glob",
+                "grep",
+                "list_directory",
+                "system_info",
+                "skills_list",
+                "skill_view",
+                "todo_write",
+                "exit_plan_mode",
+                *read_device_tools,
+            }
         }
     return allowed
 
@@ -1166,16 +1182,28 @@ def _select_skills(
         metadata, content = _split_frontmatter(body)
         score = 0
         name_terms = set(re.findall(r"[a-z0-9_+-]+", summary.name.lower()))
-        tags = {str(tag).lower() for tag in metadata.get("tags", [])} if isinstance(metadata.get("tags"), list) else set()
+        tags = set(summary.tags)
+        if not tags and isinstance(metadata.get("tags"), list):
+            tags = {str(tag).lower() for tag in metadata.get("tags", [])}
         score += len(query_terms & name_terms) * 4
         score += len(query_terms & tags) * 5
-        if state.mode and metadata.get("mode") == state.mode:
+        summary_mode = str(getattr(summary, "mode", "") or metadata.get("mode", "") or "").strip().lower()
+        if state.mode and summary_mode == state.mode:
             score += 3
         if summary.name in preferred:
             score += 100
         if score <= 0:
             continue
-        scored.append((score, summary.path.name, content.strip()))
+        if getattr(summary, "format", "legacy") == "standard":
+            body_for_context = (
+                f"Skill {summary.name}: {summary.use}\n"
+                f"Full instructions are available on demand with skill_view(name=\"{summary.name}\")."
+            )
+            label = f"{summary.name}/SKILL.md"
+        else:
+            body_for_context = content.strip()
+            label = f"{summary.name}.md"
+        scored.append((score, label, body_for_context))
     scored.sort(key=lambda item: (-item[0], item[1]))
     resolved_policy = policy or HarnessPolicy(
         tier="rich",

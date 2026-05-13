@@ -7,6 +7,8 @@ from typing import Any
 import yaml
 
 from .app_paths import openjet_install_root
+from .skills.discovery import SourceLocation, default_skill_sources, discover_skills
+from .skills.model import Skill
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,11 @@ class SkillSummary:
     source: str
     dir_label: str
     tags: tuple[str, ...] = ()
+    format: str = "legacy"
+    root: Path | None = None
+    description: str = ""
+    allowed_tools: tuple[str, ...] = ()
+    platforms: tuple[str, ...] = ()
 
 
 def openjet_home() -> Path:
@@ -51,35 +58,17 @@ def available_skill_names(root: Path) -> list[str]:
 
 
 def resolve_skill_path(root: Path, name: str) -> Path | None:
-    normalized = Path(str(name).strip()).stem
+    normalized = Path(str(name).strip()).stem.lower()
     if not normalized:
         return None
-    for _, directory, _ in reversed(_skill_source_dirs(root)):
-        candidate = directory / f"{normalized}.md"
-        if candidate.exists():
-            return candidate
+    for skill in _discover(root).skills:
+        if skill.name == normalized:
+            return skill.path
     return None
 
 
 def skill_summaries(root: Path) -> list[SkillSummary]:
-    summaries_by_name: dict[str, SkillSummary] = {}
-    for source, directory, dir_label in _skill_source_dirs(root):
-        for path in sorted(directory.glob("*.md")):
-            body = _load_doc(path)
-            if not body:
-                continue
-            metadata, content = _split_frontmatter(body)
-            tags = metadata.get("tags")
-            normalized_tags = tuple(str(tag).strip() for tag in tags if str(tag).strip()) if isinstance(tags, list) else ()
-            summaries_by_name[path.stem] = SkillSummary(
-                name=path.stem,
-                path=path,
-                use=_skill_use_summary(metadata, content),
-                source=source,
-                dir_label=dir_label,
-                tags=normalized_tags,
-            )
-    return [summaries_by_name[name] for name in sorted(summaries_by_name)]
+    return [_summary_from_skill(skill) for skill in _discover(root).skills]
 
 
 def render_skills_manifest(root: Path) -> str:
@@ -90,13 +79,16 @@ def render_skills_manifest(root: Path) -> str:
         "# Skills",
         "",
         "This file is an index only.",
-        "If a skill looks relevant to the current task, load it by skill name before following it.",
+        "If a skill looks relevant to the current task, call skill_view with its name before following it.",
         "Do not assume the short summary here contains the full instructions.",
         "Do not rely on absolute filesystem paths in this index.",
         "",
         "global_skills_dir: <install>/skills",
         f"project_skills_dir: .openjet/skills ({'present' if project_dir.exists() else 'absent'})",
+        "project_agent_skills_dir: .agents/skills",
+        "user_skills_dirs: ~/.openjet/skills, ~/.agents/skills",
         "merge_policy: project skills overlay global skills with the same name.",
+        "skill_loading: progressive_disclosure via skill_view(name).",
         "",
     ]
     if not summaries:
@@ -108,9 +100,12 @@ def render_skills_manifest(root: Path) -> str:
         lines.append(f"- name: {summary.name}")
         lines.append(f"  dir: {summary.dir_label}")
         lines.append(f"  source: {summary.source}")
+        lines.append(f"  format: {summary.format}")
         lines.append(f"  load_name: {summary.name}")
         if summary.tags:
             lines.append(f"  tags: {', '.join(summary.tags)}")
+        if summary.allowed_tools:
+            lines.append(f"  allowed_tools: {', '.join(summary.allowed_tools)}")
         lines.append(f"  use: {summary.use}")
     return "\n".join(lines).strip()
 
@@ -125,6 +120,68 @@ def sync_skills_manifest(root: Path) -> Path:
     return manifest
 
 
+def _discover(root: Path):
+    return discover_skills(root, sources=tuple(_skill_source_locations(root)))
+
+
+def _skill_source_locations(root: Path) -> list[SourceLocation]:
+    sources = list(default_skill_sources(root, bundled_dir=skills_dir(root)))
+    # Preserve tests and installed-package behavior that patch this module's
+    # openjet_install_root() by making the bundled source explicit here.
+    if not _project_is_under_home(root):
+        sources = [source for source in sources if source.kind != "user"]
+    return sources
+
+
+def _skill_source_dirs(root: Path) -> list[tuple[str, Path, str]]:
+    dirs: list[tuple[str, Path, str]] = []
+    for source in _skill_source_locations(root):
+        if not source.path.exists():
+            continue
+        dirs.append((_legacy_source_label(source.kind), source.path, source.label))
+    return dirs
+
+
+def _summary_from_skill(skill: Skill) -> SkillSummary:
+    source = _legacy_source_label(skill.source_kind)
+    return SkillSummary(
+        name=skill.name,
+        path=skill.path,
+        use=skill.description if skill.format == "legacy" else _compact_summary(skill.description),
+        source=source,
+        dir_label=skill.source_label,
+        tags=skill.metadata.tags,
+        format=skill.format,
+        root=skill.root,
+        description=skill.description,
+        allowed_tools=skill.metadata.allowed_tools,
+        platforms=skill.metadata.platforms,
+    )
+
+
+def _project_is_under_home(root: Path) -> bool:
+    try:
+        Path(root).expanduser().resolve().relative_to(Path.home().resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _compact_summary(text: str, limit: int = 240) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _legacy_source_label(source_kind: str) -> str:
+    if source_kind == "project":
+        return "project"
+    if source_kind == "user":
+        return "user"
+    return "global"
+
+
 def _load_doc(path: Path) -> str:
     try:
         if path.exists():
@@ -132,17 +189,6 @@ def _load_doc(path: Path) -> str:
     except Exception:
         return ""
     return ""
-
-
-def _skill_source_dirs(root: Path) -> list[tuple[str, Path, str]]:
-    sources: list[tuple[str, Path, str]] = []
-    global_dir = skills_dir(root)
-    if global_dir.exists():
-        sources.append(("global", global_dir, "<install>/skills"))
-    local_dir = project_skills_dir(root)
-    if local_dir.exists():
-        sources.append(("project", local_dir, ".openjet/skills"))
-    return sources
 
 
 def _split_frontmatter(body: str) -> tuple[dict[str, Any], str]:
@@ -160,7 +206,7 @@ def _split_frontmatter(body: str) -> tuple[dict[str, Any], str]:
 
 
 def _skill_use_summary(metadata: dict[str, Any], content: str) -> str:
-    explicit = str(metadata.get("use") or "").strip()
+    explicit = str(metadata.get("use") or metadata.get("description") or "").strip()
     if explicit:
         return explicit
     for line in content.splitlines():

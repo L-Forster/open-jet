@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping
 
 
@@ -21,6 +21,7 @@ class ToolSpec:
     workflow_default: bool = False
     workflow_optional: bool = False
     tags: frozenset[str] = frozenset()
+    metadata: Mapping[str, object] = field(default_factory=dict)
     executor: ToolExecutor | None = None
 
     def runtime_schema(self) -> dict[str, object]:
@@ -60,6 +61,9 @@ class ToolRegistry:
         if spec is None:
             raise KeyError(name)
         self._specs[name] = spec.with_executor(executor)
+
+    def unregister(self, name: str) -> None:
+        self._specs.pop(str(name).strip(), None)
 
     def get(self, name: str) -> ToolSpec | None:
         return self._specs.get(str(name).strip())
@@ -318,6 +322,24 @@ TOOL_REGISTRY = ToolRegistry(
             tags=("filesystem", "read"),
         ),
         _tool(
+            "skills_list",
+            "List available OpenJet skills with compact metadata only. Does not return full skill bodies.",
+            parameters={},
+            workflow_default=True,
+            tags=("skills", "read", "context"),
+        ),
+        _tool(
+            "skill_view",
+            "Read full content for a skill on demand, or read one file under a standard skill directory.",
+            parameters={
+                "name": _param("string", "Skill name"),
+                "file_path": _param("string", "Optional relative path under the skill root, such as references/notes.md"),
+            },
+            required=("name",),
+            workflow_default=True,
+            tags=("skills", "read", "context"),
+        ),
+        _tool(
             "load_file",
             "Load a text file into context.",
             parameters={
@@ -439,3 +461,7 @@ def workflow_optional_tool_names() -> tuple[str, ...]:
 
 def bind_tool_executor(name: str, executor: ToolExecutor) -> None:
     TOOL_REGISTRY.bind_executor(name, executor)
+
+
+def unregister_tool(name: str) -> None:
+    TOOL_REGISTRY.unregister(name)

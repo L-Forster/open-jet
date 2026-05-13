@@ -340,7 +340,7 @@ class Agent:
 
     def needs_confirmation(self, tool_call: ToolCall) -> bool:
         """Return True if this tool call requires user approval."""
-        return tool_call.name in CONFIRM_TOOLS
+        return tool_call.name in set(confirmation_required_tool_names())
 
     def last_condense_report(self) -> CondenseReport | None:
         return self._last_condense_report

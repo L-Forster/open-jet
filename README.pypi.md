@@ -54,6 +54,7 @@ The CLI is a full terminal agent that can:
 - **Resume sessions** — close the terminal and pick up where you left off
 - **Work on constrained hardware** — automatic context condensing and model unload/reload around heavy tasks
 - **Connect to devices** — cameras, microphones, GPIO, and remote devices for edge and embedded workflows
+- **Connect MCP tools** — optional trusted MCP servers are exposed through the normal OpenJet tool registry
 
 ## Python SDK
 

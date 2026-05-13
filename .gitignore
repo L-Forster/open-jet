@@ -40,5 +40,6 @@ testfile
 .local-scripts/
 *.gguf
 .codex
+.claude/settings.local.json
 MEMORY.md
 llama.cpp/

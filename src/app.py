@@ -370,6 +370,7 @@ class OpenJetApp:
         set_airgapped(bool(self.cfg["airgapped"]))
         self.client: RuntimeClient | None = None
         self.agent: Agent | None = None
+        self.mcp_manager = None
         self.session_logger: SessionLogger | None = None
         self.console = Console(theme=RICH_THEME)
         self._style = Style.from_dict(PROMPT_STYLE)
@@ -826,10 +827,12 @@ class OpenJetApp:
         return bool(self._active_model_ref())
 
     async def _init_client(self) -> None:
+        await self._close_mcp_manager()
         mem_cfg = self.cfg.get("memory_guard", {})
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
         configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
         self.client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
+        await self._init_mcp_manager()
         if self.client.gpu_layers == 0:
             configured_gpu_layers = 0
         if self.client.context_window_tokens != configured_ctx or self.client.gpu_layers != configured_gpu_layers:
@@ -854,6 +857,22 @@ class OpenJetApp:
             trace_hook=self._agent_trace,
         )
         self._init_swap_manager()
+
+    async def _init_mcp_manager(self) -> None:
+        from .mcp_support.manager import MCPManager
+
+        manager = MCPManager.from_sources(root=Path.cwd(), runtime_cfg=self.cfg)
+        await manager.initialize()
+        self.mcp_manager = manager
+
+    async def _close_mcp_manager(self) -> None:
+        manager = self.mcp_manager
+        self.mcp_manager = None
+        if manager is not None:
+            try:
+                await manager.aclose()
+            except Exception:
+                pass
 
     def _init_swap_manager(self) -> None:
         """Create and register a SwapManager if the runtime supports it."""
@@ -960,6 +979,7 @@ class OpenJetApp:
         previous_cfg = dict(self.cfg)
         if self.agent:
             self.persist_session_state(reason="model_switch_start")
+        await self._close_mcp_manager()
         if self.client:
             try:
                 await self.client.close()
@@ -1021,6 +1041,7 @@ class OpenJetApp:
         had_runtime = bool(self.client or self.agent)
         if self.agent:
             self.persist_session_state(reason="setup_command_start")
+        await self._close_mcp_manager()
         if self.client:
             try:
                 await self.client.close()
@@ -1274,6 +1295,7 @@ class OpenJetApp:
         self.persist_session_state(reason="quit")
         if self._generation_worker and not self._generation_worker.done():
             self._generation_worker.cancel()
+        await self._close_mcp_manager()
         if self.client:
             await self.client.close()
         if self.session_logger:
@@ -2584,6 +2606,7 @@ class OpenJetApp:
                 harness_state_getter=lambda: self.harness_state,
                 harness_state_setter=self._replace_harness_state,
                 airgapped=self.is_airgapped(),
+                mcp_manager=self.mcp_manager,
             )
             while True:
                 self._set_generating_status()

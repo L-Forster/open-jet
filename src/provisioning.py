@@ -234,12 +234,13 @@ def _select_direct_model(
     moe_rows = [row for row in model_catalog if _is_moe_catalog_row(row)]
 
     def largest(rows: list[dict[str, object]]) -> dict[str, object] | None:
-        return max(rows, key=lambda row: (_catalog_float(row, "model_size_mb"), _catalog_float(row, "max_ram_gb"))) if rows else None
+        return max(rows, key=lambda row: (bool(row.get("llama_cpu_moe")), _catalog_float(row, "model_size_mb"), _catalog_float(row, "max_ram_gb"))) if rows else None
 
     if hardware_info.has_metal:
         metal_moe = largest([
             row for row in moe_rows
-            if 0 < _catalog_float(row, "model_size_mb") <= combined_budget_mb
+            if 0 < _active_model_size_mb(row) <= combined_budget_mb
+            and _catalog_float(row, "max_ram_gb") <= hardware_info.total_ram_gb
         ])
         if metal_moe:
             return metal_moe

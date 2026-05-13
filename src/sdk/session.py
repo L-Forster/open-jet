@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -330,6 +331,7 @@ class OpenJetSession:
         harness_state_setter: Callable[[HarnessState], None] | None = None,
         airgapped: bool = False,
         session_logger: "SessionLogger | None" = None,
+        mcp_manager: object | None = None,
     ) -> None:
         self.agent = agent
         self._approval_handler = approval_handler
@@ -338,6 +340,7 @@ class OpenJetSession:
         self._harness_state_setter = harness_state_setter
         self.airgapped = bool(airgapped)
         self.session_logger = session_logger
+        self.mcp_manager = mcp_manager
         self._artifacts = _SessionArtifactRecorder(session_logger.session_dir) if session_logger else None
         set_airgapped(self.airgapped)
 
@@ -361,48 +364,65 @@ class OpenJetSession:
         resolved_cfg["airgapped"] = airgapped_from_cfg(resolved_cfg, override=airgapped)
         set_airgapped(bool(resolved_cfg["airgapped"]))
         client = create_runtime_client(resolved_cfg)
-        mem_cfg = resolved_cfg.get("memory_guard", {})
-        agent = Agent(
-            client=client,
-            system_prompt=await build_system_prompt(
-                system_prompt or "",
-                resolved_root,
-                cfg=resolved_cfg,
-            ),
-            base_system_prompt=system_prompt or "",
-            project_root=resolved_root,
-            prompt_cfg=resolved_cfg,
-            context_window_tokens=client.context_window_tokens,
-            context_reserved_tokens=(
-                int(mem_cfg["context_reserved_tokens"])
-                if mem_cfg.get("context_reserved_tokens") is not None
-                else None
-            ),
-            min_prompt_tokens=int(mem_cfg.get("min_prompt_tokens", 256)),
-            min_available_mb=(
-                int(mem_cfg["min_available_mb"])
-                if mem_cfg.get("min_available_mb") is not None
-                else None
-            ),
-            max_used_percent=(
-                float(mem_cfg["max_used_percent"])
-                if mem_cfg.get("max_used_percent") is not None
-                else None
-            ),
-            memory_check_interval_chunks=int(mem_cfg.get("check_interval_chunks", 16)),
-            condense_target_tokens=int(mem_cfg.get("condense_target_tokens", 900)),
-            keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
-        )
-        return cls(
-            agent,
-            approval_handler=approval_handler,
-            allowed_tools=allowed_tools,
-            harness_state_getter=harness_state_getter,
-            harness_state_setter=harness_state_setter,
-            airgapped=bool(resolved_cfg["airgapped"]),
-        )
+        from ..mcp_support.manager import MCPManager
+
+        mcp_manager = MCPManager.from_sources(root=resolved_root, runtime_cfg=resolved_cfg)
+        try:
+            await mcp_manager.initialize()
+            mem_cfg = resolved_cfg.get("memory_guard", {})
+            agent = Agent(
+                client=client,
+                system_prompt=await build_system_prompt(
+                    system_prompt or "",
+                    resolved_root,
+                    cfg=resolved_cfg,
+                ),
+                base_system_prompt=system_prompt or "",
+                project_root=resolved_root,
+                prompt_cfg=resolved_cfg,
+                context_window_tokens=client.context_window_tokens,
+                context_reserved_tokens=(
+                    int(mem_cfg["context_reserved_tokens"])
+                    if mem_cfg.get("context_reserved_tokens") is not None
+                    else None
+                ),
+                min_prompt_tokens=int(mem_cfg.get("min_prompt_tokens", 256)),
+                min_available_mb=(
+                    int(mem_cfg["min_available_mb"])
+                    if mem_cfg.get("min_available_mb") is not None
+                    else None
+                ),
+                max_used_percent=(
+                    float(mem_cfg["max_used_percent"])
+                    if mem_cfg.get("max_used_percent") is not None
+                    else None
+                ),
+                memory_check_interval_chunks=int(mem_cfg.get("check_interval_chunks", 16)),
+                condense_target_tokens=int(mem_cfg.get("condense_target_tokens", 900)),
+                keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
+            )
+            return cls(
+                agent,
+                approval_handler=approval_handler,
+                allowed_tools=allowed_tools,
+                harness_state_getter=harness_state_getter,
+                harness_state_setter=harness_state_setter,
+                airgapped=bool(resolved_cfg["airgapped"]),
+                mcp_manager=mcp_manager,
+            )
+        except Exception:
+            with suppress(Exception):
+                await mcp_manager.aclose()
+            with suppress(Exception):
+                await client.close()
+            raise
 
     async def close(self) -> None:
+        if self.mcp_manager is not None:
+            close = getattr(self.mcp_manager, "aclose", None)
+            if callable(close):
+                await close()
+            self.mcp_manager = None
         await self.agent.client.close()
 
     def set_airgapped(self, enabled: bool) -> None:
@@ -656,7 +676,10 @@ class OpenJetSession:
 
         t0 = time.monotonic()
         try:
-            result = await execute_tool(tool_call)
+            from ..mcp_support.manager import active_mcp_manager
+
+            with active_mcp_manager(self.mcp_manager):
+                result = await execute_tool(tool_call)
         except Exception as exc:
             output = f"Tool execution failed: {exc}"
             self.agent.complete_tool_call(tool_call, output)

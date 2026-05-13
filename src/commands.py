@@ -108,6 +108,9 @@ class SlashCommandHandler:
         if cmd == "plan":
             self._plan(log, arg)
             return True
+        if cmd == "mcp":
+            self._mcp(log, arg)
+            return True
         if cmd == "skills":
             await self._skills(log, arg)
             return True
@@ -821,6 +824,21 @@ class SlashCommandHandler:
         log.write("[yellow]Usage:[/] /plan [status|on|approve|reject]")
         log.write("")
 
+    def _mcp(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower() or "status"
+        if arg != "status":
+            log.write("[yellow]Usage:[/] /mcp status")
+            log.write("")
+            return
+        manager = getattr(self.app, "mcp_manager", None)
+        if manager is None:
+            from .mcp_support.manager import MCPManager
+
+            manager = MCPManager.from_sources(runtime_cfg=self.app.cfg)
+        for line in manager.format_status().splitlines():
+            log.write(f"[bold bright_white]{line}[/]")
+        log.write("")
+
     async def _skills(self, log: Any, raw_arg: str) -> None:
         await self._skill(log, raw_arg)
 
@@ -967,4 +985,3 @@ def _format_device_error(exc: ValueError) -> str:
     if text.startswith("unknown source: "):
         return "unknown device reference: " + text.split(": ", 1)[1]
     return text
-
