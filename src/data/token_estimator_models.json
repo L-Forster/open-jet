@@ -24,7 +24,7 @@
   {
     "key": "qwen36_27b_ud_iq2_xxs",
     "label": "Qwen3.6 27B UD-IQ2_XXS MTP",
-    "filename": "Qwen3.6-27B-UD-IQ2_XXS.gguf",
+    "filename": "Qwen3.6-27B-UD-IQ2_XXS-MTP.gguf",
     "parameter_count_billion": 27.0,
     "model_size_mb": 9626.0,
     "kv_bytes_per_token": 34816.0,
@@ -35,7 +35,7 @@
   {
     "key": "qwen36_27b_ud_iq3_xxs",
     "label": "Qwen3.6 27B UD-IQ3_XXS MTP",
-    "filename": "Qwen3.6-27B-UD-IQ3_XXS.gguf",
+    "filename": "Qwen3.6-27B-UD-IQ3_XXS-MTP.gguf",
     "parameter_count_billion": 27.0,
     "model_size_mb": 12288.0,
     "kv_bytes_per_token": 34816.0,
@@ -46,7 +46,7 @@
   {
     "key": "qwen36_27b_q4_k_m",
     "label": "Qwen3.6 27B Q4_K_M MTP",
-    "filename": "Qwen3.6-27B-Q4_K_M.gguf",
+    "filename": "Qwen3.6-27B-Q4_K_M-MTP.gguf",
     "parameter_count_billion": 27.0,
     "model_size_mb": 16896.0,
     "kv_bytes_per_token": 34816.0,
@@ -77,7 +77,7 @@
   {
     "key": "qwen36_35b_a3b_ud_q3_k_xl",
     "label": "Qwen3.6 35B A3B UD-Q3_K_XL MTP",
-    "filename": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+    "filename": "Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf",
     "parameter_count_billion": 35.0,
     "model_size_mb": 17203.0,
     "kv_bytes_per_token": 24576.0,
@@ -88,7 +88,7 @@
   {
     "key": "qwen36_35b_a3b_q4_k_m",
     "label": "Qwen3.6 35B A3B MTP",
-    "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+    "filename": "Qwen3.6-35B-A3B-UD-Q4_K_M-MTP.gguf",
     "parameter_count_billion": 35.0,
     "model_size_mb": 22630.0,
     "kv_bytes_per_token": 24576.0,

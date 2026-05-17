@@ -321,8 +321,8 @@ class SelfUpdateTests(unittest.TestCase):
             text = config_path.read_text(encoding="utf-8")
 
         self.assertTrue(changed)
-        self.assertIn("llama_model: /models/Qwen3.6-27B-Q4_K_M.gguf", text)
-        self.assertIn("model_download_path: /models/Qwen3.6-27B-Q4_K_M.gguf", text)
+        self.assertIn("llama_model: /models/Qwen3.6-27B-Q4_K_M-MTP.gguf", text)
+        self.assertIn("model_download_path: /models/Qwen3.6-27B-Q4_K_M-MTP.gguf", text)
         self.assertIn("model_source: direct", text)
         self.assertIn("setup_missing_model: true", text)
         self.assertIn("setup_update_model: true", text)

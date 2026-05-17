@@ -11,11 +11,12 @@ DEFAULT_LOG_DIRECTORY = ".openjet/state/sessions"
 ROOT_LOG_DIRECTORY = "session_logs"
 QWEN36_27B_MTP_REPO = "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF"
 QWEN36_35B_A3B_MTP_REPO = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
-QWEN36_27B_MTP_FILENAME = "Qwen3.6-27B-Q4_K_M.gguf"
+QWEN36_27B_MTP_SOURCE_FILENAME = "Qwen3.6-27B-Q4_K_M.gguf"
+QWEN36_27B_MTP_FILENAME = "Qwen3.6-27B-Q4_K_M-MTP.gguf"
 QWEN36_27B_LEGACY_MTP_FILENAME = "Qwen3.6-27B-Q4_K_M-mtp.gguf"
 QWEN36_27B_MTP_URL = (
     f"{QWEN36_27B_MTP_REPO}/resolve/main/"
-    f"{QWEN36_27B_MTP_FILENAME}?download=true"
+    f"{QWEN36_27B_MTP_SOURCE_FILENAME}?download=true"
 )
 QWEN36_27B_MTP_LLAMA_CPP_REF = "b9189"
 QWEN36_27B_OLD_MTP_REPO = "https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF/"
@@ -32,6 +33,24 @@ def _qwen36_27b_mtp_url(filename: str) -> str:
 
 def _qwen36_35b_a3b_mtp_url(filename: str) -> str:
     return f"{QWEN36_35B_A3B_MTP_REPO}/resolve/main/{filename}?download=true"
+
+
+def _qwen36_mtp_local_filename(filename: str) -> str:
+    path = Path(filename)
+    suffix = path.suffix or ".gguf"
+    stem = path.stem
+    if stem.lower().endswith("-mtp"):
+        stem = stem[:-4]
+    return f"{stem}-MTP{suffix}"
+
+
+def _qwen36_mtp_source_filename(filename: str) -> str:
+    path = Path(filename)
+    suffix = path.suffix or ".gguf"
+    stem = path.stem
+    if stem.lower().endswith("-mtp"):
+        return f"{stem[:-4]}{suffix}"
+    return path.name
 
 # Curated, size-banded shortlist used by setup recommendations.
 # Band limit = max param budget in billions for that RAM tier.
@@ -102,7 +121,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
     {
         "max_ram_gb": 12.0,
         "label": "Qwen3.6 27B UD-IQ2_XXS MTP",
-        "filename": "Qwen3.6-27B-UD-IQ2_XXS.gguf",
+        "filename": _qwen36_mtp_local_filename("Qwen3.6-27B-UD-IQ2_XXS.gguf"),
         "url": _qwen36_27b_mtp_url("Qwen3.6-27B-UD-IQ2_XXS.gguf"),
         "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
@@ -112,7 +131,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
     {
         "max_ram_gb": 16.0,
         "label": "Qwen3.6 27B UD-IQ3_XXS MTP",
-        "filename": "Qwen3.6-27B-UD-IQ3_XXS.gguf",
+        "filename": _qwen36_mtp_local_filename("Qwen3.6-27B-UD-IQ3_XXS.gguf"),
         "url": _qwen36_27b_mtp_url("Qwen3.6-27B-UD-IQ3_XXS.gguf"),
         "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
@@ -143,7 +162,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
     {
         "max_ram_gb": 24.0,
         "label": "Qwen3.6 35B A3B UD-IQ2_XXS MTP",
-        "filename": "Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+        "filename": _qwen36_mtp_local_filename("Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf"),
         "url": _qwen36_35b_a3b_mtp_url("Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf"),
         "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
@@ -157,7 +176,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
     {
         "max_ram_gb": 32.0,
         "label": "Qwen3.6 35B A3B UD-Q3_K_XL MTP",
-        "filename": "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+        "filename": _qwen36_mtp_local_filename("Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"),
         "url": _qwen36_35b_a3b_mtp_url("Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"),
         "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
@@ -246,8 +265,7 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
         text = "\n".join(str(value or "") for value in values)
         lowered = text.lower()
         return (
-            QWEN36_27B_LEGACY_MTP_FILENAME.lower() in lowered
-            or QWEN36_27B_OLD_MTP_REPO.lower() in lowered
+            QWEN36_27B_OLD_MTP_REPO.lower() in lowered
             or QWEN36_27B_NON_MTP_REPO.lower() in lowered
             or (
                 QWEN36_27B_PREFIX in lowered
@@ -277,10 +295,12 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
             filename = Path(str(replacement or row.get("model_download_path") or row.get("llama_model") or row.get("filename") or "")).name
             if not filename:
                 filename = "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"
+            filename = _qwen36_mtp_source_filename(filename)
             return _qwen36_35b_a3b_mtp_url(filename), QWEN36_35B_A3B_MTP_UPDATE_ID
         filename = Path(str(replacement or row.get("model_download_path") or row.get("llama_model") or row.get("filename") or "")).name
         if not filename:
-            filename = QWEN36_27B_MTP_FILENAME
+            filename = QWEN36_27B_MTP_SOURCE_FILENAME
+        filename = _qwen36_mtp_source_filename(filename)
         return _qwen36_27b_mtp_url(filename), QWEN36_27B_MTP_UPDATE_ID
 
     def apply_qwen_mtp_update(row: dict[str, Any], *, replacement: str | None) -> None:
@@ -313,7 +333,7 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
             if raw_path:
                 raw_name = Path(raw_path).name.lower()
                 if "qwen3.6-35b-a3b-" in raw_name or QWEN36_27B_PREFIX in raw_name:
-                    replacement = raw_path
+                    replacement = str(Path(raw_path).with_name(_qwen36_mtp_local_filename(Path(raw_path).name)))
                 else:
                     replacement = str(Path(raw_path).with_name(QWEN36_27B_MTP_FILENAME))
         if replacement or looks_like_qwen_mtp_update_target(row):
