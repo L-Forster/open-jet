@@ -31,27 +31,35 @@ setup_recommendations:
       filename: Qwen3.5-9B-Q4_K_M.gguf
       url: https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true
     - max_ram_gb: 12
-      label: Qwen3.6 27B UD-IQ2_XXS
+      label: Qwen3.6 27B UD-IQ2_XXS MTP
       filename: Qwen3.6-27B-UD-IQ2_XXS.gguf
-      url: https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-UD-IQ2_XXS.gguf?download=true
+      url: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-UD-IQ2_XXS.gguf?download=true
+      llama_cpp_ref: b9189
+      llama_mtp: true
       model_size_mb: 9626
       kv_bytes_per_token: 34816
     - max_ram_gb: 16
-      label: Qwen3.6 27B UD-IQ3_XXS
+      label: Qwen3.6 27B UD-IQ3_XXS MTP
       filename: Qwen3.6-27B-UD-IQ3_XXS.gguf
-      url: https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-UD-IQ3_XXS.gguf?download=true
+      url: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-UD-IQ3_XXS.gguf?download=true
+      llama_cpp_ref: b9189
+      llama_mtp: true
       model_size_mb: 12288
       kv_bytes_per_token: 34816
     - max_ram_gb: 20
       label: Qwen3.6 27B Q4_K_M MTP
-      filename: Qwen3.6-27B-Q4_K_M-mtp.gguf
-      url: https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M-mtp.gguf?download=true
+      filename: Qwen3.6-27B-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true
+      llama_cpp_ref: b9189
+      llama_mtp: true
       model_size_mb: 16896
       kv_bytes_per_token: 34816
     - max_ram_gb: 24
-      label: Qwen3.6 35B A3B UD-Q3_K_XL
+      label: Qwen3.6 35B A3B UD-Q3_K_XL MTP
       filename: Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf
-      url: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true
+      url: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true
+      llama_cpp_ref: b9189
+      llama_mtp: true
       model_size_mb: 17203
       active_model_size_mb: 3072
       kv_bytes_per_token: 24576
@@ -59,9 +67,11 @@ setup_recommendations:
       llama_cpu_moe: true
       llama_n_cpu_moe: 0
     - max_ram_gb: 32
-      label: Qwen3.6 35B A3B
+      label: Qwen3.6 35B A3B MTP
       filename: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-      url: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf?download=true
+      url: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf?download=true
+      llama_cpp_ref: b9189
+      llama_mtp: true
       model_size_mb: 22630
       active_model_size_mb: 3072
       kv_bytes_per_token: 24576

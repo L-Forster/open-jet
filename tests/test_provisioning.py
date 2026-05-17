@@ -20,7 +20,9 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         direct = recommend_direct_model(hardware)
 
-        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-Q3_K_XL")
+        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-Q3_K_XL MTP")
+        self.assertIn("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", direct["url"])
+        self.assertTrue(direct["llama_mtp"])
         self.assertTrue(direct["llama_cpu_moe"])
 
     def test_recommend_direct_model_uses_q3_moe_when_unified_memory_needs_system_reserve(self) -> None:
@@ -33,8 +35,10 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         direct = recommend_direct_model(hardware)
 
-        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-IQ2_XXS")
+        self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-IQ2_XXS MTP")
         self.assertEqual(direct["filename"], "Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf")
+        self.assertIn("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", direct["url"])
+        self.assertTrue(direct["llama_mtp"])
         self.assertTrue(direct["llama_cpu_moe"])
 
     def test_llama_cmake_args_honor_selected_vulkan_on_cuda_host(self) -> None:
@@ -177,7 +181,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
             ) as install_prebuilt, patch(
                 "src.provisioning._sync_managed_llama_cpp_checkout",
-                AsyncMock(return_value="pull/22673/head"),
+                AsyncMock(return_value="b9189"),
             ) as sync_checkout, patch(
                 "src.provisioning._run_exec",
                 AsyncMock(return_value=(0, "", "")),
@@ -188,7 +192,8 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 payload = await ensure_llama_server(
                     {
                         "llama_cpp_ref": "b9072",
-                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+                        "llama_mtp": True,
                     },
                     hardware_info=hardware,
                     log=log,
@@ -196,10 +201,10 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "pull/22673/head")
+        self.assertEqual(payload["llama_cpp_ref"], "b9189")
         self.assertEqual(payload["llama_server_path"], str(built))
         install_prebuilt.assert_not_awaited()
-        self.assertEqual(sync_checkout.await_args.kwargs["target_ref"], "pull/22673/head")
+        self.assertEqual(sync_checkout.await_args.kwargs["target_ref"], "b9189")
 
     async def test_ensure_llama_server_reuses_matching_source_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,7 +213,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             built.parent.mkdir(parents=True)
             built.write_text("binary", encoding="utf-8")
             (llama_dir / "build" / "openjet-llama-server.json").write_text(
-                '{"device": "cuda", "ref": "pull/22673/head"}',
+                '{"device": "cuda", "ref": "b9189"}',
                 encoding="utf-8",
             )
             bin_dir = Path(tmp) / "bin"
@@ -235,7 +240,8 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 payload = await ensure_llama_server(
                     {
                         "device": "cuda",
-                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+                        "llama_mtp": True,
                     },
                     hardware_info=hardware,
                     log=log,
@@ -243,7 +249,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "pull/22673/head")
+        self.assertEqual(payload["llama_cpp_ref"], "b9189")
         self.assertEqual(payload["llama_server_path"], str(built))
         install_prebuilt.assert_not_awaited()
         build_source.assert_not_awaited()

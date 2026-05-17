@@ -7,8 +7,14 @@ from .runtime_registry import RUNTIME_LABEL, active_model_ref
 
 PROFILE_KEYS: tuple[str, ...] = (
     "llama_model",
+    "model_download_url",
+    "model_download_path",
     "llama_server_path",
     "model_source",
+    "setup_missing_model",
+    "setup_update_model",
+    "model_update_target",
+    "model_update_applied",
     "device",
     "context_window_tokens",
     "gpu_layers",

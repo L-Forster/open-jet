@@ -23,6 +23,13 @@ _JETSON_VMM_CHUNK_MB = "1"
 _JETSON_VMM_RESERVE_MB = "4096"
 _LLAMA_SERVER_EXE_NAME = "llama-server.exe" if os.name == "nt" else "llama-server"
 _FULL_OFFLOAD_GPU_LAYERS = 99
+_MTP_SPEC_ARGS: tuple[str, ...] = (
+    "--spec-default",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-n-max",
+    "3",
+)
 
 
 def _find_built_llama_binary(name: str) -> Path | None:
@@ -62,6 +69,7 @@ class LlamaServerClient:
         gpu_layers: int = 99,
         llama_cpu_moe: bool = False,
         llama_n_cpu_moe: int = 0,
+        llama_mtp: bool = False,
         airgapped: bool = False,
         diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
@@ -74,6 +82,7 @@ class LlamaServerClient:
         self.gpu_layers = max(0, int(gpu_layers))
         self.llama_cpu_moe = bool(llama_cpu_moe)
         self.llama_n_cpu_moe = max(0, int(llama_n_cpu_moe))
+        self.llama_mtp = bool(llama_mtp)
         self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=30.0))
@@ -334,6 +343,7 @@ class LlamaServerClient:
                 no_mmap=no_mmap,
                 llama_cpu_moe=self.llama_cpu_moe,
                 llama_n_cpu_moe=self.llama_n_cpu_moe,
+                llama_mtp=self.llama_mtp,
             )
             self.gpu_layers = requested_ngl
             self.context_window_tokens = requested_ctx
@@ -352,6 +362,7 @@ class LlamaServerClient:
         no_mmap: bool,
         llama_cpu_moe: bool = False,
         llama_n_cpu_moe: int = 0,
+        llama_mtp: bool = False,
     ) -> None:
         # Ensure swap state directory exists for KV cache save/restore.
         slot_save_dir = Path(".openjet/state/swap")
@@ -379,6 +390,8 @@ class LlamaServerClient:
             cmd.append("--cpu-moe")
         elif llama_n_cpu_moe > 0:
             cmd.extend(["-ncmoe", str(llama_n_cpu_moe)])
+        if llama_mtp:
+            cmd.extend(_MTP_SPEC_ARGS)
         cmd.extend(["--flash-attn", "on", "-ctk", "q8_0", "-ctv", "q8_0"])
         cmd.extend([
             "-b",
@@ -402,6 +415,7 @@ class LlamaServerClient:
             no_mmap=no_mmap,
             llama_cpu_moe=llama_cpu_moe,
             llama_n_cpu_moe=llama_n_cpu_moe,
+            llama_mtp=llama_mtp,
             cuda_module_loading=env.get("CUDA_MODULE_LOADING", ""),
             ggml_cuda_enable_unified_memory=env.get("GGML_CUDA_ENABLE_UNIFIED_MEMORY", ""),
             ggml_cuda_vmm_chunk_mb=env.get("GGML_CUDA_VMM_CHUNK_MB", ""),

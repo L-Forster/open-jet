@@ -32,7 +32,7 @@ from src.llama_server import (
     _JETSON_VMM_CHUNK_MB,
     _JETSON_VMM_RESERVE_MB,
 )
-from src.model_profiles import sync_active_model_profile
+from src.model_profiles import apply_model_profile, get_model_profile, sync_active_model_profile
 from src.device_sources import DeviceSource
 from src.peripherals import Observation, ObservationModality, PeripheralDevice, PeripheralKind, PeripheralTransport
 from src.provisioning import ensure_direct_model, recommend_direct_model
@@ -945,7 +945,8 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(payload["model_source"], "direct")
-        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M-mtp.gguf"))
+        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M.gguf"))
+        self.assertTrue(payload["llama_mtp"])
         self.assertGreater(int(payload["context_window_tokens"]), 6144)
 
     def test_choice_prompt_wraps_long_detail_lines(self) -> None:
@@ -1243,11 +1244,11 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="12GB", total_ram_gb=12.0, has_cuda=False))["label"],
-            "Qwen3.6 27B UD-IQ2_XXS",
+            "Qwen3.6 27B UD-IQ2_XXS MTP",
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="16GB", total_ram_gb=16.0, has_cuda=False))["label"],
-            "Qwen3.6 27B UD-IQ3_XXS",
+            "Qwen3.6 27B UD-IQ3_XXS MTP",
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="24GB", total_ram_gb=24.0, has_cuda=False))["label"],
@@ -1264,7 +1265,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.6 27B UD-IQ2_XXS")
+        self.assertEqual(recommended["label"], "Qwen3.6 27B UD-IQ2_XXS MTP")
 
     def test_recommend_direct_model_prioritizes_large_dense_before_moe(self) -> None:
         recommended = recommend_direct_model(
@@ -1289,7 +1290,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.6 27B UD-IQ2_XXS")
+        self.assertEqual(recommended["label"], "Qwen3.6 27B UD-IQ2_XXS MTP")
 
     async def test_ensure_direct_model_downloads_target_file(self) -> None:
         updates: list[str] = []
@@ -1324,6 +1325,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolved["llama_model"], str(target))
         self.assertFalse(resolved["setup_missing_model"])
         self.assertTrue(any(text.startswith("downloading model.gguf") for text in updates))
+        self.assertTrue(any("example/test-GGUF" in str(call.args[0]) for call in log.write.call_args_list))
         self.assertTrue(any("50%" in str(call.args[0]) for call in log.write.call_args_list))
         download.assert_awaited_once()
 
@@ -1358,6 +1360,73 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(unrelated.exists())
             self.assertEqual(target.read_bytes(), b"new")
             self.assertEqual(resolved["llama_model"], str(target))
+
+    async def test_ensure_direct_model_redownloads_existing_file_when_update_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "Qwen3.6-27B-Q4_K_M.gguf"
+            target.write_bytes(b"old-model")
+            payload = {
+                "model_source": "direct",
+                "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+                "model_download_path": str(target),
+                "setup_missing_model": True,
+                "setup_update_model": True,
+                "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
+            }
+
+            async def fake_download(**kwargs):
+                self.assertEqual(kwargs["repo_id"], "unsloth/Qwen3.6-27B-MTP-GGUF")
+                self.assertEqual(target.read_bytes(), b"old-model")
+                self.assertNotEqual(Path(kwargs["local_dir"]), target.parent)
+                Path(kwargs["local_dir"], "Qwen3.6-27B-Q4_K_M.gguf").write_bytes(b"mtp-model")
+                return 0, "", ""
+
+            log = Mock()
+            with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download) as download:
+                resolved = await ensure_direct_model(
+                    payload,
+                    log=log,
+                    set_status=lambda _text: None,
+                    clear_status=lambda: None,
+                )
+            written = target.read_bytes()
+
+        self.assertEqual(written, b"mtp-model")
+        self.assertEqual(resolved["llama_model"], str(target))
+        self.assertFalse(resolved["setup_missing_model"])
+        self.assertNotIn("setup_update_model", resolved)
+        self.assertNotIn("model_update_target", resolved)
+        self.assertEqual(resolved["model_update_applied"], "qwen36-27b-mtp-unsloth-b9189")
+        self.assertTrue(any("unsloth/Qwen3.6-27B-MTP-GGUF" in str(call.args[0]) for call in log.write.call_args_list))
+        download.assert_awaited_once()
+
+    async def test_ensure_direct_model_keeps_existing_file_when_update_download_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "Qwen3.6-27B-Q4_K_M.gguf"
+            target.write_bytes(b"old-model")
+            payload = {
+                "model_source": "direct",
+                "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+                "model_download_path": str(target),
+                "setup_missing_model": True,
+                "setup_update_model": True,
+                "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
+            }
+
+            async def fake_download(**kwargs):
+                self.assertEqual(target.read_bytes(), b"old-model")
+                return 1, "", "rate limited"
+
+            with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download):
+                with self.assertRaisesRegex(RuntimeError, "rate limited"):
+                    await ensure_direct_model(
+                        payload,
+                        log=Mock(),
+                        set_status=lambda _text: None,
+                        clear_status=lambda: None,
+                    )
+
+            self.assertEqual(target.read_bytes(), b"old-model")
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
@@ -1967,17 +2036,57 @@ class CliCommandTests(unittest.TestCase):
     def test_sync_active_model_profile_preserves_mtp_runtime_ref(self) -> None:
         cfg = {
             "active_model_profile": "mtp",
-            "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+            "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
             "llama_server_path": "/home/louis/llama.cpp/build/bin/llama-server",
-            "llama_cpp_ref": "pull/22673/head",
+            "llama_cpp_ref": "b9189",
             "llama_mtp": True,
             "model_source": "local",
         }
 
         sync_active_model_profile(cfg)
 
-        self.assertEqual(cfg["model_profiles"][0]["llama_cpp_ref"], "pull/22673/head")
+        self.assertEqual(cfg["model_profiles"][0]["llama_cpp_ref"], "b9189")
         self.assertTrue(cfg["model_profiles"][0]["llama_mtp"])
+
+    def test_model_profile_preserves_direct_update_fields(self) -> None:
+        download_url = (
+            "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/"
+            "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true"
+        )
+        cfg = {
+            "active_model_profile": "base",
+            "llama_model": "/models/base.gguf",
+            "model_source": "local",
+            "model_profiles": [
+                {
+                    "name": "mtp",
+                    "llama_model": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+                    "model_source": "direct",
+                    "model_download_url": download_url,
+                    "model_download_path": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+                    "setup_missing_model": True,
+                    "setup_update_model": True,
+                    "model_update_target": "qwen36-35b-a3b-mtp-unsloth-b9189",
+                    "llama_cpp_ref": "b9189",
+                    "llama_mtp": True,
+                }
+            ],
+        }
+
+        profile = get_model_profile(cfg, "mtp")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile["model_download_url"], download_url)
+        self.assertTrue(profile["setup_update_model"])
+        self.assertEqual(profile["model_update_target"], "qwen36-35b-a3b-mtp-unsloth-b9189")
+
+        apply_model_profile(cfg, profile)
+
+        self.assertEqual(cfg["model_download_url"], download_url)
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf")
+        self.assertTrue(cfg["setup_missing_model"])
+        self.assertTrue(cfg["setup_update_model"])
+        self.assertEqual(cfg["model_update_target"], "qwen36-35b-a3b-mtp-unsloth-b9189")
 
     def test_format_model_profiles_summary_lists_active_profile(self) -> None:
         text = _format_model_profiles_summary(
@@ -2543,6 +2652,39 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         cmd = create_proc.await_args.args
         self.assertIn("--cpu-moe", cmd)
         self.assertNotIn("-ncmoe", cmd)
+
+    async def test_start_once_passes_mtp_speculative_decoding_args(self) -> None:
+        client = LlamaServerClient(model="model.gguf", llama_mtp=True)
+
+        class _FakeStream:
+            async def readline(self) -> bytes:
+                await asyncio.sleep(0)
+                return b""
+
+        proc = SimpleNamespace(returncode=None, pid=4321, stderr=_FakeStream())
+
+        async def fake_get(url: str):
+            return SimpleNamespace(status_code=200)
+
+        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as create_proc:
+            client._http.get = AsyncMock(side_effect=fake_get)  # type: ignore[method-assign]
+            await client._start_once(
+                binary="/usr/bin/llama-server",
+                env={},
+                ngl=99,
+                ctx=6144,
+                batch=2048,
+                ubatch=512,
+                fit_mode="on",
+                no_warmup=False,
+                no_mmap=False,
+                llama_mtp=client.llama_mtp,
+            )
+
+        cmd = create_proc.await_args.args
+        self.assertIn("--spec-default", cmd)
+        self.assertEqual(cmd[cmd.index("--spec-type") + 1], "draft-mtp")
+        self.assertEqual(cmd[cmd.index("--spec-draft-n-max") + 1], "3")
 
 class DebugPromptLoggingTests(unittest.TestCase):
     def test_prepare_turn_context_saves_full_runtime_messages_in_debug_mode(self) -> None:

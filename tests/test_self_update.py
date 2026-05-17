@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from src.self_update import (
     RepoUpdateInfo,
     _has_tracked_changes,
     _install_command,
+    _migrate_config_after_update,
     available_update,
     update_from_latest_release,
 )
@@ -117,6 +120,9 @@ class SelfUpdateTests(unittest.TestCase):
             "src.self_update._git_output",
             side_effect=lambda *args: "src/app.py\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
         ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
+            "src.self_update._migrate_config_after_update",
+            return_value=False,
+        ), patch(
             "src.self_update.subprocess.run",
         ) as run_mock:
             message = update_from_latest_release(current_version="0.3.0")
@@ -142,6 +148,9 @@ class SelfUpdateTests(unittest.TestCase):
             "src.self_update._git_output",
             side_effect=lambda *args: "pyproject.toml\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
         ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
+            "src.self_update._migrate_config_after_update",
+            return_value=False,
+        ), patch(
             "src.self_update.subprocess.run",
         ) as run_mock:
             message = update_from_latest_release(current_version="0.3.0")
@@ -163,6 +172,9 @@ class SelfUpdateTests(unittest.TestCase):
             "src.self_update._git_output",
             side_effect=lambda *args: "install.bat\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
         ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
+            "src.self_update._migrate_config_after_update",
+            return_value=False,
+        ), patch(
             "src.self_update.subprocess.run",
         ) as run_mock:
             message = update_from_latest_release(current_version="0.3.0")
@@ -208,6 +220,9 @@ class SelfUpdateTests(unittest.TestCase):
             "src.self_update._sync_managed_llama_cpp_after_update",
             return_value=None,
         ), patch(
+            "src.self_update._migrate_config_after_update",
+            return_value=False,
+        ), patch(
             "src.self_update.subprocess.run",
             side_effect=subprocess.CalledProcessError(1, ["git"]),
         ):
@@ -233,7 +248,10 @@ class SelfUpdateTests(unittest.TestCase):
         ), patch(
             "src.self_update._sync_managed_llama_cpp_after_update",
             return_value="cad2d38",
-        ) as sync_llama, patch("src.self_update.subprocess.run") as run_mock:
+        ) as sync_llama, patch(
+            "src.self_update._migrate_config_after_update",
+            return_value=False,
+        ), patch("src.self_update.subprocess.run") as run_mock:
             message = update_from_latest_release(current_version="0.3.0")
 
         self.assertEqual(
@@ -242,3 +260,73 @@ class SelfUpdateTests(unittest.TestCase):
         )
         sync_llama.assert_called_once_with()
         self.assertEqual(run_mock.call_count, 2)
+
+    def test_update_from_latest_release_migrates_model_config_after_repo_update(self) -> None:
+        update = RepoUpdateInfo(
+            remote="origin",
+            branch="master",
+            local_commit="1111111222222333333444444555555666666777",
+            remote_commit="aaaaaaa222222333333444444555556666666777",
+        )
+        with patch("src.self_update.available_update", return_value=update), patch(
+            "src.self_update._has_tracked_changes",
+            return_value=False,
+        ), patch(
+            "src.self_update._git_output",
+            side_effect=lambda *args: "src/config.py\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
+        ), patch("src.self_update._sync_managed_llama_cpp_after_update", return_value=None), patch(
+            "src.self_update._migrate_config_after_update",
+            return_value=True,
+        ) as migrate_config, patch("src.self_update.subprocess.run"):
+            message = update_from_latest_release(current_version="0.3.0")
+
+        self.assertEqual(
+            message,
+            "Updated open-jet repo from 1111111 to aaaaaaa. Updated model config for Qwen3.6 MTP.",
+        )
+        migrate_config.assert_called_once_with()
+
+    def test_update_from_latest_release_runs_model_config_migration_when_repo_is_current(self) -> None:
+        with patch("src.self_update.available_update", return_value=None), patch(
+            "src.self_update._migrate_config_after_update",
+            return_value=True,
+        ):
+            message = update_from_latest_release(current_version="0.3.0")
+
+        self.assertEqual(
+            message,
+            "open-jet repo is already up to date. Updated model config for Qwen3.6 MTP.",
+        )
+
+    def test_migrate_config_after_update_persists_legacy_qwen_mtp_model_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "llama_cpp_ref: pull/22673/head",
+                        "llama_model: /models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                        "model_profiles:",
+                        "- name: mtp",
+                        "  llama_model: /models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("src.self_update._REPO_ROOT", root):
+                changed = _migrate_config_after_update()
+
+            text = config_path.read_text(encoding="utf-8")
+
+        self.assertTrue(changed)
+        self.assertIn("llama_model: /models/Qwen3.6-27B-Q4_K_M.gguf", text)
+        self.assertIn("model_download_path: /models/Qwen3.6-27B-Q4_K_M.gguf", text)
+        self.assertIn("model_source: direct", text)
+        self.assertIn("setup_missing_model: true", text)
+        self.assertIn("setup_update_model: true", text)
+        self.assertIn("model_update_target: qwen36-27b-mtp-unsloth-b9189", text)
+        self.assertIn("https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true", text)
+        self.assertIn("llama_mtp: true", text)
+        self.assertIn("llama_cpp_ref: b9189", text)

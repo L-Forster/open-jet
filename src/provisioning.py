@@ -53,8 +53,8 @@ LLAMA_SERVER_BIN = BIN_DIR / LLAMA_SERVER_EXE_NAME
 LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-LLAMA_CPP_PINNED_REF = "64ac9ab6"
-LLAMA_CPP_MTP_REF = "pull/22673/head"
+LLAMA_CPP_PINNED_REF = "b9189"
+LLAMA_CPP_MTP_REF = "b9189"
 UNIFIED_MEMORY_SYSTEM_RESERVE_MB = 4096.0
 
 
@@ -65,14 +65,14 @@ def managed_llama_cpp_ref() -> str:
 
 def _normalized_llama_cpp_ref(ref: str) -> str:
     stripped = str(ref or "").strip()
-    if stripped in {"mtp", "qwen-mtp", "qwen3.6-mtp"}:
+    if stripped in {"mtp", "qwen-mtp", "qwen3.6-mtp", "pull/22673/head", "refs/pull/22673/head", "mtp-pr"}:
         return LLAMA_CPP_MTP_REF
     return stripped
 
 
 def _is_mtp_llama_cpp_ref(ref: str) -> bool:
-    normalized = _normalized_llama_cpp_ref(ref).lower()
-    return normalized in {LLAMA_CPP_MTP_REF, "refs/pull/22673/head", "mtp-pr"}
+    normalized = str(ref or "").strip().lower()
+    return normalized in {"pull/22673/head", "refs/pull/22673/head", "mtp-pr", "mtp", "qwen-mtp", "qwen3.6-mtp"}
 
 
 def _model_path_looks_mtp(value: object) -> bool:
@@ -1133,7 +1133,8 @@ async def ensure_direct_model(
     target_path = Path(target_raw).expanduser()
     if not url or not target_raw:
         raise RuntimeError("Direct model provisioning is missing a download URL or target path.")
-    if target_path.is_file():
+    force_model_update = bool(setup_result.get("setup_update_model", False))
+    if target_path.is_file() and not force_model_update:
         merged = dict(setup_result)
         merged["llama_model"] = str(target_path)
         merged["setup_missing_model"] = False
@@ -1149,8 +1150,15 @@ async def ensure_direct_model(
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     _clear_old_model_files(target_path.parent, target_path, log=log)
-    set_status(f"downloading {target_path.name}")
-    log.write(f"[bold bright_white]Downloading {target_path.name} with Hugging Face fast transfer...[/]")
+    temp_download_dir: Path | None = None
+    download_dir = target_path.parent
+    if force_model_update:
+        temp_download_dir = Path(
+            tempfile.mkdtemp(prefix=f".{target_path.name}.download-", dir=target_path.parent)
+        )
+        download_dir = temp_download_dir
+    set_status(f"downloading {target_path.name} from {repo_id}")
+    log.write(f"[bold bright_white]Downloading {target_path.name} from {repo_id} with Hugging Face fast transfer...[/]")
     last_progress_pct = -1
     last_progress_text = ""
 
@@ -1177,25 +1185,33 @@ async def ensure_direct_model(
         repo_id=repo_id,
         filename=filename,
         revision=revision,
-        local_dir=target_path.parent,
+        local_dir=download_dir,
         progress=report_progress,
     )
     if rc != 0:
+        if temp_download_dir:
+            shutil.rmtree(temp_download_dir, ignore_errors=True)
         clear_status()
         detail = (err or out).strip()
         raise RuntimeError(detail or "Hugging Face CLI model download failed.")
 
-    downloaded_path = target_path.parent / filename
-    if not target_path.is_file() and downloaded_path.is_file():
-        downloaded_path.replace(target_path)
-        parent = downloaded_path.parent
-        while parent != target_path.parent:
-            try:
-                parent.rmdir()
-            except OSError:
-                break
-            parent = parent.parent
+    downloaded_path = download_dir / filename
+    if downloaded_path.is_file():
+        if downloaded_path != target_path:
+            downloaded_path.replace(target_path)
+        if temp_download_dir:
+            shutil.rmtree(temp_download_dir, ignore_errors=True)
+        else:
+            parent = downloaded_path.parent
+            while parent != target_path.parent:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
     if not target_path.is_file():
+        if temp_download_dir:
+            shutil.rmtree(temp_download_dir, ignore_errors=True)
         clear_status()
         raise RuntimeError(f"Hugging Face CLI completed but did not create {target_path}.")
 
@@ -1205,6 +1221,11 @@ async def ensure_direct_model(
     merged = dict(setup_result)
     merged["llama_model"] = str(target_path)
     merged["setup_missing_model"] = False
+    update_target = str(merged.get("model_update_target") or "").strip()
+    if update_target:
+        merged["model_update_applied"] = update_target
+        merged.pop("model_update_target", None)
+    merged.pop("setup_update_model", None)
     return merged
 
 

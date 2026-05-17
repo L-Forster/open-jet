@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _INSTALL_SCRIPT = _REPO_ROOT / "install.sh"
 _WINDOWS_INSTALL_SCRIPT = _REPO_ROOT / "install.bat"
@@ -166,6 +168,21 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     return target_ref[:7]
 
 
+def _migrate_config_after_update() -> bool:
+    from .config import migrate_config_for_current_release
+
+    config_path = _REPO_ROOT / "config.yaml"
+    if not config_path.exists():
+        return False
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(cfg, dict):
+        return False
+    if not migrate_config_for_current_release(cfg):
+        return False
+    config_path.write_text(yaml.dump(cfg, default_flow_style=False), encoding="utf-8")
+    return True
+
+
 def _changed_files(base: str, head: str) -> list[str] | None:
     output = _git_output("diff", "--name-only", base, head)
     if output is None:
@@ -254,6 +271,7 @@ def install_update(update: RepoUpdateInfo, *, current_version: str | None = None
             check=True,
         )
         llama_ref = _sync_managed_llama_cpp_after_update()
+        config_migrated = _migrate_config_after_update()
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"Failed to update repo checkout from {update.local_short} to {update.remote_short}."
@@ -261,11 +279,15 @@ def install_update(update: RepoUpdateInfo, *, current_version: str | None = None
     message = f"Updated open-jet repo from {update.local_short} to {update.remote_short}."
     if llama_ref:
         message += f" Synced managed llama.cpp to {llama_ref}."
+    if config_migrated:
+        message += " Updated model config for Qwen3.6 MTP."
     return message
 
 
 def update_from_latest_release(*, current_version: str | None = None) -> str:
     update = available_update(current_version=current_version)
     if update is None:
+        if _migrate_config_after_update():
+            return "open-jet repo is already up to date. Updated model config for Qwen3.6 MTP."
         return "open-jet repo is already up to date."
     return install_update(update, current_version=current_version)

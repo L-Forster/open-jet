@@ -61,8 +61,8 @@ is the configured setup target for that row.
 |---|---|
 | Qwen3.5 4B | 6.0 |
 | Qwen3.5 9B | 12.0 |
-| Qwen3.6 27B UD-IQ2_XXS | 12.0 |
-| Qwen3.6 27B UD-IQ3_XXS | 16.0 |
+| Qwen3.6 27B UD-IQ2_XXS MTP | 12.0 |
+| Qwen3.6 27B UD-IQ3_XXS MTP | 16.0 |
 | Qwen3.6 27B Q4_K_M MTP | 20.0 |
 
 **Unified memory only (`unified_memory_only: True`, `llama_cpu_moe: True`):**
@@ -70,8 +70,8 @@ is the configured setup target for that row.
 | Model | Configured `max_ram_gb` |
 |---|---|
 | Gemma 4 26B A4B | 24.0 |
-| Qwen3.6 35B A3B UD-Q3_K_XL | 24.0 |
-| Qwen3.6 35B A3B | 32.0 |
+| Qwen3.6 35B A3B UD-Q3_K_XL MTP | 24.0 |
+| Qwen3.6 35B A3B MTP | 32.0 |
 
 Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
 
