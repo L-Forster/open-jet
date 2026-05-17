@@ -210,6 +210,29 @@ class SDKFixTests(unittest.TestCase):
         self.assertTrue(report.observation.metadata["draft_engaged"])
         self.assertTrue(report.observation.metadata["model_has_mtp_suffix"])
 
+    def test_llama_cpp_mtp_spec_flags_are_reported(self) -> None:
+        process = RuntimeProcess(
+            backend="llama.cpp",
+            pid=1234,
+            argv=(
+                "llama-server",
+                "-m", "/models/Qwen3.6-27B-Q4_K_M.gguf",
+                "--spec-default",
+                "--spec-type", "draft-mtp",
+                "--spec-draft-n-max", "3",
+                "--port", "18080",
+            ),
+            executable="llama-server",
+            port=18080,
+        )
+        hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
+
+        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+            report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False)
+
+        self.assertTrue(report.observation.metadata["draft_engaged"])
+        self.assertFalse(report.observation.metadata["model_has_mtp_suffix"])
+
     def test_mtp_suffixed_recommended_model_is_not_reported_as_model_change(self) -> None:
         process = RuntimeProcess(
             backend="llama.cpp",

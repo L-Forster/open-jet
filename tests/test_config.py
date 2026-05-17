@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from src.config import DEFAULT_LOG_DIRECTORY, DEFAULT_SESSION_STATE_PATH, normalize_config, setup_direct_model_catalog
+from src.config import (
+    DEFAULT_LOG_DIRECTORY,
+    DEFAULT_SESSION_STATE_PATH,
+    migrate_config_for_current_release,
+    normalize_config,
+    setup_direct_model_catalog,
+)
 
 
 class ConfigNormalizationTests(unittest.TestCase):
@@ -28,6 +34,108 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["logging"]["directory"], "custom/logs")
         self.assertEqual(normalized["state"]["path"], "custom/state.yaml")
 
+    def test_normalize_config_maps_legacy_qwen_mtp_filename_to_unsloth_asset(self) -> None:
+        cfg = {
+            "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+            "model_profiles": [
+                {
+                    "name": "mtp",
+                    "llama_cpp_ref": "pull/22673/head",
+                    "llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                }
+            ],
+        }
+
+        normalized = normalize_config(cfg)
+
+        self.assertEqual(normalized["llama_model"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertTrue(normalized["llama_mtp"])
+        self.assertEqual(normalized["llama_cpp_ref"], "b9189")
+        self.assertEqual(normalized["model_source"], "direct")
+        self.assertTrue(normalized["setup_missing_model"])
+        self.assertTrue(normalized["setup_update_model"])
+        self.assertEqual(normalized["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+        self.assertEqual(
+            normalized["model_download_url"],
+            "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+        )
+        self.assertEqual(normalized["model_profiles"][0]["llama_model"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertTrue(normalized["model_profiles"][0]["llama_mtp"])
+        self.assertEqual(normalized["model_profiles"][0]["llama_cpp_ref"], "b9189")
+        self.assertEqual(normalized["model_profiles"][0]["model_source"], "direct")
+        self.assertTrue(normalized["model_profiles"][0]["setup_missing_model"])
+        self.assertTrue(normalized["model_profiles"][0]["setup_update_model"])
+        self.assertEqual(normalized["model_profiles"][0]["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+
+    def test_migrate_config_for_current_release_reports_whether_it_changed_model(self) -> None:
+        cfg = {"llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf"}
+
+        self.assertTrue(migrate_config_for_current_release(cfg))
+        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertTrue(cfg["llama_mtp"])
+        self.assertEqual(cfg["model_source"], "direct")
+        self.assertTrue(cfg["setup_missing_model"])
+        self.assertTrue(cfg["setup_update_model"])
+        self.assertEqual(cfg["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+        self.assertFalse(migrate_config_for_current_release(cfg))
+
+    def test_migrate_config_for_current_release_updates_already_normalized_qwen_mtp_once(self) -> None:
+        cfg = {
+            "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+            "model_download_path": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+            "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+            "llama_mtp": True,
+            "setup_missing_model": False,
+        }
+
+        self.assertTrue(migrate_config_for_current_release(cfg))
+        self.assertTrue(cfg["setup_update_model"])
+        self.assertTrue(cfg["setup_missing_model"])
+        self.assertEqual(cfg["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+        cfg["model_update_applied"] = cfg.pop("model_update_target")
+        cfg.pop("setup_update_model")
+        cfg["setup_missing_model"] = False
+        self.assertFalse(migrate_config_for_current_release(cfg))
+
+    def test_migrate_config_for_current_release_updates_legacy_35b_a3b_model(self) -> None:
+        cfg = {
+            "llama_model": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+            "model_download_path": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+            "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true",
+            "setup_missing_model": False,
+        }
+
+        self.assertTrue(migrate_config_for_current_release(cfg))
+        self.assertEqual(
+            cfg["model_download_url"],
+            "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true",
+        )
+        self.assertTrue(cfg["llama_mtp"])
+        self.assertTrue(cfg["setup_missing_model"])
+        self.assertTrue(cfg["setup_update_model"])
+        self.assertEqual(cfg["model_update_target"], "qwen36-35b-a3b-mtp-unsloth-b9189")
+
+    def test_migrate_config_for_current_release_updates_legacy_27b_quant_model(self) -> None:
+        cfg = {
+            "llama_model": "/models/Qwen3.6-27B-UD-IQ2_XXS.gguf",
+            "model_download_path": "/models/Qwen3.6-27B-UD-IQ2_XXS.gguf",
+            "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/resolve/main/Qwen3.6-27B-UD-IQ2_XXS.gguf?download=true",
+            "setup_missing_model": False,
+        }
+
+        self.assertTrue(migrate_config_for_current_release(cfg))
+        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-UD-IQ2_XXS.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-UD-IQ2_XXS.gguf")
+        self.assertEqual(
+            cfg["model_download_url"],
+            "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-UD-IQ2_XXS.gguf?download=true",
+        )
+        self.assertTrue(cfg["llama_mtp"])
+        self.assertTrue(cfg["setup_missing_model"])
+        self.assertTrue(cfg["setup_update_model"])
+        self.assertEqual(cfg["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+
     def test_setup_direct_model_catalog_preserves_optional_metadata(self) -> None:
         catalog = setup_direct_model_catalog(
             {
@@ -44,6 +152,8 @@ class ConfigNormalizationTests(unittest.TestCase):
                             "unified_memory_only": True,
                             "llama_cpu_moe": True,
                             "llama_n_cpu_moe": 12,
+                            "llama_cpp_ref": "b9189",
+                            "llama_mtp": True,
                         }
                     ]
                 }
@@ -56,3 +166,5 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertTrue(catalog[0]["unified_memory_only"])
         self.assertTrue(catalog[0]["llama_cpu_moe"])
         self.assertEqual(catalog[0]["llama_n_cpu_moe"], 12)
+        self.assertEqual(catalog[0]["llama_cpp_ref"], "b9189")
+        self.assertTrue(catalog[0]["llama_mtp"])

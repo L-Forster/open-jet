@@ -323,7 +323,10 @@ def _recommended_summary(payload: Mapping[str, object]) -> str:
     if payload.get("setup_missing_runtime"):
         notes.append("llama-server will be provisioned")
     if payload.get("setup_missing_model"):
-        notes.append("recommended GGUF will be downloaded")
+        if payload.get("setup_update_model"):
+            notes.append("recommended GGUF will be updated")
+        else:
+            notes.append("recommended GGUF will be downloaded")
     note_suffix = f" [{', '.join(notes)}]" if notes else ""
     return (
         f"runtime=llama_cpp, model_source={model_source}, model={model_text}, "
@@ -398,6 +401,9 @@ def _recommended_local_payload(
         "kv_bytes_per_token",
         "resident_model_size_mb",
         "active_model_size_mb",
+        "llama_cpp_ref",
+        "llama_mtp",
+        "setup_update_model",
     ):
         if direct.get(key) is not None:
             payload[key] = direct[key]
@@ -418,6 +424,9 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
         "kv_bytes_per_token",
         "resident_model_size_mb",
         "active_model_size_mb",
+        "llama_cpp_ref",
+        "llama_mtp",
+        "setup_update_model",
     ):
         if row.get(key) is not None:
             payload[key] = row[key]
@@ -540,6 +549,9 @@ def build_recommended_payload(
             "unified_memory_only",
             "llama_cpu_moe",
             "llama_n_cpu_moe",
+            "llama_cpp_ref",
+            "llama_mtp",
+            "setup_update_model",
         ):
             if direct.get(key) is not None:
                 payload[key] = direct[key]

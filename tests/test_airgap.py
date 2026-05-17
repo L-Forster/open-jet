@@ -87,6 +87,17 @@ class RuntimeRegistryAirgapTests(AirgapBaseTestCase):
         self.assertEqual(client.llama_n_cpu_moe, 12)
         asyncio.run(client.close())
 
+    def test_create_runtime_client_passes_mtp_flag(self) -> None:
+        client = create_runtime_client(
+            {
+                "llama_model": "local.gguf",
+                "llama_mtp": True,
+            }
+        )
+
+        self.assertTrue(client.llama_mtp)
+        asyncio.run(client.close())
+
 
 class AppAirgapTests(AirgapBaseTestCase):
     def test_estimate_tokens_uses_local_airgapped_counter(self) -> None:

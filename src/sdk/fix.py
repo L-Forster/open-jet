@@ -752,14 +752,13 @@ def _bool_flag(argv: Sequence[str], *names: str) -> bool | None:
 
 
 def _llama_cpp_draft_engaged(argv: Sequence[str]) -> bool:
-    return bool(
-        _flag_value(
-            argv,
-            "--model-draft",
-            "--draft-model",
-            "--draft",
-            "-md",
-        )
+    if bool(_flag_value(argv, "--model-draft", "--draft-model", "--draft", "-md")):
+        return True
+    spec_type = _flag_value(argv, "--spec-type")
+    return (
+        _bool_flag(argv, "--spec-default") is True
+        or (isinstance(spec_type, str) and spec_type.strip().lower() == "draft-mtp")
+        or _bool_flag(argv, "--spec-draft-n-max") is True
     )
 
 
