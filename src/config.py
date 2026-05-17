@@ -264,19 +264,41 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
         ]
         text = "\n".join(str(value or "") for value in values)
         lowered = text.lower()
+        local_names = [
+            Path(str(value or "")).name.lower()
+            for value in (row.get("llama_model"), row.get("model_download_path"), row.get("filename"))
+            if str(value or "").strip()
+        ]
+        has_non_mtp_qwen36_local_name = any(
+            (
+                name.startswith(QWEN36_27B_PREFIX)
+                or name.startswith("qwen3.6-35b-a3b-")
+            )
+            and name.endswith(".gguf")
+            and not Path(name).stem.endswith("-mtp")
+            for name in local_names
+        )
         return (
             QWEN36_27B_OLD_MTP_REPO.lower() in lowered
             or QWEN36_27B_NON_MTP_REPO.lower() in lowered
+            or (QWEN36_27B_MTP_REPO.lower() in lowered and has_non_mtp_qwen36_local_name)
             or (
                 QWEN36_27B_PREFIX in lowered
                 and bool(row.get("llama_mtp"))
-                and str(row.get("model_update_applied") or "") != QWEN36_27B_MTP_UPDATE_ID
+                and (
+                    has_non_mtp_qwen36_local_name
+                    or str(row.get("model_update_applied") or "") != QWEN36_27B_MTP_UPDATE_ID
+                )
             )
             or QWEN36_35B_A3B_NON_MTP_REPO.lower() in lowered
+            or (QWEN36_35B_A3B_MTP_REPO.lower() in lowered and has_non_mtp_qwen36_local_name)
             or (
                 "qwen3.6-35b-a3b-" in lowered
                 and bool(row.get("llama_mtp"))
-                and str(row.get("model_update_applied") or "") != QWEN36_35B_A3B_MTP_UPDATE_ID
+                and (
+                    has_non_mtp_qwen36_local_name
+                    or str(row.get("model_update_applied") or "") != QWEN36_35B_A3B_MTP_UPDATE_ID
+                )
             )
         )
 
@@ -312,14 +334,16 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
                 row[key] = value
                 changed = True
 
-        model_download_url, model_update_target = qwen_mtp_update_details(row, replacement)
+        model_download_url, _model_update_target = qwen_mtp_update_details(row, replacement)
         set_value("model_source", "direct")
         set_value("model_download_url", model_download_url)
         set_value("llama_mtp", True)
         set_value("llama_cpp_ref", QWEN36_27B_MTP_LLAMA_CPP_REF)
         set_value("setup_missing_model", True)
-        set_value("setup_update_model", True)
-        set_value("model_update_target", model_update_target)
+        if row.pop("setup_update_model", None) is not None:
+            changed = True
+        if row.pop("model_update_target", None) is not None:
+            changed = True
         if replacement:
             set_value("llama_model", replacement)
             set_value("model_download_path", replacement)

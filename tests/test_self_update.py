@@ -11,9 +11,11 @@ from src.self_update import (
     _has_tracked_changes,
     _install_command,
     _migrate_config_after_update,
+    _sync_managed_llama_cpp_after_update,
     available_update,
     update_from_latest_release,
 )
+from src.hardware import HardwareInfo
 
 
 class SelfUpdateTests(unittest.TestCase):
@@ -261,6 +263,36 @@ class SelfUpdateTests(unittest.TestCase):
         sync_llama.assert_called_once_with()
         self.assertEqual(run_mock.call_count, 2)
 
+    def test_sync_managed_llama_cpp_after_update_fetches_target_ref_without_recloning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            llama_dir = Path(tmp) / "llama.cpp"
+            (llama_dir / ".git").mkdir(parents=True)
+            calls: list[list[str]] = []
+
+            def fake_run(command, *args, **kwargs):
+                calls.append(list(command))
+                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
+                "src.provisioning.managed_llama_cpp_ref",
+                return_value="b9189",
+            ), patch(
+                "src.hardware.detect_hardware_info",
+                return_value=HardwareInfo(label="CPU", total_ram_gb=16.0, has_cuda=False),
+            ), patch(
+                "src.self_update._llama_git_output",
+                return_value="1111111222222333333444444555555666666777",
+            ), patch(
+                "src.self_update.shutil.which",
+                return_value="/usr/bin/cmake",
+            ), patch("src.self_update.subprocess.run", side_effect=fake_run):
+                synced = _sync_managed_llama_cpp_after_update()
+
+        self.assertEqual(synced, "b9189")
+        self.assertFalse(any("clone" in command for command in calls))
+        self.assertTrue(any("fetch" in command and "--depth=1" in command and "b9189" in command for command in calls))
+        self.assertTrue(any(command[-2:] == ["--detach", "FETCH_HEAD"] for command in calls))
+
     def test_update_from_latest_release_migrates_model_config_after_repo_update(self) -> None:
         update = RepoUpdateInfo(
             remote="origin",
@@ -325,8 +357,8 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertIn("model_download_path: /models/Qwen3.6-27B-Q4_K_M-MTP.gguf", text)
         self.assertIn("model_source: direct", text)
         self.assertIn("setup_missing_model: true", text)
-        self.assertIn("setup_update_model: true", text)
-        self.assertIn("model_update_target: qwen36-27b-mtp-unsloth-b9189", text)
+        self.assertNotIn("setup_update_model:", text)
+        self.assertNotIn("model_update_target:", text)
         self.assertIn("https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true", text)
         self.assertIn("llama_mtp: true", text)
         self.assertIn("llama_cpp_ref: b9189", text)

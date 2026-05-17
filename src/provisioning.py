@@ -340,6 +340,44 @@ async def _run_exec(*args: str, cwd: Path | None = None) -> tuple[int, str, str]
     return proc.returncode or 0, out_raw.decode(errors="replace"), err_raw.decode(errors="replace")
 
 
+_GIT_NETWORK_OPTIONS: tuple[str, ...] = (
+    "-c",
+    "http.version=HTTP/1.1",
+    "-c",
+    "http.postBuffer=524288000",
+)
+_GIT_RETRY_MARKERS: tuple[str, ...] = (
+    "early eof",
+    "fetch-pack",
+    "invalid index-pack",
+    "rpc failed",
+    "stream",
+    "unexpected disconnect",
+)
+
+
+def _git_network_args(*args: str) -> tuple[str, ...]:
+    return ("git", *_GIT_NETWORK_OPTIONS, *args)
+
+
+def _looks_like_transient_git_network_error(out: str, err: str) -> bool:
+    text = f"{out}\n{err}".lower()
+    return any(marker in text for marker in _GIT_RETRY_MARKERS)
+
+
+async def _run_git_network(*args: str, cwd: Path | None = None, attempts: int = 3) -> tuple[int, str, str]:
+    last: tuple[int, str, str] = (1, "", "")
+    for attempt in range(1, max(1, attempts) + 1):
+        last = await _run_exec(*_git_network_args(*args), cwd=cwd)
+        rc, out, err = last
+        if rc == 0:
+            return last
+        if attempt >= attempts or not _looks_like_transient_git_network_error(out, err):
+            return last
+        await asyncio.sleep(float(attempt))
+    return last
+
+
 _BUILD_PROGRESS_NINJA_RE = re.compile(r"\[\s*(\d+)\s*/\s*(\d+)\s*\]")
 _BUILD_PROGRESS_MAKE_RE = re.compile(r"\[\s*(\d+)\s*%\s*\]")
 
@@ -707,38 +745,31 @@ async def _sync_managed_llama_cpp_checkout(
         shutil.rmtree(LLAMA_CPP_DIR)
 
     if not repo_exists:
-        set_status("cloning llama.cpp")
-        log.write("  [dim]Cloning llama.cpp...[/]")
-        rc, out, err = await _run_exec(
-            "git",
-            "clone",
-            LLAMA_CPP_REPO_URL,
-            str(LLAMA_CPP_DIR),
-        )
+        set_status("initializing llama.cpp checkout")
+        log.write("  [dim]Initializing llama.cpp checkout...[/]")
+        LLAMA_CPP_DIR.mkdir(parents=True, exist_ok=True)
+        rc, out, err = await _run_exec("git", "init", cwd=LLAMA_CPP_DIR)
         if rc != 0:
             clear_status()
-            raise RuntimeError((err or out).strip() or "Failed to clone llama.cpp")
+            raise RuntimeError((err or out).strip() or "Failed to initialize llama.cpp checkout")
+        rc, out, err = await _run_exec("git", "remote", "add", "origin", LLAMA_CPP_REPO_URL, cwd=LLAMA_CPP_DIR)
+        if rc != 0:
+            clear_status()
+            raise RuntimeError((err or out).strip() or "Failed to configure llama.cpp remote")
 
     if repo_exists:
         await _run_exec("git", "reset", "--hard", "HEAD", cwd=LLAMA_CPP_DIR)
         await _run_exec("git", "clean", "-fd", cwd=LLAMA_CPP_DIR)
+        await _run_exec("git", "remote", "set-url", "origin", LLAMA_CPP_REPO_URL, cwd=LLAMA_CPP_DIR)
 
     set_status("fetching llama.cpp")
-    log.write("  [dim]Fetching llama.cpp refs...[/]")
-    rc, out, err = await _run_exec("git", "fetch", "--tags", "--prune", "origin", cwd=LLAMA_CPP_DIR)
+    log.write(f"  [dim]Fetching llama.cpp {target_ref[:12]}...[/]")
+    rc, out, err = await _run_git_network("fetch", "--depth=1", "origin", target_ref, cwd=LLAMA_CPP_DIR)
     if rc != 0:
         clear_status()
         raise RuntimeError((err or out).strip() or "Failed to fetch llama.cpp")
 
-    checkout_ref = target_ref
-    if _is_mtp_llama_cpp_ref(target_ref):
-        rc, out, err = await _run_exec("git", "fetch", "origin", "+pull/22673/head:mtp-pr", cwd=LLAMA_CPP_DIR)
-        if rc != 0:
-            clear_status()
-            raise RuntimeError((err or out).strip() or "Failed to fetch llama.cpp MTP PR.")
-        checkout_ref = "mtp-pr"
-
-    rc, out, err = await _run_exec("git", "checkout", "--detach", checkout_ref, cwd=LLAMA_CPP_DIR)
+    rc, out, err = await _run_exec("git", "checkout", "--detach", "FETCH_HEAD", cwd=LLAMA_CPP_DIR)
     if rc != 0:
         clear_status()
         raise RuntimeError((err or out).strip() or f"Failed to checkout llama.cpp ref {target_ref}.")
@@ -1133,11 +1164,16 @@ async def ensure_direct_model(
     target_path = Path(target_raw).expanduser()
     if not url or not target_raw:
         raise RuntimeError("Direct model provisioning is missing a download URL or target path.")
-    force_model_update = bool(setup_result.get("setup_update_model", False))
-    if target_path.is_file() and not force_model_update:
+    configured_model_raw = str(setup_result.get("llama_model") or "").strip()
+    configured_model = Path(configured_model_raw).expanduser() if configured_model_raw else None
+    existing_path = target_path if target_path.is_file() else configured_model if configured_model and configured_model.is_file() else None
+    if existing_path is not None:
         merged = dict(setup_result)
-        merged["llama_model"] = str(target_path)
+        merged["llama_model"] = str(existing_path)
+        merged["model_download_path"] = str(existing_path)
         merged["setup_missing_model"] = False
+        merged.pop("setup_update_model", None)
+        merged.pop("model_update_target", None)
         return merged
 
     parsed = _parse_huggingface_resolve_url(url)
@@ -1149,15 +1185,7 @@ async def ensure_direct_model(
     repo_id, revision, filename = parsed
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    if not force_model_update:
-        _clear_old_model_files(target_path.parent, target_path, log=log)
-    temp_download_dir: Path | None = None
     download_dir = target_path.parent
-    if force_model_update:
-        temp_download_dir = Path(
-            tempfile.mkdtemp(prefix=f".{target_path.name}.download-", dir=target_path.parent)
-        )
-        download_dir = temp_download_dir
     set_status(f"downloading {target_path.name} from {repo_id}")
     log.write(f"[bold bright_white]Downloading {target_path.name} from {repo_id} with Hugging Face fast transfer...[/]")
     last_progress_pct = -1
@@ -1190,8 +1218,6 @@ async def ensure_direct_model(
         progress=report_progress,
     )
     if rc != 0:
-        if temp_download_dir:
-            shutil.rmtree(temp_download_dir, ignore_errors=True)
         clear_status()
         detail = (err or out).strip()
         raise RuntimeError(detail or "Hugging Face CLI model download failed.")
@@ -1200,35 +1226,26 @@ async def ensure_direct_model(
     if downloaded_path.is_file():
         if downloaded_path != target_path:
             downloaded_path.replace(target_path)
-        if temp_download_dir:
-            shutil.rmtree(temp_download_dir, ignore_errors=True)
-        else:
-            parent = downloaded_path.parent
-            while parent != target_path.parent:
-                try:
-                    parent.rmdir()
-                except OSError:
-                    break
-                parent = parent.parent
+        parent = downloaded_path.parent
+        while parent != target_path.parent:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
     if not target_path.is_file():
-        if temp_download_dir:
-            shutil.rmtree(temp_download_dir, ignore_errors=True)
         clear_status()
         raise RuntimeError(f"Hugging Face CLI completed but did not create {target_path}.")
 
     downloaded = target_path.stat().st_size
-    if force_model_update:
-        _clear_old_model_files(target_path.parent, target_path, log=log)
+    _clear_old_model_files(target_path.parent, target_path, log=log)
     log.write(f"[bold bright_white]Download complete: {_fmt_size(downloaded)}[/]")
     clear_status()
     merged = dict(setup_result)
     merged["llama_model"] = str(target_path)
     merged["setup_missing_model"] = False
-    update_target = str(merged.get("model_update_target") or "").strip()
-    if update_target:
-        merged["model_update_applied"] = update_target
-        merged.pop("model_update_target", None)
     merged.pop("setup_update_model", None)
+    merged.pop("model_update_target", None)
     return merged
 
 

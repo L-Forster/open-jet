@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from src.hardware import HardwareInfo
-from src.provisioning import _llama_cmake_args, ensure_llama_server, recommend_direct_model
+from src.provisioning import _llama_cmake_args, _sync_managed_llama_cpp_checkout, ensure_llama_server, recommend_direct_model
 
 
 class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
@@ -54,6 +54,41 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("-DGGML_VULKAN=ON", args)
         self.assertNotIn("-DGGML_CUDA=ON", args)
+
+    async def test_sync_managed_llama_cpp_checkout_uses_shallow_retry_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            llama_dir = Path(tmp) / "llama.cpp"
+            calls: list[tuple[str, ...]] = []
+            fetch_attempts = 0
+
+            async def fake_run_exec(*args: str, cwd: Path | None = None):
+                nonlocal fetch_attempts
+                calls.append(args)
+                if "fetch" in args:
+                    fetch_attempts += 1
+                    if fetch_attempts == 1:
+                        return 1, "", "RPC failed; curl 92 HTTP/2 stream was not closed cleanly\nfatal: early EOF"
+                return 0, "", ""
+
+            with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
+                "src.provisioning._run_exec",
+                AsyncMock(side_effect=fake_run_exec),
+            ), patch("src.provisioning.asyncio.sleep", AsyncMock()):
+                synced = await _sync_managed_llama_cpp_checkout(
+                    target_ref="b9189",
+                    log=Mock(),
+                    set_status=lambda _message: None,
+                    clear_status=lambda: None,
+                )
+
+        self.assertEqual(synced, "b9189")
+        self.assertFalse(any("clone" in call for call in calls))
+        fetch_calls = [call for call in calls if "fetch" in call]
+        self.assertEqual(len(fetch_calls), 2)
+        self.assertIn("http.version=HTTP/1.1", fetch_calls[0])
+        self.assertIn("--depth=1", fetch_calls[0])
+        self.assertEqual(fetch_calls[0][-2:], ("origin", "b9189"))
+        self.assertTrue(any(call[-2:] == ("--detach", "FETCH_HEAD") for call in calls))
 
     async def test_ensure_llama_server_installs_prebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

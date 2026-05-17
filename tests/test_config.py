@@ -53,8 +53,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["llama_cpp_ref"], "b9189")
         self.assertEqual(normalized["model_source"], "direct")
         self.assertTrue(normalized["setup_missing_model"])
-        self.assertTrue(normalized["setup_update_model"])
-        self.assertEqual(normalized["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+        self.assertNotIn("setup_update_model", normalized)
+        self.assertNotIn("model_update_target", normalized)
         self.assertEqual(
             normalized["model_download_url"],
             "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
@@ -64,8 +64,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["model_profiles"][0]["llama_cpp_ref"], "b9189")
         self.assertEqual(normalized["model_profiles"][0]["model_source"], "direct")
         self.assertTrue(normalized["model_profiles"][0]["setup_missing_model"])
-        self.assertTrue(normalized["model_profiles"][0]["setup_update_model"])
-        self.assertEqual(normalized["model_profiles"][0]["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+        self.assertNotIn("setup_update_model", normalized["model_profiles"][0])
+        self.assertNotIn("model_update_target", normalized["model_profiles"][0])
 
     def test_migrate_config_for_current_release_reports_whether_it_changed_model(self) -> None:
         cfg = {"llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf"}
@@ -76,8 +76,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertTrue(cfg["llama_mtp"])
         self.assertEqual(cfg["model_source"], "direct")
         self.assertTrue(cfg["setup_missing_model"])
-        self.assertTrue(cfg["setup_update_model"])
-        self.assertEqual(cfg["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+        self.assertNotIn("setup_update_model", cfg)
+        self.assertNotIn("model_update_target", cfg)
         self.assertFalse(migrate_config_for_current_release(cfg))
 
     def test_migrate_config_for_current_release_updates_already_normalized_qwen_mtp_once(self) -> None:
@@ -92,13 +92,29 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertTrue(migrate_config_for_current_release(cfg))
         self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
         self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
-        self.assertTrue(cfg["setup_update_model"])
         self.assertTrue(cfg["setup_missing_model"])
-        self.assertEqual(cfg["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
-        cfg["model_update_applied"] = cfg.pop("model_update_target")
-        cfg.pop("setup_update_model")
+        self.assertNotIn("setup_update_model", cfg)
+        self.assertNotIn("model_update_target", cfg)
+        cfg["model_update_applied"] = "qwen36-27b-mtp-unsloth-b9189"
         cfg["setup_missing_model"] = False
         self.assertFalse(migrate_config_for_current_release(cfg))
+
+    def test_migrate_config_for_current_release_fixes_stale_applied_marker_with_non_mtp_filename(self) -> None:
+        cfg = {
+            "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+            "model_download_path": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+            "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+            "llama_mtp": True,
+            "model_update_applied": "qwen36-27b-mtp-unsloth-b9189",
+            "setup_missing_model": False,
+        }
+
+        self.assertTrue(migrate_config_for_current_release(cfg))
+        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
+        self.assertTrue(cfg["setup_missing_model"])
+        self.assertNotIn("setup_update_model", cfg)
+        self.assertNotIn("model_update_target", cfg)
 
     def test_migrate_config_for_current_release_updates_legacy_35b_a3b_model(self) -> None:
         cfg = {
@@ -117,8 +133,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         )
         self.assertTrue(cfg["llama_mtp"])
         self.assertTrue(cfg["setup_missing_model"])
-        self.assertTrue(cfg["setup_update_model"])
-        self.assertEqual(cfg["model_update_target"], "qwen36-35b-a3b-mtp-unsloth-b9189")
+        self.assertNotIn("setup_update_model", cfg)
+        self.assertNotIn("model_update_target", cfg)
 
     def test_migrate_config_for_current_release_updates_legacy_27b_quant_model(self) -> None:
         cfg = {
@@ -137,8 +153,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         )
         self.assertTrue(cfg["llama_mtp"])
         self.assertTrue(cfg["setup_missing_model"])
-        self.assertTrue(cfg["setup_update_model"])
-        self.assertEqual(cfg["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
+        self.assertNotIn("setup_update_model", cfg)
+        self.assertNotIn("model_update_target", cfg)
 
     def test_setup_direct_model_catalog_preserves_optional_metadata(self) -> None:
         catalog = setup_direct_model_catalog(

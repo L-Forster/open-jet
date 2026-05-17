@@ -1329,7 +1329,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("50%" in str(call.args[0]) for call in log.write.call_args_list))
         download.assert_awaited_once()
 
-    async def test_ensure_direct_model_clears_old_gguf_files_before_download(self) -> None:
+    async def test_ensure_direct_model_clears_old_gguf_files_after_successful_download(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
             old_model = model_dir / "old.gguf"
@@ -1361,7 +1361,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(target.read_bytes(), b"new")
             self.assertEqual(resolved["llama_model"], str(target))
 
-    async def test_ensure_direct_model_redownloads_existing_file_when_update_required(self) -> None:
+    async def test_ensure_direct_model_reuses_existing_file_when_update_flag_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "Qwen3.6-27B-Q4_K_M-MTP.gguf"
             target.write_bytes(b"old-model")
@@ -1374,15 +1374,8 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
             }
 
-            async def fake_download(**kwargs):
-                self.assertEqual(kwargs["repo_id"], "unsloth/Qwen3.6-27B-MTP-GGUF")
-                self.assertEqual(target.read_bytes(), b"old-model")
-                self.assertNotEqual(Path(kwargs["local_dir"]), target.parent)
-                Path(kwargs["local_dir"], "Qwen3.6-27B-Q4_K_M.gguf").write_bytes(b"mtp-model")
-                return 0, "", ""
-
             log = Mock()
-            with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download) as download:
+            with patch("src.provisioning._run_hf_cli_download", AsyncMock()) as download:
                 resolved = await ensure_direct_model(
                     payload,
                     log=log,
@@ -1391,30 +1384,26 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 )
             written = target.read_bytes()
 
-        self.assertEqual(written, b"mtp-model")
+        self.assertEqual(written, b"old-model")
         self.assertEqual(resolved["llama_model"], str(target))
         self.assertFalse(resolved["setup_missing_model"])
         self.assertNotIn("setup_update_model", resolved)
         self.assertNotIn("model_update_target", resolved)
-        self.assertEqual(resolved["model_update_applied"], "qwen36-27b-mtp-unsloth-b9189")
-        self.assertTrue(any("unsloth/Qwen3.6-27B-MTP-GGUF" in str(call.args[0]) for call in log.write.call_args_list))
-        download.assert_awaited_once()
+        download.assert_not_awaited()
 
-    async def test_ensure_direct_model_keeps_existing_file_when_update_download_fails(self) -> None:
+    async def test_ensure_direct_model_downloads_only_when_target_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            old_model = Path(tmp) / "old.gguf"
+            old_model.write_bytes(b"old")
             target = Path(tmp) / "Qwen3.6-27B-Q4_K_M-MTP.gguf"
-            target.write_bytes(b"old-model")
             payload = {
                 "model_source": "direct",
                 "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
                 "model_download_path": str(target),
                 "setup_missing_model": True,
-                "setup_update_model": True,
-                "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
             }
 
             async def fake_download(**kwargs):
-                self.assertEqual(target.read_bytes(), b"old-model")
                 return 1, "", "rate limited"
 
             with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download):
@@ -1426,15 +1415,17 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                         clear_status=lambda: None,
                     )
 
-            self.assertEqual(target.read_bytes(), b"old-model")
+            self.assertEqual(old_model.read_bytes(), b"old")
+            self.assertFalse(target.exists())
 
-    async def test_ensure_direct_model_keeps_old_named_file_until_update_succeeds(self) -> None:
+    async def test_ensure_direct_model_reuses_existing_llama_model_when_download_path_changed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_target = Path(tmp) / "Qwen3.6-27B-Q4_K_M.gguf"
             old_target.write_bytes(b"old-model")
             target = Path(tmp) / "Qwen3.6-27B-Q4_K_M-MTP.gguf"
             payload = {
                 "model_source": "direct",
+                "llama_model": str(old_target),
                 "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
                 "model_download_path": str(target),
                 "setup_missing_model": True,
@@ -1442,21 +1433,22 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
             }
 
-            async def fake_download(**kwargs):
-                self.assertEqual(old_target.read_bytes(), b"old-model")
-                return 1, "", "rate limited"
-
-            with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download):
-                with self.assertRaisesRegex(RuntimeError, "rate limited"):
-                    await ensure_direct_model(
-                        payload,
-                        log=Mock(),
-                        set_status=lambda _text: None,
-                        clear_status=lambda: None,
-                    )
+            with patch("src.provisioning._run_hf_cli_download", AsyncMock()) as download:
+                resolved = await ensure_direct_model(
+                    payload,
+                    log=Mock(),
+                    set_status=lambda _text: None,
+                    clear_status=lambda: None,
+                )
 
             self.assertEqual(old_target.read_bytes(), b"old-model")
+            self.assertEqual(resolved["llama_model"], str(old_target))
+            self.assertEqual(resolved["model_download_path"], str(old_target))
+            self.assertFalse(resolved["setup_missing_model"])
+            self.assertNotIn("setup_update_model", resolved)
+            self.assertNotIn("model_update_target", resolved)
             self.assertFalse(target.exists())
+            download.assert_not_awaited()
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
@@ -2078,7 +2070,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(cfg["model_profiles"][0]["llama_cpp_ref"], "b9189")
         self.assertTrue(cfg["model_profiles"][0]["llama_mtp"])
 
-    def test_model_profile_preserves_direct_update_fields(self) -> None:
+    def test_model_profile_preserves_direct_download_fields(self) -> None:
         download_url = (
             "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/"
             "Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true"
@@ -2095,8 +2087,6 @@ class CliCommandTests(unittest.TestCase):
                     "model_download_url": download_url,
                     "model_download_path": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf",
                     "setup_missing_model": True,
-                    "setup_update_model": True,
-                    "model_update_target": "qwen36-35b-a3b-mtp-unsloth-b9189",
                     "llama_cpp_ref": "b9189",
                     "llama_mtp": True,
                 }
@@ -2107,16 +2097,16 @@ class CliCommandTests(unittest.TestCase):
         self.assertIsNotNone(profile)
         assert profile is not None
         self.assertEqual(profile["model_download_url"], download_url)
-        self.assertTrue(profile["setup_update_model"])
-        self.assertEqual(profile["model_update_target"], "qwen36-35b-a3b-mtp-unsloth-b9189")
+        self.assertNotIn("setup_update_model", profile)
+        self.assertNotIn("model_update_target", profile)
 
         apply_model_profile(cfg, profile)
 
         self.assertEqual(cfg["model_download_url"], download_url)
         self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf")
         self.assertTrue(cfg["setup_missing_model"])
-        self.assertTrue(cfg["setup_update_model"])
-        self.assertEqual(cfg["model_update_target"], "qwen36-35b-a3b-mtp-unsloth-b9189")
+        self.assertNotIn("setup_update_model", cfg)
+        self.assertNotIn("model_update_target", cfg)
 
     def test_format_model_profiles_summary_lists_active_profile(self) -> None:
         text = _format_model_profiles_summary(

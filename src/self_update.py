@@ -18,6 +18,21 @@ _INSTALL_RELEVANT_FILES = {
     "pyproject.toml",
     "setup.py",
 }
+_LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
+_GIT_NETWORK_OPTIONS = (
+    "-c",
+    "http.version=HTTP/1.1",
+    "-c",
+    "http.postBuffer=524288000",
+)
+_GIT_RETRY_MARKERS = (
+    "early eof",
+    "fetch-pack",
+    "invalid index-pack",
+    "rpc failed",
+    "stream",
+    "unexpected disconnect",
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +121,28 @@ def _llama_git_output(cwd: Path, *args: str) -> str | None:
     return result.stdout.strip()
 
 
+def _looks_like_transient_git_network_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _GIT_RETRY_MARKERS)
+
+
+def _llama_git_network_run(cwd: Path, *args: str, attempts: int = 3) -> None:
+    command = ["git", *_GIT_NETWORK_OPTIONS, *args]
+    last_error = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        result = subprocess.run(command, cwd=cwd, check=False, capture_output=True, text=True)
+        if result.returncode == 0:
+            return
+        last_error = (result.stderr or result.stdout or "").strip()
+        if attempt >= attempts or not _looks_like_transient_git_network_error(last_error):
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                command,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+
+
 def _sync_managed_llama_cpp_after_update() -> str | None:
     from .hardware import detect_hardware_info
     from .provisioning import (
@@ -128,7 +165,7 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     target_ref = managed_llama_cpp_ref()
     current_ref = _llama_git_output(LLAMA_CPP_DIR, "rev-parse", "HEAD")
     if current_ref is None:
-        raise RuntimeError("Failed to read managed llama.cpp revision before update.")
+        current_ref = ""
 
     binary_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
     binary = LLAMA_CPP_DIR / "build" / "bin" / binary_name
@@ -142,10 +179,12 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
         raise RuntimeError(missing_cuda_toolkit_message())
 
     try:
-        shutil.rmtree(LLAMA_CPP_DIR)
-        subprocess.run(["git", "clone", "https://github.com/ggerganov/llama.cpp.git", str(LLAMA_CPP_DIR)], check=True)
+        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=LLAMA_CPP_DIR, check=False)
+        subprocess.run(["git", "clean", "-fd"], cwd=LLAMA_CPP_DIR, check=False)
+        subprocess.run(["git", "remote", "set-url", "origin", _LLAMA_CPP_REPO_URL], cwd=LLAMA_CPP_DIR, check=False)
+        _llama_git_network_run(LLAMA_CPP_DIR, "fetch", "--depth=1", "origin", target_ref)
         subprocess.run(
-            ["git", "checkout", "--detach", target_ref],
+            ["git", "checkout", "--detach", "FETCH_HEAD"],
             cwd=LLAMA_CPP_DIR,
             check=True,
         )
