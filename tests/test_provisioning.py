@@ -36,7 +36,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         direct = recommend_direct_model(hardware)
 
         self.assertEqual(direct["label"], "Qwen3.6 35B A3B UD-IQ2_XXS MTP")
-        self.assertEqual(direct["filename"], "Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf")
+        self.assertEqual(direct["filename"], "Qwen3.6-35B-A3B-UD-IQ2_XXS-MTP.gguf")
         self.assertIn("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", direct["url"])
         self.assertTrue(direct["llama_mtp"])
         self.assertTrue(direct["llama_cpu_moe"])
@@ -192,7 +192,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 payload = await ensure_llama_server(
                     {
                         "llama_cpp_ref": "b9072",
-                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf",
                         "llama_mtp": True,
                     },
                     hardware_info=hardware,
@@ -240,7 +240,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 payload = await ensure_llama_server(
                     {
                         "device": "cuda",
-                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf",
                         "llama_mtp": True,
                     },
                     hardware_info=hardware,

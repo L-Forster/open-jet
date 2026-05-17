@@ -48,7 +48,7 @@ class ConfigNormalizationTests(unittest.TestCase):
 
         normalized = normalize_config(cfg)
 
-        self.assertEqual(normalized["llama_model"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertEqual(normalized["llama_model"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
         self.assertTrue(normalized["llama_mtp"])
         self.assertEqual(normalized["llama_cpp_ref"], "b9189")
         self.assertEqual(normalized["model_source"], "direct")
@@ -59,7 +59,7 @@ class ConfigNormalizationTests(unittest.TestCase):
             normalized["model_download_url"],
             "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
         )
-        self.assertEqual(normalized["model_profiles"][0]["llama_model"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertEqual(normalized["model_profiles"][0]["llama_model"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
         self.assertTrue(normalized["model_profiles"][0]["llama_mtp"])
         self.assertEqual(normalized["model_profiles"][0]["llama_cpp_ref"], "b9189")
         self.assertEqual(normalized["model_profiles"][0]["model_source"], "direct")
@@ -71,8 +71,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         cfg = {"llama_model": "/models/Qwen3.6-27B-Q4_K_M-mtp.gguf"}
 
         self.assertTrue(migrate_config_for_current_release(cfg))
-        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
-        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-Q4_K_M.gguf")
+        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
         self.assertTrue(cfg["llama_mtp"])
         self.assertEqual(cfg["model_source"], "direct")
         self.assertTrue(cfg["setup_missing_model"])
@@ -90,6 +90,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         }
 
         self.assertTrue(migrate_config_for_current_release(cfg))
+        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
         self.assertTrue(cfg["setup_update_model"])
         self.assertTrue(cfg["setup_missing_model"])
         self.assertEqual(cfg["model_update_target"], "qwen36-27b-mtp-unsloth-b9189")
@@ -107,6 +109,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         }
 
         self.assertTrue(migrate_config_for_current_release(cfg))
+        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf")
         self.assertEqual(
             cfg["model_download_url"],
             "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true",
@@ -125,8 +129,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         }
 
         self.assertTrue(migrate_config_for_current_release(cfg))
-        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-UD-IQ2_XXS.gguf")
-        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-UD-IQ2_XXS.gguf")
+        self.assertEqual(cfg["llama_model"], "/models/Qwen3.6-27B-UD-IQ2_XXS-MTP.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-27B-UD-IQ2_XXS-MTP.gguf")
         self.assertEqual(
             cfg["model_download_url"],
             "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-UD-IQ2_XXS.gguf?download=true",

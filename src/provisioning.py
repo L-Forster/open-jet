@@ -1149,7 +1149,8 @@ async def ensure_direct_model(
     repo_id, revision, filename = parsed
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    _clear_old_model_files(target_path.parent, target_path, log=log)
+    if not force_model_update:
+        _clear_old_model_files(target_path.parent, target_path, log=log)
     temp_download_dir: Path | None = None
     download_dir = target_path.parent
     if force_model_update:
@@ -1216,6 +1217,8 @@ async def ensure_direct_model(
         raise RuntimeError(f"Hugging Face CLI completed but did not create {target_path}.")
 
     downloaded = target_path.stat().st_size
+    if force_model_update:
+        _clear_old_model_files(target_path.parent, target_path, log=log)
     log.write(f"[bold bright_white]Download complete: {_fmt_size(downloaded)}[/]")
     clear_status()
     merged = dict(setup_result)

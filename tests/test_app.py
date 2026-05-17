@@ -945,7 +945,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(payload["model_source"], "direct")
-        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M.gguf"))
+        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M-MTP.gguf"))
         self.assertTrue(payload["llama_mtp"])
         self.assertGreater(int(payload["context_window_tokens"]), 6144)
 
@@ -1363,7 +1363,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ensure_direct_model_redownloads_existing_file_when_update_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "Qwen3.6-27B-Q4_K_M.gguf"
+            target = Path(tmp) / "Qwen3.6-27B-Q4_K_M-MTP.gguf"
             target.write_bytes(b"old-model")
             payload = {
                 "model_source": "direct",
@@ -1402,7 +1402,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ensure_direct_model_keeps_existing_file_when_update_download_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "Qwen3.6-27B-Q4_K_M.gguf"
+            target = Path(tmp) / "Qwen3.6-27B-Q4_K_M-MTP.gguf"
             target.write_bytes(b"old-model")
             payload = {
                 "model_source": "direct",
@@ -1427,6 +1427,36 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     )
 
             self.assertEqual(target.read_bytes(), b"old-model")
+
+    async def test_ensure_direct_model_keeps_old_named_file_until_update_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old_target = Path(tmp) / "Qwen3.6-27B-Q4_K_M.gguf"
+            old_target.write_bytes(b"old-model")
+            target = Path(tmp) / "Qwen3.6-27B-Q4_K_M-MTP.gguf"
+            payload = {
+                "model_source": "direct",
+                "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
+                "model_download_path": str(target),
+                "setup_missing_model": True,
+                "setup_update_model": True,
+                "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
+            }
+
+            async def fake_download(**kwargs):
+                self.assertEqual(old_target.read_bytes(), b"old-model")
+                return 1, "", "rate limited"
+
+            with patch("src.provisioning._run_hf_cli_download", side_effect=fake_download):
+                with self.assertRaisesRegex(RuntimeError, "rate limited"):
+                    await ensure_direct_model(
+                        payload,
+                        log=Mock(),
+                        set_status=lambda _text: None,
+                        clear_status=lambda: None,
+                    )
+
+            self.assertEqual(old_target.read_bytes(), b"old-model")
+            self.assertFalse(target.exists())
 
 
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
@@ -2036,7 +2066,7 @@ class CliCommandTests(unittest.TestCase):
     def test_sync_active_model_profile_preserves_mtp_runtime_ref(self) -> None:
         cfg = {
             "active_model_profile": "mtp",
-            "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+            "llama_model": "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf",
             "llama_server_path": "/home/louis/llama.cpp/build/bin/llama-server",
             "llama_cpp_ref": "b9189",
             "llama_mtp": True,
@@ -2060,10 +2090,10 @@ class CliCommandTests(unittest.TestCase):
             "model_profiles": [
                 {
                     "name": "mtp",
-                    "llama_model": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+                    "llama_model": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf",
                     "model_source": "direct",
                     "model_download_url": download_url,
-                    "model_download_path": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf",
+                    "model_download_path": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf",
                     "setup_missing_model": True,
                     "setup_update_model": True,
                     "model_update_target": "qwen36-35b-a3b-mtp-unsloth-b9189",
@@ -2083,7 +2113,7 @@ class CliCommandTests(unittest.TestCase):
         apply_model_profile(cfg, profile)
 
         self.assertEqual(cfg["model_download_url"], download_url)
-        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf")
+        self.assertEqual(cfg["model_download_path"], "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf")
         self.assertTrue(cfg["setup_missing_model"])
         self.assertTrue(cfg["setup_update_model"])
         self.assertEqual(cfg["model_update_target"], "qwen36-35b-a3b-mtp-unsloth-b9189")
