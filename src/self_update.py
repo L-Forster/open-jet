@@ -126,11 +126,16 @@ def _looks_like_transient_git_network_error(text: str) -> bool:
     return any(marker in lowered for marker in _GIT_RETRY_MARKERS)
 
 
-def _llama_git_network_run(cwd: Path, *args: str, attempts: int = 3) -> None:
+def _llama_git_network_run(
+    cwd: Path,
+    *args: str,
+    attempts: int = 3,
+    env: dict[str, str] | None = None,
+) -> None:
     command = ["git", *_GIT_NETWORK_OPTIONS, *args]
     last_error = ""
     for attempt in range(1, max(1, attempts) + 1):
-        result = subprocess.run(command, cwd=cwd, check=False, capture_output=True, text=True)
+        result = subprocess.run(command, cwd=cwd, check=False, capture_output=True, text=True, env=env)
         if result.returncode == 0:
             return
         last_error = (result.stderr or result.stdout or "").strip()
@@ -150,6 +155,9 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
         _llama_build_command,
         _llama_cmake_args,
         _needs_rebuild,
+        _native_tool_path,
+        _prebuilt_runtime_device,
+        _subprocess_env,
         cuda_toolkit_available,
         managed_llama_cpp_ref,
         missing_cmake_message,
@@ -170,35 +178,40 @@ def _sync_managed_llama_cpp_after_update() -> str | None:
     binary_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
     binary = LLAMA_CPP_DIR / "build" / "bin" / binary_name
     hardware_info = detect_hardware_info()
-    needs_rebuild = not binary.is_file() or _needs_rebuild(hardware_info, str(binary))
+    build_device = _prebuilt_runtime_device(hardware_info)
+    needs_rebuild = not binary.is_file() or _needs_rebuild(hardware_info, str(binary), device=build_device)
     if current_ref == target_ref and not needs_rebuild:
         return None
-    if shutil.which("cmake") is None:
+    if _native_tool_path("cmake") is None:
         raise RuntimeError(missing_cmake_message())
-    if hardware_info.has_cuda and not cuda_toolkit_available():
+    if build_device == "cuda" and not cuda_toolkit_available():
         raise RuntimeError(missing_cuda_toolkit_message())
 
     try:
-        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=LLAMA_CPP_DIR, check=False)
-        subprocess.run(["git", "clean", "-fd"], cwd=LLAMA_CPP_DIR, check=False)
-        subprocess.run(["git", "remote", "set-url", "origin", _LLAMA_CPP_REPO_URL], cwd=LLAMA_CPP_DIR, check=False)
-        _llama_git_network_run(LLAMA_CPP_DIR, "fetch", "--depth=1", "origin", target_ref)
+        env = _subprocess_env()
+        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=LLAMA_CPP_DIR, check=False, env=env)
+        subprocess.run(["git", "clean", "-fd"], cwd=LLAMA_CPP_DIR, check=False, env=env)
+        subprocess.run(["git", "remote", "set-url", "origin", _LLAMA_CPP_REPO_URL], cwd=LLAMA_CPP_DIR, check=False, env=env)
+        _llama_git_network_run(LLAMA_CPP_DIR, "fetch", "--depth=1", "origin", target_ref, env=env)
         subprocess.run(
             ["git", "checkout", "--detach", "FETCH_HEAD"],
             cwd=LLAMA_CPP_DIR,
             check=True,
+            env=env,
         )
         build_dir = LLAMA_CPP_DIR / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            _llama_cmake_args(hardware_info),
+            _llama_cmake_args(hardware_info, device=build_device),
             cwd=build_dir,
             check=True,
+            env=env,
         )
         subprocess.run(
             _llama_build_command(4),
             cwd=build_dir,
             check=True,
+            env=env,
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
+
+TELEMETRY_CONSENT_VERSION = 1
+TELEMETRY_DEFAULT_ENDPOINT = "https://telemetry.openjet.dev"
+
+
+def default_telemetry_endpoint() -> str:
+    override = os.environ.get("OPENJET_TELEMETRY_ENDPOINT", "").strip()
+    return override or TELEMETRY_DEFAULT_ENDPOINT
 DEFAULT_SESSION_STATE_PATH = ".openjet/state/session_state.yaml"
 DEFAULT_LOG_DIRECTORY = ".openjet/state/sessions"
 ROOT_LOG_DIRECTORY = "session_logs"

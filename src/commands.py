@@ -90,6 +90,9 @@ class SlashCommandHandler:
         if cmd == "air-gapped":
             self._air_gapped(log, arg)
             return True
+        if cmd == "telemetry":
+            self._telemetry(log, arg)
+            return True
         if cmd == "resume":
             await self._resume(log)
             return True
@@ -773,6 +776,40 @@ class SlashCommandHandler:
             log.write(
                 "[bold bright_white]Air-gapped mode set to false. External network access is allowed again.[/]"
             )
+        log.write("")
+
+    def _telemetry(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower() or "status"
+        telemetry_cfg = self.app.cfg.get("telemetry", {}) or {}
+        broadcast_cfg = telemetry_cfg.get("broadcast", {}) or {}
+        if arg == "status":
+            current = self.app._telemetry_consent_status() or "undecided"
+            endpoint = str(broadcast_cfg.get("endpoint", "")).strip() or "(unset)"
+            broadcast_active = bool(
+                self.app.session_logger
+                and self.app.session_logger.broadcast.enabled
+                and self.app.session_logger.broadcast.endpoint
+            )
+            log.write(f"[bold bright_white]Telemetry consent: {current}[/]")
+            log.write(f"[dim]Broadcast active: {broadcast_active} — endpoint: {endpoint}[/]")
+            if self.app.is_airgapped():
+                log.write("[dim]Air-gapped mode is on; telemetry is disabled regardless of consent.[/]")
+            log.write("")
+            return
+
+        if arg not in {"on", "off", "grant", "granted", "deny", "denied", "true", "false"}:
+            log.write("[yellow]Usage:[/] /telemetry [status|on|off]")
+            log.write("")
+            return
+
+        decision = "granted" if arg in {"on", "grant", "granted", "true"} else "denied"
+        self.app._persist_telemetry_consent(decision)
+        if decision == "granted":
+            log.write("[bold bright_white]Telemetry on — anonymous usage data only.[/]")
+            if self.app.is_airgapped():
+                log.write("[dim]Air-gapped mode is on; nothing will be sent until you disable it.[/]")
+        else:
+            log.write("[bold bright_white]Telemetry off.[/]")
         log.write("")
 
     def _mode(self, log: Any, raw_arg: str) -> None:

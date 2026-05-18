@@ -58,6 +58,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(name="reasoning", description="Show or set llama.cpp reasoning mode: /reasoning [status|on|off|default]"),
     CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
+    CommandSpec(name="telemetry", description="Show or set anonymous telemetry consent: /telemetry [status|on|off]"),
     CommandSpec(name="resume", description="Pick and load a saved chat back into chat/runtime"),
     CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
     CommandSpec(

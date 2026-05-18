@@ -2800,3 +2800,59 @@ class DebugPromptLoggingTests(unittest.TestCase):
         (root / ".openjet" / "agents" / "base.md").write_text("base guidance", encoding="utf-8")
         (root / ".openjet" / "agents" / "debugger.md").write_text("debug guidance", encoding="utf-8")
         (root / ".openjet" / "projects" / "default.md").write_text("project guidance", encoding="utf-8")
+
+
+class TelemetryConsentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.app = OpenJetApp()
+        self.app.cfg = {}
+        self.save_patcher = patch("src.app.save_config", lambda _cfg: None)
+        self.save_patcher.start()
+
+    def tearDown(self) -> None:
+        self.save_patcher.stop()
+
+    def test_status_none_when_undecided(self) -> None:
+        self.assertIsNone(self.app._telemetry_consent_status())
+        self.assertFalse(self.app._effective_broadcast_config().enabled)
+
+    def test_grant_enables_broadcast_with_default_endpoint(self) -> None:
+        self.app._persist_telemetry_consent("granted")
+        from src.config import default_telemetry_endpoint
+
+        self.assertEqual(self.app._telemetry_consent_status(), "granted")
+        broadcast = self.app._effective_broadcast_config()
+        self.assertTrue(broadcast.enabled)
+        self.assertEqual(broadcast.endpoint, default_telemetry_endpoint())
+
+    def test_deny_disables_broadcast(self) -> None:
+        self.app._persist_telemetry_consent("denied")
+        self.assertEqual(self.app._telemetry_consent_status(), "denied")
+        self.assertFalse(self.app._effective_broadcast_config().enabled)
+
+    def test_airgapped_blocks_broadcast_even_when_granted(self) -> None:
+        self.app._persist_telemetry_consent("granted")
+        self.app.cfg["airgapped"] = True
+        self.assertFalse(self.app._effective_broadcast_config().enabled)
+
+    def test_explicit_endpoint_overrides_default(self) -> None:
+        self.app.cfg["telemetry"] = {
+            "broadcast": {"endpoint": "https://collector.example.com"},
+        }
+        self.app._persist_telemetry_consent("granted")
+        broadcast = self.app._effective_broadcast_config()
+        self.assertEqual(broadcast.endpoint, "https://collector.example.com")
+        self.assertTrue(broadcast.enabled)
+
+    def test_older_consent_version_treated_as_undecided(self) -> None:
+        self.app.cfg["telemetry"] = {
+            "consent": "granted",
+            "consent_version": 0,
+        }
+        self.assertIsNone(self.app._telemetry_consent_status())
+
+    def test_env_override_endpoint_used_on_grant(self) -> None:
+        with patch.dict(os.environ, {"OPENJET_TELEMETRY_ENDPOINT": "https://test.collector"}):
+            self.app._persist_telemetry_consent("granted")
+            broadcast = self.app._effective_broadcast_config()
+            self.assertEqual(broadcast.endpoint, "https://test.collector")

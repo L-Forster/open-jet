@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
+import os
 from pathlib import Path
 
 from .airgap import airgapped_from_cfg
@@ -443,6 +444,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _entrypoint_label(args: argparse.Namespace) -> str:
+    if getattr(args, "status", False):
+        return "cli.status"
+    if getattr(args, "update", False):
+        return "cli.update"
+    if getattr(args, "context", None) is not None:
+        return "cli.context"
+    if getattr(args, "commands", False):
+        return "cli.commands"
+    if getattr(args, "models", False):
+        return "cli.models"
+    command = str(getattr(args, "command", "") or "").strip().lower()
+    if not command:
+        return "app"
+    if command in {"bench", "benchmark"}:
+        return "benchmark"
+    if command in {"device", "devices"}:
+        return "device"
+    if command in {"skill", "skills"}:
+        return "skill"
+    return command
+
+
 def main(argv: list[str] | None = None) -> None:
     if argv:
         normalized_argv = list(argv)
@@ -455,6 +479,7 @@ def main(argv: list[str] | None = None) -> None:
             normalized_argv = ["--context", *normalized_argv[1:]]
         argv = normalized_argv
     args = build_parser().parse_args(argv)
+    os.environ.setdefault("OPENJET_ENTRYPOINT", _entrypoint_label(args))
 
     if getattr(args, "version", False):
         print(f"open-jet {_open_jet_version()}")

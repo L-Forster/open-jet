@@ -52,7 +52,12 @@ from .app_telemetry import (
 from .agent import ActionKind, Agent, ToolCall
 from .commands import SlashCommandHandler
 from .completion import CompletionEngine, DeviceMentionCompletionProvider, FileMentionCompletionProvider, SlashCompletionProvider
-from .config import load_config, save_config
+from .config import (
+    TELEMETRY_CONSENT_VERSION,
+    default_telemetry_endpoint,
+    load_config,
+    save_config,
+)
 from .device_sources import (
     DeviceSource,
     assign_device_alias,
@@ -648,18 +653,97 @@ class OpenJetApp:
         return changed
 
     def _effective_broadcast_config(self) -> BroadcastConfig:
-        telemetry_cfg = self.cfg.get("telemetry", {})
-        broadcast_cfg = telemetry_cfg.get("broadcast", {})
-        enabled = bool(broadcast_cfg.get("enabled", False)) and not self.is_airgapped()
+        telemetry_cfg = self.cfg.get("telemetry", {}) or {}
+        broadcast_cfg = telemetry_cfg.get("broadcast", {}) or {}
+        consent = str(telemetry_cfg.get("consent", "") or "").strip().lower()
+        explicit_enabled = "enabled" in broadcast_cfg
+        if explicit_enabled:
+            broadcast_enabled = bool(broadcast_cfg.get("enabled", False))
+        else:
+            broadcast_enabled = consent == "granted"
+        endpoint = str(broadcast_cfg.get("endpoint", "")).strip()
+        if not endpoint and consent == "granted":
+            endpoint = default_telemetry_endpoint()
+        enabled = broadcast_enabled and consent == "granted" and not self.is_airgapped()
         return BroadcastConfig(
             enabled=enabled,
-            endpoint=str(broadcast_cfg.get("endpoint", "")).strip() or None,
+            endpoint=endpoint or None,
             headers=broadcast_cfg.get("headers") if isinstance(broadcast_cfg.get("headers"), dict) else None,
             timeout_seconds=float(broadcast_cfg.get("timeout_seconds", 3.0)),
             export_logs=bool(broadcast_cfg.get("export_logs", True)),
             export_metrics=bool(broadcast_cfg.get("export_metrics", True)),
             export_traces=bool(broadcast_cfg.get("export_traces", True)),
         )
+
+    def _telemetry_consent_status(self) -> str | None:
+        telemetry_cfg = self.cfg.get("telemetry", {}) or {}
+        recorded = str(telemetry_cfg.get("consent", "") or "").strip().lower()
+        if recorded not in {"granted", "denied"}:
+            return None
+        recorded_version = telemetry_cfg.get("consent_version")
+        try:
+            recorded_version_int = int(recorded_version) if recorded_version is not None else 0
+        except (TypeError, ValueError):
+            recorded_version_int = 0
+        if recorded_version_int < TELEMETRY_CONSENT_VERSION:
+            return None
+        return recorded
+
+    def _persist_telemetry_consent(self, decision: str) -> None:
+        telemetry_cfg = dict(self.cfg.get("telemetry", {}) or {})
+        telemetry_cfg["consent"] = decision
+        telemetry_cfg["consent_version"] = TELEMETRY_CONSENT_VERSION
+        telemetry_cfg["consent_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        broadcast_cfg = dict(telemetry_cfg.get("broadcast", {}) or {})
+        if decision == "granted":
+            if not str(broadcast_cfg.get("endpoint", "")).strip():
+                broadcast_cfg["endpoint"] = default_telemetry_endpoint()
+            broadcast_cfg["enabled"] = True
+        else:
+            broadcast_cfg["enabled"] = False
+        telemetry_cfg["broadcast"] = broadcast_cfg
+        self.cfg["telemetry"] = telemetry_cfg
+        save_config(self.cfg)
+        if self.session_logger:
+            self.session_logger.broadcast = self._effective_broadcast_config()
+
+    async def _maybe_prompt_telemetry_consent(self, log: Any) -> None:
+        if self._telemetry_consent_status() is not None:
+            return
+        if self.is_airgapped():
+            return
+        if os.environ.get("OPENJET_TELEMETRY_NO_PROMPT", "").strip().lower() in {"1", "true", "yes"}:
+            return
+        detail = (
+            "Anonymous usage data only — tool acceptance rates, error types, hardware class, "
+            "model identifiers, timings. Never sends prompt text, file paths, tool I/O, or model paths. "
+            "Toggle later with /telemetry."
+        )
+        try:
+            selected = await _prompt_choice(
+                self._new_detached_prompt_session(),
+                self.console,
+                "Help improve OpenJet with anonymous telemetry?",
+                [
+                    ("Opt in — share anonymous usage data", "granted"),
+                    ("Opt out — keep everything local", "denied"),
+                ],
+                detail=detail,
+            )
+        except (EOFError, KeyboardInterrupt):
+            return
+        decision = "granted" if selected == "granted" else "denied"
+        self._persist_telemetry_consent(decision)
+        if decision == "granted":
+            log.write(f"  {rich_text('Telemetry on', 'success')} {rich_text('— thanks. Anonymous usage data only.', 'muted')}")
+        else:
+            log.write(f"  {rich_text('Telemetry off', 'muted')}")
+        if self.session_logger:
+            self.session_logger.log_event(
+                "telemetry_consent_decision",
+                decision=decision,
+                consent_version=TELEMETRY_CONSENT_VERSION,
+            )
 
     def _trace_runtime_context(self) -> dict[str, object]:
         model_ref = self._active_model_ref()
@@ -1278,6 +1362,7 @@ class OpenJetApp:
         log.write(f"  {rich_text('Ready', 'success')}")
         if self.is_airgapped():
             log.write(f"  {rich_text('Air-gapped', 'chrome_warning')} {rich_text('external network access is blocked', 'muted')}")
+        await self._maybe_prompt_telemetry_consent(log)
         if self.auto_resume:
             self._restore_session_state(log)
         self._restore_harness_state()

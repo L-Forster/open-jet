@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -121,24 +123,33 @@ def _normalize_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
     return normalized
 
 
-def _load_or_create_install_id(path: Path) -> str:
+def _load_or_create_install_id(path: Path) -> tuple[str, str]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         install_id = str(payload.get("install_id", "")).strip()
+        created_at = str(payload.get("created_at", "")).strip()
         if install_id:
-            return install_id
+            if not created_at:
+                created_at = _utc_now()
+                try:
+                    payload["created_at"] = created_at
+                    path.write_text(_compact_json(payload) + "\n", encoding="utf-8")
+                except OSError:
+                    pass
+            return install_id, created_at
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         pass
 
     install_id = uuid.uuid4().hex
+    created_at = _utc_now()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "install_id": install_id,
-        "created_at": _utc_now(),
+        "created_at": created_at,
         "schema_version": LOG_SCHEMA_VERSION,
     }
     path.write_text(_compact_json(payload) + "\n", encoding="utf-8")
-    return install_id
+    return install_id, created_at
 
 
 def _safe_error_details(error: str) -> dict[str, Any]:
@@ -199,6 +210,7 @@ class SessionLogger:
         retention_days: int | None = 30,
         max_sessions: int | None = 100,
         broadcast: BroadcastConfig | None = None,
+        entrypoint: str | None = None,
     ) -> None:
         self.base_dir = base_dir
         self.label = _sanitize_label(label)
@@ -207,9 +219,10 @@ class SessionLogger:
         self.retention_days = retention_days if retention_days is None else max(1, int(retention_days))
         self.max_sessions = max_sessions if max_sessions is None else max(1, int(max_sessions))
         self.broadcast = broadcast or BroadcastConfig()
+        self.entrypoint = (entrypoint or os.environ.get("OPENJET_ENTRYPOINT", "") or "app").strip() or "app"
 
         self.session_id = uuid.uuid4().hex
-        self.install_id = _load_or_create_install_id(self.install_id_path)
+        self.install_id, self.install_created_at = _load_or_create_install_id(self.install_id_path)
         self.session_stamp = _session_stamp()
         date_prefix = datetime.now(timezone.utc).strftime("%Y/%m/%d")
         self.session_dir = self.base_dir / date_prefix / (
@@ -240,6 +253,13 @@ class SessionLogger:
                 "deployment.environment": "local",
                 "host.arch": os.uname().machine if hasattr(os, "uname") else None,
                 "os.type": os.name,
+                "openjet.python.version": platform.python_version(),
+                "openjet.python.implementation": platform.python_implementation(),
+                "openjet.platform": platform.platform(),
+                "openjet.platform.system": platform.system(),
+                "openjet.platform.release": platform.release(),
+                "openjet.entrypoint": self.entrypoint,
+                "openjet.install.created_at": self.install_created_at,
             }
         )
         self._logger_provider = LoggerProvider(resource=resource)
@@ -878,6 +898,8 @@ class SessionLogger:
             "openjet.schema_version": LOG_SCHEMA_VERSION,
             "openjet.session.id": self.session_id,
             "openjet.install.id": self.install_id,
+            "openjet.install.created_at": self.install_created_at,
+            "openjet.entrypoint": self.entrypoint,
             "openjet.event.sequence": self._event_index,
             **self._runtime_context,
         }

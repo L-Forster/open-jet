@@ -2,6 +2,24 @@
 
 `openjet` emits real OpenTelemetry logs, traces, and metrics. The app does not write its own telemetry files anymore; it exports OTLP/HTTP to an OpenTelemetry Collector when telemetry is enabled.
 
+## Consent
+
+Telemetry is off by default. After the model loads on first run, `openjet` shows an in-line opt-in prompt:
+
+```
+Help improve OpenJet with anonymous telemetry?
+  > Opt in — share anonymous usage data
+    Opt out — keep everything local
+```
+
+The decision is persisted in `config.yaml` under `telemetry.consent` (`granted` or `denied`) along with `telemetry.consent_version`. The prompt is only shown again if the consent schema version increases, so users won't be re-asked unless what we collect materially changes.
+
+Change your mind any time with `/telemetry on|off|status`. Air-gapped mode disables broadcast regardless of consent.
+
+Suppress the first-run prompt entirely (e.g. in CI) with `OPENJET_TELEMETRY_NO_PROMPT=1`.
+
+When consent is granted and no explicit `telemetry.broadcast.endpoint` is configured, OpenJet falls back to its default collector endpoint. Override via `OPENJET_TELEMETRY_ENDPOINT` to point at your own collector.
+
 ## What is sent
 
 Telemetry is intentionally narrow:
@@ -55,6 +73,12 @@ telemetry:
 
 Useful emitted attributes now include:
 
+- `service.version` (OpenJet release the data came from)
+- `openjet.install.id` and `openjet.install.created_at` (anonymous, persisted)
+- `openjet.session.id`, `openjet.event.sequence`, `openjet.schema_version`
+- `openjet.entrypoint` (`app`, `benchmark`, `setup`, `fix`, `device`, `skill`, `workflow`, `sdk`, ...)
+- `openjet.python.version`, `openjet.python.implementation`
+- `openjet.platform`, `openjet.platform.system`, `openjet.platform.release`
 - `openjet.backend`
 - `openjet.runtime`
 - `openjet.model.name`

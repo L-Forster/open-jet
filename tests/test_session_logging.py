@@ -165,5 +165,47 @@ class ShellCommandClassificationTests(unittest.TestCase):
         self.assertEqual(classified["hallucinated_command"], True)
 
 
+class IdentityAndEntrypointTests(unittest.TestCase):
+    def test_install_identity_persists_created_at(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            install_path = Path(tmp) / "identity.json"
+            first = SessionLogger(
+                base_dir=Path(tmp) / "sessions",
+                label="trace-test",
+                install_id_path=install_path,
+                entrypoint="benchmark",
+            )
+            saved = json.loads(install_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["install_id"], first.install_id)
+            self.assertEqual(saved["created_at"], first.install_created_at)
+            self.assertTrue(first.install_created_at)
+            self.assertEqual(first.entrypoint, "benchmark")
+
+            second = SessionLogger(
+                base_dir=Path(tmp) / "sessions",
+                label="trace-test",
+                install_id_path=install_path,
+            )
+            self.assertEqual(second.install_id, first.install_id)
+            self.assertEqual(second.install_created_at, first.install_created_at)
+            self.assertEqual(second.entrypoint, "app")
+
+    def test_legacy_identity_without_created_at_gets_backfilled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            install_path = Path(tmp) / "identity.json"
+            install_path.write_text(json.dumps({"install_id": "legacy-abc"}), encoding="utf-8")
+
+            logger = SessionLogger(
+                base_dir=Path(tmp) / "sessions",
+                label="trace-test",
+                install_id_path=install_path,
+            )
+
+            self.assertEqual(logger.install_id, "legacy-abc")
+            self.assertTrue(logger.install_created_at)
+            saved = json.loads(install_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["created_at"], logger.install_created_at)
+
+
 if __name__ == "__main__":
     unittest.main()

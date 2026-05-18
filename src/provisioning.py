@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -56,6 +57,45 @@ LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releas
 LLAMA_CPP_PINNED_REF = "b9189"
 LLAMA_CPP_MTP_REF = "b9189"
 UNIFIED_MEMORY_SYSTEM_RESERVE_MB = 4096.0
+
+
+def _running_under_wsl() -> bool:
+    if sys.platform != "linux":
+        return False
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    for path in (Path("/proc/sys/kernel/osrelease"), Path("/proc/version")):
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        if "microsoft" in text or "wsl" in text:
+            return True
+    return False
+
+
+def _path_without_windows_interop_entries(path_value: str) -> str:
+    entries = []
+    for entry in path_value.split(os.pathsep):
+        normalized = entry.replace("\\", "/").lower()
+        if re.match(r"^/mnt/[a-z]/", normalized):
+            continue
+        entries.append(entry)
+    return os.pathsep.join(entries)
+
+
+def _native_tool_path(name: str) -> str | None:
+    path_value = os.environ.get("PATH")
+    if path_value is not None and _running_under_wsl():
+        path_value = _path_without_windows_interop_entries(path_value)
+    return shutil.which(name, path=path_value)
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    if _running_under_wsl():
+        env["PATH"] = _path_without_windows_interop_entries(env.get("PATH", ""))
+    return env
 
 
 def managed_llama_cpp_ref() -> str:
@@ -128,7 +168,7 @@ def _linux_os_id() -> str:
 
 
 def cuda_toolkit_available() -> bool:
-    if shutil.which("nvcc") is not None:
+    if _native_tool_path("nvcc") is not None:
         return True
     return any(os.environ.get(name) for name in ("CUDA_PATH", "CUDA_HOME"))
 
@@ -329,10 +369,21 @@ def current_llama_server_path() -> str | None:
     return None
 
 
+def _configured_llama_server_path(setup_result: Mapping[str, Any]) -> str | None:
+    raw = str(setup_result.get("llama_server_path") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if path.is_file():
+        return str(path)
+    return None
+
+
 async def _run_exec(*args: str, cwd: Path | None = None) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=str(cwd) if cwd else None,
+        env=_subprocess_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -421,6 +472,7 @@ async def _run_build_with_progress(
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 cwd=str(cwd),
+                env=_subprocess_env(),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=slave_fd,
                 stderr=slave_fd,
@@ -454,6 +506,7 @@ async def _run_build_with_progress(
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=str(cwd),
+        env=_subprocess_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
@@ -487,10 +540,10 @@ def _parse_huggingface_resolve_url(url: str) -> tuple[str, str, str] | None:
 
 
 def _hf_cli_command() -> list[str]:
-    hf = shutil.which("hf")
+    hf = _native_tool_path("hf")
     if hf:
         return [hf, "download"]
-    huggingface_cli = shutil.which("huggingface-cli")
+    huggingface_cli = _native_tool_path("huggingface-cli")
     if huggingface_cli:
         return [huggingface_cli, "download"]
     raise RuntimeError(
@@ -707,6 +760,34 @@ def _write_source_build_tag(*, ref: str, device: str | None) -> None:
     )
 
 
+def _source_build_device(default: str | None) -> str | None:
+    tagged = _source_build_tag().get("device", "").strip().lower()
+    if tagged in {"cpu", "cuda", "vulkan", "rocm", "metal"}:
+        return tagged
+    return default
+
+
+def _source_checkout_ref_matches(required_ref: str) -> bool:
+    ref = _normalized_llama_cpp_ref(required_ref)
+    if not ref or not (LLAMA_CPP_DIR / ".git").is_dir():
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=LLAMA_CPP_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_subprocess_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    return proc.stdout.strip().lower().startswith(ref.lower())
+
+
 def _source_build_matches(
     *,
     hardware_info: HardwareInfo,
@@ -717,10 +798,17 @@ def _source_build_matches(
     if not binary.is_file():
         return False
     tag = _source_build_tag()
-    desired = (desired_device or "auto").strip().lower() or "auto"
-    if tag.get("ref") != required_ref or tag.get("device") != desired:
+    tagged_ref = tag.get("ref", "")
+    if tagged_ref:
+        ref_matches = tagged_ref == required_ref
+    else:
+        ref_matches = _source_checkout_ref_matches(required_ref)
+    if not ref_matches:
         return False
-    return not _needs_rebuild(hardware_info, str(binary), device=desired_device)
+    # The managed build tag is written only after a successful source build.
+    # Do not opportunistically rebuild a matching ref just because launch-time
+    # hardware preferences changed.
+    return True
 
 
 def _llama_build_command(jobs: int) -> list[str]:
@@ -998,7 +1086,7 @@ async def _build_llama_server_from_source(
     set_status: Callable[[str], None],
     clear_status: Callable[[], None],
 ) -> tuple[Path, str]:
-    if shutil.which("cmake") is None:
+    if _native_tool_path("cmake") is None:
         raise RuntimeError(missing_cmake_message())
     if rebuilding:
         set_status("rebuilding llama-server for GPU support")
@@ -1059,17 +1147,29 @@ async def ensure_llama_server(
     requires_mtp_runtime = _setup_uses_mtp_model(setup_result) or _is_mtp_llama_cpp_ref(required_ref)
     configured_device = str(setup_result.get("device") or "").strip().lower() or None
     desired_device = configured_device or None
-    if not requires_mtp_runtime:
-        desired_device = prebuilt_device or desired_device
+    if prebuilt_device:
+        desired_device = prebuilt_device
+    configured_server = _configured_llama_server_path(setup_result)
+    if configured_server:
+        merged = dict(setup_result)
+        merged["llama_server_path"] = configured_server
+        merged["setup_missing_runtime"] = False
+        merged["llama_cpp_ref"] = required_ref
+        if configured_device:
+            merged["device"] = configured_device
+        return merged
     if _source_build_matches(
         hardware_info=hardware_info,
         required_ref=required_ref,
         desired_device=desired_device,
     ):
+        source_device = _source_build_device(configured_device or desired_device)
         merged = dict(setup_result)
         merged["llama_server_path"] = str(_managed_source_llama_server_path())
         merged["setup_missing_runtime"] = False
         merged["llama_cpp_ref"] = required_ref
+        if source_device:
+            merged["device"] = source_device
         return merged
     # Cache hit: managed binary + tag file present and binary doesn't need a GPU rebuild.
     if (
@@ -1146,6 +1246,8 @@ async def ensure_llama_server(
     merged["llama_server_path"] = str(built)
     merged["setup_missing_runtime"] = False
     merged["llama_cpp_ref"] = synced_ref
+    if desired_device:
+        merged["device"] = desired_device
     return merged
 
 
