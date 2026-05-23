@@ -692,11 +692,14 @@ def _llama_cmake_args(hardware_info: HardwareInfo, *, device: str | None = None)
     selected_device = (device or "").strip().lower()
     if not selected_device or selected_device == "auto":
         selected_device = "cuda" if hardware_info.has_cuda else "vulkan" if hardware_info.has_vulkan else ""
+    if selected_device == "vulkan" and not hardware_info.has_vulkan and hardware_info.has_cuda:
+        selected_device = "cuda"
     if selected_device == "cuda" and hardware_info.has_cuda:
         args.append("-DGGML_CUDA=ON")
+        args.append("-DGGML_VULKAN=OFF")
         if is_jetson_label(hardware_info.label):
             args.append("-DCMAKE_CUDA_ARCHITECTURES=87")
-    elif selected_device == "vulkan" and (hardware_info.has_vulkan or hardware_info.has_cuda):
+    elif selected_device == "vulkan" and hardware_info.has_vulkan:
         args.append("-DGGML_VULKAN=ON")
     return args
 

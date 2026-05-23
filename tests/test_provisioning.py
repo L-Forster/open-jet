@@ -63,6 +63,21 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("-DGGML_VULKAN=ON", args)
         self.assertNotIn("-DGGML_CUDA=ON", args)
 
+    def test_llama_cmake_args_falls_back_to_cuda_when_vulkan_selected_without_vulkan(self) -> None:
+        hardware = HardwareInfo(
+            label="RTX 3090",
+            total_ram_gb=64.0,
+            has_cuda=True,
+            has_vulkan=False,
+            vram_mb=24576.0,
+        )
+
+        args = _llama_cmake_args(hardware, device="vulkan")
+
+        self.assertNotIn("-DGGML_VULKAN=ON", args)
+        self.assertIn("-DGGML_VULKAN=OFF", args)
+        self.assertIn("-DGGML_CUDA=ON", args)
+
     def test_wsl_subprocess_env_drops_windows_path_entries(self) -> None:
         original_path = "/usr/local/bin:/mnt/c/Program Files/nodejs:/usr/bin:/mnt/d/CUDA/bin"
 
