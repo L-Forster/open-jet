@@ -6,6 +6,8 @@ from typing import Any, Mapping
 
 import yaml
 
+from .app_paths import openjet_install_root
+
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 TELEMETRY_CONSENT_VERSION = 1
@@ -34,6 +36,7 @@ QWEN36_27B_MTP_UPDATE_ID = "qwen36-27b-mtp-unsloth-b9189"
 QWEN36_27B_PREFIX = "qwen3.6-27b-"
 QWEN36_35B_A3B_NON_MTP_REPO = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/"
 QWEN36_35B_A3B_MTP_UPDATE_ID = "qwen36-35b-a3b-mtp-unsloth-b9189"
+MANAGED_MODELS_DIR = openjet_install_root() / "models"
 
 
 def _qwen36_27b_mtp_url(filename: str) -> str:
@@ -255,14 +258,42 @@ def normalize_config(cfg: dict) -> dict:
 
 def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
     changed = False
+    managed_models_dir = MANAGED_MODELS_DIR.expanduser().resolve()
+
+    def managed_model_path(value: object) -> Path | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = (openjet_install_root() / path).resolve()
+        else:
+            path = path.resolve(strict=False)
+        try:
+            path.relative_to(managed_models_dir)
+        except ValueError:
+            return None
+        return path
 
     def resolve_model_path(value: object) -> str | None:
-        path = Path(str(value or "").strip())
+        path = managed_model_path(value)
+        if path is None:
+            return None
         if path.name != QWEN36_27B_LEGACY_MTP_FILENAME:
             return None
         return str(path.with_name(QWEN36_27B_MTP_FILENAME))
 
     def looks_like_qwen_mtp_update_target(row: dict[str, Any]) -> bool:
+        managed_paths = [
+            path
+            for path in (
+                managed_model_path(row.get("llama_model")),
+                managed_model_path(row.get("model_download_path")),
+            )
+            if path is not None
+        ]
+        if not managed_paths:
+            return False
         values = [
             row.get("llama_model"),
             row.get("model_download_path"),
@@ -273,11 +304,7 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
         ]
         text = "\n".join(str(value or "") for value in values)
         lowered = text.lower()
-        local_names = [
-            Path(str(value or "")).name.lower()
-            for value in (row.get("llama_model"), row.get("model_download_path"), row.get("filename"))
-            if str(value or "").strip()
-        ]
+        local_names = [path.name.lower() for path in managed_paths]
         has_non_mtp_qwen36_local_name = any(
             (
                 name.startswith(QWEN36_27B_PREFIX)
@@ -363,12 +390,13 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
         replacement = replacement or resolve_model_path(row.get("model_download_path"))
         if not replacement and looks_like_qwen_mtp_update_target(row):
             raw_path = str(row.get("model_download_path") or row.get("llama_model") or "").strip()
-            if raw_path:
-                raw_name = Path(raw_path).name.lower()
+            managed_path = managed_model_path(raw_path)
+            if managed_path is not None:
+                raw_name = managed_path.name.lower()
                 if "qwen3.6-35b-a3b-" in raw_name or QWEN36_27B_PREFIX in raw_name:
-                    replacement = str(Path(raw_path).with_name(_qwen36_mtp_local_filename(Path(raw_path).name)))
+                    replacement = str(managed_path.with_name(_qwen36_mtp_local_filename(managed_path.name)))
                 else:
-                    replacement = str(Path(raw_path).with_name(QWEN36_27B_MTP_FILENAME))
+                    replacement = str(managed_path.with_name(QWEN36_27B_MTP_FILENAME))
         if replacement or looks_like_qwen_mtp_update_target(row):
             apply_qwen_mtp_update(row, replacement=replacement)
 

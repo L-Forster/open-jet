@@ -9,6 +9,7 @@ src/*.so
 src/*.pyd
 benchmark_results/
 bin/
+.openjet
 # Runtime/session state
 session_logs/
 session_state.json

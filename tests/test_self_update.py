@@ -15,6 +15,7 @@ from src.self_update import (
     available_update,
     update_from_latest_release,
 )
+from src.config import MANAGED_MODELS_DIR
 from src.hardware import HardwareInfo
 
 
@@ -334,14 +335,16 @@ class SelfUpdateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.yaml"
+            legacy_model = str(MANAGED_MODELS_DIR / "Qwen3.6-27B-Q4_K_M-mtp.gguf")
+            migrated_model = str(MANAGED_MODELS_DIR / "Qwen3.6-27B-Q4_K_M-MTP.gguf")
             config_path.write_text(
                 "\n".join(
                     [
                         "llama_cpp_ref: pull/22673/head",
-                        "llama_model: /models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                        f"llama_model: {legacy_model}",
                         "model_profiles:",
                         "- name: mtp",
-                        "  llama_model: /models/Qwen3.6-27B-Q4_K_M-mtp.gguf",
+                        f"  llama_model: {legacy_model}",
                     ]
                 ),
                 encoding="utf-8",
@@ -353,8 +356,8 @@ class SelfUpdateTests(unittest.TestCase):
             text = config_path.read_text(encoding="utf-8")
 
         self.assertTrue(changed)
-        self.assertIn("llama_model: /models/Qwen3.6-27B-Q4_K_M-MTP.gguf", text)
-        self.assertIn("model_download_path: /models/Qwen3.6-27B-Q4_K_M-MTP.gguf", text)
+        self.assertIn(f"llama_model: {migrated_model}", text)
+        self.assertIn(f"model_download_path: {migrated_model}", text)
         self.assertIn("model_source: direct", text)
         self.assertIn("setup_missing_model: true", text)
         self.assertNotIn("setup_update_model:", text)
