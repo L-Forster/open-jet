@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -48,6 +49,11 @@ SERVICE_NAMESPACE = "openjet"
 DEFAULT_INSTALL_ID_PATH = Path(".openjet/state/telemetry_identity.json")
 _PATH_TOKEN_RE = re.compile(r"(/[^\\s:]+)+")
 _URL_RE = re.compile(r"https?://\\S+")
+_OTEL_EXPORTER_LOGGERS = (
+    "opentelemetry.exporter.otlp.proto.http._log_exporter",
+    "opentelemetry.exporter.otlp.proto.http.metric_exporter",
+    "opentelemetry.exporter.otlp.proto.http.trace_exporter",
+)
 
 
 def _utc_now() -> str:
@@ -121,6 +127,13 @@ def _normalize_headers(headers: Mapping[str, str] | None) -> dict[str, str]:
             continue
         normalized[str(key)] = str(value)
     return normalized
+
+
+def _suppress_otel_exporter_logging() -> None:
+    for logger_name in _OTEL_EXPORTER_LOGGERS:
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(logging.CRITICAL + 1)
+        logger.propagate = False
 
 
 def _load_or_create_install_id(path: Path) -> tuple[str, str]:
@@ -270,6 +283,7 @@ class SessionLogger:
         base_endpoint = (self.broadcast.endpoint or "").strip() if self.broadcast.enabled else ""
         headers = _normalize_headers(self.broadcast.headers)
         if self.broadcast.enabled and base_endpoint:
+            _suppress_otel_exporter_logging()
             if self.broadcast.export_logs:
                 self._logger_provider.add_log_record_processor(
                     BatchLogRecordProcessor(

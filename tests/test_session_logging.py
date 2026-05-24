@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import tempfile
 import unittest
 from pathlib import Path
 
 from src.app_telemetry import _classify_shell_command
-from src.session_logging import BroadcastConfig, SessionLogger
+from src.session_logging import BroadcastConfig, SessionLogger, _suppress_otel_exporter_logging
 
 
 class SessionLoggerTests(unittest.TestCase):
@@ -44,6 +45,19 @@ class SessionLoggerTests(unittest.TestCase):
 
             self.assertEqual(manifest["telemetry"]["collector_endpoint"], "http://127.0.0.1:4318")
             self.assertEqual(manifest["telemetry"]["enabled"], True)
+
+    def test_broadcast_suppresses_noisy_otlp_exporter_loggers(self) -> None:
+        exporter_logger = logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter")
+        previous_level = exporter_logger.level
+        previous_propagate = exporter_logger.propagate
+        try:
+            _suppress_otel_exporter_logging()
+
+            self.assertGreater(exporter_logger.level, logging.CRITICAL)
+            self.assertFalse(exporter_logger.propagate)
+        finally:
+            exporter_logger.setLevel(previous_level)
+            exporter_logger.propagate = previous_propagate
 
     def test_user_message_telemetry_does_not_store_prompt_text_in_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

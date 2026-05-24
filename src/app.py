@@ -1304,6 +1304,7 @@ class OpenJetApp:
         await self._maybe_prompt_for_startup_update(log)
         if self._quit_requested:
             return
+        setup_materialized = False
         if self.force_setup or not self._has_any_configured_model():
             try:
                 setup_result = await self._run_setup_wizard()
@@ -1324,6 +1325,7 @@ class OpenJetApp:
                 self._persist_setup_result(setup_result)
                 save_config(self.cfg)
                 self._write_setup_success_message(log)
+                setup_materialized = True
             elif not self._has_any_configured_model():
                 self._quit_requested = True
                 return
@@ -1335,9 +1337,10 @@ class OpenJetApp:
             self.cfg.setdefault("gpu_layers", recommended_gpu_layers(str(self.cfg.get("device", "auto"))))
             save_config(self.cfg)
 
-        resolved = await self._materialize_setup_model(dict(self.cfg), log)
-        self._persist_setup_result(resolved)
-        save_config(self.cfg)
+        if not setup_materialized:
+            resolved = await self._materialize_setup_model(dict(self.cfg), log)
+            self._persist_setup_result(resolved)
+            save_config(self.cfg)
 
         active_model = self._active_model_ref()
         model_name = Path(active_model).name or active_model

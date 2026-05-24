@@ -155,6 +155,15 @@ async def _prompt_choice(
 
         @bindings.add("enter")
         def _submit_choice(event) -> None:
+            raw = str(getattr(event.current_buffer, "text", "") or "").strip()
+            if raw:
+                try:
+                    picked = int(raw) - 1
+                except ValueError:
+                    picked = selected_index
+                if 0 <= picked < len(options):
+                    event.app.exit(result=options[picked][1])
+                    return
             event.app.exit(result=options[selected_index][1])
 
         result = await session.prompt_async(
@@ -171,6 +180,9 @@ async def _prompt_choice(
             enable_suspend=False,
         )
         raw = str(result).strip()
+        for _label, option_value in options:
+            if result == option_value:
+                return option_value
         if not raw:
             return options[selected_index][1]
         try:

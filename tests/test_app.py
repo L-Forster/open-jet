@@ -1451,6 +1451,61 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             download.assert_not_awaited()
 
 
+class SetupPromptChoiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prompt_choice_allows_typed_number_submission(self) -> None:
+        test_case = self
+
+        class FakeApp:
+            result = None
+
+            def exit(self, *, result=None) -> None:
+                self.result = result
+
+        class FakeBuffer:
+            text = "2"
+
+            def reset(self) -> None:
+                return
+
+        class FakeEvent:
+            def __init__(self) -> None:
+                self.app = FakeApp()
+                self.current_buffer = FakeBuffer()
+
+        class FakeSession:
+            async def prompt_async(self, _prompt, **kwargs):
+                event = FakeEvent()
+                handlers = {
+                    tuple(binding.keys): binding.handler
+                    for binding in kwargs["key_bindings"].bindings
+                }
+                enter_handler = handlers.get(("enter",))
+                if enter_handler is None:
+                    for keys, handler in handlers.items():
+                        if keys and getattr(keys[0], "value", None) == "c-m":
+                            enter_handler = handler
+                            break
+                test_case.assertIsNotNone(enter_handler)
+                enter_handler(event)
+                return event.app.result
+
+        session = FakeSession()
+
+        result = await _prompt_choice(
+            session,
+            Console(),
+            "Setup mode",
+            [
+                ("Use recommended setup", "recommended"),
+                ("Review and edit recommended setup", "guided"),
+                ("Manual setup", "manual"),
+            ],
+            default_index=0,
+        )
+
+        self.assertEqual(result, "guided")
+
+
 class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_setup_command_saves_config_before_materializing_model(self) -> None:
         app = OpenJetApp()
