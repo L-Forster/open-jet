@@ -35,7 +35,7 @@ class SourceTreeTests(unittest.TestCase):
         missing = [str(path.relative_to(root)) for path in removed_paths if path.exists()]
         self.assertEqual(missing, [], f"Remote-runtime legacy files must stay deleted: {missing}")
 
-    def test_user_facing_docs_do_not_reference_removed_runtimes(self) -> None:
+    def test_user_facing_docs_do_not_reference_removed_runtime_modules(self) -> None:
         root = Path(__file__).resolve().parents[1]
         docs = [
             root / "README.md",
@@ -46,7 +46,7 @@ class SourceTreeTests(unittest.TestCase):
             root / "docs" / "runtimes" / "llama-cpp.md",
         ]
 
-        banned = ("openai_compatible", "openrouter", "ollama")
+        banned = ("openai_compatible.py", "ollama_setup.py")
         offenders: list[str] = []
         for path in docs:
             text = path.read_text(encoding="utf-8").lower()

@@ -159,11 +159,36 @@ class PersistentMemoryFileTests(unittest.IsolatedAsyncioTestCase):
     async def test_build_system_prompt_uses_default_base_prompt_when_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch("src.config.load_config", return_value={}):
-                prompt = await build_system_prompt("", root)
+            prompt = await build_system_prompt("", root, cfg={"llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf"})
 
         self.assertIn("You are Qwen, created by Alibaba Cloud. You are a helpful assistant.", prompt)
         self.assertIn("Be concise, direct, and practical.", prompt)
+
+    async def test_build_system_prompt_omits_qwen_identity_for_non_qwen_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = {"runtime": "openai_codex", "model": "gpt-5.5"}
+            prompt = await build_system_prompt("", root, cfg=cfg)
+
+        self.assertNotIn("You are Qwen, created by Alibaba Cloud. You are a helpful assistant.", prompt)
+        self.assertTrue(prompt.startswith("- Be concise, direct, and practical."))
+
+    async def test_build_system_prompt_detects_qwen_from_active_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = {
+                "active_model_profile": "local-qwen",
+                "model_profiles": [
+                    {
+                        "name": "local-qwen",
+                        "runtime": "llama_cpp",
+                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M.gguf",
+                    }
+                ],
+            }
+            prompt = await build_system_prompt("", root, cfg=cfg)
+
+        self.assertTrue(prompt.startswith("You are Qwen, created by Alibaba Cloud. You are a helpful assistant."))
 
     async def test_build_system_prompt_omits_memory_update_policy_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

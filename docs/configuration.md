@@ -128,6 +128,62 @@ Behavior:
 
 Setup stores reusable model presets under `model_profiles`. The active preset is tracked by `active_model_profile`.
 
+Profiles may use the local `llama_cpp` runtime or the OpenAI Codex OAuth runtime:
+
+```yaml
+model_profiles:
+  - name: local-qwen
+    runtime: llama_cpp
+    llama_model: /home/you/models/Qwen.gguf
+    context_window_tokens: 32768
+    gpu_layers: 99
+
+  - name: codex
+    runtime: openai_codex
+    provider: openai-codex
+    model: gpt-5.5
+    context_window_tokens: 272000
+    reasoning_effort: medium
+    reasoning_summary: auto
+    text_verbosity: medium
+```
+
+Use `/connect openai-codex` to sign in through the official Codex CLI ChatGPT OAuth flow, or `/connect openai-codex --device-auth` for Codex CLI's device-code flow on SSH/headless systems, then `/runtime cloud` or `/cloud` to switch manually. OpenJet never routes prompts to Codex automatically. Codex OAuth is not API-key auth: OpenJet reads the Codex CLI OAuth session from `$CODEX_HOME/auth.json` or `~/.codex/auth.json` and sends requests to the Codex backend. `airgapped: true` disables Codex login and Codex runtime startup while preserving local llama.cpp profiles.
+
+API-key providers use the optional LiteLLM runtime. Install it with `pip install open-jet[cloud]`, save credentials with `/connect openai`, `/connect anthropic`, or `/connect openrouter`, then switch manually with `/cloud <name>` or `/model <name>`:
+
+OpenJet does not write provider secrets to OpenJet-owned JSON files. API-key `/connect` uses OS keyring storage; environment variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `OPENROUTER_API_KEY` take precedence and are the recommended path for headless systems.
+
+```yaml
+model_profiles:
+  - name: openai-api
+    runtime: litellm
+    provider: openai
+    model: openai/gpt-5.2
+    api_key_env: OPENAI_API_KEY
+    context_window_tokens: 272000
+
+  - name: claude-api
+    runtime: litellm
+    provider: anthropic
+    model: anthropic/claude-sonnet-4-5-20250929
+    api_key_env: ANTHROPIC_API_KEY
+
+  - name: openrouter
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/anthropic/claude-sonnet-4-5
+    api_key_env: OPENROUTER_API_KEY
+
+  - name: lmstudio
+    runtime: litellm
+    provider: openai-compatible
+    model: openai/local-model
+    base_url: http://127.0.0.1:1234/v1
+```
+
+`airgapped: true` blocks remote LiteLLM providers. Loopback `base_url` profiles such as LM Studio, Ollama, and vLLM remain allowed.
+
 This is the recommended way to switch between local GGUF presets with different paths, context windows, or GPU offload settings.
 
 ## Related docs

@@ -35,6 +35,18 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["logging"]["directory"], "custom/logs")
         self.assertEqual(normalized["state"]["path"], "custom/state.yaml")
 
+    def test_normalize_config_preserves_active_cloud_runtime(self) -> None:
+        cfg = {
+            "runtime": "openai_codex",
+            "model": "gpt-5.5",
+            "active_model_profile": "codex",
+        }
+
+        normalized = normalize_config(cfg)
+
+        self.assertEqual(normalized["runtime"], "openai_codex")
+        self.assertEqual(normalized["model"], "gpt-5.5")
+
     def test_normalize_config_maps_legacy_qwen_mtp_filename_to_unsloth_asset(self) -> None:
         legacy_model = str(MANAGED_MODELS_DIR / "Qwen3.6-27B-Q4_K_M-mtp.gguf")
         migrated_model = str(MANAGED_MODELS_DIR / "Qwen3.6-27B-Q4_K_M-MTP.gguf")

@@ -12,8 +12,9 @@ from .executor import edit_file
 from .runtime_limits import MIN_TOKEN_BUDGET, derive_file_token_budget, estimate_tokens, read_memory_snapshot
 from .shell_targets import shell_targets_prompt
 
-DEFAULT_BASE_SYSTEM_PROMPT = """You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
-- Be concise, direct, and practical.
+QWEN_IDENTITY_SYSTEM_PROMPT = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+
+DEFAULT_BASE_SYSTEM_PROMPT = """- Be concise, direct, and practical.
 - Follow repository conventions and inspect real files before making changes.
 - Never assume libraries, frameworks, commands, or paths without checking the repo.
 - For coding tasks, follow this loop: inspect -> implement narrowly -> verify.
@@ -352,4 +353,39 @@ def _resolve_base_system_prompt(
     configured = ""
     if isinstance(cfg, Mapping):
         configured = str(cfg.get("system_prompt", "") or "").strip()
-    return configured or DEFAULT_BASE_SYSTEM_PROMPT
+    if configured:
+        return configured
+    if _is_qwen_model_cfg(cfg):
+        return f"{QWEN_IDENTITY_SYSTEM_PROMPT}\n{DEFAULT_BASE_SYSTEM_PROMPT}"
+    return DEFAULT_BASE_SYSTEM_PROMPT
+
+
+def _is_qwen_model_cfg(cfg: Mapping[str, object] | None) -> bool:
+    if not isinstance(cfg, Mapping):
+        return False
+    model_ref = _active_model_ref_from_cfg(cfg).lower()
+    return "qwen" in model_ref
+
+
+def _active_model_ref_from_cfg(cfg: Mapping[str, object]) -> str:
+    runtime = str(cfg.get("runtime") or "llama_cpp").strip().lower()
+    if runtime in {"openai_codex", "litellm"}:
+        direct_model = str(cfg.get("model") or "").strip()
+    else:
+        direct_model = str(cfg.get("llama_model") or "").strip()
+    if direct_model:
+        return direct_model
+
+    active_profile = str(cfg.get("active_model_profile") or "").strip().lower()
+    profiles = cfg.get("model_profiles")
+    if active_profile and isinstance(profiles, list):
+        for item in profiles:
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("name") or "").strip().lower() != active_profile:
+                continue
+            profile_runtime = str(item.get("runtime") or runtime).strip().lower()
+            if profile_runtime in {"openai_codex", "litellm"}:
+                return str(item.get("model") or "").strip()
+            return str(item.get("llama_model") or "").strip()
+    return str(cfg.get("model") or cfg.get("llama_model") or "").strip()

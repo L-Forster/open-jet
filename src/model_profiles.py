@@ -3,9 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Mapping
 
-from .runtime_registry import RUNTIME_LABEL, active_model_ref
+from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, LITELLM_RUNTIME, RUNTIME_LABEL, active_model_ref, active_runtime
 
 PROFILE_KEYS: tuple[str, ...] = (
+    "runtime",
+    "provider",
+    "model",
+    "base_url",
+    "api_key_env",
+    "codex_base_url",
+    "reasoning_effort",
+    "reasoning_summary",
+    "text_verbosity",
     "llama_model",
     "model_download_url",
     "model_download_path",
@@ -39,6 +48,8 @@ def profile_model_ref(profile: Mapping[str, object]) -> str:
 
 def default_profile_name(source: Mapping[str, object]) -> str:
     model_ref = profile_model_ref(source)
+    if active_runtime(dict(source)) in {CODEX_RUNTIME, LITELLM_RUNTIME}:
+        return model_ref or "OpenAI Codex"
     if not model_ref:
         return RUNTIME_LABEL
     name = Path(model_ref).name or model_ref
@@ -53,7 +64,8 @@ def build_model_profile(source: Mapping[str, object], *, name: str | None = None
         return None
 
     profile_name = (name or str(source.get("active_model_profile") or "")).strip() or default_profile_name(source)
-    profile: dict[str, Any] = {"name": profile_name}
+    runtime = active_runtime(dict(source))
+    profile: dict[str, Any] = {"name": profile_name, "runtime": runtime}
     for key in PROFILE_KEYS:
         value = source.get(key)
         if value is None:
@@ -63,7 +75,13 @@ def build_model_profile(source: Mapping[str, object], *, name: str | None = None
             if not value:
                 continue
         profile[key] = value
-    profile["llama_model"] = model_ref
+    if runtime in {CODEX_RUNTIME, LITELLM_RUNTIME}:
+        profile["model"] = model_ref
+        if runtime == CODEX_RUNTIME:
+            profile.setdefault("provider", "openai-codex")
+    else:
+        profile["llama_model"] = model_ref
+        profile["runtime"] = DEFAULT_RUNTIME
     return profile
 
 
@@ -112,7 +130,7 @@ def replace_model_profile(
 ) -> dict[str, Any]:
     built = build_model_profile(profile, name=str(profile.get("name") or "").strip() or None)
     if not built:
-        raise ValueError("Model profile requires a configured GGUF path.")
+        raise ValueError("Model profile requires a configured model reference.")
 
     previous_key = (previous_name or "").strip().lower()
     target_key = built["name"].strip().lower()
@@ -129,7 +147,7 @@ def replace_model_profile(
 def apply_model_profile(cfg: dict[str, Any], profile: Mapping[str, object]) -> dict[str, Any]:
     built = build_model_profile(profile, name=str(profile.get("name") or "").strip() or None)
     if not built:
-        raise ValueError("Model profile requires a configured GGUF path.")
+        raise ValueError("Model profile requires a configured model reference.")
 
     for key in PROFILE_KEYS:
         if key in built:

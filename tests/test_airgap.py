@@ -56,6 +56,8 @@ class RuntimeRegistryAirgapTests(AirgapBaseTestCase):
             options,
             [
                 ("Local model: llama.cpp (GGUF)", "llama_cpp"),
+                ("OpenAI Codex OAuth", "openai_codex"),
+                ("API model: LiteLLM", "litellm"),
             ],
         )
 

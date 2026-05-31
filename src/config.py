@@ -229,7 +229,7 @@ def save_config(cfg: dict) -> None:
 
 def normalize_config(cfg: dict) -> dict:
     normalized = dict(cfg or {})
-    removed_exact_keys = {"runtime", "model", "ollama_model", "recommended_llm"}
+    removed_exact_keys = {"ollama_model", "recommended_llm"}
     removed_prefixes = ("openai_compatible_", "openrouter_")
     for key in list(normalized):
         if key in removed_exact_keys or any(key.startswith(prefix) for prefix in removed_prefixes):

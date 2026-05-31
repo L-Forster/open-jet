@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import time
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit.shortcuts import radiolist_dialog
 
+from .api_auth import ApiKeyStore, default_api_key_env, normalize_provider_id
+from .codex_auth import CodexAuthError, CodexOAuthProvider
 from .config import save_config
 from .model_profiles import get_model_profile, list_model_profiles, replace_model_profile
+from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, LITELLM_RUNTIME, active_runtime
 from .memory_reflection import refresh_agent_system_prompt
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
@@ -21,6 +25,79 @@ from .theme import rich_text
 if TYPE_CHECKING:
     from .app import OpenJetApp
     from .session_state import SavedChatEntry
+
+
+_API_KEY_CONNECT_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "openrouter",
+    "google",
+    "xai",
+    "mistral",
+    "deepseek",
+    "openai-compatible",
+}
+
+_DEFAULT_CODEX_PROFILE: dict[str, object] = {
+    "name": "codex",
+    "runtime": CODEX_RUNTIME,
+    "provider": "openai-codex",
+    "model": "gpt-5.5",
+    "context_window_tokens": 272000,
+    "reasoning_effort": "medium",
+    "reasoning_summary": "auto",
+    "text_verbosity": "medium",
+}
+
+
+def _ensure_codex_model_profile(cfg: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    existing = get_model_profile(cfg, "codex")
+    if existing and active_runtime(existing) == CODEX_RUNTIME:
+        return existing, False
+    fallback = get_model_profile(cfg, "openai-codex")
+    if fallback and active_runtime(fallback) == CODEX_RUNTIME:
+        return fallback, False
+
+    profile = dict(_DEFAULT_CODEX_PROFILE)
+    if existing:
+        profile["name"] = _unique_profile_name(cfg, "openai-codex")
+    stored = replace_model_profile(cfg, profile)
+    return stored, True
+
+
+def _unique_profile_name(cfg: dict[str, Any], preferred: str) -> str:
+    existing = {str(profile.get("name") or "").strip().lower() for profile in list_model_profiles(cfg)}
+    base = preferred.strip() or "profile"
+    if base.lower() not in existing:
+        return base
+    suffix = 2
+    while f"{base}-{suffix}".lower() in existing:
+        suffix += 1
+    return f"{base}-{suffix}"
+
+
+def _runtime_kind(profile: dict[str, Any]) -> str:
+    return "local" if active_runtime(profile) == DEFAULT_RUNTIME else "cloud"
+
+
+def _preferred_runtime_profile(
+    profiles: list[dict[str, Any]],
+    *,
+    kind: str,
+    active: str,
+) -> dict[str, Any] | None:
+    candidates = [profile for profile in profiles if _runtime_kind(profile) == kind]
+    if not candidates:
+        return None
+    active_key = active.strip().lower()
+    for profile in candidates:
+        if str(profile.get("name") or "").strip().lower() == active_key:
+            return profile
+    if kind == "cloud":
+        for profile in candidates:
+            if str(profile.get("name") or "").strip().lower() in {"codex", "openai-codex"}:
+                return profile
+    return candidates[0]
 
 
 class SlashCommandHandler:
@@ -93,6 +170,9 @@ class SlashCommandHandler:
         if cmd == "telemetry":
             self._telemetry(log, arg)
             return True
+        if cmd == "connect":
+            await self._connect(log, arg)
+            return True
         if cmd == "resume":
             await self._resume(log)
             return True
@@ -101,6 +181,15 @@ class SlashCommandHandler:
             return True
         if cmd == "model":
             await self._model(log, arg)
+            return True
+        if cmd == "runtime":
+            await self._runtime(log, arg)
+            return True
+        if cmd == "local":
+            await self._runtime(log, "local")
+            return True
+        if cmd == "cloud":
+            await self._cloud(log, arg)
             return True
         if cmd == "edit-model":
             await self._edit_model(log, arg)
@@ -525,63 +614,15 @@ class SlashCommandHandler:
         profiles = self.app.model_profiles()
         active = str(self.app.cfg.get("active_model_profile") or "").strip()
 
-        if not arg:
-            if not profiles:
-                log.write("[yellow]No saved model presets yet. Run /setup to add one.[/]")
-                log.write("")
-                return
-            if self.app._awaiting_approval:
-                log.write("[yellow]Cannot switch models while a tool approval prompt is active.[/]")
-                log.write("")
-                return
-            if self.app._thinking_timer:
-                log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
-                log.write("")
-                return
-
-            selected = await radiolist_dialog(
-                title="Switch model preset",
-                text="Use arrow keys to choose a saved model preset.",
-                values=[
-                    (
-                        profile["name"],
-                        f"{profile['name']}"
-                        f"{' (active)' if profile['name'] == active else ''}"
-                        f" | ctx={profile.get('context_window_tokens', 'n/a')}"
-                        f" | gpu={profile.get('gpu_layers', 'n/a')}",
-                    )
-                    for profile in profiles
-                ],
-            ).run_async()
-            if selected is None:
-                log.write("[bold bright_white]Model switch cancelled.[/]")
-                log.write("")
-                return
-            if str(selected).strip().lower() == active.lower():
-                log.write(f"[bold bright_white]Model preset '{selected}' is already active.[/]")
-                log.write("")
-                return
-            if not await self.app.activate_model_profile(str(selected), log):
-                log.write(f"[yellow]Unknown model preset:[/] {selected}")
-                log.write("")
-            return
-
-        if arg.lower() in {"status", "list"}:
+        if not arg or arg.lower() in {"status", "list"}:
             if not profiles:
                 log.write("[yellow]No saved model presets yet. Run /setup to add one.[/]")
                 log.write("")
                 return
             log.write(f"[bold bright_white]Active model preset: {active or 'none'}[/]")
-            for profile in profiles:
-                marker = " (active)" if profile["name"] == active else ""
-                model_ref = str(profile.get("llama_model") or "")
-                log.write(
-                    "[bold bright_white]"
-                    f"- {profile['name']}{marker}: "
-                    f"context={profile.get('context_window_tokens', 'n/a')} gpu={profile.get('gpu_layers', 'n/a')} "
-                    f"model={model_ref or 'n/a'}"
-                    "[/]"
-                )
+            self._write_model_profile_list(log, profiles, active=active)
+            if not arg:
+                log.write("[dim]Use /model <preset> to switch model preset, or /runtime local|cloud to switch runtime.[/]")
             log.write("")
             return
 
@@ -594,8 +635,259 @@ class SlashCommandHandler:
             log.write("")
             return
         if not await self.app.activate_model_profile(arg, log):
+            if arg.strip().lower() in {"codex", "openai-codex"} and self._ensure_connected_codex_profile():
+                if await self.app.activate_model_profile("codex", log):
+                    return
             log.write(f"[yellow]Unknown model preset:[/] {arg}")
             log.write("")
+
+    async def _runtime(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower() or "status"
+        if arg in {"cloud", "codex", "openai-codex"}:
+            await self._switch_runtime_kind(log, "cloud")
+            return
+        if arg in {"local", "llama", "llama_cpp", "llama-cpp"}:
+            await self._switch_runtime_kind(log, "local")
+            return
+        if arg not in {"status", "list"}:
+            log.write("[yellow]Usage:[/] /runtime [status|local|cloud]")
+            log.write("")
+            return
+
+        profiles = self.app.model_profiles()
+        active = str(self.app.cfg.get("active_model_profile") or "").strip()
+        active_runtime_name = active_runtime(self.app.cfg)
+        log.write(f"[bold bright_white]Active runtime:[/] {active_runtime_name} ({active or 'no preset'})")
+        local_profiles = [profile for profile in profiles if _runtime_kind(profile) == "local"]
+        cloud_profiles = [profile for profile in profiles if _runtime_kind(profile) == "cloud"]
+        log.write("[bold bright_white]Local profiles:[/]")
+        self._write_model_profile_list(log, local_profiles, active=active, empty="none")
+        log.write("[bold bright_white]Cloud profiles:[/]")
+        self._write_model_profile_list(log, cloud_profiles, active=active, empty="none")
+        log.write("[dim]Use /runtime local or /runtime cloud. Shortcuts: /local, /cloud.[/]")
+        log.write("")
+
+    async def _switch_runtime_kind(self, log: Any, kind: str) -> None:
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot switch runtime while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+
+        profiles = self.app.model_profiles()
+        if kind == "cloud" and not any(_runtime_kind(profile) == "cloud" for profile in profiles):
+            self._ensure_connected_codex_profile()
+            profiles = self.app.model_profiles()
+        target = _preferred_runtime_profile(profiles, kind=kind, active=str(self.app.cfg.get("active_model_profile") or ""))
+        if target is None:
+            if kind == "cloud":
+                log.write("[yellow]No cloud runtime profile found. Run /connect openai-codex first.[/]")
+            else:
+                log.write("[yellow]No local runtime profile found. Run /setup to add one.[/]")
+            log.write("")
+            return
+
+        active = str(self.app.cfg.get("active_model_profile") or "").strip()
+        if str(target["name"]).strip().lower() == active.lower():
+            log.write(f"[bold bright_white]Already using {kind} runtime: {target['name']}.[/]")
+            log.write("")
+            return
+        if not await self.app.activate_model_profile(str(target["name"]), log):
+            log.write(f"[yellow]Runtime switch failed:[/] unknown preset {target['name']}")
+            log.write("")
+            return
+
+    async def _cloud(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip()
+        if not arg:
+            await self._switch_runtime_kind(log, "cloud")
+            return
+
+        parts = arg.split(maxsplit=1)
+        action = parts[0].strip().lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if action in {"status", "list", "profiles"}:
+            self._cloud_status(log)
+            return
+        if action == "model":
+            await self._set_cloud_model(log, rest)
+            return
+        if action == "add":
+            await self._add_cloud_profile(log)
+            return
+
+        profile = get_model_profile(self.app.cfg, arg)
+        if profile and _runtime_kind(profile) == "cloud":
+            if not await self.app.activate_model_profile(str(profile["name"]), log):
+                log.write(f"[yellow]Cloud switch failed:[/] {profile['name']}")
+                log.write("")
+            return
+
+        log.write("[yellow]Usage:[/] /cloud [status|model <model>|add|<profile>]")
+        log.write("")
+
+    def _cloud_status(self, log: Any) -> None:
+        profiles = [profile for profile in self.app.model_profiles() if _runtime_kind(profile) == "cloud"]
+        active = str(self.app.cfg.get("active_model_profile") or "").strip()
+        if not profiles:
+            log.write("[yellow]No cloud runtime profiles found. Run /connect openai-codex or /cloud add.[/]")
+            log.write("")
+            return
+        log.write(f"[bold bright_white]Active cloud profile: {active if active_runtime(self.app.cfg) != DEFAULT_RUNTIME else 'none'}[/]")
+        self._write_model_profile_list(log, profiles, active=active)
+        log.write("[dim]Use /cloud to switch to cloud, /cloud <profile> to pick one, or /cloud model <model> to edit the current cloud profile.[/]")
+        log.write("")
+
+    async def _set_cloud_model(self, log: Any, model: str) -> None:
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot change cloud model while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+        model = model.strip()
+        if not model:
+            log.write("[yellow]Usage:[/] /cloud model <model>")
+            log.write("")
+            return
+
+        profiles = self.app.model_profiles()
+        if not any(_runtime_kind(profile) == "cloud" for profile in profiles):
+            self._ensure_connected_codex_profile()
+            profiles = self.app.model_profiles()
+        profile = _preferred_runtime_profile(
+            profiles,
+            kind="cloud",
+            active=str(self.app.cfg.get("active_model_profile") or ""),
+        )
+        if profile is None:
+            log.write("[yellow]No cloud runtime profile found. Run /connect openai-codex or /cloud add first.[/]")
+            log.write("")
+            return
+
+        previous_cfg = dict(self.app.cfg)
+        updated = dict(profile)
+        updated["model"] = model
+        updated.pop("llama_model", None)
+        try:
+            stored = replace_model_profile(self.app.cfg, updated, previous_name=str(profile["name"]))
+        except ValueError as exc:
+            log.write(f"[yellow]{exc}[/]")
+            log.write("")
+            return
+
+        save_config(self.app.cfg)
+        active = str(self.app.cfg.get("active_model_profile") or "").strip().lower()
+        if active == str(stored["name"]).strip().lower():
+            if await self.app.activate_model_profile(str(stored["name"]), log):
+                return
+            self.app.cfg = previous_cfg
+            save_config(self.app.cfg)
+            try:
+                await self.app._init_client()
+            except Exception:
+                pass
+            return
+        log.write(f"[bold bright_white]Cloud model for '{stored['name']}' set to {model}.[/]")
+        log.write("")
+
+    async def _add_cloud_profile(self, log: Any) -> None:
+        if self.app._awaiting_approval:
+            log.write("[yellow]Cannot add cloud profile while a tool approval prompt is active.[/]")
+            log.write("")
+            return
+        if self.app._thinking_timer:
+            log.write("[yellow]Wait for the current generation to finish, then retry.[/]")
+            log.write("")
+            return
+
+        existing_names = {str(profile.get("name") or "").strip().lower() for profile in self.app.model_profiles()}
+        default_name = "codex" if "codex" not in existing_names else "cloud"
+        name_value = await _prompt_text(self.app._session, "cloud profile name> ", default=default_name)
+        provider_value = await _prompt_text(self.app._session, "provider> ", default="openai-codex")
+        provider_id = normalize_provider_id(provider_value) if provider_value else "openai-codex"
+        if provider_id in {"codex", "openai_codex"}:
+            provider_id = "openai-codex"
+
+        is_codex = provider_id == "openai-codex"
+        default_model = "gpt-5.5" if is_codex else f"{provider_id}/"
+        model_value = await _prompt_text(self.app._session, "model> ", default=default_model)
+        context_default = "272000" if is_codex else "128000"
+        context_value = await _prompt_text(self.app._session, "context window> ", default=context_default)
+        try:
+            context_tokens = int(context_value.strip())
+        except ValueError:
+            log.write("[yellow]Context window must be an integer.[/]")
+            log.write("")
+            return
+
+        profile: dict[str, Any] = {
+            "name": name_value.strip() or default_name,
+            "runtime": CODEX_RUNTIME if is_codex else LITELLM_RUNTIME,
+            "provider": "openai-codex" if is_codex else provider_id,
+            "model": model_value.strip(),
+            "context_window_tokens": context_tokens,
+        }
+        if is_codex:
+            profile.update(
+                {
+                    "reasoning_effort": "medium",
+                    "reasoning_summary": "auto",
+                    "text_verbosity": "medium",
+                }
+            )
+        else:
+            base_url_value = await _prompt_text(self.app._session, "base url> ", default="")
+            env_default = default_api_key_env(provider_id)
+            env_value = await _prompt_text(self.app._session, "api key env> ", default=env_default)
+            if base_url_value.strip():
+                profile["base_url"] = base_url_value.strip()
+            if env_value.strip():
+                profile["api_key_env"] = env_value.strip()
+
+        try:
+            stored = replace_model_profile(self.app.cfg, profile)
+        except ValueError as exc:
+            log.write(f"[yellow]{exc}[/]")
+            log.write("")
+            return
+        save_config(self.app.cfg)
+        log.write(
+            "[bold bright_white]"
+            f"Cloud profile '{stored['name']}' added. Use /cloud {stored['name']} to switch."
+            "[/]"
+        )
+        log.write("")
+
+    @staticmethod
+    def _write_model_profile_list(
+        log: Any,
+        profiles: list[dict[str, Any]],
+        *,
+        active: str,
+        empty: str = "",
+    ) -> None:
+        if not profiles:
+            if empty:
+                log.write(f"[dim]- {empty}[/]")
+            return
+        for profile in profiles:
+            marker = " (active)" if profile["name"] == active else ""
+            runtime = str(profile.get("runtime") or DEFAULT_RUNTIME)
+            model_ref = str(profile.get("model") or profile.get("llama_model") or "")
+            log.write(
+                "[bold bright_white]"
+                f"- {profile['name']}{marker}: "
+                f"runtime={runtime} context={profile.get('context_window_tokens', 'n/a')} "
+                f"gpu={profile.get('gpu_layers', 'n/a')} "
+                f"model={model_ref or 'n/a'}"
+                "[/]"
+            )
 
     async def _edit_model(self, log: Any, raw_arg: str) -> None:
         if self.app._awaiting_approval:
@@ -627,7 +919,7 @@ class SlashCommandHandler:
         model_value = await _prompt_text(
             self.app._session,
             "model ref> ",
-            default=str(profile.get("llama_model") or ""),
+            default=str(profile.get("model") or profile.get("llama_model") or ""),
         )
         context_value = await _prompt_text(
             self.app._session,
@@ -652,7 +944,11 @@ class SlashCommandHandler:
         updated["name"] = name_value.strip() or profile["name"]
         updated["context_window_tokens"] = context_tokens
         updated["gpu_layers"] = gpu_layers
-        updated["llama_model"] = model_value.strip()
+        if active_runtime(updated) in {CODEX_RUNTIME, LITELLM_RUNTIME}:
+            updated["model"] = model_value.strip()
+            updated.pop("llama_model", None)
+        else:
+            updated["llama_model"] = model_value.strip()
 
         try:
             stored = replace_model_profile(self.app.cfg, updated, previous_name=profile["name"])
@@ -811,6 +1107,115 @@ class SlashCommandHandler:
         else:
             log.write("[bold bright_white]Telemetry off.[/]")
         log.write("")
+
+    async def _connect(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower() or "status"
+        parts = arg.split()
+        api_key_store = ApiKeyStore()
+        codex_provider = CodexOAuthProvider()
+        if arg == "status":
+            status = codex_provider.status()
+            if status.get("logged_in"):
+                expiry = float(status.get("expires_at") or 0)
+                remaining = max(0, int(expiry - time.time()))
+                account = str(status.get("account_id") or "").strip()
+                account_suffix = f" account={account}" if account else ""
+                log.write(
+                    "[bold bright_white]"
+                    f"OpenAI Codex: connected{account_suffix} expires_in={remaining}s storage={status.get('storage')}"
+                    "[/]"
+                )
+            else:
+                log.write(f"[bold bright_white]OpenAI Codex: not connected storage={status.get('storage')}[/]")
+            api_status = api_key_store.status(
+                ["openai", "anthropic", "openrouter", "google", "xai", "mistral", "deepseek", "openai-compatible"]
+            )
+            for provider_id, provider_status in api_status.items():
+                source = "env" if provider_status.get("env_present") else ("stored" if provider_status.get("stored") else "missing")
+                env_name = provider_status.get("env") or "n/a"
+                log.write(
+                    "[bold bright_white]"
+                    f"{provider_id}: {source} env={env_name} storage={provider_status.get('storage')}"
+                    "[/]"
+                )
+            log.write("")
+            return
+        if arg in {"logout openai-codex", "logout codex", "openai-codex logout"}:
+            codex_provider.logout()
+            log.write("[bold bright_white]OpenAI Codex disconnected.[/]")
+            log.write("")
+            return
+        if len(parts) == 2 and parts[0] == "logout":
+            provider_id = normalize_provider_id(parts[1])
+            if provider_id in _API_KEY_CONNECT_PROVIDERS:
+                if not api_key_store.clear_key(provider_id):
+                    log.write(f"[bold red]{provider_id} API key removal failed:[/] OS keyring is unavailable.")
+                    log.write("")
+                    return
+                log.write(f"[bold bright_white]{provider_id} API key removed from OpenJet storage.[/]")
+                log.write("")
+                return
+        codex_login_requested = bool(parts and parts[0] in {"openai-codex", "codex"})
+        codex_login_args = set(parts[1:])
+        codex_args_supported = codex_login_requested and codex_login_args.issubset({"--device-auth", "device-auth"})
+        if codex_login_requested and codex_args_supported:
+            if self.app.is_airgapped():
+                log.write("[yellow]Air-gapped mode blocks OpenAI Codex login.[/]")
+                log.write("")
+                return
+            try:
+                credentials = await codex_provider.login_browser(device_auth=bool(codex_login_args))
+            except CodexAuthError as exc:
+                log.write(f"[bold red]OpenAI Codex login failed:[/] {exc}")
+                log.write("")
+                return
+            remaining = max(0, int(credentials.expires_at - time.time()))
+            _, added_profile = _ensure_codex_model_profile(self.app.cfg)
+            if added_profile:
+                save_config(self.app.cfg)
+            profile_suffix = " Model preset 'codex' added." if added_profile else ""
+            log.write(f"[bold bright_white]OpenAI Codex connected. Token expires in {remaining}s.{profile_suffix}[/]")
+            log.write("")
+            return
+        provider_id = normalize_provider_id(arg)
+        if provider_id not in _API_KEY_CONNECT_PROVIDERS:
+            log.write(
+                "[yellow]Usage:[/] "
+                "/connect [status|openai-codex [--device-auth]|openai|anthropic|openrouter|logout <provider>]"
+            )
+            log.write("")
+            return
+        if self.app.is_airgapped():
+            log.write("[yellow]Air-gapped mode blocks API provider login.[/]")
+            log.write("")
+            return
+        env_name = default_api_key_env(provider_id)
+        if env_name and os.environ.get(env_name):
+            log.write(f"[bold bright_white]{provider_id} is already available from {env_name}.[/]")
+            log.write("")
+            return
+        api_key = await _prompt_text(self.app._session, f"{provider_id} api key> ", is_password=True)
+        if not api_key.strip():
+            log.write("[yellow]API key not saved.[/]")
+            log.write("")
+            return
+        try:
+            api_key_store.save_key(provider_id, api_key.strip())
+        except ValueError as exc:
+            log.write(f"[bold red]API key save failed:[/] {exc}")
+            log.write("")
+            return
+        log.write(f"[bold bright_white]{provider_id} API key saved.[/]")
+        log.write("")
+
+    def _ensure_connected_codex_profile(self) -> bool:
+        status = CodexOAuthProvider().status()
+        if not status.get("logged_in"):
+            return False
+        _, added_profile = _ensure_codex_model_profile(self.app.cfg)
+        if added_profile:
+            save_config(self.app.cfg)
+        return True
 
     def _mode(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip().lower()

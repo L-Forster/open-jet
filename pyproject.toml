@@ -37,6 +37,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cloud = [
+    "keyring>=25",
+    "litellm>=1.74",
+]
 mcp = [
     "mcp>=1.0",
 ]

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 
-from src.runtime_protocol import TOOLS, stream_openai_chat, tool_schema_token_estimate
+from src.multimodal import build_user_content
+from src.runtime_protocol import TOOLS, stream_openai_chat, stream_openai_responses, tool_schema_token_estimate
 
 
 class _FakeResponse:
@@ -81,6 +83,60 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<tool_guidelines>", str((http.last_payload or {})["messages"][0]["content"]))
         self.assertTrue(any(chunk.reasoning for chunk in chunks))
         self.assertFalse(any(chunk.text for chunk in chunks[:-1]))
+
+    async def test_stream_openai_responses_preserves_multimodal_user_content(self) -> None:
+        http = _FakeHTTPClient(['data: {"type":"response.completed"}'])
+        with tempfile.NamedTemporaryFile(suffix=".png") as image:
+            image.write(b"png")
+            image.flush()
+            content = build_user_content("Describe this image", [image.name])
+
+            chunks = [
+                chunk
+                async for chunk in stream_openai_responses(
+                    http,
+                    base_url="https://api.openai.test/v1",
+                    model="gpt-test",
+                    messages=[{"role": "user", "content": content}],
+                    use_tools=False,
+                )
+            ]
+
+        self.assertTrue(chunks[-1].done)
+        payload = http.last_payload or {}
+        input_content = payload["input"][0]["content"]
+        self.assertIsInstance(input_content, list)
+        self.assertEqual(input_content[0]["type"], "input_text")
+        self.assertIn("Describe this image", input_content[0]["text"])
+        self.assertEqual(input_content[1]["type"], "input_image")
+        self.assertTrue(str(input_content[1]["image_url"]).startswith("data:image/png;base64,"))
+
+    async def test_stream_openai_responses_preserves_existing_input_image_part(self) -> None:
+        http = _FakeHTTPClient(['data: {"type":"response.completed"}'])
+
+        chunks = [
+            chunk
+            async for chunk in stream_openai_responses(
+                http,
+                base_url="https://api.openai.test/v1",
+                model="gpt-test",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "Look"},
+                            {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                        ],
+                    }
+                ],
+                use_tools=False,
+            )
+        ]
+
+        self.assertTrue(chunks[-1].done)
+        input_content = (http.last_payload or {})["input"][0]["content"]
+        self.assertEqual(input_content[0], {"type": "input_text", "text": "Look"})
+        self.assertEqual(input_content[1], {"type": "input_image", "image_url": "data:image/png;base64,abc"})
 
     async def test_stream_openai_chat_extracts_qwen3_coder_xml_tool_call_from_content(self) -> None:
         http = _FakeHTTPClient(

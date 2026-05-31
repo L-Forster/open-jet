@@ -118,7 +118,7 @@ from .provisioning import pending_direct_model_download_summary, provision_setup
 from .skills_registry import resolve_skill_path
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
-from .runtime_registry import DEFAULT_RUNTIME, active_model_ref, create_runtime_client
+from .runtime_registry import DEFAULT_RUNTIME, active_model_ref, active_runtime, create_runtime_client
 from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
@@ -749,7 +749,7 @@ class OpenJetApp:
         model_ref = self._active_model_ref()
         model_id, model_variant = _telemetry_model_fields(model_ref)
         return {
-            "runtime": DEFAULT_RUNTIME,
+            "runtime": active_runtime(self.cfg),
             "backend": _telemetry_backend(self.cfg),
             "model": model_ref,
             "model_id": model_id,
@@ -915,7 +915,17 @@ class OpenJetApp:
         mem_cfg = self.cfg.get("memory_guard", {})
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
         configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
-        self.client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
+        client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
+        if active_runtime(self.cfg) != DEFAULT_RUNTIME:
+            try:
+                await client.start()
+            except Exception:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                raise
+        self.client = client
         await self._init_mcp_manager()
         if self.client.gpu_layers == 0:
             configured_gpu_layers = 0
@@ -994,6 +1004,8 @@ class OpenJetApp:
             self.session_logger.log_event(event_type, **data)
         if event_type != "runtime_llama_start_ready":
             return
+        if active_runtime(self.cfg) != DEFAULT_RUNTIME:
+            return
         changed = False
         if "ctx" in data:
             ctx = int(data["ctx"])
@@ -1010,6 +1022,8 @@ class OpenJetApp:
             save_config(self.cfg)
 
     async def _materialize_setup_model(self, setup_result: dict, log: LogView) -> dict:
+        if active_runtime(setup_result) != DEFAULT_RUNTIME:
+            return setup_result
         status = self.query_one("#assistant-status")
 
         def _set_status(text: str) -> None:
@@ -1770,7 +1784,7 @@ class OpenJetApp:
         return [
             ("mode", self.harness_state.mode or "chat", "chrome_accent"),
             ("model", self._model_label(), "chrome_value"),
-            ("backend", DEFAULT_RUNTIME.replace("_", "."), "chrome_value"),
+            ("backend", active_runtime(self.cfg).replace("_", "."), "chrome_value"),
             ("workspace", self._workspace_label(26), "chrome_value"),
             ("", "local", "chrome_accent"),
             ("", air_state, air_style),
@@ -1794,7 +1808,7 @@ class OpenJetApp:
                 Text("OpenJet", style="chrome_brand_text"),
                 Text(self.harness_state.mode or "chat", style="chrome_accent"),
                 Text(self._model_label(22), style="chrome_value"),
-                Text(DEFAULT_RUNTIME.replace("_", "."), style="chrome_value"),
+                Text(active_runtime(self.cfg).replace("_", "."), style="chrome_value"),
                 Text(self._workspace_label(20), style="chrome_value"),
                 Text("local", style="chrome_accent"),
                 Text(net_state, style=net_style),
@@ -2187,7 +2201,7 @@ class OpenJetApp:
             "chat_id": self._chat_session_id,
             "session_id": self.session_logger.session_id if self.session_logger else None,
             "airgapped": self.is_airgapped(),
-            "runtime": DEFAULT_RUNTIME,
+            "runtime": active_runtime(self.cfg),
             "model_ref": self._active_model_ref(),
             "device": self.cfg.get("device", "auto"),
             "context_window_tokens": self.client.context_window_tokens if self.client else self.cfg.get("context_window_tokens", 2048),
@@ -2332,7 +2346,7 @@ class OpenJetApp:
             saved_runtime = str(state.get("runtime") or "").strip()
             saved_model = str(state.get("model_ref") or "").strip()
             current_model = self._active_model_ref()
-            runtime_matches = not saved_runtime or saved_runtime == DEFAULT_RUNTIME
+            runtime_matches = not saved_runtime or saved_runtime == active_runtime(self.cfg)
             model_matches = not saved_model or saved_model == current_model
             if runtime_matches and model_matches:
                 try:
@@ -3629,7 +3643,7 @@ class OpenJetApp:
             key_bindings=self._bindings(),
             style=self._style,
             bottom_toolbar=self._toolbar_text,
-            reserve_space_for_menu=0,
+            reserve_space_for_menu=4,
             rprompt=self._rprompt_text,
             erase_when_done=True,
         )

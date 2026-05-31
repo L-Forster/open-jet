@@ -8,6 +8,7 @@ from typing import AsyncIterator, Iterator, Sequence
 
 import httpx
 
+from .multimodal import content_to_plain_text, runtime_content
 from .runtime_limits import estimate_tokens
 from .tools.registry import all_tool_names, runtime_tool_schemas
 
@@ -174,6 +175,100 @@ def _messages_with_tool_guidelines(messages: list[dict]) -> list[dict]:
         merged["content"] = f"{first.get('content', '')}\n\n{guidelines}".strip()
         return [merged, *messages[1:]]
     return [{"role": "system", "content": guidelines}, *messages]
+
+
+def _responses_payload_from_messages(
+    messages: list[dict],
+    *,
+    model: str,
+    use_tools: bool,
+    extra_body: dict | None = None,
+) -> dict[str, object]:
+    instructions: list[str] = []
+    input_items: list[dict[str, object]] = []
+    if use_tools:
+        instructions.append(tool_guidelines_xml())
+    for msg in messages:
+        role = str(msg.get("role", "user") or "user").strip().lower()
+        content = msg.get("content", "")
+        if role == "system":
+            if content:
+                instructions.append(_responses_text_content(content))
+            continue
+        if role == "tool":
+            role = "user"
+            content = f"Tool result:\n{_responses_text_content(content)}"
+        if role not in {"user", "assistant", "developer"}:
+            role = "user"
+        input_items.append({"role": role, "content": _responses_input_content(content)})
+    payload: dict[str, object] = {
+        "model": model,
+        "input": input_items,
+        "stream": True,
+        "store": False,
+        "include": ["reasoning.encrypted_content"],
+    }
+    if instructions:
+        payload["instructions"] = "\n\n".join(part for part in instructions if part).strip()
+    if extra_body:
+        payload.update(extra_body)
+    return payload
+
+
+def _responses_text_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    return content_to_plain_text(content)
+
+
+def _responses_input_content(content: object) -> str | list[dict[str, object]]:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+
+    parts: list[dict[str, object]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            parts.append({"type": "input_text", "text": str(block)})
+            continue
+        block_type = str(block.get("type", "")).strip().lower()
+        if block_type == "input_text":
+            parts.append({"type": "input_text", "text": str(block.get("text", ""))})
+            continue
+        if block_type == "text":
+            parts.append({"type": "input_text", "text": str(block.get("text", ""))})
+            continue
+        if block_type == "input_image":
+            image_url = str(block.get("image_url") or block.get("url") or "").strip()
+            if image_url:
+                parts.append({"type": "input_image", "image_url": image_url})
+                continue
+            converted = runtime_content([block])
+            if isinstance(converted, list):
+                for converted_block in converted:
+                    converted_image = converted_block.get("image_url") if isinstance(converted_block, dict) else None
+                    converted_url = ""
+                    if isinstance(converted_image, dict):
+                        converted_url = str(converted_image.get("url") or "").strip()
+                    elif isinstance(converted_image, str):
+                        converted_url = converted_image.strip()
+                    if converted_url:
+                        parts.append({"type": "input_image", "image_url": converted_url})
+                        break
+            continue
+        if block_type == "image_url":
+            image = block.get("image_url")
+            image_url = ""
+            if isinstance(image, dict):
+                image_url = str(image.get("url") or "").strip()
+            elif isinstance(image, str):
+                image_url = image.strip()
+            if image_url:
+                parts.append({"type": "input_image", "image_url": image_url})
+            continue
+        parts.append({"type": "input_text", "text": str(block)})
+    return parts
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
@@ -399,3 +494,115 @@ async def stream_openai_chat(
                     tool_calls.append(ToolCall(name=name, arguments=args, id=structured_tool_ids.get(idx)))
             yield StreamChunk(tool_calls=tool_calls, done=True)
             return
+
+
+async def stream_openai_responses(
+    http: httpx.AsyncClient,
+    *,
+    base_url: str,
+    model: str,
+    messages: list[dict],
+    use_tools: bool = True,
+    headers: dict[str, str] | None = None,
+    extra_body: dict | None = None,
+) -> AsyncIterator[StreamChunk]:
+    payload = _responses_payload_from_messages(
+        messages,
+        model=model,
+        use_tools=use_tools,
+        extra_body=extra_body,
+    )
+    content_buf = ""
+    reasoning_buf = ""
+    text_emit_buffer = ""
+    saw_content_tool_markup = False
+    async with http.stream(
+        "POST",
+        f"{base_url.rstrip('/')}/responses",
+        json=payload,
+        headers=headers,
+    ) as resp:
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = ""
+            try:
+                body = await resp.aread()
+                text = body.decode("utf-8", errors="replace").strip()
+                if text:
+                    detail = f": {text[:500]}"
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"{exc}{detail}") from exc
+
+        async for line in resp.aiter_lines():
+            line = line.strip()
+            if not line or line == "data: [DONE]":
+                continue
+            if line.startswith("event: "):
+                continue
+            if line.startswith("data: "):
+                line = line[6:]
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event_type = str(data.get("type") or "")
+            if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+                text = str(data.get("delta") or "")
+                if not text:
+                    continue
+                content_buf += text
+                if not use_tools:
+                    yield StreamChunk(text=text)
+                elif saw_content_tool_markup:
+                    yield StreamChunk(tool_args_delta=text)
+                else:
+                    text_emit_buffer += text
+                    marker_index = text_emit_buffer.lower().find(_TOOL_CALL_MARKER)
+                    if marker_index >= 0:
+                        visible = text_emit_buffer[:marker_index]
+                        if visible:
+                            yield StreamChunk(text=visible)
+                        hidden = text_emit_buffer[marker_index:]
+                        if hidden:
+                            yield StreamChunk(tool_args_delta=hidden)
+                        text_emit_buffer = ""
+                        saw_content_tool_markup = True
+                    elif len(text_emit_buffer) > _TOOL_CALL_MARKER_OVERLAP:
+                        visible = text_emit_buffer[:-_TOOL_CALL_MARKER_OVERLAP]
+                        text_emit_buffer = text_emit_buffer[-_TOOL_CALL_MARKER_OVERLAP:]
+                        if visible:
+                            yield StreamChunk(text=visible)
+                continue
+            if event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
+                reasoning = str(data.get("delta") or "")
+                if reasoning:
+                    reasoning_buf += reasoning
+                    yield StreamChunk(reasoning=reasoning)
+                continue
+            if event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                if use_tools and not saw_content_tool_markup and text_emit_buffer:
+                    yield StreamChunk(text=text_emit_buffer)
+                    text_emit_buffer = ""
+                if event_type == "response.failed":
+                    error = data.get("error")
+                    raise RuntimeError(f"OpenAI Codex response failed: {error or 'unknown error'}")
+                if event_type == "response.incomplete":
+                    detail = _response_incomplete_detail(data)
+                    raise RuntimeError(f"OpenAI Codex response incomplete: {detail}")
+                tool_calls = parse_tool_calls(f"{content_buf}\n{reasoning_buf}") if use_tools else []
+                yield StreamChunk(tool_calls=tool_calls, done=True)
+                return
+
+
+def _response_incomplete_detail(data: dict) -> str:
+    details = data.get("incomplete_details")
+    if not details and isinstance(data.get("response"), dict):
+        details = data["response"].get("incomplete_details")
+    if isinstance(details, dict):
+        reason = details.get("reason") or details.get("type") or details.get("status")
+        return str(reason or details)
+    if details:
+        return str(details)
+    return "unknown reason"

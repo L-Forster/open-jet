@@ -6,6 +6,7 @@ import json
 import io
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
@@ -294,6 +295,15 @@ class AppStatusTests(unittest.TestCase):
 
     def test_init_client_does_not_eagerly_start_runtime(self) -> None:
         app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update(
+            {
+                "runtime": "llama_cpp",
+                "llama_model": "/models/local.gguf",
+                "context_window_tokens": 4096,
+                "gpu_layers": 99,
+            }
+        )
         fake_client = FakeInitClient()
 
         async def _run() -> None:
@@ -306,6 +316,33 @@ class AppStatusTests(unittest.TestCase):
         asyncio.run(_run())
 
         fake_client.start.assert_not_awaited()
+        self.assertIsNotNone(app.agent)
+
+    def test_init_client_preflights_cloud_runtime(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update(
+            {
+                "runtime": "openai_codex",
+                "model": "gpt-5.5",
+                "context_window_tokens": 272000,
+                "gpu_layers": 0,
+            }
+        )
+        fake_client = FakeInitClient()
+        fake_client.context_window_tokens = 272000
+        fake_client.gpu_layers = 0
+
+        async def _run() -> None:
+            with patch("src.app.create_runtime_client", return_value=fake_client), patch(
+                "src.app.build_system_prompt",
+                new=AsyncMock(return_value="system"),
+            ):
+                await app._init_client()
+
+        asyncio.run(_run())
+
+        fake_client.start.assert_awaited_once()
         self.assertIsNotNone(app.agent)
 
     def test_tool_output_line_highlights_shell_commands(self) -> None:
@@ -487,6 +524,7 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(prompt_session.call_args.kwargs["erase_when_done"])
         self.assertIn("│", prompt_session.call_args.kwargs["rprompt"]().value)
+        self.assertGreaterEqual(prompt_session.call_args.kwargs["reserve_space_for_menu"], 3)
         self.assertNotIn("input_processors", prompt_session.call_args.kwargs)
 
     async def test_run_async_exits_without_printing_prompt_top_border_when_already_quit(self) -> None:
@@ -1648,7 +1686,68 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         activate.assert_awaited_once_with("alt", app.query_one("#chat-log"))
 
-    async def test_model_command_without_args_opens_picker_and_switches(self) -> None:
+    async def test_model_command_lists_codex_profile(self) -> None:
+        app = OpenJetApp()
+        app.cfg["active_model_profile"] = "codex"
+        app.cfg["model_profiles"] = [
+            {
+                "name": "codex",
+                "runtime": "openai_codex",
+                "model": "gpt-5.5",
+                "context_window_tokens": 272000,
+            }
+        ]
+
+        handled = await app.commands.maybe_handle("/model list")
+
+        self.assertTrue(handled)
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("runtime=openai_codex", entries)
+        self.assertIn("gpt-5.5", entries)
+
+    async def test_model_codex_adds_profile_when_oauth_is_already_connected(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update({"airgapped": False, "model_profiles": []})
+
+        with patch.object(app, "activate_model_profile", AsyncMock(side_effect=[False, True])) as activate, patch(
+            "src.commands.CodexOAuthProvider"
+        ) as provider_cls, patch("src.commands.save_config") as save_cfg:
+            provider_cls.return_value.status.return_value = {"logged_in": True}
+            handled = await app.commands.maybe_handle("/model codex")
+
+        self.assertTrue(handled)
+        self.assertEqual(activate.await_count, 2)
+        save_cfg.assert_called_once_with(app.cfg)
+        self.assertEqual(app.cfg["model_profiles"][0]["name"], "codex")
+        self.assertEqual(app.cfg["model_profiles"][0]["runtime"], "openai_codex")
+
+    async def test_connect_codex_uses_non_conflicting_profile_name_when_local_codex_exists(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update(
+            {
+                "airgapped": False,
+                "model_profiles": [
+                    {
+                        "name": "codex",
+                        "runtime": "llama_cpp",
+                        "llama_model": "/models/local-codex.gguf",
+                    }
+                ],
+            }
+        )
+
+        with patch("src.commands.CodexOAuthProvider") as provider_cls, patch("src.commands.save_config"):
+            provider_cls.return_value.login_browser = AsyncMock(return_value=SimpleNamespace(expires_at=time.time() + 3600))
+            handled = await app.commands.maybe_handle("/connect openai-codex")
+
+        self.assertTrue(handled)
+        profiles = {profile["name"]: profile for profile in app.cfg["model_profiles"]}
+        self.assertEqual(profiles["codex"]["runtime"], "llama_cpp")
+        self.assertEqual(profiles["openai-codex"]["runtime"], "openai_codex")
+
+    async def test_model_command_without_args_lists_profiles_inline(self) -> None:
         app = OpenJetApp()
         app.cfg["model_profiles"] = [
             {
@@ -1669,15 +1768,76 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
 
         app.cfg["active_model_profile"] = "base"
 
-        picker = AsyncMock(return_value="alt")
-        dialog = Mock(run_async=picker)
-        with patch("src.commands.radiolist_dialog", return_value=dialog), patch.object(
-            app, "activate_model_profile", AsyncMock(return_value=True)
-        ) as activate:
+        with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate:
             handled = await app.commands.maybe_handle("/model")
 
         self.assertTrue(handled)
-        activate.assert_awaited_once_with("alt", app.query_one("#chat-log"))
+        activate.assert_not_awaited()
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Active model preset: base", entries)
+        self.assertIn("- base (active)", entries)
+        self.assertIn("- alt", entries)
+        self.assertIn("/runtime local|cloud", entries)
+
+    async def test_runtime_cloud_switches_to_codex_profile(self) -> None:
+        app = OpenJetApp()
+        app.cfg["active_model_profile"] = "local"
+        app.cfg["model_profiles"] = [
+            {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
+            {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.5"},
+        ]
+
+        with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate:
+            handled = await app.commands.maybe_handle("/runtime cloud")
+
+        self.assertTrue(handled)
+        activate.assert_awaited_once_with("codex", app.query_one("#chat-log"))
+
+    async def test_cloud_shortcut_switches_to_cloud_runtime(self) -> None:
+        app = OpenJetApp()
+        app.cfg["active_model_profile"] = "local"
+        app.cfg["model_profiles"] = [
+            {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
+            {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.5"},
+        ]
+
+        with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate:
+            handled = await app.commands.maybe_handle("/cloud")
+
+        self.assertTrue(handled)
+        activate.assert_awaited_once_with("codex", app.query_one("#chat-log"))
+
+    async def test_cloud_profile_switch_uses_full_profile_name(self) -> None:
+        app = OpenJetApp()
+        app.cfg["active_model_profile"] = "local"
+        app.cfg["model_profiles"] = [
+            {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
+            {"name": "Claude Sonnet", "runtime": "litellm", "provider": "anthropic", "model": "anthropic/claude"},
+        ]
+
+        with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate:
+            handled = await app.commands.maybe_handle("/cloud Claude Sonnet")
+
+        self.assertTrue(handled)
+        activate.assert_awaited_once_with("Claude Sonnet", app.query_one("#chat-log"))
+
+    async def test_runtime_status_lists_local_and_cloud_profiles(self) -> None:
+        app = OpenJetApp()
+        app.cfg["active_model_profile"] = "local"
+        app.cfg["runtime"] = "llama_cpp"
+        app.cfg["model_profiles"] = [
+            {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
+            {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.5"},
+        ]
+
+        handled = await app.commands.maybe_handle("/runtime")
+
+        self.assertTrue(handled)
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Active runtime", entries)
+        self.assertIn("Local profiles", entries)
+        self.assertIn("Cloud profiles", entries)
+        self.assertIn("/runtime local", entries)
 
     async def test_edit_model_updates_saved_profile(self) -> None:
         app = OpenJetApp()
@@ -1704,6 +1864,146 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.cfg["model_profiles"][0]["context_window_tokens"], 8192)
         self.assertEqual(app.cfg["model_profiles"][0]["gpu_layers"], 70)
         save_cfg.assert_called_once()
+
+    async def test_edit_model_preserves_cloud_model_default(self) -> None:
+        app = OpenJetApp()
+        app.cfg["model_profiles"] = [
+            {
+                "name": "codex",
+                "runtime": "openai_codex",
+                "model": "gpt-5.5",
+                "context_window_tokens": 272000,
+            }
+        ]
+        app.cfg["active_model_profile"] = "local"
+
+        prompts = iter(["Codex Edited", "gpt-5.5", "300000", "0"])
+        with patch("src.commands._prompt_text", side_effect=lambda *_args, **_kwargs: next(prompts)) as prompt, patch(
+            "src.commands.save_config"
+        ) as save_cfg:
+            handled = await app.commands.maybe_handle("/edit-model codex")
+
+        self.assertTrue(handled)
+        self.assertEqual(prompt.call_args_list[1].kwargs["default"], "gpt-5.5")
+        self.assertEqual(app.cfg["model_profiles"][0]["name"], "Codex Edited")
+        self.assertEqual(app.cfg["model_profiles"][0]["model"], "gpt-5.5")
+        self.assertNotIn("llama_model", app.cfg["model_profiles"][0])
+        save_cfg.assert_called_once()
+
+
+class ConnectCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connect_status_does_not_leak_tokens(self) -> None:
+        app = OpenJetApp()
+
+        with patch("src.commands.CodexOAuthProvider") as provider_cls, patch("src.commands.ApiKeyStore") as store_cls:
+            provider = provider_cls.return_value
+            provider.status.return_value = {
+                "logged_in": True,
+                "expires_at": time.time() + 3600,
+                "account_id": "acct",
+                "storage": "keyring",
+            }
+            store_cls.return_value.status.return_value = {
+                "openai-compatible": {"env": "", "env_present": False, "stored": True, "storage": "keyring"}
+            }
+            handled = await app.commands.maybe_handle("/connect status")
+
+        self.assertTrue(handled)
+        store_cls.return_value.status.assert_called_once()
+        self.assertIn("openai-compatible", store_cls.return_value.status.call_args.args[0])
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("OpenAI Codex: connected", entries)
+        self.assertIn("openai-compatible", entries)
+        self.assertNotIn("access_token", entries)
+        self.assertNotIn("refresh_token", entries)
+
+    async def test_connect_login_is_blocked_when_airgapped(self) -> None:
+        app = OpenJetApp()
+        app.set_airgapped(True, persist=False)
+
+        with patch("src.commands.CodexOAuthProvider") as provider_cls:
+            handled = await app.commands.maybe_handle("/connect openai-codex")
+
+        self.assertTrue(handled)
+        provider_cls.return_value.login_browser.assert_not_called()
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Air-gapped mode blocks OpenAI Codex login", entries)
+
+    async def test_connect_codex_device_auth_uses_device_code_flow(self) -> None:
+        app = OpenJetApp()
+
+        with patch("src.commands.CodexOAuthProvider") as provider_cls:
+            provider_cls.return_value.login_browser = AsyncMock(
+                return_value=SimpleNamespace(expires_at=time.time() + 3600)
+            )
+            handled = await app.commands.maybe_handle("/connect openai-codex --device-auth")
+
+        self.assertTrue(handled)
+        provider_cls.return_value.login_browser.assert_awaited_once_with(device_auth=True)
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("OpenAI Codex connected", entries)
+
+    async def test_connect_codex_adds_selectable_model_profile(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update({"airgapped": False, "model_profiles": []})
+
+        with patch("src.commands.CodexOAuthProvider") as provider_cls, patch("src.commands.save_config") as save_cfg:
+            provider_cls.return_value.login_browser = AsyncMock(
+                return_value=SimpleNamespace(expires_at=time.time() + 3600)
+            )
+            handled = await app.commands.maybe_handle("/connect openai-codex")
+
+        self.assertTrue(handled)
+        save_cfg.assert_called_once_with(app.cfg)
+        self.assertEqual(app.cfg["model_profiles"][0]["name"], "codex")
+        self.assertEqual(app.cfg["model_profiles"][0]["runtime"], "openai_codex")
+        self.assertEqual(app.cfg["model_profiles"][0]["model"], "gpt-5.5")
+        self.assertNotEqual(app.cfg.get("active_model_profile"), "codex")
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("Model preset 'codex' added", entries)
+
+    async def test_connect_api_provider_saves_key_without_leaking_it(self) -> None:
+        app = OpenJetApp()
+
+        with patch("src.commands._prompt_text", AsyncMock(return_value="sk-secret")) as prompt, patch(
+            "src.commands.ApiKeyStore"
+        ) as store_cls:
+            handled = await app.commands.maybe_handle("/connect openai")
+
+        self.assertTrue(handled)
+        self.assertTrue(prompt.call_args.kwargs["is_password"])
+        store_cls.return_value.save_key.assert_called_once_with("openai", "sk-secret")
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("openai API key saved", entries)
+        self.assertNotIn("sk-secret", entries)
+
+    async def test_connect_api_provider_uses_existing_env_key(self) -> None:
+        app = OpenJetApp()
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "env-secret"}), patch(
+            "src.commands._prompt_text", AsyncMock()
+        ) as prompt:
+            handled = await app.commands.maybe_handle("/connect openai")
+
+        self.assertTrue(handled)
+        prompt.assert_not_awaited()
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("OPENAI_API_KEY", entries)
+        self.assertNotIn("env-secret", entries)
+
+    async def test_connect_logout_reports_api_key_removal_failure(self) -> None:
+        app = OpenJetApp()
+
+        with patch("src.commands.ApiKeyStore") as store_cls:
+            store_cls.return_value.clear_key.return_value = False
+            handled = await app.commands.maybe_handle("/connect logout openai")
+
+        self.assertTrue(handled)
+        store_cls.return_value.clear_key.assert_called_once_with("openai")
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("openai API key removal failed", entries)
+        self.assertNotIn("removed from OpenJet storage", entries)
 
 
 class AppQuitTests(unittest.TestCase):
@@ -2020,6 +2320,51 @@ class AppResumeStateAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SlashResumeCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cloud_model_updates_cloud_profile_and_restarts_when_active(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update(
+            {
+                "active_model_profile": "codex",
+                "runtime": "openai_codex",
+                "model": "gpt-5.5",
+                "context_window_tokens": 272000,
+                "model_profiles": [
+                    {
+                        "name": "codex",
+                        "runtime": "openai_codex",
+                        "provider": "openai-codex",
+                        "model": "gpt-5.5",
+                        "context_window_tokens": 272000,
+                    }
+                ],
+            }
+        )
+
+        with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate, patch(
+            "src.commands.save_config"
+        ):
+            handled = await app.commands.maybe_handle("/cloud model gpt-5.6")
+
+        self.assertTrue(handled)
+        self.assertEqual(app.cfg["model_profiles"][0]["model"], "gpt-5.6")
+        activate.assert_awaited_once_with("codex", app.query_one("#chat-log"))
+
+    async def test_cloud_add_creates_codex_profile_from_tui_prompts(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        prompts = AsyncMock(side_effect=["team-codex", "openai-codex", "gpt-5.5", "272000"])
+
+        with patch("src.commands._prompt_text", prompts), patch("src.commands.save_config"):
+            handled = await app.commands.maybe_handle("/cloud add")
+
+        self.assertTrue(handled)
+        profile = get_model_profile(app.cfg, "team-codex")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile["runtime"], "openai_codex")
+        self.assertEqual(profile["model"], "gpt-5.5")
+
     async def test_resume_command_uses_picker_and_loads_selected_chat(self) -> None:
         app = OpenJetApp()
         app.agent = SimpleNamespace(messages=[{"role": "system", "content": "system"}])
@@ -2202,6 +2547,8 @@ class CliCommandTests(unittest.TestCase):
 
         self.assertIn("/model: Show or switch saved model presets", text)
         self.assertIn("/models", text)
+        self.assertIn("/cloud", text)
+        self.assertIn("/local", text)
         self.assertIn("/plan", text)
         self.assertIn("/todo", text)
 

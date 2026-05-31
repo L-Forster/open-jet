@@ -59,11 +59,15 @@ def apply_airgap_env(env: MutableMapping[str, str], *, enabled: bool) -> Mutable
 def assert_endpoint_allowed(target: str | None, *, label: str) -> None:
     if not is_airgapped():
         return
-    host = _extract_host(target)
-    if host and _is_loopback_host(host):
+    if endpoint_is_loopback(target):
         return
     detail = target.strip() if isinstance(target, str) else "<unspecified>"
     raise AirgapViolationError(f"Air-gapped mode blocks {label}: {detail}")
+
+
+def endpoint_is_loopback(target: str | None) -> bool:
+    host = _extract_host(target)
+    return bool(host and _is_loopback_host(host))
 
 
 def _install_network_guard() -> None:

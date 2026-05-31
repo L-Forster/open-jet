@@ -13,7 +13,7 @@ from .config import load_config, save_config
 from .device_sources import assign_device_alias, list_device_sources, set_device_enabled, sync_devices_registry
 from .model_profiles import list_model_profiles, sync_active_model_profile
 from .peripherals.system import device_discovery_hint
-from .runtime_registry import RUNTIME_LABEL, active_model_ref
+from .runtime_registry import RUNTIME_LABEL, active_model_ref, active_runtime
 from .self_update import update_from_latest_release
 from .skills.registry import SkillRegistry
 from .skills.tools import skill_view
@@ -53,12 +53,14 @@ def _format_model_profiles_summary(cfg: dict[str, object]) -> str:
     active_name = _active_profile_name(cfg).lower()
     lines = [f"Active model preset: {_active_profile_name(cfg)}"]
     for profile in profiles:
+        runtime = active_runtime(dict(profile))
         model_ref = active_model_ref(dict(profile)) or "n/a"
         marker = " (active)" if str(profile["name"]).strip().lower() == active_name else ""
         lines.append(
             f"- {profile['name']}{marker}: "
             f"context={profile.get('context_window_tokens', 'n/a')} "
             f"gpu={profile.get('gpu_layers', 'n/a')} "
+            f"runtime={runtime} "
             f"model={model_ref}"
         )
     return "\n".join(lines)
@@ -67,7 +69,7 @@ def _format_model_profiles_summary(cfg: dict[str, object]) -> str:
 def _format_cli_status(cfg: dict[str, object]) -> str:
     model_ref = active_model_ref(cfg) or "n/a"
     lines = [
-        f"Runtime: {RUNTIME_LABEL}",
+        f"Runtime: {RUNTIME_LABEL if active_runtime(cfg) == 'llama_cpp' else active_runtime(cfg)}",
         f"Active model preset: {_active_profile_name(cfg)}",
         f"Model ref: {model_ref}",
         f"Context window: {cfg.get('context_window_tokens', 'n/a')}",

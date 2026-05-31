@@ -11,13 +11,17 @@
 - `/load <path>` load a file into context
 - `/resume` pick a saved chat checkpoint from `.openjet/state/` and load it back into the TUI
 - `/setup` reopen setup wizard
-- `/model` open an arrow-key picker to switch saved model presets
+- `/model` show saved model presets inline
 - `/model [status|list|<name>]` show or switch saved model presets
 - `/models` alias for `/model`
+- `/runtime [status|local|cloud]` switch local/cloud runtime
+- `/local` switch to the local runtime profile
+- `/cloud [status|model <model>|add|<profile>]` switch to cloud, list/edit cloud profiles, or add one
 - `/edit-model [name]` edit a saved model preset
 - `/memory [show|clear <user|agent>]` inspect or clear persistent memory
 - `/reasoning [status|on|off|default]` control llama.cpp reasoning mode
 - `/air-gapped [status|true|false]` control air-gapped mode
+- `/connect [status|openai-codex [--device-auth]|openai|anthropic|openrouter|logout <provider>]` manage external provider credentials
 - `/mode [chat|code|review|debug|status]` set harness mode
 - `/plan [status|on|approve|reject]` inspect or control read-only plan mode
 - `/mcp status` show configured MCP server status

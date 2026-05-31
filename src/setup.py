@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import os
 import shutil
 import textwrap
@@ -68,10 +69,16 @@ async def _prompt_text(
     prompt: str,
     *,
     default: str = "",
+    is_password: bool = False,
 ) -> str:
     if session is not None:
-        result = await session.prompt_async(prompt, default=default)
+        kwargs: dict[str, object] = {"default": default}
+        if is_password:
+            kwargs["is_password"] = True
+        result = await session.prompt_async(prompt, **kwargs)
         return str(result).strip()
+    if is_password:
+        return getpass.getpass(prompt).strip()
     return input(f"{prompt}{default}").strip()
 
 
