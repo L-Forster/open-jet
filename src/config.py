@@ -29,13 +29,12 @@ QWEN36_27B_MTP_URL = (
     f"{QWEN36_27B_MTP_REPO}/resolve/main/"
     f"{QWEN36_27B_MTP_SOURCE_FILENAME}?download=true"
 )
-QWEN36_27B_MTP_LLAMA_CPP_REF = "b9189"
 QWEN36_27B_OLD_MTP_REPO = "https://huggingface.co/froggeric/Qwen3.6-27B-MTP-GGUF/"
 QWEN36_27B_NON_MTP_REPO = "https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/"
-QWEN36_27B_MTP_UPDATE_ID = "qwen36-27b-mtp-unsloth-b9189"
+QWEN36_27B_MTP_UPDATE_ID = "qwen36-27b-mtp-unsloth"
 QWEN36_27B_PREFIX = "qwen3.6-27b-"
 QWEN36_35B_A3B_NON_MTP_REPO = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/"
-QWEN36_35B_A3B_MTP_UPDATE_ID = "qwen36-35b-a3b-mtp-unsloth-b9189"
+QWEN36_35B_A3B_MTP_UPDATE_ID = "qwen36-35b-a3b-mtp-unsloth"
 MANAGED_MODELS_DIR = openjet_install_root() / "models"
 
 
@@ -135,7 +134,6 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.6 27B UD-IQ2_XXS MTP",
         "filename": _qwen36_mtp_local_filename("Qwen3.6-27B-UD-IQ2_XXS.gguf"),
         "url": _qwen36_27b_mtp_url("Qwen3.6-27B-UD-IQ2_XXS.gguf"),
-        "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
         "model_size_mb": 9626,
         "kv_bytes_per_token": 34816,
@@ -145,7 +143,6 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.6 27B UD-IQ3_XXS MTP",
         "filename": _qwen36_mtp_local_filename("Qwen3.6-27B-UD-IQ3_XXS.gguf"),
         "url": _qwen36_27b_mtp_url("Qwen3.6-27B-UD-IQ3_XXS.gguf"),
-        "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
         "model_size_mb": 12288,
         "kv_bytes_per_token": 34816,
@@ -155,7 +152,6 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.6 27B Q4_K_M MTP",
         "filename": QWEN36_27B_MTP_FILENAME,
         "url": QWEN36_27B_MTP_URL,
-        "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
         "model_size_mb": 16817,
         "resident_model_size_mb": 16896,
@@ -176,7 +172,6 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.6 35B A3B UD-IQ2_XXS MTP",
         "filename": _qwen36_mtp_local_filename("Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf"),
         "url": _qwen36_35b_a3b_mtp_url("Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf"),
-        "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
         "model_size_mb": 12288,
         "active_model_size_mb": 3072,
@@ -190,7 +185,6 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "label": "Qwen3.6 35B A3B UD-Q3_K_XL MTP",
         "filename": _qwen36_mtp_local_filename("Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"),
         "url": _qwen36_35b_a3b_mtp_url("Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"),
-        "llama_cpp_ref": QWEN36_27B_MTP_LLAMA_CPP_REF,
         "llama_mtp": True,
         "model_size_mb": 17203,
         "active_model_size_mb": 3072,
@@ -374,7 +368,8 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
         set_value("model_source", "direct")
         set_value("model_download_url", model_download_url)
         set_value("llama_mtp", True)
-        set_value("llama_cpp_ref", QWEN36_27B_MTP_LLAMA_CPP_REF)
+        if row.pop("llama_cpp_ref", None) is not None:
+            changed = True
         set_value("setup_missing_model", True)
         if row.pop("setup_update_model", None) is not None:
             changed = True
@@ -451,10 +446,6 @@ def setup_direct_model_catalog(cfg: Mapping[str, object] | None = None) -> tuple
             row["unified_memory_only"] = bool(item.get("unified_memory_only"))
         if "llama_cpu_moe" in item:
             row["llama_cpu_moe"] = bool(item.get("llama_cpu_moe"))
-        if "llama_cpp_ref" in item:
-            llama_cpp_ref = str(item.get("llama_cpp_ref") or "").strip()
-            if llama_cpp_ref:
-                row["llama_cpp_ref"] = llama_cpp_ref
         if "llama_mtp" in item:
             row["llama_mtp"] = bool(item.get("llama_mtp"))
         try:

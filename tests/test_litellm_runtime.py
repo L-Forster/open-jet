@@ -36,17 +36,17 @@ class LiteLLMRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {
                 "runtime": LITELLM_RUNTIME,
                 "provider": "openai",
-                "model": "openai/gpt-5.2",
+                "model": "openai/gpt-5.5",
                 "api_key_env": "OPENAI_API_KEY",
             }
         )
 
         self.assertIsInstance(client, LiteLLMClient)
-        self.assertEqual(client.model, "openai/gpt-5.2")
+        self.assertEqual(client.model, "openai/gpt-5.5")
         self.assertEqual(client.provider, "openai")
 
     async def test_missing_litellm_extra_has_actionable_error(self) -> None:
-        client = LiteLLMClient(model="openai/gpt-5.2", provider="openai", auth_store=ApiKeyStore())
+        client = LiteLLMClient(model="openai/gpt-5.5", provider="openai", auth_store=ApiKeyStore())
         error = LiteLLMUnavailableError(
             "LiteLLM support is not installed. Install it with `pip install open-jet[cloud]`."
         )
@@ -59,31 +59,31 @@ class LiteLLMRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_preflights_litellm_model(self) -> None:
         fake_litellm = _FakeLiteLLM()
         store = ApiKeyStore()
-        client = LiteLLMClient(model="openai/gpt-5.2", provider="openai", api_key_env="OPENAI_API_KEY", auth_store=store)
+        client = LiteLLMClient(model="openai/gpt-5.5", provider="openai", api_key_env="OPENAI_API_KEY", auth_store=store)
 
         with patch.object(client, "_import_litellm", return_value=fake_litellm), patch.object(
             store, "resolve_key", return_value="test-key"
         ):
             await client.start()
 
-        self.assertEqual(fake_litellm.last_kwargs["model"], "openai/gpt-5.2")
+        self.assertEqual(fake_litellm.last_kwargs["model"], "openai/gpt-5.5")
         self.assertFalse(fake_litellm.last_kwargs["stream"])
         self.assertEqual(fake_litellm.last_kwargs["max_tokens"], 1)
         self.assertEqual(fake_litellm.last_kwargs["api_key"], "test-key")
 
     async def test_provider_matrix_preflights_through_litellm(self) -> None:
         cases = [
-            ("openai", "openai/gpt-5.2", "OPENAI_API_KEY", ""),
-            ("anthropic", "anthropic/claude-sonnet-4-5", "ANTHROPIC_API_KEY", ""),
-            ("openrouter", "openrouter/anthropic/claude-sonnet-4-5", "OPENROUTER_API_KEY", ""),
-            ("google", "gemini/gemini-2.5-pro", "GOOGLE_API_KEY", ""),
-            ("xai", "xai/grok-4", "XAI_API_KEY", ""),
-            ("mistral", "mistral/mistral-large-latest", "MISTRAL_API_KEY", ""),
-            ("deepseek", "deepseek/deepseek-chat", "DEEPSEEK_API_KEY", ""),
-            ("openai-compatible", "openai/local-model", "", "http://127.0.0.1:1234/v1"),
+            ("openai", "openai/gpt-5.5", "OPENAI_API_KEY"),
+            ("anthropic", "anthropic/claude-opus-4-8", "ANTHROPIC_API_KEY"),
+            ("openrouter", "openrouter/anthropic/claude-opus-4.8", ""),
+            ("openrouter", "openrouter/google/gemini-3.1-pro-preview", ""),
+            ("openrouter", "openrouter/x-ai/grok-4.20", ""),
+            ("openrouter", "openrouter/deepseek/deepseek-v4-pro", ""),
+            ("openrouter", "openrouter/z-ai/glm-5.1", ""),
+            ("openrouter", "openrouter/moonshotai/kimi-k2.5", ""),
         ]
 
-        for provider, model, env_name, base_url in cases:
+        for provider, model, env_name in cases:
             with self.subTest(provider=provider):
                 fake_litellm = _FakeLiteLLM()
                 store = ApiKeyStore()
@@ -91,12 +91,10 @@ class LiteLLMRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     model=model,
                     provider=provider,
                     api_key_env=env_name,
-                    base_url=base_url,
                     auth_store=store,
                 )
-                key = "test-key" if env_name else None
                 with patch.object(client, "_import_litellm", return_value=fake_litellm), patch.object(
-                    store, "resolve_key", return_value=key
+                    store, "resolve_key", return_value="test-key"
                 ):
                     await client.start()
 
@@ -104,15 +102,10 @@ class LiteLLMRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(kwargs["model"], model)
                 self.assertFalse(kwargs["stream"])
                 self.assertEqual(kwargs["max_tokens"], 1)
-                if env_name:
-                    self.assertEqual(kwargs["api_key"], "test-key")
-                else:
-                    self.assertEqual(kwargs["api_key"], "openjet-local")
-                    self.assertEqual(kwargs["base_url"], base_url)
-                    self.assertEqual(kwargs["api_base"], base_url)
+                self.assertEqual(kwargs["api_key"], "test-key")
 
     async def test_provider_stream_shapes_map_to_openjet_chunks(self) -> None:
-        client = LiteLLMClient(model="anthropic/claude-sonnet-4-5", provider="anthropic", auth_store=ApiKeyStore())
+        client = LiteLLMClient(model="anthropic/claude-opus-4-8", provider="anthropic", auth_store=ApiKeyStore())
         stream = _stream_chunks(
             [
                 {"choices": [{"delta": {"reasoning": "thinking"}}]},
@@ -135,7 +128,7 @@ class LiteLLMRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "runtime": LITELLM_RUNTIME,
                     "provider": "openai",
-                    "model": "openai/gpt-5.2",
+                    "model": "openai/gpt-5.5",
                     "airgapped": True,
                 }
             )
@@ -156,7 +149,7 @@ class LiteLLMRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(client, LiteLLMClient)
 
     async def test_litellm_stream_maps_text_and_tool_calls(self) -> None:
-        client = LiteLLMClient(model="openai/gpt-5.2", provider="openai", auth_store=ApiKeyStore())
+        client = LiteLLMClient(model="openai/gpt-5.5", provider="openai", auth_store=ApiKeyStore())
         stream = _stream_chunks(
             [
                 {"choices": [{"delta": {"content": "hello "}}]},

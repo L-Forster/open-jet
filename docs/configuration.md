@@ -34,7 +34,6 @@ setup_recommendations:
       label: Qwen3.6 27B UD-IQ2_XXS MTP
       filename: Qwen3.6-27B-UD-IQ2_XXS-MTP.gguf
       url: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-UD-IQ2_XXS.gguf?download=true
-      llama_cpp_ref: b9189
       llama_mtp: true
       model_size_mb: 9626
       kv_bytes_per_token: 34816
@@ -42,7 +41,6 @@ setup_recommendations:
       label: Qwen3.6 27B UD-IQ3_XXS MTP
       filename: Qwen3.6-27B-UD-IQ3_XXS-MTP.gguf
       url: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-UD-IQ3_XXS.gguf?download=true
-      llama_cpp_ref: b9189
       llama_mtp: true
       model_size_mb: 12288
       kv_bytes_per_token: 34816
@@ -50,7 +48,6 @@ setup_recommendations:
       label: Qwen3.6 27B Q4_K_M MTP
       filename: Qwen3.6-27B-Q4_K_M-MTP.gguf
       url: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true
-      llama_cpp_ref: b9189
       llama_mtp: true
       model_size_mb: 16896
       kv_bytes_per_token: 34816
@@ -58,7 +55,6 @@ setup_recommendations:
       label: Qwen3.6 35B A3B UD-Q3_K_XL MTP
       filename: Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf
       url: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf?download=true
-      llama_cpp_ref: b9189
       llama_mtp: true
       model_size_mb: 17203
       active_model_size_mb: 3072
@@ -70,7 +66,6 @@ setup_recommendations:
       label: Qwen3.6 35B A3B MTP
       filename: Qwen3.6-35B-A3B-UD-Q4_K_M-MTP.gguf
       url: https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf?download=true
-      llama_cpp_ref: b9189
       llama_mtp: true
       model_size_mb: 22630
       active_model_size_mb: 3072
@@ -159,30 +154,50 @@ model_profiles:
   - name: openai-api
     runtime: litellm
     provider: openai
-    model: openai/gpt-5.2
+    model: openai/gpt-5.5
     api_key_env: OPENAI_API_KEY
     context_window_tokens: 272000
 
   - name: claude-api
     runtime: litellm
     provider: anthropic
-    model: anthropic/claude-sonnet-4-5-20250929
+    model: anthropic/claude-opus-4-8
     api_key_env: ANTHROPIC_API_KEY
 
   - name: openrouter
     runtime: litellm
     provider: openrouter
-    model: openrouter/anthropic/claude-sonnet-4-5
-    api_key_env: OPENROUTER_API_KEY
+    model: openrouter/anthropic/claude-opus-4.8
 
-  - name: lmstudio
+  - name: gemini-api
     runtime: litellm
-    provider: openai-compatible
-    model: openai/local-model
-    base_url: http://127.0.0.1:1234/v1
+    provider: openrouter
+    model: openrouter/google/gemini-3.1-pro-preview
+
+  - name: grok-api
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/x-ai/grok-4.20
+
+  - name: deepseek-v4
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/deepseek/deepseek-v4-pro
+
+  - name: glm-5.1
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/z-ai/glm-5.1
+    context_window_tokens: 202752
+
+  - name: kimi-k2.5
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/moonshotai/kimi-k2.5
+    context_window_tokens: 262000
 ```
 
-`airgapped: true` blocks remote LiteLLM providers. Loopback `base_url` profiles such as LM Studio, Ollama, and vLLM remain allowed.
+`airgapped: true` blocks remote LiteLLM providers. Loopback `base_url` profiles remain allowed.
 
 This is the recommended way to switch between local GGUF presets with different paths, context windows, or GPU offload settings.
 

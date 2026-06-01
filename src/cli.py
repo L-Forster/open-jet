@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import importlib.metadata
 import os
+import sys
 from pathlib import Path
 
 from .airgap import airgapped_from_cfg
@@ -470,8 +471,8 @@ def _entrypoint_label(args: argparse.Namespace) -> str:
 
 
 def main(argv: list[str] | None = None) -> None:
-    if argv:
-        normalized_argv = list(argv)
+    normalized_argv = list(argv) if argv is not None else sys.argv[1:]
+    if normalized_argv:
         command = str(normalized_argv[0]).strip().lower()
         if command == "status":
             normalized_argv = ["--status", *normalized_argv[1:]]
@@ -479,8 +480,7 @@ def main(argv: list[str] | None = None) -> None:
             normalized_argv = ["--update", *normalized_argv[1:]]
         elif command == "context":
             normalized_argv = ["--context", *normalized_argv[1:]]
-        argv = normalized_argv
-    args = build_parser().parse_args(argv)
+    args = build_parser().parse_args(normalized_argv)
     os.environ.setdefault("OPENJET_ENTRYPOINT", _entrypoint_label(args))
 
     if getattr(args, "version", False):

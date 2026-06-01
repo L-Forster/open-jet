@@ -21,3 +21,14 @@ class CliUpdateTests(unittest.TestCase):
 
         self.assertIn("Updated open-jet from 0.3.0 to 0.4.0.", stdout.getvalue())
         self.assertNotIn("src.app", sys.modules)
+
+    def test_update_cli_uses_self_update_path_from_console_script_argv(self) -> None:
+        stdout = io.StringIO()
+
+        with patch("src.cli.update_from_latest_release", return_value="open-jet repo is already up to date."), patch(
+            "src.cli._open_jet_version",
+            return_value="0.4.24",
+        ), patch("sys.argv", ["openjet", "update"]), patch("sys.stdout", stdout):
+            cli_main()
+
+        self.assertIn("open-jet repo is already up to date.", stdout.getvalue())

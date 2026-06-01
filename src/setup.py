@@ -420,7 +420,6 @@ def _recommended_local_payload(
         "kv_bytes_per_token",
         "resident_model_size_mb",
         "active_model_size_mb",
-        "llama_cpp_ref",
         "llama_mtp",
         "setup_update_model",
     ):
@@ -443,7 +442,6 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
         "kv_bytes_per_token",
         "resident_model_size_mb",
         "active_model_size_mb",
-        "llama_cpp_ref",
         "llama_mtp",
         "setup_update_model",
     ):
@@ -568,7 +566,6 @@ def build_recommended_payload(
             "unified_memory_only",
             "llama_cpu_moe",
             "llama_n_cpu_moe",
-            "llama_cpp_ref",
             "llama_mtp",
             "setup_update_model",
         ):

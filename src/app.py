@@ -459,6 +459,7 @@ class OpenJetApp:
         self._session_prompt_tokens = 0
         self._session_completion_tokens = 0
         self._session_runtime_requests = 0
+        self._session_model_usage: dict[str, dict[str, object]] = {}
         self._pending_image_paths: list[str] = []
         self._active_turn_device_refs: tuple[str, ...] = ()
         self._last_completed_turn: dict[str, Any] | None = None
@@ -568,15 +569,39 @@ class OpenJetApp:
 
     def _update_lifetime_totals(self, prompt_tokens: int, completion_tokens: int, api_spend: str) -> None:
         import json
-        totals_path = Path(__file__).resolve().parent.parent / "totals.json"
-        totals = {"input_tokens": 0, "output_tokens": 0, "api_cost_usd": 0.0, "sessions": 0}
+        totals_path = self._lifetime_totals_path()
+        totals = {"input_tokens": 0, "output_tokens": 0, "api_cost_usd": 0.0, "sessions": 0, "models": {}}
         if totals_path.exists():
             totals.update(json.loads(totals_path.read_text()))
         totals["input_tokens"] += prompt_tokens
         totals["output_tokens"] += completion_tokens
         totals["api_cost_usd"] = round(totals["api_cost_usd"] + float(api_spend.lstrip("$")), 2)
         totals["sessions"] += 1
+        models = totals.get("models")
+        if not isinstance(models, dict):
+            models = {}
+            totals["models"] = models
+        for row in self.token_usage_snapshot()["models"]:
+            model_ref = str(row["model_ref"])
+            entry = models.setdefault(
+                model_ref,
+                {
+                    "model_ref": model_ref,
+                    "label": row["label"],
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "runtime_requests": 0,
+                },
+            )
+            entry["label"] = row["label"]
+            entry["input_tokens"] = self._coerce_token_count(entry.get("input_tokens")) + int(row["prompt_tokens"])
+            entry["output_tokens"] = self._coerce_token_count(entry.get("output_tokens")) + int(row["completion_tokens"])
+            entry["runtime_requests"] = self._coerce_token_count(entry.get("runtime_requests")) + int(row["runtime_requests"])
         totals_path.write_text(json.dumps(totals, indent=2))
+
+    @staticmethod
+    def _lifetime_totals_path() -> Path:
+        return Path(__file__).resolve().parent.parent / "totals.json"
 
     def _write_setup_success_message(self, log: LogView) -> None:
         log.write(f"[dim]{self._SETUP_SUCCESS_MESSAGE}[/]")
@@ -633,6 +658,17 @@ class OpenJetApp:
 
     def _active_model_ref(self) -> str:
         return active_model_ref(self.cfg)
+
+    @staticmethod
+    def _usage_model_label(model_ref: str) -> str:
+        ref = str(model_ref or "").strip()
+        if not ref:
+            return "unknown"
+        expanded_prefix = ref.startswith(("/", "~", "."))
+        if expanded_prefix or ref.endswith(".gguf"):
+            label = Path(ref).name or ref
+            return label[:-5] if label.endswith(".gguf") else label
+        return ref
 
     def is_airgapped(self) -> bool:
         return bool(self.cfg.get("airgapped", False))
@@ -769,11 +805,33 @@ class OpenJetApp:
 
     def _agent_trace(self, event: str, data: dict[str, object]) -> None:
         if event == "runtime_exchange_complete":
-            self._session_prompt_tokens += self._coerce_token_count(data.get("prompt_tokens"))
-            self._session_completion_tokens += self._coerce_token_count(data.get("completion_tokens"))
-            self._session_runtime_requests += 1
+            self._record_runtime_token_usage(
+                prompt_tokens=self._coerce_token_count(data.get("prompt_tokens")),
+                completion_tokens=self._coerce_token_count(data.get("completion_tokens")),
+            )
         if self.session_logger:
             self.session_logger.record_agent_trace(event, data, turn_id=self._active_turn_id)
+
+    def _record_runtime_token_usage(self, *, prompt_tokens: int, completion_tokens: int) -> None:
+        self._session_prompt_tokens += prompt_tokens
+        self._session_completion_tokens += completion_tokens
+        self._session_runtime_requests += 1
+
+        model_ref = self._active_model_ref() or "unknown"
+        entry = self._session_model_usage.setdefault(
+            model_ref,
+            {
+                "model_ref": model_ref,
+                "label": self._usage_model_label(model_ref),
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "runtime_requests": 0,
+            },
+        )
+        entry["label"] = self._usage_model_label(model_ref)
+        entry["prompt_tokens"] = self._coerce_token_count(entry.get("prompt_tokens")) + prompt_tokens
+        entry["completion_tokens"] = self._coerce_token_count(entry.get("completion_tokens")) + completion_tokens
+        entry["runtime_requests"] = self._coerce_token_count(entry.get("runtime_requests")) + 1
 
     def _begin_turn_trace(self, prompt: str) -> None:
         self._turn_counter += 1
@@ -1075,6 +1133,7 @@ class OpenJetApp:
             return False
 
         previous_cfg = dict(self.cfg)
+        previous_session = self._build_session_payload(reason="model_switch_start") if self.agent else None
         if self.agent:
             self.persist_session_state(reason="model_switch_start")
         await self._close_mcp_manager()
@@ -1099,6 +1158,15 @@ class OpenJetApp:
             save_config(self.cfg)
             try:
                 await self._init_client()
+                if previous_session is not None:
+                    self._apply_session_payload(
+                        previous_session,
+                        log,
+                        summary_label="Previous context restored",
+                        restore_airgapped=False,
+                        replay_history=False,
+                        use_current_system_prompt=True,
+                    )
             except Exception:
                 pass
             log.write(f"[bold red]Model switch failed:[/] {_format_error(exc)}")
@@ -1119,6 +1187,15 @@ class OpenJetApp:
             save_config(self.cfg)
             try:
                 await self._init_client()
+                if previous_session is not None:
+                    self._apply_session_payload(
+                        previous_session,
+                        log,
+                        summary_label="Previous context restored",
+                        restore_airgapped=False,
+                        replay_history=False,
+                        use_current_system_prompt=True,
+                    )
             except Exception:
                 pass
             log.write(f"[bold red]Model switch failed:[/] {_format_error(exc)}")
@@ -1126,11 +1203,26 @@ class OpenJetApp:
             return False
         status.update("")
         status.add_class("hidden")
-        self.loaded_files.clear()
-        self._start_new_chat_session()
+        carried_context = False
+        if previous_session is not None:
+            carried_context = self._apply_session_payload(
+                previous_session,
+                log,
+                summary_label="Carried context into new runtime",
+                runtime_note="KV cache will rebuild on next turn.",
+                restore_airgapped=False,
+                replay_history=False,
+                use_current_system_prompt=True,
+            )
+        if not carried_context:
+            self.loaded_files.clear()
+            self._start_new_chat_session()
         self.persist_session_state(reason="model_switch")
         self._render_token_counter()
-        log.write("[bold bright_white]Model switched. Runtime restarted and context reset.[/]")
+        if carried_context:
+            log.write("[bold bright_white]Model switched. Runtime restarted with transcript context preserved.[/]")
+        else:
+            log.write("[bold bright_white]Model switched. Runtime restarted and context reset.[/]")
         log.write("")
         return True
 
@@ -2115,6 +2207,115 @@ class OpenJetApp:
             "turn_context_remaining_budget": getattr(getattr(context_snapshot, "budget", None), "remaining_budget", 0),
         }
 
+    def token_usage_snapshot(self) -> dict[str, object]:
+        active_model = self._active_model_ref() or "unknown"
+        models: list[dict[str, object]] = []
+        for model_ref, entry in self._session_model_usage.items():
+            prompt_tokens = self._coerce_token_count(entry.get("prompt_tokens"))
+            completion_tokens = self._coerce_token_count(entry.get("completion_tokens"))
+            requests = self._coerce_token_count(entry.get("runtime_requests"))
+            models.append(
+                {
+                    "model_ref": model_ref,
+                    "label": str(entry.get("label") or self._usage_model_label(model_ref)),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "runtime_requests": requests,
+                    "active": model_ref == active_model,
+                }
+            )
+        models.sort(key=lambda row: (not bool(row["active"]), -int(row["total_tokens"]), str(row["label"]).lower()))
+        total = {
+            "prompt_tokens": self._session_prompt_tokens,
+            "completion_tokens": self._session_completion_tokens,
+            "total_tokens": self._session_prompt_tokens + self._session_completion_tokens,
+            "runtime_requests": self._session_runtime_requests,
+        }
+        return {
+            "total": total,
+            "models": models,
+            "api_cost": _format_openjet_api_spend(
+                self._session_prompt_tokens,
+                self._session_completion_tokens,
+            ),
+        }
+
+    def lifetime_token_usage_snapshot(self) -> dict[str, object]:
+        import json
+
+        totals_path = self._lifetime_totals_path()
+        totals: dict[str, object] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "api_cost_usd": 0.0,
+            "sessions": 0,
+            "models": {},
+        }
+        if totals_path.exists():
+            try:
+                loaded = json.loads(totals_path.read_text())
+                if isinstance(loaded, dict):
+                    totals.update(loaded)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+
+        model_rows: dict[str, dict[str, object]] = {}
+        saved_models = totals.get("models")
+        if isinstance(saved_models, dict):
+            for model_ref, entry in saved_models.items():
+                if not isinstance(entry, dict):
+                    continue
+                key = str(model_ref or entry.get("model_ref") or "").strip() or "unknown"
+                prompt_tokens = self._coerce_token_count(entry.get("input_tokens", entry.get("prompt_tokens")))
+                completion_tokens = self._coerce_token_count(entry.get("output_tokens", entry.get("completion_tokens")))
+                model_rows[key] = {
+                    "model_ref": key,
+                    "label": str(entry.get("label") or self._usage_model_label(key)),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "runtime_requests": self._coerce_token_count(entry.get("runtime_requests")),
+                }
+
+        for row in self.token_usage_snapshot()["models"]:
+            key = str(row["model_ref"])
+            entry = model_rows.setdefault(
+                key,
+                {
+                    "model_ref": key,
+                    "label": row["label"],
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "runtime_requests": 0,
+                },
+            )
+            entry["label"] = row["label"]
+            entry["prompt_tokens"] = self._coerce_token_count(entry.get("prompt_tokens")) + int(row["prompt_tokens"])
+            entry["completion_tokens"] = self._coerce_token_count(entry.get("completion_tokens")) + int(row["completion_tokens"])
+            entry["total_tokens"] = int(entry["prompt_tokens"]) + int(entry["completion_tokens"])
+            entry["runtime_requests"] = self._coerce_token_count(entry.get("runtime_requests")) + int(row["runtime_requests"])
+
+        models = sorted(
+            model_rows.values(),
+            key=lambda row: (-int(row["total_tokens"]), str(row["label"]).lower()),
+        )
+        prompt_tokens = self._coerce_token_count(totals.get("input_tokens")) + self._session_prompt_tokens
+        completion_tokens = self._coerce_token_count(totals.get("output_tokens")) + self._session_completion_tokens
+        return {
+            "total": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "sessions": self._coerce_token_count(totals.get("sessions")),
+            },
+            "models": models,
+            "api_cost": _format_openjet_api_spend(prompt_tokens, completion_tokens),
+            "has_model_breakdown": bool(models),
+            "has_unsplit_history": prompt_tokens + completion_tokens > sum(int(row["total_tokens"]) for row in models),
+        }
+
     def refresh_token_counter(self) -> None:
         self._render_token_counter()
 
@@ -2213,6 +2414,10 @@ class OpenJetApp:
                 "prompt_tokens": self._session_prompt_tokens,
                 "completion_tokens": self._session_completion_tokens,
                 "runtime_requests": self._session_runtime_requests,
+                "models": {
+                    model_ref: dict(entry)
+                    for model_ref, entry in self._session_model_usage.items()
+                },
             },
         }
 
@@ -2273,18 +2478,27 @@ class OpenJetApp:
         summary_label: str,
         runtime_note: str | None = None,
         chat_id_override: str | None = None,
+        restore_airgapped: bool = True,
+        replay_history: bool = True,
+        use_current_system_prompt: bool = False,
     ) -> bool:
         if not self.agent:
             return False
         valid_messages = self._validated_session_messages(state)
         if not valid_messages:
             return False
+        if use_current_system_prompt:
+            first = dict(valid_messages[0])
+            first["content"] = self.agent.system_prompt
+            first["role"] = "system"
+            valid_messages = [first, *valid_messages[1:]]
         airgapped = state.get("airgapped")
-        if isinstance(airgapped, bool):
+        if restore_airgapped and isinstance(airgapped, bool):
             self.set_airgapped(airgapped, persist=False)
         self.agent.clear_turn_context()
         self.agent.messages = valid_messages
-        self._replay_restored_history(log, self.agent.messages)
+        if replay_history:
+            self._replay_restored_history(log, self.agent.messages)
         self._seed_prompt_history_from_messages(self.agent.messages)
         loaded_files = state.get("loaded_files")
         self.loaded_files = loaded_files if isinstance(loaded_files, dict) else {}
@@ -2302,10 +2516,38 @@ class OpenJetApp:
             self._session_prompt_tokens = self._coerce_token_count(token_usage.get("prompt_tokens"))
             self._session_completion_tokens = self._coerce_token_count(token_usage.get("completion_tokens"))
             self._session_runtime_requests = self._coerce_token_count(token_usage.get("runtime_requests"))
+            restored_models = token_usage.get("models")
+            self._session_model_usage = {}
+            if isinstance(restored_models, dict):
+                for model_ref, entry in restored_models.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    key = str(model_ref or entry.get("model_ref") or "").strip() or "unknown"
+                    prompt_tokens = self._coerce_token_count(entry.get("prompt_tokens", entry.get("input_tokens")))
+                    completion_tokens = self._coerce_token_count(
+                        entry.get("completion_tokens", entry.get("output_tokens"))
+                    )
+                    self._session_model_usage[key] = {
+                        "model_ref": key,
+                        "label": str(entry.get("label") or self._usage_model_label(key)),
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "runtime_requests": self._coerce_token_count(entry.get("runtime_requests")),
+                    }
+            if not self._session_model_usage and self._session_runtime_requests:
+                model_ref = str(state.get("model_ref") or self._active_model_ref() or "unknown").strip() or "unknown"
+                self._session_model_usage[model_ref] = {
+                    "model_ref": model_ref,
+                    "label": self._usage_model_label(model_ref),
+                    "prompt_tokens": self._session_prompt_tokens,
+                    "completion_tokens": self._session_completion_tokens,
+                    "runtime_requests": self._session_runtime_requests,
+                }
         else:
             self._session_prompt_tokens = 0
             self._session_completion_tokens = 0
             self._session_runtime_requests = 0
+            self._session_model_usage = {}
         restored_chat_id = chat_id_override or str(state.get("chat_id") or "").strip()
         if restored_chat_id:
             self._chat_session_id = restored_chat_id

@@ -140,6 +140,9 @@ class SlashCommandHandler:
         if cmd == "status":
             self._status(log)
             return True
+        if cmd == "usage":
+            self._usage(log)
+            return True
         if cmd == "device":
             self._device(log, arg)
             return True
@@ -665,6 +668,40 @@ class SlashCommandHandler:
         log.write("[bold bright_white]Cloud profiles:[/]")
         self._write_model_profile_list(log, cloud_profiles, active=active, empty="none")
         log.write("[dim]Use /runtime local or /runtime cloud. Shortcuts: /local, /cloud.[/]")
+        log.write("")
+
+    def _usage(self, log: Any) -> None:
+        snapshot = self.app.lifetime_token_usage_snapshot()
+        total = snapshot["total"]
+        if not total["total_tokens"]:
+            log.write("[bold bright_white]No model token usage recorded yet.[/]")
+            log.write("")
+            return
+
+        log.write("[bold bright_white]Token usage:[/]")
+        log.write(
+            "[bold bright_white]"
+            f"Total: {total['prompt_tokens']:,} input | "
+            f"{total['completion_tokens']:,} output | "
+            f"{total['total_tokens']:,} tokens | "
+            f"{total['sessions']:,} saved sessions | "
+            f"{snapshot['api_cost']} API Cost"
+            "[/]"
+        )
+        if snapshot.get("has_unsplit_history"):
+            log.write("[dim]Some older saved usage has no per-model breakdown.[/]")
+        for row in snapshot["models"]:
+            log.write(
+                "[bold bright_white]"
+                f"- {row['label']}: "
+                f"{row['prompt_tokens']:,} input | "
+                f"{row['completion_tokens']:,} output | "
+                f"{row['total_tokens']:,} tokens | "
+                f"{row['runtime_requests']:,} requests"
+                "[/]"
+            )
+        if not snapshot["models"]:
+            log.write("[dim]Per-model breakdown starts after this version records model-level usage.[/]")
         log.write("")
 
     async def _switch_runtime_kind(self, log: Any, kind: str) -> None:

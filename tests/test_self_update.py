@@ -276,7 +276,7 @@ class SelfUpdateTests(unittest.TestCase):
 
             with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
                 "src.provisioning.managed_llama_cpp_ref",
-                return_value="b9189",
+                return_value="b9442",
             ), patch(
                 "src.hardware.detect_hardware_info",
                 return_value=HardwareInfo(label="CPU", total_ram_gb=16.0, has_cuda=False),
@@ -289,9 +289,9 @@ class SelfUpdateTests(unittest.TestCase):
             ), patch("src.self_update.subprocess.run", side_effect=fake_run):
                 synced = _sync_managed_llama_cpp_after_update()
 
-        self.assertEqual(synced, "b9189")
+        self.assertEqual(synced, "b9442")
         self.assertFalse(any("clone" in command for command in calls))
-        self.assertTrue(any("fetch" in command and "--depth=1" in command and "b9189" in command for command in calls))
+        self.assertTrue(any("fetch" in command and "--depth=1" in command and "b9442" in command for command in calls))
         self.assertTrue(any(command[-2:] == ["--detach", "FETCH_HEAD"] for command in calls))
 
     def test_update_from_latest_release_migrates_model_config_after_repo_update(self) -> None:
@@ -364,4 +364,4 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertNotIn("model_update_target:", text)
         self.assertIn("https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true", text)
         self.assertIn("llama_mtp: true", text)
-        self.assertIn("llama_cpp_ref: b9189", text)
+        self.assertNotIn("llama_cpp_ref:", text)

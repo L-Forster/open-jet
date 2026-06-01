@@ -27,6 +27,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
         aliases=("clear_messages",),
     ),
     CommandSpec(name="status", description="Show runtime memory/context status", aliases=("stats",)),
+    CommandSpec(name="usage", description="Show lifetime token usage by model"),
     CommandSpec(
         name="device",
         description="List or configure devices: /device [list|add <existing_id> <new_id>|on <id>|off <id>|help]",
@@ -84,6 +85,6 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(
         name="util",
         description="Show/hide utilization line: /util [show|hide|toggle|status]",
-        aliases=("usage",),
+        aliases=("utilization",),
     ),
 )

@@ -113,19 +113,19 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(side_effect=fake_run_exec),
             ), patch("src.provisioning.asyncio.sleep", AsyncMock()):
                 synced = await _sync_managed_llama_cpp_checkout(
-                    target_ref="b9189",
+                    target_ref="b9442",
                     log=Mock(),
                     set_status=lambda _message: None,
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(synced, "b9189")
+        self.assertEqual(synced, "b9442")
         self.assertFalse(any("clone" in call for call in calls))
         fetch_calls = [call for call in calls if "fetch" in call]
         self.assertEqual(len(fetch_calls), 2)
         self.assertIn("http.version=HTTP/1.1", fetch_calls[0])
         self.assertIn("--depth=1", fetch_calls[0])
-        self.assertEqual(fetch_calls[0][-2:], ("origin", "b9189"))
+        self.assertEqual(fetch_calls[0][-2:], ("origin", "b9442"))
         self.assertTrue(any(call[-2:] == ("--detach", "FETCH_HEAD") for call in calls))
 
     async def test_ensure_llama_server_installs_prebuilt(self) -> None:
@@ -223,13 +223,11 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["setup_missing_runtime"])
         sync_checkout.assert_awaited_once()
 
-    async def test_ensure_llama_server_builds_mtp_runtime_for_mtp_model(self) -> None:
+    async def test_ensure_llama_server_installs_prebuilt_for_mtp_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             llama_dir = Path(tmp) / "llama.cpp"
-            built = llama_dir / "build" / "bin" / "llama-server"
-            built.parent.mkdir(parents=True)
-            built.write_text("binary", encoding="utf-8")
             bin_dir = Path(tmp) / "bin"
+            installed = bin_dir / "llama-server"
             old_prebuilt = bin_dir / "llama-server"
             old_prebuilt.parent.mkdir(parents=True)
             old_prebuilt.write_text("old", encoding="utf-8")
@@ -239,10 +237,10 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             log = Mock()
             hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
 
-            async def fake_build_progress(*_args, **_kwargs):
-                built.parent.mkdir(parents=True, exist_ok=True)
-                built.write_text("binary", encoding="utf-8")
-                return 0, ""
+            async def fake_install_prebuilt(*_args, **_kwargs):
+                installed.write_text("binary", encoding="utf-8")
+                tag_file.write_text("b9442", encoding="utf-8")
+                return installed, "b9442", "vulkan"
 
             with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
                 "src.provisioning.BIN_DIR", bin_dir
@@ -254,17 +252,11 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "src.provisioning.current_llama_server_path", return_value="/usr/bin/llama-server"
             ), patch(
                 "src.provisioning._install_prebuilt_llama_server",
-                AsyncMock(),
+                AsyncMock(side_effect=fake_install_prebuilt),
             ) as install_prebuilt, patch(
-                "src.provisioning._sync_managed_llama_cpp_checkout",
-                AsyncMock(return_value="b9189"),
-            ) as sync_checkout, patch(
-                "src.provisioning._run_exec",
-                AsyncMock(return_value=(0, "", "")),
-            ), patch(
-                "src.provisioning._run_build_with_progress",
-                AsyncMock(side_effect=fake_build_progress),
-            ):
+                "src.provisioning._build_llama_server_from_source",
+                AsyncMock(),
+            ) as build_source:
                 payload = await ensure_llama_server(
                     {
                         "llama_cpp_ref": "b9072",
@@ -277,10 +269,11 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "b9189")
-        self.assertEqual(payload["llama_server_path"], str(built))
-        install_prebuilt.assert_not_awaited()
-        self.assertEqual(sync_checkout.await_args.kwargs["target_ref"], "b9189")
+        self.assertEqual(payload["llama_cpp_ref"], "b9442")
+        self.assertEqual(payload["llama_server_path"], str(installed))
+        self.assertEqual(payload["device"], "vulkan")
+        self.assertEqual(install_prebuilt.await_args.kwargs["target_ref"], "b9442")
+        build_source.assert_not_awaited()
 
     async def test_ensure_llama_server_reuses_configured_runtime_path_for_mtp_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -322,20 +315,25 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "b9189")
+        self.assertEqual(payload["llama_cpp_ref"], "b9442")
         self.assertEqual(payload["llama_server_path"], str(configured))
         self.assertEqual(payload["device"], "cuda")
         install_prebuilt.assert_not_awaited()
         build_source.assert_not_awaited()
 
-    async def test_ensure_llama_server_builds_mtp_with_vulkan_on_linux_nvidia(self) -> None:
+    async def test_ensure_llama_server_downloads_release_for_mtp_on_linux_nvidia(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             llama_dir = Path(tmp) / "llama.cpp"
-            built = llama_dir / "build" / "bin" / "llama-server"
             bin_dir = Path(tmp) / "bin"
+            installed = bin_dir / "llama-server"
 
             log = Mock()
             hardware = HardwareInfo(label="RTX 5090", total_ram_gb=64.0, has_cuda=True, vram_mb=32768.0)
+
+            async def fake_install_prebuilt(*_args, **_kwargs):
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                installed.write_text("binary", encoding="utf-8")
+                return installed, "b9442", "vulkan"
 
             with patch("src.provisioning.sys.platform", "linux"), patch(
                 "src.provisioning.platform.machine", return_value="x86_64"
@@ -349,10 +347,10 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "src.provisioning.current_llama_server_path", return_value=None
             ), patch(
                 "src.provisioning._install_prebuilt_llama_server",
-                AsyncMock(),
+                AsyncMock(side_effect=fake_install_prebuilt),
             ) as install_prebuilt, patch(
                 "src.provisioning._build_llama_server_from_source",
-                AsyncMock(return_value=(built, "b9189")),
+                AsyncMock(),
             ) as build_source:
                 payload = await ensure_llama_server(
                     {
@@ -366,11 +364,11 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "b9189")
-        self.assertEqual(payload["llama_server_path"], str(built))
+        self.assertEqual(payload["llama_cpp_ref"], "b9442")
+        self.assertEqual(payload["llama_server_path"], str(installed))
         self.assertEqual(payload["device"], "vulkan")
-        install_prebuilt.assert_not_awaited()
-        self.assertEqual(build_source.await_args.kwargs["device"], "vulkan")
+        self.assertEqual(install_prebuilt.await_args.kwargs["target_ref"], "b9442")
+        build_source.assert_not_awaited()
 
     async def test_ensure_llama_server_reuses_matching_source_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,7 +377,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             built.parent.mkdir(parents=True)
             built.write_text("binary", encoding="utf-8")
             (llama_dir / "build" / "openjet-llama-server.json").write_text(
-                '{"device": "vulkan", "ref": "b9189"}',
+                '{"device": "vulkan", "ref": "b9442"}',
                 encoding="utf-8",
             )
             bin_dir = Path(tmp) / "bin"
@@ -398,7 +396,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "src.provisioning.current_llama_server_path", return_value="/usr/bin/llama-server"
             ), patch(
                 "src.provisioning._install_prebuilt_llama_server",
-                AsyncMock(),
+                AsyncMock(return_value=None),
             ) as install_prebuilt, patch(
                 "src.provisioning._build_llama_server_from_source",
                 AsyncMock(),
@@ -415,20 +413,21 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "b9189")
+        self.assertEqual(payload["llama_cpp_ref"], "b9442")
         self.assertEqual(payload["llama_server_path"], str(built))
         self.assertEqual(payload["device"], "vulkan")
-        install_prebuilt.assert_not_awaited()
+        install_prebuilt.assert_awaited_once()
         build_source.assert_not_awaited()
 
-    async def test_ensure_llama_server_reuses_matching_cuda_source_runtime_on_linux_nvidia(self) -> None:
+    async def test_ensure_llama_server_does_not_reuse_cuda_source_runtime_for_vulkan_mtp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             llama_dir = Path(tmp) / "llama.cpp"
-            built = llama_dir / "build" / "bin" / "llama-server"
-            built.parent.mkdir(parents=True)
-            built.write_text("binary", encoding="utf-8")
+            old_built = llama_dir / "build" / "bin" / "llama-server"
+            old_built.parent.mkdir(parents=True)
+            old_built.write_text("binary", encoding="utf-8")
+            new_built = llama_dir / "new-build" / "bin" / "llama-server"
             (llama_dir / "build" / "openjet-llama-server.json").write_text(
-                '{"device": "cuda", "ref": "b9189"}',
+                '{"device": "cuda", "ref": "b9442"}',
                 encoding="utf-8",
             )
             bin_dir = Path(tmp) / "bin"
@@ -446,13 +445,13 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             ), patch(
                 "src.provisioning._needs_rebuild", return_value=True
             ), patch(
-                "src.provisioning.current_llama_server_path", return_value=str(built)
+                "src.provisioning.current_llama_server_path", return_value=str(old_built)
             ), patch(
                 "src.provisioning._install_prebuilt_llama_server",
-                AsyncMock(),
+                AsyncMock(return_value=None),
             ) as install_prebuilt, patch(
                 "src.provisioning._build_llama_server_from_source",
-                AsyncMock(),
+                AsyncMock(return_value=(new_built, "b9442")),
             ) as build_source:
                 payload = await ensure_llama_server(
                     {
@@ -466,11 +465,11 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "b9189")
-        self.assertEqual(payload["llama_server_path"], str(built))
-        self.assertEqual(payload["device"], "cuda")
-        install_prebuilt.assert_not_awaited()
-        build_source.assert_not_awaited()
+        self.assertEqual(payload["llama_cpp_ref"], "b9442")
+        self.assertEqual(payload["llama_server_path"], str(new_built))
+        self.assertEqual(payload["device"], "vulkan")
+        install_prebuilt.assert_awaited_once()
+        self.assertEqual(build_source.await_args.kwargs["device"], "vulkan")
 
     async def test_ensure_llama_server_reuses_source_runtime_when_checkout_ref_matches_without_tag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -496,7 +495,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "src.provisioning.current_llama_server_path", return_value=str(built)
             ), patch(
                 "src.provisioning._install_prebuilt_llama_server",
-                AsyncMock(),
+                AsyncMock(return_value=None),
             ) as install_prebuilt, patch(
                 "src.provisioning._build_llama_server_from_source",
                 AsyncMock(),
@@ -513,8 +512,8 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                     clear_status=lambda: None,
                 )
 
-        self.assertEqual(payload["llama_cpp_ref"], "b9189")
+        self.assertEqual(payload["llama_cpp_ref"], "b9442")
         self.assertEqual(payload["llama_server_path"], str(built))
         self.assertEqual(payload["device"], "cuda")
-        install_prebuilt.assert_not_awaited()
+        install_prebuilt.assert_awaited_once()
         build_source.assert_not_awaited()

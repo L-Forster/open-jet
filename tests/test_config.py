@@ -65,7 +65,7 @@ class ConfigNormalizationTests(unittest.TestCase):
 
         self.assertEqual(normalized["llama_model"], migrated_model)
         self.assertTrue(normalized["llama_mtp"])
-        self.assertEqual(normalized["llama_cpp_ref"], "b9189")
+        self.assertNotIn("llama_cpp_ref", normalized)
         self.assertEqual(normalized["model_source"], "direct")
         self.assertTrue(normalized["setup_missing_model"])
         self.assertNotIn("setup_update_model", normalized)
@@ -76,7 +76,7 @@ class ConfigNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(normalized["model_profiles"][0]["llama_model"], migrated_model)
         self.assertTrue(normalized["model_profiles"][0]["llama_mtp"])
-        self.assertEqual(normalized["model_profiles"][0]["llama_cpp_ref"], "b9189")
+        self.assertNotIn("llama_cpp_ref", normalized["model_profiles"][0])
         self.assertEqual(normalized["model_profiles"][0]["model_source"], "direct")
         self.assertTrue(normalized["model_profiles"][0]["setup_missing_model"])
         self.assertNotIn("setup_update_model", normalized["model_profiles"][0])
@@ -113,7 +113,7 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertTrue(cfg["setup_missing_model"])
         self.assertNotIn("setup_update_model", cfg)
         self.assertNotIn("model_update_target", cfg)
-        cfg["model_update_applied"] = "qwen36-27b-mtp-unsloth-b9189"
+        cfg["model_update_applied"] = "qwen36-27b-mtp-unsloth"
         cfg["setup_missing_model"] = False
         self.assertFalse(migrate_config_for_current_release(cfg))
 
@@ -125,7 +125,7 @@ class ConfigNormalizationTests(unittest.TestCase):
             "model_download_path": source_model,
             "model_download_url": "https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true",
             "llama_mtp": True,
-            "model_update_applied": "qwen36-27b-mtp-unsloth-b9189",
+            "model_update_applied": "qwen36-27b-mtp-unsloth",
             "setup_missing_model": False,
         }
 
@@ -211,7 +211,6 @@ class ConfigNormalizationTests(unittest.TestCase):
                             "unified_memory_only": True,
                             "llama_cpu_moe": True,
                             "llama_n_cpu_moe": 12,
-                            "llama_cpp_ref": "b9189",
                             "llama_mtp": True,
                         }
                     ]
@@ -225,5 +224,5 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertTrue(catalog[0]["unified_memory_only"])
         self.assertTrue(catalog[0]["llama_cpu_moe"])
         self.assertEqual(catalog[0]["llama_n_cpu_moe"], 12)
-        self.assertEqual(catalog[0]["llama_cpp_ref"], "b9189")
+        self.assertNotIn("llama_cpp_ref", catalog[0])
         self.assertTrue(catalog[0]["llama_mtp"])

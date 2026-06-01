@@ -29,7 +29,6 @@ PROFILE_KEYS: tuple[str, ...] = (
     "gpu_layers",
     "llama_cpu_moe",
     "llama_n_cpu_moe",
-    "llama_cpp_ref",
     "llama_mtp",
     "model_size_mb",
     "active_model_size_mb",

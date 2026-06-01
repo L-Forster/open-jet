@@ -5,6 +5,7 @@
 - `/clear` clear chat and restart runtime (flush KV cache)
 - `/clear-chat` clear chat only
 - `/status` show context/RAM status
+- `/usage` show lifetime token usage by model
 - `/device [list|add <existing_id> <new_id>|on <id>|off <id>|help]` list or configure devices in chat
 - `/devices` alias for `/device`
 - `/condense` condense older context

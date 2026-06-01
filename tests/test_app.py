@@ -239,6 +239,12 @@ class AppStatusTests(unittest.TestCase):
 
         self.assertEqual(app.commands.resolve_command("cmds"), "help")
 
+    def test_usage_is_token_usage_command_not_utilization_alias(self) -> None:
+        app = OpenJetApp()
+
+        self.assertEqual(app.commands.resolve_command("usage"), "usage")
+        self.assertEqual(app.commands.resolve_command("utilization"), "util")
+
     def test_generating_status_renders_live_and_disappears_after_stop(self) -> None:
         app = OpenJetApp()
         token = app._start_thinking()
@@ -510,6 +516,58 @@ class AppStatusTests(unittest.TestCase):
         self.assertTrue(app._auto_accept_code_changes)
         self.assertTrue(future.done())
         self.assertTrue(future.result())
+
+
+class AppUsageCommandTests(unittest.IsolatedAsyncioTestCase):
+    async def test_usage_command_lists_token_usage_by_model(self) -> None:
+        app = OpenJetApp()
+        app.cfg["llama_model"] = "/models/base.gguf"
+        app._agent_trace("runtime_exchange_complete", {"prompt_tokens": 100, "completion_tokens": 25})
+        app.cfg.update({"runtime": "litellm", "model": "openai/gpt-5.5"})
+        app._agent_trace("runtime_exchange_complete", {"prompt_tokens": 300, "completion_tokens": 75})
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            app, "_lifetime_totals_path", return_value=Path(tmp) / "totals.json"
+        ):
+            handled = await app.commands.maybe_handle("/usage")
+
+        self.assertTrue(handled)
+        entries = [str(entry) for entry in app.query_one("#chat-log")._entries]
+        self.assertTrue(any("Token usage" in entry for entry in entries))
+        self.assertTrue(any("Total: 400 input | 100 output | 500 tokens" in entry for entry in entries))
+        self.assertTrue(any("base: 100 input | 25 output | 125 tokens | 1 requests" in entry for entry in entries))
+        self.assertTrue(any("openai/gpt-5.5: 300 input | 75 output | 375 tokens | 1 requests" in entry for entry in entries))
+
+    async def test_usage_command_reads_lifetime_model_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            totals_path = Path(tmp) / "totals.json"
+            totals_path.write_text(
+                json.dumps(
+                    {
+                        "input_tokens": 1000,
+                        "output_tokens": 200,
+                        "api_cost_usd": 0.0,
+                        "sessions": 4,
+                        "models": {
+                            "openai/gpt-5.5": {
+                                "label": "openai/gpt-5.5",
+                                "input_tokens": 700,
+                                "output_tokens": 150,
+                                "runtime_requests": 3,
+                            }
+                        },
+                    }
+                )
+            )
+            app = OpenJetApp()
+
+            with patch.object(app, "_lifetime_totals_path", return_value=totals_path):
+                handled = await app.commands.maybe_handle("/usage")
+
+        self.assertTrue(handled)
+        entries = [str(entry) for entry in app.query_one("#chat-log")._entries]
+        self.assertTrue(any("Total: 1,000 input | 200 output | 1,200 tokens | 4 saved sessions" in entry for entry in entries))
+        self.assertTrue(any("openai/gpt-5.5: 700 input | 150 output | 850 tokens | 3 requests" in entry for entry in entries))
 
 
 class AppInputTests(unittest.IsolatedAsyncioTestCase):
@@ -1409,7 +1467,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "model_download_path": str(target),
                 "setup_missing_model": True,
                 "setup_update_model": True,
-                "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
+                "model_update_target": "qwen36-27b-mtp-unsloth",
             }
 
             log = Mock()
@@ -1468,7 +1526,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 "model_download_path": str(target),
                 "setup_missing_model": True,
                 "setup_update_model": True,
-                "model_update_target": "qwen36-27b-mtp-unsloth-b9189",
+                "model_update_target": "qwen36-27b-mtp-unsloth",
             }
 
             with patch("src.provisioning._run_hf_cli_download", AsyncMock()) as download:
@@ -1812,14 +1870,14 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         app.cfg["active_model_profile"] = "local"
         app.cfg["model_profiles"] = [
             {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
-            {"name": "Claude Sonnet", "runtime": "litellm", "provider": "anthropic", "model": "anthropic/claude"},
+            {"name": "Claude Opus", "runtime": "litellm", "provider": "anthropic", "model": "anthropic/claude-opus-4-8"},
         ]
 
         with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate:
-            handled = await app.commands.maybe_handle("/cloud Claude Sonnet")
+            handled = await app.commands.maybe_handle("/cloud Claude Opus")
 
         self.assertTrue(handled)
-        activate.assert_awaited_once_with("Claude Sonnet", app.query_one("#chat-log"))
+        activate.assert_awaited_once_with("Claude Opus", app.query_one("#chat-log"))
 
     async def test_runtime_status_lists_local_and_cloud_profiles(self) -> None:
         app = OpenJetApp()
@@ -1838,6 +1896,99 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Local profiles", entries)
         self.assertIn("Cloud profiles", entries)
         self.assertIn("/runtime local", entries)
+
+    async def test_activate_model_profile_preserves_transcript_context(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update(
+            {
+                "active_model_profile": "local",
+                "runtime": "llama_cpp",
+                "llama_model": "/models/local.gguf",
+                "model_profiles": [
+                    {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
+                    {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.5"},
+                ],
+            }
+        )
+        original_chat_id = app._chat_session_id
+        app.client = SimpleNamespace(context_window_tokens=4096, gpu_layers=99, close=AsyncMock())
+        app.agent = SimpleNamespace(
+            system_prompt="system",
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "keep this"},
+                {"role": "assistant", "content": "kept"},
+            ],
+            clear_turn_context=Mock(),
+        )
+        app.loaded_files = {"README.md": {"path": "README.md", "content": "loaded"}}
+
+        async def init_new_client() -> None:
+            app.client = SimpleNamespace(context_window_tokens=272000, gpu_layers=0, close=AsyncMock())
+            app.agent = SimpleNamespace(
+                system_prompt="new system",
+                messages=[{"role": "system", "content": "new system"}],
+                clear_turn_context=Mock(),
+            )
+
+        with patch.object(app, "_materialize_setup_model", AsyncMock(side_effect=lambda cfg, _log: cfg)), patch.object(
+            app, "_init_client", AsyncMock(side_effect=init_new_client)
+        ), patch("src.app.save_config"):
+            switched = await app.activate_model_profile("codex", app.query_one("#chat-log"))
+
+        self.assertTrue(switched)
+        self.assertEqual(app._chat_session_id, original_chat_id)
+        self.assertEqual(app.loaded_files["README.md"]["content"], "loaded")
+        self.assertEqual(app.agent.messages[0]["content"], "new system")
+        self.assertEqual([msg["content"] for msg in app.agent.messages[-2:]], ["keep this", "kept"])
+        entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
+        self.assertIn("transcript context preserved", entries)
+        self.assertNotIn("context reset", entries)
+
+    async def test_activate_model_profile_failure_restores_previous_context(self) -> None:
+        app = OpenJetApp()
+        app.cfg.clear()
+        app.cfg.update(
+            {
+                "active_model_profile": "local",
+                "runtime": "llama_cpp",
+                "llama_model": "/models/local.gguf",
+                "model_profiles": [
+                    {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
+                    {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.5"},
+                ],
+            }
+        )
+        app.client = SimpleNamespace(context_window_tokens=4096, gpu_layers=99, close=AsyncMock())
+        app.agent = SimpleNamespace(
+            system_prompt="system",
+            messages=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "do not lose"},
+            ],
+            clear_turn_context=Mock(),
+        )
+        app.loaded_files = {"README.md": {"path": "README.md", "content": "loaded"}}
+
+        async def restore_runtime() -> None:
+            app.client = SimpleNamespace(context_window_tokens=4096, gpu_layers=99, close=AsyncMock())
+            app.agent = SimpleNamespace(
+                system_prompt="system",
+                messages=[{"role": "system", "content": "system"}],
+                clear_turn_context=Mock(),
+            )
+
+        with patch.object(app, "_materialize_setup_model", AsyncMock(side_effect=RuntimeError("boom"))), patch.object(
+            app, "_init_client", AsyncMock(side_effect=restore_runtime)
+        ), patch("src.app.save_config"):
+            switched = await app.activate_model_profile("codex", app.query_one("#chat-log"))
+
+        self.assertFalse(switched)
+        self.assertEqual(app.cfg["active_model_profile"], "local")
+        self.assertEqual(app.loaded_files["README.md"]["content"], "loaded")
+        self.assertEqual(app.agent.messages[0]["content"], "system")
+        self.assertEqual(app.agent.messages[-1]["content"], "do not lose")
 
     async def test_edit_model_updates_saved_profile(self) -> None:
         app = OpenJetApp()
@@ -2455,19 +2606,19 @@ class AppToolHandlingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CliCommandTests(unittest.TestCase):
-    def test_sync_active_model_profile_preserves_mtp_runtime_ref(self) -> None:
+    def test_sync_active_model_profile_does_not_store_runtime_ref_per_model(self) -> None:
         cfg = {
             "active_model_profile": "mtp",
             "llama_model": "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf",
             "llama_server_path": "/home/louis/llama.cpp/build/bin/llama-server",
-            "llama_cpp_ref": "b9189",
+            "llama_cpp_ref": "b9442",
             "llama_mtp": True,
             "model_source": "local",
         }
 
         sync_active_model_profile(cfg)
 
-        self.assertEqual(cfg["model_profiles"][0]["llama_cpp_ref"], "b9189")
+        self.assertNotIn("llama_cpp_ref", cfg["model_profiles"][0])
         self.assertTrue(cfg["model_profiles"][0]["llama_mtp"])
 
     def test_model_profile_preserves_direct_download_fields(self) -> None:
@@ -2487,7 +2638,6 @@ class CliCommandTests(unittest.TestCase):
                     "model_download_url": download_url,
                     "model_download_path": "/models/Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf",
                     "setup_missing_model": True,
-                    "llama_cpp_ref": "b9189",
                     "llama_mtp": True,
                 }
             ],
