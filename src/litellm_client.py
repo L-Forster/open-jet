@@ -43,10 +43,10 @@ class LiteLLMClient:
         self.auth_store = auth_store or ApiKeyStore()
         self.extra_body = dict(extra_body or {})
 
-    async def start(self) -> None:
+    async def start(self, messages: list[dict] | None = None) -> None:
         self._assert_network_allowed()
         litellm = self._import_litellm()
-        kwargs = self._completion_kwargs([{"role": "user", "content": "Reply OK."}], stream=False)
+        kwargs = self._completion_kwargs(messages or [{"role": "user", "content": "Reply OK."}], stream=False)
         kwargs["max_tokens"] = 1
         try:
             await litellm.acompletion(**kwargs)

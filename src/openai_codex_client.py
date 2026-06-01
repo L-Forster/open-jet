@@ -36,11 +36,11 @@ class OpenAICodexClient:
         self.text_verbosity = _optional_enum(text_verbosity, {"low", "medium", "high"})
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0))
 
-    async def start(self) -> None:
+    async def start(self, messages: list[dict] | None = None) -> None:
         assert_endpoint_allowed(self.base_url, label="OpenAI Codex runtime")
         try:
             async for chunk in self._stream_once(
-                [{"role": "user", "content": "Reply OK."}],
+                messages or [{"role": "user", "content": "Reply OK."}],
                 use_tools=False,
                 extra_body={"max_output_tokens": 1},
             ):

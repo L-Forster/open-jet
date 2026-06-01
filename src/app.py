@@ -974,9 +974,15 @@ class OpenJetApp:
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
         configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
         client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
+        system_prompt = await build_system_prompt("", Path.cwd(), cfg=self.cfg)
         if active_runtime(self.cfg) != DEFAULT_RUNTIME:
             try:
-                await client.start()
+                await client.start(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "Reply OK."},
+                    ]
+                )
             except Exception:
                 try:
                     await client.close()
@@ -994,7 +1000,7 @@ class OpenJetApp:
             save_config(self.cfg)
         self.agent = Agent(
             client=self.client,
-            system_prompt=await build_system_prompt("", Path.cwd(), cfg=self.cfg),
+            system_prompt=system_prompt,
             base_system_prompt="",
             project_root=Path.cwd(),
             prompt_cfg=self.cfg,

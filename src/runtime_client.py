@@ -9,7 +9,7 @@ class RuntimeClient(Protocol):
     context_window_tokens: int
     gpu_layers: int
 
-    async def start(self) -> None:
+    async def start(self, messages: list[dict] | None = None) -> None:
         ...
 
     async def close(self) -> None:

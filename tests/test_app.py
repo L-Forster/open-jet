@@ -348,7 +348,12 @@ class AppStatusTests(unittest.TestCase):
 
         asyncio.run(_run())
 
-        fake_client.start.assert_awaited_once()
+        fake_client.start.assert_awaited_once_with(
+            [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "Reply OK."},
+            ]
+        )
         self.assertIsNotNone(app.agent)
 
     def test_tool_output_line_highlights_shell_commands(self) -> None:

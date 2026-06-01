@@ -297,6 +297,25 @@ class CodexResponsesStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(http.last_payload["model"], "gpt-5.5")
         self.assertEqual(http.last_payload["max_output_tokens"], 1)
 
+    async def test_codex_start_uses_supplied_preflight_system_prompt(self) -> None:
+        class _Provider:
+            async def credentials(self):
+                return CodexCredentials(access_token="access", refresh_token="refresh", expires_at=time.time() + 3600)
+
+        http = _FakeHTTPClient(['data: {"type":"response.completed"}'])
+        client = OpenAICodexClient(model="gpt-5.5", auth_provider=_Provider())
+        client._http = http
+
+        await client.start(
+            [
+                {"role": "system", "content": "real system prompt"},
+                {"role": "user", "content": "Reply OK."},
+            ]
+        )
+
+        self.assertEqual(http.last_payload["instructions"], "real system prompt")
+        self.assertEqual(http.last_payload["input"], [{"role": "user", "content": "Reply OK."}])
+
     async def test_codex_start_maps_unsupported_model_to_cloud_model_hint(self) -> None:
         class _Provider:
             async def credentials(self):
