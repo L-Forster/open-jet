@@ -42,7 +42,6 @@ class OpenAICodexClient:
             async for chunk in self._stream_once(
                 messages or [{"role": "user", "content": "Reply OK."}],
                 use_tools=False,
-                extra_body={"max_output_tokens": 1},
             ):
                 if chunk.done:
                     break
@@ -140,7 +139,9 @@ def _looks_like_auth_expired(text: str) -> bool:
 def _format_codex_error(exc: Exception, *, model: str) -> str:
     text = str(exc).strip() or type(exc).__name__
     lowered = text.lower()
-    if "not supported" in lowered or "unsupported" in lowered or ("model" in lowered and "400" in lowered):
+    if "unsupported parameter" in lowered:
+        return f"OpenAI Codex preflight failed: {text}"
+    if "model not supported" in lowered or "unsupported model" in lowered or ("model" in lowered and "400" in lowered):
         return f"OpenAI Codex rejected model `{model}`. Change it with `/cloud model <model>`. Details: {text}"
     if "401" in lowered or "unauthorized" in lowered or "invalid_token" in lowered:
         return "OpenAI Codex authentication failed. Run /connect openai-codex again."

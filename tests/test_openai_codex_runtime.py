@@ -295,7 +295,7 @@ class CodexResponsesStreamTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(http.last_url, "https://chatgpt.com/backend-api/codex/responses")
         self.assertEqual(http.last_payload["model"], "gpt-5.5")
-        self.assertEqual(http.last_payload["max_output_tokens"], 1)
+        self.assertNotIn("max_output_tokens", http.last_payload)
 
     async def test_codex_start_uses_supplied_preflight_system_prompt(self) -> None:
         class _Provider:
@@ -326,6 +326,18 @@ class CodexResponsesStreamTests(unittest.IsolatedAsyncioTestCase):
         client._http = http
 
         with self.assertRaisesRegex(RuntimeError, "/cloud model <model>"):
+            await client.start()
+
+    async def test_codex_start_reports_unsupported_parameter_as_preflight_error(self) -> None:
+        class _Provider:
+            async def credentials(self):
+                return CodexCredentials(access_token="access", refresh_token="refresh", expires_at=time.time() + 3600)
+
+        http = _FakeHTTPClient([], status_code=400, body='{"detail":"Unsupported parameter: max_output_tokens"}')
+        client = OpenAICodexClient(model="gpt-5.5", auth_provider=_Provider())
+        client._http = http
+
+        with self.assertRaisesRegex(RuntimeError, "preflight failed"):
             await client.start()
 
     async def test_codex_client_uses_codex_oauth_backend_and_account_header(self) -> None:
