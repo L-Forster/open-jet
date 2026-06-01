@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,21 +17,6 @@ _INSTALL_RELEVANT_FILES = {
     "pyproject.toml",
     "setup.py",
 }
-_LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
-_GIT_NETWORK_OPTIONS = (
-    "-c",
-    "http.version=HTTP/1.1",
-    "-c",
-    "http.postBuffer=524288000",
-)
-_GIT_RETRY_MARKERS = (
-    "early eof",
-    "fetch-pack",
-    "invalid index-pack",
-    "rpc failed",
-    "stream",
-    "unexpected disconnect",
-)
 
 
 @dataclass(frozen=True)
@@ -107,117 +91,11 @@ def _has_tracked_changes(cwd: Path) -> bool | None:
     return bool(result.stdout.strip())
 
 
-def _llama_git_output(cwd: Path, *args: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=cwd,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return result.stdout.strip()
-
-
-def _looks_like_transient_git_network_error(text: str) -> bool:
-    lowered = text.lower()
-    return any(marker in lowered for marker in _GIT_RETRY_MARKERS)
-
-
-def _llama_git_network_run(
-    cwd: Path,
-    *args: str,
-    attempts: int = 3,
-    env: dict[str, str] | None = None,
-) -> None:
-    command = ["git", *_GIT_NETWORK_OPTIONS, *args]
-    last_error = ""
-    for attempt in range(1, max(1, attempts) + 1):
-        result = subprocess.run(command, cwd=cwd, check=False, capture_output=True, text=True, env=env)
-        if result.returncode == 0:
-            return
-        last_error = (result.stderr or result.stdout or "").strip()
-        if attempt >= attempts or not _looks_like_transient_git_network_error(last_error):
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                command,
-                output=result.stdout,
-                stderr=result.stderr,
-            )
-
-
 def _sync_managed_llama_cpp_after_update() -> str | None:
-    from .hardware import detect_hardware_info
-    from .provisioning import (
-        LLAMA_CPP_DIR,
-        _llama_build_command,
-        _llama_cmake_args,
-        _needs_rebuild,
-        _native_tool_path,
-        _prebuilt_runtime_device,
-        _subprocess_env,
-        cuda_toolkit_available,
-        managed_llama_cpp_ref,
-        missing_cmake_message,
-        missing_cuda_toolkit_message,
-    )
-
-    git_dir = LLAMA_CPP_DIR / ".git"
-    if not git_dir.is_dir():
-        return None
-    if sys.platform == "darwin":
-        return None
-
-    target_ref = managed_llama_cpp_ref()
-    current_ref = _llama_git_output(LLAMA_CPP_DIR, "rev-parse", "HEAD")
-    if current_ref is None:
-        current_ref = ""
-
-    binary_name = "llama-server.exe" if sys.platform == "win32" else "llama-server"
-    binary = LLAMA_CPP_DIR / "build" / "bin" / binary_name
-    hardware_info = detect_hardware_info()
-    build_device = _prebuilt_runtime_device(hardware_info)
-    needs_rebuild = not binary.is_file() or _needs_rebuild(hardware_info, str(binary), device=build_device)
-    if current_ref == target_ref and not needs_rebuild:
-        return None
-    if _native_tool_path("cmake") is None:
-        raise RuntimeError(missing_cmake_message())
-    if build_device == "cuda" and not cuda_toolkit_available():
-        raise RuntimeError(missing_cuda_toolkit_message())
-
-    try:
-        env = _subprocess_env()
-        subprocess.run(["git", "reset", "--hard", "HEAD"], cwd=LLAMA_CPP_DIR, check=False, env=env)
-        subprocess.run(["git", "clean", "-fd"], cwd=LLAMA_CPP_DIR, check=False, env=env)
-        subprocess.run(["git", "remote", "set-url", "origin", _LLAMA_CPP_REPO_URL], cwd=LLAMA_CPP_DIR, check=False, env=env)
-        _llama_git_network_run(LLAMA_CPP_DIR, "fetch", "--depth=1", "origin", target_ref, env=env)
-        subprocess.run(
-            ["git", "checkout", "--detach", "FETCH_HEAD"],
-            cwd=LLAMA_CPP_DIR,
-            check=True,
-            env=env,
-        )
-        build_dir = LLAMA_CPP_DIR / "build"
-        build_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            _llama_cmake_args(hardware_info, device=build_device),
-            cwd=build_dir,
-            check=True,
-            env=env,
-        )
-        subprocess.run(
-            _llama_build_command(4),
-            cwd=build_dir,
-            check=True,
-            env=env,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            f"Failed to sync managed llama.cpp checkout to {target_ref[:7]}."
-        ) from exc
-    return target_ref[:7]
+    # Runtime provisioning installs the pinned llama.cpp release binary. Self-update
+    # must not source-build llama.cpp, because missing local build dependencies would
+    # make the package update fail even though the release binary can run.
+    return None
 
 
 def _migrate_config_after_update() -> bool:
@@ -322,15 +200,13 @@ def install_update(update: RepoUpdateInfo, *, current_version: str | None = None
             },
             check=True,
         )
-        llama_ref = _sync_managed_llama_cpp_after_update()
+        _sync_managed_llama_cpp_after_update()
         config_migrated = _migrate_config_after_update()
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"Failed to update repo checkout from {update.local_short} to {update.remote_short}."
         ) from exc
     message = f"Updated open-jet repo from {update.local_short} to {update.remote_short}."
-    if llama_ref:
-        message += f" Synced managed llama.cpp to {llama_ref}."
     if config_migrated:
         message += " Updated model config for Qwen3.6 MTP."
     return message

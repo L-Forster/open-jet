@@ -16,7 +16,6 @@ from src.self_update import (
     update_from_latest_release,
 )
 from src.config import MANAGED_MODELS_DIR
-from src.hardware import HardwareInfo
 
 
 class SelfUpdateTests(unittest.TestCase):
@@ -235,7 +234,7 @@ class SelfUpdateTests(unittest.TestCase):
             ):
                 update_from_latest_release(current_version="0.3.0")
 
-    def test_update_from_latest_release_syncs_managed_llama_cpp_when_present(self) -> None:
+    def test_update_from_latest_release_does_not_source_build_managed_llama_cpp(self) -> None:
         update = RepoUpdateInfo(
             remote="origin",
             branch="master",
@@ -250,7 +249,7 @@ class SelfUpdateTests(unittest.TestCase):
             side_effect=lambda *args: "src/app.py\n" if args == ("diff", "--name-only", update.local_commit, update.remote_commit) else None,
         ), patch(
             "src.self_update._sync_managed_llama_cpp_after_update",
-            return_value="cad2d38",
+            return_value=None,
         ) as sync_llama, patch(
             "src.self_update._migrate_config_after_update",
             return_value=False,
@@ -259,40 +258,17 @@ class SelfUpdateTests(unittest.TestCase):
 
         self.assertEqual(
             message,
-            "Updated open-jet repo from 1111111 to aaaaaaa. Synced managed llama.cpp to cad2d38.",
+            "Updated open-jet repo from 1111111 to aaaaaaa.",
         )
         sync_llama.assert_called_once_with()
         self.assertEqual(run_mock.call_count, 2)
 
-    def test_sync_managed_llama_cpp_after_update_fetches_target_ref_without_recloning(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            llama_dir = Path(tmp) / "llama.cpp"
-            (llama_dir / ".git").mkdir(parents=True)
-            calls: list[list[str]] = []
+    def test_sync_managed_llama_cpp_after_update_does_not_run_source_build(self) -> None:
+        with patch("src.self_update.subprocess.run") as run_mock:
+            synced = _sync_managed_llama_cpp_after_update()
 
-            def fake_run(command, *args, **kwargs):
-                calls.append(list(command))
-                return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-            with patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
-                "src.provisioning.managed_llama_cpp_ref",
-                return_value="b9442",
-            ), patch(
-                "src.hardware.detect_hardware_info",
-                return_value=HardwareInfo(label="CPU", total_ram_gb=16.0, has_cuda=False),
-            ), patch(
-                "src.self_update._llama_git_output",
-                return_value="1111111222222333333444444555555666666777",
-            ), patch(
-                "src.self_update.shutil.which",
-                return_value="/usr/bin/cmake",
-            ), patch("src.self_update.subprocess.run", side_effect=fake_run):
-                synced = _sync_managed_llama_cpp_after_update()
-
-        self.assertEqual(synced, "b9442")
-        self.assertFalse(any("clone" in command for command in calls))
-        self.assertTrue(any("fetch" in command and "--depth=1" in command and "b9442" in command for command in calls))
-        self.assertTrue(any(command[-2:] == ["--detach", "FETCH_HEAD"] for command in calls))
+        self.assertIsNone(synced)
+        run_mock.assert_not_called()
 
     def test_update_from_latest_release_migrates_model_config_after_repo_update(self) -> None:
         update = RepoUpdateInfo(
