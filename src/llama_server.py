@@ -82,7 +82,7 @@ class LlamaServerClient:
         self.gpu_layers = max(0, int(gpu_layers))
         self.llama_cpu_moe = bool(llama_cpu_moe)
         self.llama_n_cpu_moe = max(0, int(llama_n_cpu_moe))
-        self.llama_mtp = bool(llama_mtp)
+        self.llama_mtp = bool(llama_mtp) or Path(str(model)).stem.lower().endswith("-mtp")
         self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=30.0))

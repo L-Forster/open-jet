@@ -968,7 +968,7 @@ class OpenJetApp:
     def _has_any_configured_model(self) -> bool:
         return bool(self._active_model_ref())
 
-    async def _init_client(self) -> None:
+    async def _init_client(self, *, persist_config_updates: bool = True) -> None:
         await self._close_mcp_manager()
         mem_cfg = self.cfg.get("memory_guard", {})
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
@@ -997,7 +997,8 @@ class OpenJetApp:
             self.cfg["context_window_tokens"] = self.client.context_window_tokens
             self.cfg["gpu_layers"] = self.client.gpu_layers
             sync_active_model_profile(self.cfg)
-            save_config(self.cfg)
+            if persist_config_updates:
+                save_config(self.cfg)
         self.agent = Agent(
             client=self.client,
             system_prompt=system_prompt,
@@ -1154,16 +1155,13 @@ class OpenJetApp:
         self._render_token_counter()
 
         apply_model_profile(self.cfg, selected)
-        save_config(self.cfg)
         try:
             resolved = await self._materialize_setup_model(dict(self.cfg), log)
             self._persist_setup_result({**resolved, "model_profile_name": selected["name"]})
-            save_config(self.cfg)
         except Exception as exc:
             self.cfg = previous_cfg
-            save_config(self.cfg)
             try:
-                await self._init_client()
+                await self._init_client(persist_config_updates=False)
                 if previous_session is not None:
                     self._apply_session_payload(
                         previous_session,
@@ -1185,14 +1183,13 @@ class OpenJetApp:
         status.update(f"[bold {ACCENT_GREEN}]loading {escape(model_name)}...[/]")
         status.remove_class("hidden")
         try:
-            await self._init_client()
+            await self._init_client(persist_config_updates=False)
         except Exception as exc:
             status.update("")
             status.add_class("hidden")
             self.cfg = previous_cfg
-            save_config(self.cfg)
             try:
-                await self._init_client()
+                await self._init_client(persist_config_updates=False)
                 if previous_session is not None:
                     self._apply_session_payload(
                         previous_session,

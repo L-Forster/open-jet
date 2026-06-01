@@ -1929,7 +1929,7 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         app.loaded_files = {"README.md": {"path": "README.md", "content": "loaded"}}
 
-        async def init_new_client() -> None:
+        async def init_new_client(**_kwargs: object) -> None:
             app.client = SimpleNamespace(context_window_tokens=272000, gpu_layers=0, close=AsyncMock())
             app.agent = SimpleNamespace(
                 system_prompt="new system",
@@ -1976,7 +1976,7 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         app.loaded_files = {"README.md": {"path": "README.md", "content": "loaded"}}
 
-        async def restore_runtime() -> None:
+        async def restore_runtime(**_kwargs: object) -> None:
             app.client = SimpleNamespace(context_window_tokens=4096, gpu_layers=99, close=AsyncMock())
             app.agent = SimpleNamespace(
                 system_prompt="system",
