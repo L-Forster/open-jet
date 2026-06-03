@@ -3259,9 +3259,14 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
             )
 
         cmd = create_proc.await_args.args
-        self.assertIn("--spec-default", cmd)
+        self.assertNotIn("--spec-default", cmd)
         self.assertEqual(cmd[cmd.index("--spec-type") + 1], "draft-mtp")
         self.assertEqual(cmd[cmd.index("--spec-draft-n-max") + 1], "3")
+
+    def test_mtp_model_name_enables_speculative_decoding(self) -> None:
+        client = LlamaServerClient(model="/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
+
+        self.assertTrue(client.llama_mtp)
 
 class DebugPromptLoggingTests(unittest.TestCase):
     def test_prepare_turn_context_saves_full_runtime_messages_in_debug_mode(self) -> None:

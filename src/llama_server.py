@@ -24,7 +24,6 @@ _JETSON_VMM_RESERVE_MB = "4096"
 _LLAMA_SERVER_EXE_NAME = "llama-server.exe" if os.name == "nt" else "llama-server"
 _FULL_OFFLOAD_GPU_LAYERS = 99
 _MTP_SPEC_ARGS: tuple[str, ...] = (
-    "--spec-default",
     "--spec-type",
     "draft-mtp",
     "--spec-draft-n-max",

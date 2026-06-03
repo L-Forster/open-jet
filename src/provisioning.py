@@ -55,6 +55,7 @@ LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 LLAMA_CPP_PINNED_REF = "b9442"
+LLAMA_CPP_MTP_REF = "b9442"
 UNIFIED_MEMORY_SYSTEM_RESERVE_MB = 4096.0
 
 
@@ -105,7 +106,7 @@ def managed_llama_cpp_ref() -> str:
 def _normalized_llama_cpp_ref(ref: str) -> str:
     stripped = str(ref or "").strip()
     if stripped in {"mtp", "qwen-mtp", "qwen3.6-mtp", "pull/22673/head", "refs/pull/22673/head", "mtp-pr"}:
-        return LLAMA_CPP_PINNED_REF
+        return LLAMA_CPP_MTP_REF
     return stripped
 
 
@@ -129,7 +130,11 @@ def _setup_uses_mtp_model(setup_result: Mapping[str, Any]) -> bool:
 
 
 def _llama_cpp_ref_for_setup(setup_result: Mapping[str, Any]) -> str:
-    del setup_result
+    if _setup_uses_mtp_model(setup_result):
+        return LLAMA_CPP_MTP_REF
+    explicit = _normalized_llama_cpp_ref(str(setup_result.get("llama_cpp_ref") or ""))
+    if explicit:
+        return explicit
     return managed_llama_cpp_ref()
 
 
@@ -341,6 +346,7 @@ def recommend_direct_model(
         "kv_bytes_per_token": kv_bytes_per_token,
         "llama_cpu_moe": bool(selected.get("llama_cpu_moe", False)),
         "llama_n_cpu_moe": int(selected.get("llama_n_cpu_moe", 0) or 0),
+        "llama_cpp_ref": str(selected.get("llama_cpp_ref") or ""),
         "llama_mtp": _model_path_looks_mtp(filename) or bool(selected.get("llama_mtp", False)),
         "unified_memory_only": bool(selected.get("unified_memory_only", False)),
         "context_window_tokens": _context_window_for_model(
@@ -711,7 +717,7 @@ def _needs_rebuild(hardware_info: HardwareInfo, existing_binary: str, *, device:
         ldd_output = os.popen(f"ldd {shlex.quote(existing_binary)} 2>/dev/null").read().lower()
     except Exception:
         return False
-    if desired_device == "cuda" and "libcuda" not in ldd_output:
+    if desired_device == "cuda" and "cuda" not in ldd_output:
         return True
     if desired_device == "vulkan" and "libvulkan" not in ldd_output:
         return True
@@ -802,14 +808,25 @@ def _source_build_matches(
         ref_matches = _source_checkout_ref_matches(required_ref)
     if not ref_matches:
         return False
+    wanted_device = (desired_device or "").strip().lower()
     tagged_device = tag.get("device", "").strip().lower()
-    desired = (desired_device or "").strip().lower()
-    if tagged_device in {"cpu", "cuda", "vulkan", "rocm", "metal"} and desired and tagged_device != desired:
+    if wanted_device and tagged_device and tagged_device != wanted_device:
         return False
-    # The managed build tag is written only after a successful source build.
-    # Do not opportunistically rebuild a matching ref just because launch-time
-    # hardware preferences changed.
+    if wanted_device and not tagged_device and _needs_rebuild(hardware_info, str(binary), device=wanted_device):
+        return False
     return True
+
+
+def _source_build_default_device(hardware_info: HardwareInfo) -> str | None:
+    if hardware_info.has_cuda:
+        return "cuda"
+    if hardware_info.has_vulkan:
+        return "vulkan"
+    if hardware_info.has_rocm:
+        return "rocm"
+    if hardware_info.has_metal:
+        return "metal"
+    return None
 
 
 def _llama_build_command(jobs: int) -> list[str]:
@@ -922,27 +939,21 @@ def _installed_llama_server_tag() -> str | None:
         return None
 
 
-async def _fetch_release_tag_and_assets(target_ref: str | None = None) -> tuple[str, list[dict[str, Any]]]:
-    ref = _normalized_llama_cpp_ref(target_ref or "").strip()
-    endpoint = (
-        f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{ref}"
-        if ref
-        else LLAMA_CPP_RELEASES_API
-    )
+async def _fetch_latest_release_tag_and_assets() -> tuple[str, list[dict[str, Any]]]:
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
         headers = {"Accept": "application/vnd.github+json"}
         token = os.environ.get("GITHUB_TOKEN", "").strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        response = await client.get(endpoint, headers=headers)
+        response = await client.get(LLAMA_CPP_RELEASES_API, headers=headers)
         response.raise_for_status()
         payload = response.json()
     tag = str(payload.get("tag_name") or "").strip()
     if not tag:
-        raise RuntimeError("llama.cpp release is missing tag_name.")
+        raise RuntimeError("llama.cpp latest release is missing tag_name.")
     assets = payload.get("assets") or []
     if not isinstance(assets, list):
-        raise RuntimeError("llama.cpp release returned malformed assets.")
+        raise RuntimeError("llama.cpp latest release returned malformed assets.")
     return tag, assets
 
 
@@ -1040,7 +1051,6 @@ def _install_from_archive(archive_path: Path) -> Path:
 async def _install_prebuilt_llama_server(
     hardware_info: HardwareInfo,
     *,
-    target_ref: str | None = None,
     log: Any,
     set_status: Callable[[str], None],
 ) -> tuple[Path, str, str | None] | None:
@@ -1048,7 +1058,7 @@ async def _install_prebuilt_llama_server(
     if not candidates:
         return None
     try:
-        tag, assets = await _fetch_release_tag_and_assets(target_ref)
+        tag, assets = await _fetch_latest_release_tag_and_assets()
     except Exception as exc:
         log.write(f"  [dim]Could not reach llama.cpp releases API ({exc}).[/]")
         return None
@@ -1154,9 +1164,8 @@ async def ensure_llama_server(
     required_ref = _llama_cpp_ref_for_setup(setup_result)
     requires_mtp_runtime = _setup_uses_mtp_model(setup_result) or _is_mtp_llama_cpp_ref(required_ref)
     configured_device = str(setup_result.get("device") or "").strip().lower() or None
-    desired_device = configured_device or None
-    if prebuilt_device:
-        desired_device = prebuilt_device
+    source_desired_device = configured_device or _source_build_default_device(hardware_info)
+    prebuilt_desired_device = prebuilt_device or configured_device
     configured_server = _configured_llama_server_path(setup_result)
     if configured_server:
         merged = dict(setup_result)
@@ -1166,14 +1175,27 @@ async def ensure_llama_server(
         if configured_device:
             merged["device"] = configured_device
         return merged
-
+    if _source_build_matches(
+        hardware_info=hardware_info,
+        required_ref=required_ref,
+        desired_device=source_desired_device,
+    ):
+        source_device = _source_build_device(source_desired_device)
+        merged = dict(setup_result)
+        merged["llama_server_path"] = str(_managed_source_llama_server_path())
+        merged["setup_missing_runtime"] = False
+        merged["llama_cpp_ref"] = required_ref
+        if source_device:
+            merged["device"] = source_device
+        return merged
     # Cache hit: managed binary + tag file present and binary doesn't need a GPU rebuild.
     if (
-        LLAMA_SERVER_BIN.is_file()
-        and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN), device=desired_device)
+        not requires_mtp_runtime
+        and LLAMA_SERVER_BIN.is_file()
+        and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN), device=prebuilt_desired_device)
     ):
         cached_tag = _installed_llama_server_tag()
-        if cached_tag == required_ref or not requires_mtp_runtime:
+        if cached_tag:
             merged = dict(setup_result)
             merged["llama_server_path"] = str(LLAMA_SERVER_BIN)
             merged["setup_missing_runtime"] = False
@@ -1192,7 +1214,7 @@ async def ensure_llama_server(
         not requires_mtp_runtime
         and existing
         and not existing_is_source_managed
-        and not _needs_rebuild(hardware_info, existing, device=desired_device)
+        and not _needs_rebuild(hardware_info, existing, device=prebuilt_desired_device)
     ):
         merged = dict(setup_result)
         merged["llama_server_path"] = existing
@@ -1203,12 +1225,13 @@ async def ensure_llama_server(
 
     rebuilding = existing is not None
 
-    prebuilt = await _install_prebuilt_llama_server(
-        hardware_info,
-        target_ref=required_ref,
-        log=log,
-        set_status=set_status,
-    )
+    prebuilt = None
+    if not requires_mtp_runtime:
+        prebuilt = await _install_prebuilt_llama_server(
+            hardware_info,
+            log=log,
+            set_status=set_status,
+        )
     if prebuilt is not None:
         clear_status()
         if len(prebuilt) == 2:
@@ -1224,26 +1247,12 @@ async def ensure_llama_server(
             merged["device"] = runtime_device
         return merged
 
-    if _source_build_matches(
-        hardware_info=hardware_info,
-        required_ref=required_ref,
-        desired_device=desired_device,
-    ):
-        source_device = _source_build_device(configured_device or desired_device)
-        merged = dict(setup_result)
-        merged["llama_server_path"] = str(_managed_source_llama_server_path())
-        merged["setup_missing_runtime"] = False
-        merged["llama_cpp_ref"] = required_ref
-        if source_device:
-            merged["device"] = source_device
-        return merged
-
     if sys.platform == "darwin":
         raise RuntimeError("Failed to install the macOS prebuilt llama-server.")
 
     built, synced_ref = await _build_llama_server_from_source(
         hardware_info=hardware_info,
-        device=desired_device,
+        device=source_desired_device,
         target_ref=required_ref,
         rebuilding=rebuilding,
         log=log,
@@ -1254,8 +1263,8 @@ async def ensure_llama_server(
     merged["llama_server_path"] = str(built)
     merged["setup_missing_runtime"] = False
     merged["llama_cpp_ref"] = synced_ref
-    if desired_device:
-        merged["device"] = desired_device
+    if source_desired_device:
+        merged["device"] = source_desired_device
     return merged
 
 
