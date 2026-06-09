@@ -10,25 +10,39 @@
 
 <br />
 
-<h1 align="center">A local AI agent for your own machine</h1>
+<h1 align="center">The local agent for your own GPU</h1>
 
 <h3 align="center">
-  The easiest and fastest way to get a useful local agent running.
+  Files -> tools -> shell approval -> workflows -> local model.
 </h3>
 
 <p align="center">
-  OpenJet sets up the local model backend for your hardware and gives you an agent that can work with files, run commands, use tools, and connect to local devices fully on your own machine.
+  OpenJet runs the agent loop locally. No API calls. No code or data upload.
+</p>
+
+<p align="center">
+  RTX 3090 + Qwen 27B: <strong>33 tok/s -> 70 tok/s</strong> with MTP. Open source.
 </p>
 
 <p align="center">
   <a href="https://discord.com/invite/pspKHtExSa">Discord</a>
 </p>
 
-If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config.
+Someone built a local AI agent that runs on your own GPU.
 
-If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
+OpenJet runs the agent loop locally:
 
-OpenJet is built for people looking for an **easy local LLM setup, a self-hosted AI agent, or a private automation environment that runs on their own hardware.**
+```text
+files -> tools -> shell approval -> workflows -> local model
+```
+
+No API calls. No code or data upload.
+
+RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP.
+
+Open source.
+
+If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config. If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
 
 ## Install
 
@@ -101,20 +115,21 @@ from openjet.sdk import OpenJetSession, recommend_hardware_config
 |---|---|
 | **Easy local LLM setup** | Get a working local agent without manually learning the entire backend and runtime stack first |
 | **Unified backend + harness** | One local system instead of separately wiring together a model runtime, config layer, frontend, and agent workflow |
-| **Agent workflow in the terminal** | Work with files, run commands, connect tools, and keep context across sessions instead of using a plain chat window |
+| **Local agent loop** | Work with files, approve shell commands, connect tools, and iterate against a local model |
 | **Hardware-aware setup** | OpenJet picks sensible defaults for your machine instead of leaving you to trial-and-error every setting |
-| **Fully local** | Your data, files, and workflows stay on your machine, with no cloud dependency required |
+| **No API calls or data upload** | Keep the agent loop on your machine instead of sending work to a hosted model provider |
 | **Remote execution support** | Run the model on one machine and execute on another |
 | **SDK + benchmarks included** | Script the same runtime from Python and measure performance on your own hardware |
 
-## How it compares
+## What OpenJet combines
 
-| Tool | Backend setup | Local runtime provisioning | Hardware auto-config | Terminal agent | Memory persistence |
-| --- | --- | --- | --- | --- | --- |
-| OpenJet | Built in: install + `openjet setup` | Yes: model discovery/download + `llama.cpp` config | Yes | Full TUI | Yes: global + project memory |
-| Aider | Manual: choose API, local endpoint, or provider config | No | No | Terminal chat | No persistent agent memory |
-| Cline | Manual: extension/CLI plus provider or local model config | No | No | Editor-first; CLI available | Yes: Memory Bank/rules |
-| OpenCode | Manual: install CLI plus provider/local model config | No | No | Full TUI | Sessions/config persist |
+| Layer | What OpenJet provides |
+| --- | --- |
+| Local model runtime | Model discovery, download, and `llama.cpp` configuration |
+| Agent interface | Terminal TUI for file work, commands, tools, and session continuity |
+| Hardware setup | RAM / VRAM profiling and sensible defaults for the current machine |
+| Workflow harness | Repeatable runs from the CLI, SDK, or background workflow runner |
+| Device and tool access | MCP tools, cameras, microphones, GPIO, and remote execution targets |
 
 ## What you get
 
@@ -125,6 +140,9 @@ An agent in your terminal that can actually do useful work:
 
 - **Run shell commands**  
   Explicit approval before commands execute
+
+- **Run workflows and checks**  
+  Let the agent inspect results, update files, and try again against the local model
 
 - **Resume sessions**  
   Close the terminal, come back later, keep going
@@ -168,9 +186,9 @@ openjet benchmark --sweep
 
 ## Why this exists
 
-Cloud agents need API keys, send your data to someone else's server, and charge per token.
+Cloud agents need API keys, send your work to someone else's server, and charge per token.
 
-Most local tools stop at chat. You can run a model, but you still do not have a real agent workflow for files, commands, tools, devices, and repeatable automation.
+Most local tools stop at chat. You can run a model, but you still do not have a real agent loop for files, commands, tools, devices, and repeatable workflows.
 
 OpenJet closes that gap. It is built for people who want the speed, control, and privacy of local LLMs without becoming experts in runtimes, config, and frontend/backend glue just to get started.
 

@@ -1,18 +1,30 @@
 # OpenJet
 
-## A local AI agent for your own machine
+## The local agent for your own GPU
 
-**The easiest and fastest way to get a useful local agent running.**
+**Files -> tools -> shell approval -> workflows -> local model.**
 
-OpenJet sets up the local model backend for your hardware and gives you an agent that can work with files, run commands, use tools, and connect to local devices fully on your own machine.
+OpenJet runs the agent loop locally. No API calls. No code or data upload.
+
+RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP. Open source.
 
 [Discord](https://discord.gg/pspKHtExSa)
 
-If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config.
+Someone built a local AI agent that runs on your own GPU.
 
-If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
+OpenJet runs the agent loop locally:
 
-OpenJet is built for people looking for an **easy local LLM setup, a self-hosted AI agent, or a private automation environment that runs on their own hardware.**
+```text
+files -> tools -> shell approval -> workflows -> local model
+```
+
+No API calls. No code or data upload.
+
+RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP.
+
+Open source.
+
+If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config. If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
 
 This is the PyPI package for OpenJet. Install it with:
 
@@ -51,6 +63,7 @@ The CLI is a full terminal agent that can:
 
 - **Work with local files** — search, read, create, and update files in your projects
 - **Run shell commands** — with explicit approval before execution
+- **Run workflows and checks** — inspect results, update files, and try again against the local model
 - **Resume sessions** — close the terminal and pick up where you left off
 - **Work on constrained hardware** — automatic context condensing and model unload/reload around heavy tasks
 - **Connect to devices** — cameras, microphones, GPIO, and remote devices for edge and embedded workflows
