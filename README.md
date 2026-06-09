@@ -10,14 +10,14 @@
 
 <br />
 
-<h1 align="center">Claude Code for local LLMs</h1>
+<h1 align="center">A local AI agent for your own machine</h1>
 
 <h3 align="center">
-  The easiest and fastest way to get a local coding agent running.
+  The easiest and fastest way to get a useful local agent running.
 </h3>
 
 <p align="center">
-  OpenJet sets up the local model backend for your hardware and gives you a Claude-Code-style coding agent that can read files, edit code, and run commands fully on your own machine.
+  OpenJet sets up the local model backend for your hardware and gives you an agent that can work with files, run commands, use tools, and connect to local devices fully on your own machine.
 </p>
 
 <p align="center">
@@ -26,9 +26,9 @@
 
 If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config.
 
-If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual coding agent, OpenJet removes that setup tax.
+If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
 
-OpenJet is built for people looking for a **Claude Code alternative, easy local LLM setup, or a self-hosted local coding agent.**
+OpenJet is built for people looking for an **easy local LLM setup, a self-hosted AI agent, or a private automation environment that runs on their own hardware.**
 
 ## Install
 
@@ -99,11 +99,11 @@ from openjet.sdk import OpenJetSession, recommend_hardware_config
 
 | What it does | Why it matters |
 |---|---|
-| **Easy local LLM setup** | Get a working local coding agent without manually learning the entire backend and runtime stack first |
+| **Easy local LLM setup** | Get a working local agent without manually learning the entire backend and runtime stack first |
 | **Unified backend + harness** | One local system instead of separately wiring together a model runtime, config layer, frontend, and agent workflow |
-| **Claude-Code-style workflow** | Read files, edit code, run commands, and work in a terminal agent instead of a plain chat window |
+| **Agent workflow in the terminal** | Work with files, run commands, connect tools, and keep context across sessions instead of using a plain chat window |
 | **Hardware-aware setup** | OpenJet picks sensible defaults for your machine instead of leaving you to trial-and-error every setting |
-| **Fully local** | Your code stays on your machine, with no cloud dependency required |
+| **Fully local** | Your data, files, and workflows stay on your machine, with no cloud dependency required |
 | **Remote execution support** | Run the model on one machine and execute on another |
 | **SDK + benchmarks included** | Script the same runtime from Python and measure performance on your own hardware |
 
@@ -120,8 +120,8 @@ from openjet.sdk import OpenJetSession, recommend_hardware_config
 
 An agent in your terminal that can actually do useful work:
 
-- **Read and edit your code**  
-  Search files, apply edits, and write new ones
+- **Work with local files**  
+  Search, read, create, and update files in your projects
 
 - **Run shell commands**  
   Explicit approval before commands execute
@@ -135,7 +135,8 @@ An agent in your terminal that can actually do useful work:
 - **Connect to devices**  
   Cameras, microphones, GPIO, and remote devices for edge and embedded workflows
 
-- **Connect MCP tools** - optionally expose trusted MCP server tools through OpenJet's normal tool registry
+- **Connect tools**  
+  Expose trusted MCP server tools through OpenJet's normal tool registry
 
 - **Use the Python SDK**  
   Automate the same runtime from scripts and external apps
@@ -167,9 +168,9 @@ openjet benchmark --sweep
 
 ## Why this exists
 
-Cloud coding agents need API keys, send your code to someone else's server, and charge per token.
+Cloud agents need API keys, send your data to someone else's server, and charge per token.
 
-Most local tools stop at chat. You can run a model, but you still do not have a real coding workflow.
+Most local tools stop at chat. You can run a model, but you still do not have a real agent workflow for files, commands, tools, devices, and repeatable automation.
 
 OpenJet closes that gap. It is built for people who want the speed, control, and privacy of local LLMs without becoming experts in runtimes, config, and frontend/backend glue just to get started.
 
@@ -214,8 +215,8 @@ Benchmarkers and testers are appreciated.
 
 ## License
 
-OpenJet core is licensed under `Apache-2.0`.
+OpenJet core is licensed under `AGPL-3.0-only`.
 
-That means individual developers and companies can use, modify, and embed the core SDK and CLI freely under the Apache terms. Future paid offerings for hosted, team, or enterprise functionality may be shipped separately under commercial terms.
+That means individual developers and companies can use, modify, and redistribute the core SDK and CLI under the GNU Affero General Public License v3.0 terms, including its network-use source availability requirements. Future paid offerings for hosted, team, or enterprise functionality may be shipped separately under commercial terms.
 
 External contributions are accepted under the contributor terms in [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md).

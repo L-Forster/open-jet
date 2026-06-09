@@ -19,7 +19,7 @@ class SkillsParserTests(unittest.TestCase):
                 "description: Review SQL migrations safely.\n"
                 "version: 1.2.3\n"
                 "author: OpenJet\n"
-                "license: Apache-2.0\n"
+                "license: AGPL-3.0-only\n"
                 "platforms: [linux, macos]\n"
                 "required_environment_variables: [DATABASE_URL]\n"
                 "allowed-tools: [read_file, grep]\n"

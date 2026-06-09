@@ -16,7 +16,7 @@ contribution as part of OpenJet and related products or services.
 
 This includes the right to use your contribution in:
 
-- the Apache-2.0 open source repository
+- the AGPL-3.0-only open source repository
 - commercial editions
 - hosted or managed services
 - enterprise offerings
