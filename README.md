@@ -2,7 +2,7 @@
 
 ![Stars](https://img.shields.io/github/stars/L-Forster/open-jet)
 ![License](https://img.shields.io/github/license/L-Forster/open-jet)
-![Terminal-Bench 2.0](https://img.shields.io/badge/Terminal--Bench%202.0-59.3-blue)
+![Qwen3.6-27B Terminal-Bench 2.0](https://img.shields.io/badge/Qwen3.6--27B%20Terminal--Bench%202.0-59.3-blue)
 
 <p align="center">
   <img width="1672" height="941" alt="OpenJet screenshot" src="https://github.com/user-attachments/assets/b06b0b8f-1bbc-443d-920e-bd70bff1479c" />
@@ -28,19 +28,20 @@
   <a href="https://discord.com/invite/pspKHtExSa">Discord</a>
 </p>
 
-Someone built a local AI agent that runs on your own GPU.
-
-OpenJet runs the agent loop locally:
-
-```text
-files -> tools -> shell approval -> workflows -> local model
+```bash
+pipx install open-jet
+openjet setup
 ```
 
+Setup profiles your hardware, picks a model that fits, downloads it, configures `llama.cpp`, and drops you into the agent. Then run `openjet`.
+
+## Built for small models, not shrunk down from big ones
+
+Most coding agents assume a frontier model with a huge context window, then let you point them at a local endpoint. OpenJet assumes the opposite: a model that fits on your GPU, with limited context that drifts over a long task.
+
+So the harness does the work — `chat` / `code` / `review` / `debug` modes, step-oriented state that persists across turns, project and skill docs loaded into bounded turn context, automatic context condensing, and model unload/reload on constrained hardware. The point is that the loop still knows what it is doing at step twenty.
+
 No API calls. No code or data upload.
-
-RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP.
-
-Open source.
 
 If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config. If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
 
