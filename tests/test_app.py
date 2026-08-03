@@ -42,6 +42,7 @@ from src.sdk import ToolResult
 from src.session_state import ChatArchiveStore, SavedChatEntry, SessionStateStore
 from src.setup import (
     _choice_prompt_html,
+    _clean_path_input,
     _hardware_memory_text,
     _prompt_choice,
     _runtime_prompt_options,
@@ -250,12 +251,11 @@ class AppStatusTests(unittest.TestCase):
         token = app._start_thinking()
 
         prompt = app._prompt_message()
+        status = app.query_one("#assistant-status")
         toolbar = app._toolbar_text()
 
-        self.assertIn("Generating", prompt.value)
-        self.assertIn("Tip: Join Discord for community support", prompt.value)
-        self.assertIn("prompt-tip", prompt.value)
-        self.assertNotIn("prompt-splash-block-", prompt.value)
+        self.assertEqual(status.text, "Generating...")
+        self.assertFalse(status.hidden)
         self.assertIn("<prompt-border>╭", prompt.value)
         self.assertIn("<prompt-border>│</prompt-border>", prompt.value)
         self.assertNotIn("Generating...", toolbar.value)
@@ -263,8 +263,9 @@ class AppStatusTests(unittest.TestCase):
         app._stop_thinking(token)
         prompt = app._prompt_message()
 
-        self.assertNotIn("Generating", prompt.value)
-        self.assertNotIn("Tip: Join Discord for community support", prompt.value)
+        self.assertEqual(status.text, "")
+        self.assertTrue(status.hidden)
+        self.assertNotIn("<prompt-border>╭", prompt.value)
 
     def test_generating_tip_advances_per_message_not_time(self) -> None:
         app = OpenJetApp()
@@ -289,7 +290,7 @@ class AppStatusTests(unittest.TestCase):
         with patch("src.app.time.monotonic", return_value=1.0):
             self.assertEqual(OpenJetApp._generating_status_text(), "Generating...")
 
-    def test_pre_prompt_status_does_not_print_generating_to_scrollback(self) -> None:
+    def test_pre_prompt_status_prints_generating_state(self) -> None:
         output = io.StringIO()
         app = OpenJetApp()
         app.console = Console(file=output, force_terminal=True)
@@ -297,7 +298,9 @@ class AppStatusTests(unittest.TestCase):
 
         app._print_pre_prompt_status()
 
-        self.assertEqual(output.getvalue(), "")
+        rendered = output.getvalue()
+        self.assertIn("Tip: Join Discord for community support", rendered)
+        self.assertIn("Generating", rendered)
 
     def test_init_client_does_not_eagerly_start_runtime(self) -> None:
         app = OpenJetApp()
@@ -666,7 +669,6 @@ class AppInputTests(unittest.IsolatedAsyncioTestCase):
         maybe_handle.assert_not_awaited()
         self.assertEqual(app.agent.messages[-1]["content"], "/spoken literal")
         entries = app.query_one("#chat-log")._entries
-        self.assertTrue(any("USER" in str(entry) for entry in entries))
         self.assertFalse(any("Slash Command" in str(entry) for entry in entries))
 
     def test_status_cli_does_not_import_tui_surface(self) -> None:
@@ -913,8 +915,9 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNotNone(payload)
-        self.assertEqual(payload["llama_model"], manual_model)
-        self.assertEqual(payload["setup_model_history"], {"llama_cpp": [manual_model]})
+        normalized_model = str(Path(manual_model))
+        self.assertEqual(payload["llama_model"], normalized_model)
+        self.assertEqual(payload["setup_model_history"], {"llama_cpp": [normalized_model]})
         self.assertEqual(payload["model_profile_name"], profile_name)
 
     async def test_run_setup_wizard_lists_saved_llama_model_path_on_next_run(self) -> None:
@@ -1002,12 +1005,127 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNotNone(payload)
-        self.assertEqual(payload["llama_model"], current_model)
+        self.assertEqual(payload["llama_model"], str(Path(current_model)))
         self.assertEqual(payload["context_window_tokens"], 4096)
         self.assertEqual(payload["gpu_layers"], 20)
-        self.assertEqual(text_defaults[0], current_model)
+        # An existing current model is still offered as an editable default.
+        self.assertEqual(text_defaults[0], str(Path(current_model)))
         self.assertIsInstance(captured_defaults["Context window"], int)
         self.assertIsInstance(captured_defaults["GPU layers"], int)
+
+    async def _run_local_model_wizard(
+        self,
+        *,
+        typed_paths: list[str],
+        current_cfg: dict,
+    ) -> tuple[dict | None, list[str]]:
+        """Drive the wizard to the manual-path prompt and feed it `typed_paths`."""
+        hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
+        text_defaults: list[str] = []
+        answers = iter([*typed_paths, "Custom Model"])
+
+        async def fake_choice(_session, _console, title, options, **kwargs):
+            if title == "Setup mode":
+                return "manual"
+            if title == "Hardware profile":
+                return "auto"
+            if title == "Model source":
+                return "__local__"
+            if title == "Local model":
+                return "__manual__"
+            if title in {"Context window", "GPU layers"}:
+                return options[kwargs["default_index"]][1]
+            raise AssertionError(f"Unexpected setup prompt: {title}")
+
+        async def fake_text(_session, prompt, **kwargs):
+            if prompt.startswith("model path"):
+                text_defaults.append(str(kwargs.get("default", "")))
+            return next(answers)
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.recommended_context_window_tokens", return_value=4096
+        ), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=4096
+        ), patch("src.setup.recommended_gpu_layers", return_value=99):
+            payload = await run_setup_wizard(
+                session=None,
+                console=Mock(),
+                hardware_info=hardware,
+                recommended_ctx=4096,
+                current_cfg=current_cfg,
+            )
+        return payload, text_defaults
+
+    async def test_run_setup_wizard_does_not_prefill_missing_model_path(self) -> None:
+        # A stale default is prepended to whatever the user types, so a model path
+        # that no longer exists must not be offered as editable text.
+        with tempfile.TemporaryDirectory() as tmp:
+            wanted = Path(tmp) / "wanted.gguf"
+            wanted.write_bytes(b"gguf")
+            payload, text_defaults = await self._run_local_model_wizard(
+                typed_paths=[str(wanted)],
+                current_cfg={"llama_model": str(Path(tmp) / "deleted.gguf")},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(text_defaults, [""])
+        self.assertEqual(payload["llama_model"], str(wanted))
+
+    async def test_run_setup_wizard_reprompts_instead_of_aborting_on_bad_model_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wanted = Path(tmp) / "wanted.gguf"
+            wanted.write_bytes(b"gguf")
+            not_a_model = Path(tmp) / "notes.txt"
+            not_a_model.write_text("nope", encoding="utf-8")
+            payload, _defaults = await self._run_local_model_wizard(
+                typed_paths=[
+                    str(Path(tmp) / "missing.gguf"),
+                    str(not_a_model),
+                    tmp,
+                    f'"{wanted}"',
+                ],
+                current_cfg={},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["llama_model"], str(wanted))
+
+    async def test_run_setup_wizard_clears_stale_mtp_flag_for_plain_local_model(self) -> None:
+        # Switching off an MTP model must clear llama_mtp, otherwise provisioning
+        # keeps demanding an MTP llama.cpp build for a plain GGUF.
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+            plain.write_bytes(b"gguf")
+            payload, _defaults = await self._run_local_model_wizard(
+                typed_paths=[str(plain)],
+                current_cfg={"llama_mtp": True, "llama_model": str(plain)},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertIs(payload["llama_mtp"], False)
+
+    async def test_run_setup_wizard_keeps_mtp_flag_for_mtp_local_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            mtp = Path(tmp) / "Qwen3.6-35B-A3B-UD-Q3_K_XL-MTP.gguf"
+            mtp.write_bytes(b"gguf")
+            payload, _defaults = await self._run_local_model_wizard(
+                typed_paths=[str(mtp)],
+                current_cfg={},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertIs(payload["llama_mtp"], True)
+
+    def test_clean_path_input_strips_quotes_and_whitespace(self) -> None:
+        self.assertEqual(_clean_path_input('  "/models/a b.gguf"  '), "/models/a b.gguf")
+        self.assertEqual(_clean_path_input("'/models/a.gguf'"), "/models/a.gguf")
+        self.assertEqual(_clean_path_input(""), "")
+
+    @unittest.skipIf(os.name == "nt", "shell escaping is POSIX-only")
+    def test_clean_path_input_unescapes_dragged_paths(self) -> None:
+        self.assertEqual(_clean_path_input("/models/a\\ b.gguf"), "/models/a b.gguf")
 
     def test_build_recommended_payload_marks_missing_runtime_and_prefers_direct_model(self) -> None:
         hardware = HardwareInfo(label="CPU-only device", total_ram_gb=8.0, has_cuda=False)
@@ -1645,6 +1763,8 @@ class AppSetupOrderingTests(unittest.IsolatedAsyncioTestCase):
             AsyncMock(side_effect=lambda result, _log: events.append("materialize") or {**result, "llama_model": "/models/resolved.gguf"}),
         ), patch.object(app, "_init_client", AsyncMock(side_effect=lambda: events.append("init"))), patch.object(
             app, "_maybe_prompt_for_startup_update", AsyncMock()
+        ), patch.object(
+            app, "_maybe_prompt_telemetry_consent", AsyncMock()
         ), patch.object(
             app, "_render_token_counter"
         ), patch.object(

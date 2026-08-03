@@ -143,9 +143,17 @@ class StartupUpdateFlowTests(unittest.IsolatedAsyncioTestCase):
             return_value="/models/demo.gguf",
         ), patch.object(
             app,
+            "_materialize_setup_model",
+            AsyncMock(side_effect=lambda payload, log: payload),
+        ), patch.object(
+            app,
             "_init_client",
             AsyncMock(side_effect=lambda: events.append("init")),
         ) as init_client, patch.object(
+            app,
+            "_maybe_prompt_telemetry_consent",
+            AsyncMock(),
+        ), patch.object(
             app,
             "_restore_harness_state",
         ), patch.object(

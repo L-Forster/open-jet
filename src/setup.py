@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 import shutil
 import textwrap
 from html import escape as html_escape
@@ -22,7 +23,13 @@ from .hardware import (
 )
 from .model_profiles import default_profile_name
 from .llama_server import _find_built_llama_binary
-from .provisioning import MODELS_DIR, OPENJET_HOME, UNIFIED_MEMORY_SYSTEM_RESERVE_MB, recommend_direct_model
+from .provisioning import (
+    MODELS_DIR,
+    OPENJET_HOME,
+    UNIFIED_MEMORY_SYSTEM_RESERVE_MB,
+    _model_path_looks_mtp,
+    recommend_direct_model,
+)
 from .setup_memory import recommend_context_window_for_model, recommend_setup_context_window
 
 if TYPE_CHECKING:
@@ -80,6 +87,54 @@ async def _prompt_text(
     if is_password:
         return getpass.getpass(prompt).strip()
     return input(f"{prompt}{default}").strip()
+
+
+def _clean_path_input(raw: str) -> str:
+    """Normalise a typed, pasted or drag-and-dropped filesystem path."""
+    value = str(raw or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        value = value[1:-1]
+    if os.name != "nt":
+        # Terminals backslash-escape spaces when a file is dragged onto them.
+        value = re.sub(r"\\(.)", r"\1", value)
+    return value.strip()
+
+
+async def _prompt_model_path(
+    session: PromptSession[object] | None,
+    console: Console,
+    current: str,
+    *,
+    attempts: int = 5,
+) -> Path:
+    """Ask for a .gguf path until a usable one is given, rather than aborting setup."""
+    current_file = Path(_clean_path_input(current)).expanduser() if current.strip() else None
+    keep_current = current_file is not None and current_file.is_file()
+    if current_file is not None:
+        suffix = "" if keep_current else " [missing]"
+        console.print(f"[dim]Current: {escape(str(current_file))}{suffix}[/]")
+        if keep_current:
+            console.print("[dim]Press Enter to keep it, or type a new path.[/]")
+    for _attempt in range(attempts):
+        # Only pre-fill a path worth editing: a stale default is prepended to
+        # whatever the user types next, which silently corrupts the input.
+        raw = await _prompt_text(session, "model path> ", default=str(current_file) if keep_current else "")
+        candidate = _clean_path_input(raw)
+        if not candidate:
+            if keep_current:
+                return current_file  # type: ignore[return-value]
+            console.print("[yellow]Enter the full path to a .gguf file.[/]")
+            continue
+        model_file = Path(candidate).expanduser()
+        if model_file.is_dir():
+            console.print(f"[yellow]{escape(str(model_file))} is a directory, not a .gguf file.[/]")
+        elif not model_file.is_file():
+            console.print(f"[yellow]No file at {escape(str(model_file))}.[/]")
+        elif model_file.suffix.lower() != ".gguf":
+            console.print(f"[yellow]{escape(model_file.name)} is not a .gguf file.[/]")
+        else:
+            return model_file
+    raise RuntimeError("No usable .gguf model path was provided.")
 
 
 def _choice_prompt_html(
@@ -741,16 +796,16 @@ async def run_setup_wizard(
             detail="Select a detected GGUF file or choose Manual path.",
         )
         if local_choice == "__manual__":
-            model_path = await _prompt_text(session, "model path> ", default=current_llama_model)
+            model_file = await _prompt_model_path(session, console, current_llama_model)
         else:
-            model_path = str(local_choice)
-        model_file = Path(model_path).expanduser()
-        if not model_file.is_file():
-            raise RuntimeError("Model file does not exist.")
-        if model_file.suffix.lower() != ".gguf":
-            raise RuntimeError("Model file must end with .gguf.")
+            model_file = Path(str(local_choice)).expanduser()
+            if not model_file.is_file():
+                raise RuntimeError(f"Model file does not exist: {model_file}")
         payload["model_source"] = "local"
         payload["llama_model"] = str(model_file)
+        # A previously selected MTP model leaves llama_mtp set; a plain GGUF must clear it
+        # or the runtime keeps demanding an MTP llama.cpp build.
+        payload["llama_mtp"] = _model_path_looks_mtp(model_file.name)
         _remember_model_ref(payload, current_cfg, "llama_cpp", str(model_file))
     else:
         recommended_url = str(direct["url"])

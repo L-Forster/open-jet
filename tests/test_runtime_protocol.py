@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from pathlib import Path
 
 from src.multimodal import build_user_content
 from src.runtime_protocol import TOOLS, stream_openai_chat, stream_openai_responses, tool_schema_token_estimate
@@ -86,10 +87,10 @@ class RuntimeProtocolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stream_openai_responses_preserves_multimodal_user_content(self) -> None:
         http = _FakeHTTPClient(['data: {"type":"response.completed"}'])
-        with tempfile.NamedTemporaryFile(suffix=".png") as image:
-            image.write(b"png")
-            image.flush()
-            content = build_user_content("Describe this image", [image.name])
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "image.png"
+            image_path.write_bytes(b"png")
+            content = build_user_content("Describe this image", [str(image_path)])
 
             chunks = [
                 chunk

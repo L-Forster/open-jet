@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from src.app_telemetry import _classify_shell_command
 from src.session_logging import BroadcastConfig, SessionLogger, _suppress_otel_exporter_logging
@@ -195,11 +197,12 @@ class IdentityAndEntrypointTests(unittest.TestCase):
             self.assertTrue(first.install_created_at)
             self.assertEqual(first.entrypoint, "benchmark")
 
-            second = SessionLogger(
-                base_dir=Path(tmp) / "sessions",
-                label="trace-test",
-                install_id_path=install_path,
-            )
+            with patch.dict(os.environ, {"OPENJET_ENTRYPOINT": ""}):
+                second = SessionLogger(
+                    base_dir=Path(tmp) / "sessions",
+                    label="trace-test",
+                    install_id_path=install_path,
+                )
             self.assertEqual(second.install_id, first.install_id)
             self.assertEqual(second.install_created_at, first.install_created_at)
             self.assertEqual(second.entrypoint, "app")

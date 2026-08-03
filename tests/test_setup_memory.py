@@ -253,7 +253,7 @@ class SetupSourceIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(call)
         self.assertEqual(call.kwargs["runtime"], "llama_cpp")
         self.assertEqual(call.kwargs["device"], "cuda")
-        self.assertIn("/models/demo.gguf", call.kwargs["model_refs"])
+        self.assertIn(str(Path("/models/demo.gguf")), call.kwargs["model_refs"])
         self.assertEqual(call.kwargs["total_vram_mb"], hardware.vram_mb)
 
     def test_build_recommended_payload_uses_direct_catalog_sizing_with_detected_vram(self) -> None:

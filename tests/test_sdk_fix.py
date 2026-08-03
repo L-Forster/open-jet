@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import importlib
 import json
 import unittest
 from contextlib import contextmanager
@@ -9,6 +10,8 @@ from unittest.mock import patch
 from openjet.sdk import RuntimeProcess, fix, format_fix_report
 from src.cli import main as cli_main
 from src.hardware import HardwareInfo
+
+FIX_MODULE = importlib.import_module("src.sdk.fix")
 
 
 class SDKFixTests(unittest.TestCase):
@@ -36,7 +39,7 @@ class SDKFixTests(unittest.TestCase):
             vram_mb=24576.0,
         )
 
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]):
             report = fix(
                 "llama.cpp",
                 cfg={"llama_model": "/models/qwen.gguf", "device": "cuda", "gpu_layers": 99, "context_window_tokens": 16384},
@@ -74,7 +77,7 @@ class SDKFixTests(unittest.TestCase):
         )
         hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
 
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]):
             report = fix(
                 "llama.cpp",
                 cfg={"llama_model": "/models/qwen.gguf", "device": "cuda", "gpu_layers": 99},
@@ -104,11 +107,11 @@ class SDKFixTests(unittest.TestCase):
             "context_length": 65536,
             "details": {"parameter_size": "14B", "quantization_level": "Q4_K_M"},
         }]
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]), \
-             patch("src.sdk.fix._ollama_api_ps", return_value=api_models), \
-             patch("src.sdk.fix._ollama_ps_rows", return_value=[{"name": "qwen2.5-coder:14b", "processor": "72% GPU"}]), \
-             patch("src.sdk.fix._ollama_list_rows", return_value=[]), \
-             patch("src.sdk.fix._probe_ollama_decode", return_value=9.8):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]), \
+             patch.object(FIX_MODULE, "_ollama_api_ps", return_value=api_models), \
+             patch.object(FIX_MODULE, "_ollama_ps_rows", return_value=[{"name": "qwen2.5-coder:14b", "processor": "72% GPU"}]), \
+             patch.object(FIX_MODULE, "_ollama_list_rows", return_value=[]), \
+             patch.object(FIX_MODULE, "_probe_ollama_decode", return_value=9.8):
             report = fix("ollama", cfg={}, hardware=hardware, run_probe=True)
 
         rendered = format_fix_report(report)
@@ -134,11 +137,11 @@ class SDKFixTests(unittest.TestCase):
             "context_length": 32768,
             "details": {"parameter_size": "32B", "quantization_level": "Q4_K_M"},
         }]
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]), \
-             patch("src.sdk.fix._ollama_api_ps", return_value=api_models), \
-             patch("src.sdk.fix._ollama_ps_rows", return_value=[]), \
-             patch("src.sdk.fix._ollama_list_rows", return_value=[]), \
-             patch("src.sdk.fix._probe_ollama_decode", return_value=3.4):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]), \
+             patch.object(FIX_MODULE, "_ollama_api_ps", return_value=api_models), \
+             patch.object(FIX_MODULE, "_ollama_ps_rows", return_value=[]), \
+             patch.object(FIX_MODULE, "_ollama_list_rows", return_value=[]), \
+             patch.object(FIX_MODULE, "_probe_ollama_decode", return_value=3.4):
             report = fix("ollama", cfg={}, hardware=hardware, run_probe=True)
 
         rendered = format_fix_report(report)
@@ -149,7 +152,7 @@ class SDKFixTests(unittest.TestCase):
 
     def test_no_runtime_detected_outputs_target_only(self) -> None:
         hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[]):
             report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False)
 
         rendered = format_fix_report(report)
@@ -161,10 +164,11 @@ class SDKFixTests(unittest.TestCase):
     def test_cli_fix_passes_no_probe_flag_through(self) -> None:
         stdout = io.StringIO()
         hardware = HardwareInfo(label="CPU only", total_ram_gb=16.0, has_cuda=False)
+        fix_module = importlib.import_module("src.sdk.fix")
 
         with patch("src.cli.load_config", return_value={}), \
-             patch("src.sdk.fix.detect_runtime_processes", return_value=[]), \
-             patch("src.sdk.fix.detect_hardware_info", return_value=hardware), \
+             patch.object(fix_module, "detect_runtime_processes", return_value=[]), \
+             patch.object(fix_module, "detect_hardware_info", return_value=hardware), \
              patch("sys.stdout", stdout):
             cli_main(["fix", "llama.cpp", "--no-probe"])
 
@@ -183,7 +187,7 @@ class SDKFixTests(unittest.TestCase):
         )
         hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
 
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]):
             report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False)
 
         self.assertFalse(report.observation.metadata["draft_engaged"])
@@ -204,7 +208,7 @@ class SDKFixTests(unittest.TestCase):
         )
         hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
 
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]):
             report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False)
 
         self.assertTrue(report.observation.metadata["draft_engaged"])
@@ -227,7 +231,7 @@ class SDKFixTests(unittest.TestCase):
         )
         hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
 
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]):
             report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False)
 
         self.assertTrue(report.observation.metadata["draft_engaged"])
@@ -250,7 +254,7 @@ class SDKFixTests(unittest.TestCase):
         )
         hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
 
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]):
             report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False, observed_decode_tok_s=21.2)
 
         rendered = format_fix_report(report)
@@ -276,7 +280,7 @@ class SDKFixTests(unittest.TestCase):
         )
         hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
 
-        with patch("src.sdk.fix.detect_runtime_processes", return_value=[process]):
+        with patch.object(FIX_MODULE, "detect_runtime_processes", return_value=[process]):
             report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False, observed_decode_tok_s=36.5)
 
         rendered = format_fix_report(report)
@@ -303,7 +307,7 @@ class SDKFixTests(unittest.TestCase):
 
             yield Response()
 
-        with patch("src.sdk.fix.urlopen", side_effect=fake_urlopen):
+        with patch.object(FIX_MODULE, "urlopen", side_effect=fake_urlopen):
             measured = _probe_llama_cpp_decode("127.0.0.1", 18080)
 
         self.assertEqual(measured, 68.7)
@@ -321,8 +325,9 @@ class SDKFixTests(unittest.TestCase):
             "--port", "8080",
         ]
 
-        with patch(
-            "src.sdk.fix._iter_process_argv",
+        with patch.object(
+            FIX_MODULE,
+            "_iter_process_argv",
             return_value=[(777, argv, "/home/louis/llama.cpp/build/bin/server")],
         ):
             report = fix("llama.cpp", cfg={}, hardware=hardware, run_probe=False, observed_decode_tok_s=70.0)

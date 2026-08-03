@@ -9,11 +9,11 @@ authors = [
 ]
 keywords = ["llm", "local-llm", "ai-agent", "tui", "jetson", "edge-ai", "offline", "llama.cpp"]
 license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
@@ -57,12 +57,11 @@ open-jet = "src.cli:main"
 openjet = "src.cli:main"
 
 [build-system]
-requires = ["setuptools>=68,<80", "wheel"]
+requires = ["setuptools>=77,<81", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = false
-license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*"]

@@ -35,7 +35,7 @@ class DeviceCliTests(unittest.TestCase):
             cli_main(["device", "list"])
 
         rendered = stdout.getvalue()
-        self.assertIn("Device registry: /tmp/devices.md", rendered)
+        self.assertIn(f"Device registry: {Path('/tmp/devices.md')}", rendered)
         self.assertIn("- camera0: Front Camera", rendered)
         self.assertIn("open-jet device add <existing_id> <new_id>", rendered)
 

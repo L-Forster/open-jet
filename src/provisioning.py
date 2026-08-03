@@ -76,12 +76,14 @@ def _running_under_wsl() -> bool:
 
 def _path_without_windows_interop_entries(path_value: str) -> str:
     entries = []
-    for entry in path_value.split(os.pathsep):
+    # This helper operates on the POSIX PATH exposed inside WSL even when it
+    # is exercised by tests running from a Windows checkout.
+    for entry in path_value.split(":"):
         normalized = entry.replace("\\", "/").lower()
         if re.match(r"^/mnt/[a-z]/", normalized):
             continue
         entries.append(entry)
-    return os.pathsep.join(entries)
+    return ":".join(entries)
 
 
 def _native_tool_path(name: str) -> str | None:
@@ -1232,6 +1234,11 @@ async def ensure_llama_server(
             log=log,
             set_status=set_status,
         )
+        # macOS ships no source-build toolchain expectation, so a failed prebuilt
+        # install is terminal there. An MTP runtime never reaches this branch: it
+        # needs the source build below, not the prebuilt binary.
+        if prebuilt is None and sys.platform == "darwin":
+            raise RuntimeError("Failed to install the macOS prebuilt llama-server.")
     if prebuilt is not None:
         clear_status()
         if len(prebuilt) == 2:
@@ -1246,9 +1253,6 @@ async def ensure_llama_server(
         if runtime_device:
             merged["device"] = runtime_device
         return merged
-
-    if sys.platform == "darwin":
-        raise RuntimeError("Failed to install the macOS prebuilt llama-server.")
 
     built, synced_ref = await _build_llama_server_from_source(
         hardware_info=hardware_info,

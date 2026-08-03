@@ -132,7 +132,7 @@ class SelfUpdateTests(unittest.TestCase):
         self.assertEqual(message, "Updated open-jet repo from 1111111 to aaaaaaa.")
         self.assertEqual(run_mock.call_count, 2)
         self.assertEqual(run_mock.call_args_list[0].args[0][:4], ["git", "pull", "--ff-only", "origin"])
-        self.assertEqual(run_mock.call_args_list[1].args[0][:2], ["bash", str(update_from_latest_release.__globals__["_INSTALL_SCRIPT"])])
+        self.assertEqual(run_mock.call_args_list[1].args[0], _install_command())
         self.assertEqual(run_mock.call_args_list[1].kwargs["env"]["OPENJET_INSTALL_MODE"], "update")
         self.assertEqual(run_mock.call_args_list[1].kwargs["env"]["OPENJET_UPDATE_REINSTALL"], "0")
 

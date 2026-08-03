@@ -120,7 +120,7 @@ def _classify_shell_command(command: str) -> dict[str, object]:
     return {
         "primary_command": primary,
         "classified_verification": verification,
-        "hallucinated_command": not executable_found,
+        "hallucinated_command": not executable_found and not false_positive,
         "false_positive_proposal": false_positive,
         "classification_reason": ", ".join(reasons) if reasons else None,
     }

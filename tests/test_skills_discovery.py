@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 
@@ -60,7 +61,13 @@ class SkillsDiscoveryTests(unittest.TestCase):
             base = Path(tmp)
             project_skills = base / "project" / ".openjet" / "skills"
             project_skills.mkdir(parents=True)
-            _write_standard(project_skills, "windows-only", "Windows only", platforms="windows")
+            unsupported_platform = "linux" if sys.platform == "win32" else "windows"
+            _write_standard(
+                project_skills,
+                "unsupported-platform",
+                "Unsupported platform",
+                platforms=unsupported_platform,
+            )
 
             result = discover_skills(base / "project", home=base / "home", bundled_dir=base / "install" / "skills")
 

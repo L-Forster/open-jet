@@ -31,7 +31,7 @@ class WorkflowCliTests(unittest.TestCase):
         rendered = stdout.getvalue()
         self.assertIn("Discovered workflows:", rendered)
         self.assertIn("nightwatch", rendered)
-        self.assertIn("path=/tmp/open-jet/workflows/nightwatch.md", rendered)
+        self.assertIn(f"path={root / 'workflows' / 'nightwatch.md'}", rendered)
 
     def test_workflow_list_cli_reports_invalid_workflow_files(self) -> None:
         stdout = io.StringIO()
@@ -91,7 +91,7 @@ class WorkflowCliTests(unittest.TestCase):
 
         rendered = stdout.getvalue()
         self.assertIn("Workflow nightwatch completed with status=success.", rendered)
-        self.assertIn("Report: /tmp/report.md", rendered)
+        self.assertIn(f"Report: {Path('/tmp/report.md')}", rendered)
         self.assertIn("gpio0", rendered)
 
     def test_workflow_start_cli_starts_background_runner(self) -> None:

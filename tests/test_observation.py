@@ -180,10 +180,14 @@ class SpeechDetectionTests(unittest.TestCase):
                 payload_ref=str(clip),
             )
 
-            processed = process_audio_observation(
-                observation,
-                transcription_cfg={"enabled": True, "backend": "faster_whisper"},
-            )
+            with patch(
+                "src.observation.processors.import_module",
+                side_effect=ImportError("faster-whisper unavailable"),
+            ):
+                processed = process_audio_observation(
+                    observation,
+                    transcription_cfg={"enabled": True, "backend": "faster_whisper"},
+                )
 
             self.assertEqual(processed.modality, ObservationModality.TEXT)
             self.assertIn("Speech detected", processed.summary)
