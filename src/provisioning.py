@@ -54,8 +54,8 @@ LLAMA_SERVER_BIN = BIN_DIR / LLAMA_SERVER_EXE_NAME
 LLAMA_CPP_TAG_FILE = BIN_DIR / "llama-server.tag"
 LLAMA_CPP_REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
-LLAMA_CPP_PINNED_REF = "b9442"
-LLAMA_CPP_MTP_REF = "b9442"
+LLAMA_CPP_PINNED_REF = "b10246"
+LLAMA_CPP_MTP_REF = "b10246"
 UNIFIED_MEMORY_SYSTEM_RESERVE_MB = 4096.0
 
 
@@ -902,7 +902,11 @@ def _prebuilt_asset_candidates(hardware_info: HardwareInfo) -> list[str]:
     if sys.platform == "win32":
         if machine in {"x86_64", "amd64"}:
             if hardware_info.has_cuda:
-                return ["bin-win-cuda-13.1-x64", "bin-win-cuda-12.4-x64"]
+                return [
+                    "bin-win-cuda-13.3-x64",
+                    "bin-win-cuda-13.1-x64",
+                    "bin-win-cuda-12.4-x64",
+                ]
             if hardware_info.has_vulkan:
                 return ["bin-win-vulkan-x64"]
             return ["bin-win-cpu-x64"]
