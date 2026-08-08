@@ -30,6 +30,40 @@ Setup supports:
 - `Self-hosted API: OpenAI-compatible`
 - `Hosted API: OpenRouter`
 
+Project provisioning, for embedding a model in an application you ship:
+
+```bash
+openjet project
+openjet project --use-case dialogue --target handheld --budget 4 --context-tokens 4096
+```
+
+`openjet project` is a build-time step, distinct from `openjet setup`. Setup detects this
+machine and picks a coding model for it; `openjet project` asks which device you are
+shipping to, how much memory your application will concede to the model, and what the
+model is for, then downloads it into `.openjet/models/` in the project.
+
+| Flag | Meaning | Omitted |
+|---|---|---|
+| `--use-case` | `chat`, `dialogue`, `extract`, `classify`, `summarize` | prompts |
+| `--target` | device you ship to, not this machine — `handheld`, `laptop_8`, `laptop_16`, `desktop_gpu_8`, `desktop_gpu_16`, `desktop_gpu_24`, `server` | prompts |
+| `--budget` | memory in GB the model may take on the target | the target preset's default |
+| `--context-tokens` | context window to size the KV cache for | 4096 |
+
+Pass all four to run it non-interactively from a build script or Dockerfile. Selection
+fails loudly rather than silently downgrading: if nothing in the catalog meets the use
+case's first-token deadline inside the budget, the command exits with the reason each
+candidate was rejected.
+
+Written output, both gitignored:
+
+```text
+your-project/.openjet/models/<model>.gguf   # weights, for your build to bundle
+your-project/.openjet/config.yaml           # the model pin, overlaid on config.yaml
+```
+
+See the [SDK quickstart](../sdk/quickstart.md), [Choosing a model](../models.md), and
+[project configuration](../configuration.md#project-configuration-openjetconfigyaml).
+
 Read-only helpers:
 
 ```bash

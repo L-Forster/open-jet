@@ -1,6 +1,7 @@
 # Configuration
 
-Main settings live in `config.yaml`.
+Main settings live in `config.yaml`. A project that embeds the SDK can pin its own model
+on top of that with a [project overlay](#project-configuration-openjetconfigyaml).
 
 ## Minimal local config
 
@@ -77,6 +78,80 @@ setup_recommendations:
 
 Rows are matched by `max_ram_gb`, and the last row is used as the fallback above the highest configured RAM band.
 For unified-memory MoE rows, setup keeps a 4GB system reserve before applying the normal model/KV headroom, so Q4_K_M remains preferred when it fits and UD-Q3_K_XL is the smaller fallback.
+
+## Project configuration (`.openjet/config.yaml`)
+
+`openjet project` writes a second, smaller config inside the project it is run in. It is
+an overlay, not a replacement: the machine-wide `config.yaml` still supplies the device
+profile, `llama_server_path`, telemetry consent, MCP servers, and everything else, and
+the project file overrides only the model.
+
+```yaml
+# your-project/.openjet/config.yaml
+project:
+  model_id: qwen35-4b-q4km
+  use_case: dialogue
+  target: handheld
+  budget_gb: 4.0
+model_source: direct
+llama_model: /home/you/your-project/.openjet/models/Qwen3.5-4B-Q4_K_M.gguf
+context_window_tokens: 4096
+filename: Qwen3.5-4B-Q4_K_M.gguf
+model_size_mb: 2806
+model_download_url: https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf?download=true
+model_download_path: /home/you/your-project/.openjet/models/Qwen3.5-4B-Q4_K_M.gguf
+```
+
+### Which keys a project may own
+
+Only model selection keys: `project`, `model_source`, `llama_model`,
+`context_window_tokens`, `llama_mtp`, `llama_cpu_moe`, `llama_n_cpu_moe`,
+`model_download_url`, `model_download_path`, `model_size_mb`, `filename`. Anything else in
+the file is ignored on write.
+
+The scope is deliberate. A project overlay describes *what model this application ships
+with*, which is portable. Device profile, GPU layers, and shell targets describe *the
+machine you happen to be on*, and freezing a snapshot of one developer's machine into a
+project would drift the moment anyone else built it.
+
+### How the overlay is found
+
+`OpenJetSession` and every `openjet` subcommand walk up from the current directory
+looking for a `.openjet/` directory, and stop at the first `.git/` they reach. So the
+overlay applies from anywhere inside the project — `src/`, a test, your app's
+entrypoint — and never leaks into a sibling checkout.
+
+### Precedence
+
+Lowest to highest:
+
+1. `./config.yaml` in the working directory, if present, otherwise the installed
+   `config.yaml`
+2. `.openjet/config.yaml` from the nearest enclosing project
+
+The project overlay is applied twice: once before normalization, and again after, so that
+a release migration re-deriving the model from managed paths cannot outrank an explicit
+project pin.
+
+`openjet --status` prints the files feeding the active configuration, lowest precedence
+first:
+
+```
+Project model: qwen35-4b-q4km (use case: dialogue, target: handheld)
+Config: /home/you/.openjet/config.yaml <- /home/you/your-project/.openjet/config.yaml
+```
+
+One `Config:` entry means no overlay is in effect.
+
+### Version control
+
+`.openjet/` ignores itself — `openjet project` writes `.openjet/.gitignore` containing
+`*` on first run. Weights do not belong in a repository, and the overlay records absolute
+machine-local paths. Model choice is a hardware decision rather than a project one, so
+each developer and each build target runs `openjet project` for the machine in front of
+them.
+
+See [SDK quickstart](sdk/quickstart.md) and [Choosing a model](models.md).
 
 ## General settings
 

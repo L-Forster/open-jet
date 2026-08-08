@@ -1,5 +1,9 @@
 # Quickstart
 
+Getting the terminal agent running from source. If you want to embed a model in an
+application you ship instead, use the [SDK quickstart](sdk/quickstart.md) — that path
+installs from PyPI and provisions the model with `openjet project`.
+
 ## 1. Install
 
 ```bash
@@ -58,6 +62,7 @@ The setup wizard now focuses on:
 ## 5. Next docs
 
 - [Product surfaces](overview.md)
+- [Getting started](getting-started.md)
 - [Installation](installation.md)
 - [Configuration](configuration.md)
 - [Backend Workflows](usage/backend-workflows.md)

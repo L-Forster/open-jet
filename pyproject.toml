@@ -1,25 +1,48 @@
 [project]
 name = "open-jet"
 version = "0.4.31"
-description = "Claude Code for local devices: chat with self-hosted models, run agent tools, and manage context safely - all without an internet connection."
+description = "Run local LLMs on your own hardware: a terminal coding agent, and a Python SDK for embedding on-device models in your own applications. No API keys, no data upload."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 authors = [
     { name = "Louis" }
 ]
-keywords = ["llm", "local-llm", "ai-agent", "tui", "jetson", "edge-ai", "offline", "llama.cpp"]
+keywords = [
+    "llm",
+    "local-llm",
+    "run-llm-locally",
+    "on-device-llm",
+    "private-llm",
+    "embedded-llm",
+    "edge-llm",
+    "offline-llm",
+    "llm-inference",
+    "llm-sdk",
+    "gguf",
+    "ai-agent",
+    "coding-agent",
+    "tui",
+    "jetson",
+    "edge-ai",
+    "offline",
+    "llama.cpp",
+]
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Software Development :: User Interfaces",
     "Typing :: Typed",
 ]
@@ -49,6 +72,7 @@ mcp = [
 [project.urls]
 Homepage = "https://openjet.dev/"
 Website = "https://openjet.dev/"
+Documentation = "https://github.com/l-forster/open-jet/blob/master/docs/getting-started.md"
 Repository = "https://github.com/l-forster/open-jet"
 Issues = "https://github.com/l-forster/open-jet/issues"
 

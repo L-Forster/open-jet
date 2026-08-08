@@ -10,8 +10,9 @@ import sys
 from pathlib import Path
 
 from .airgap import airgapped_from_cfg
-from .config import load_config, save_config
+from .config import active_config_sources, load_config, save_config
 from .device_sources import assign_device_alias, list_device_sources, set_device_enabled, sync_devices_registry
+from .embed_catalog import DEFAULT_EMBED_CONTEXT_TOKENS, EMBED_USE_CASES, TARGET_DEVICE_PRESETS
 from .model_profiles import list_model_profiles, sync_active_model_profile
 from .peripherals.system import device_discovery_hint
 from .runtime_registry import RUNTIME_LABEL, active_model_ref, active_runtime
@@ -77,6 +78,13 @@ def _format_cli_status(cfg: dict[str, object]) -> str:
         f"GPU layers: {cfg.get('gpu_layers', 'n/a')}",
         f"Air-gapped: {'true' if airgapped_from_cfg(cfg) else 'false'}",
     ]
+    project = cfg.get("project")
+    if isinstance(project, dict):
+        lines.append(
+            f"Project model: {project.get('model_id')} "
+            f"(use case: {project.get('use_case')}, target: {project.get('target')})"
+        )
+    lines.append("Config: " + " <- ".join(str(path) for path in active_config_sources()))
     return "\n".join(lines)
 
 
@@ -383,6 +391,29 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser = subparsers.add_parser("chat", help="start the interactive chat UI or run a one-shot prompt")
     chat_parser.add_argument("prompt", nargs=argparse.REMAINDER, help="optional one-shot prompt text")
     subparsers.add_parser("setup", help="run setup wizard before launching the chat UI")
+    project_parser = subparsers.add_parser(
+        "project",
+        help="provision this project's embedded model (build-time; the SDK never downloads at runtime)",
+    )
+    project_parser.add_argument(
+        "--use-case",
+        choices=[str(row["id"]) for row in EMBED_USE_CASES],
+        default=None,
+        help="what the model is for (prompts when omitted)",
+    )
+    project_parser.add_argument(
+        "--target",
+        choices=[str(row["id"]) for row in TARGET_DEVICE_PRESETS],
+        default=None,
+        help="device your application ships to, not this machine (prompts when omitted)",
+    )
+    project_parser.add_argument("--budget", type=float, default=None, help="memory in GB the model may use on the target")
+    project_parser.add_argument(
+        "--context-tokens",
+        type=int,
+        default=None,
+        help=f"context window to size the KV cache for (default {DEFAULT_EMBED_CONTEXT_TOKENS})",
+    )
     bench_parser = subparsers.add_parser("benchmark", aliases=("bench",), help="run a model benchmark with the active profile")
     bench_parser.add_argument("-p", "--n-prompt", type=int, default=512, help="prompt tokens for pp test (default: 512)")
     bench_parser.add_argument("-n", "--n-gen", type=int, default=128, help="tokens to generate for tg test (default: 128)")
@@ -468,6 +499,22 @@ def _entrypoint_label(args: argparse.Namespace) -> str:
     if command in {"skill", "skills"}:
         return "skill"
     return command
+
+
+def _start_project(args: argparse.Namespace) -> None:
+    from .project_setup import provision_project
+
+    try:
+        asyncio.run(
+            provision_project(
+                use_case_id=args.use_case,
+                target_id=args.target,
+                budget_gb=args.budget,
+                context_tokens=args.context_tokens,
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -662,6 +709,9 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
         )
+        return
+    if args.command == "project":
+        _start_project(args)
         return
     force_setup = bool(args.command == "setup")
     launch_tui(force_setup=force_setup)

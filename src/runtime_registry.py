@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 from .airgap import AirgapViolationError, airgapped_from_cfg, endpoint_is_loopback
@@ -32,6 +33,29 @@ def active_model_ref(cfg: dict) -> str:
     if active_runtime(cfg) in {CODEX_RUNTIME, LITELLM_RUNTIME}:
         return str(cfg.get("model") or "").strip()
     return str(cfg.get("llama_model") or "").strip()
+
+
+def require_provisioned_model(cfg: dict) -> None:
+    """Fail fast when the local model is absent. Never fetches it.
+
+    Model acquisition is a build-time step (`open-jet project`). An application that
+    embeds the SDK must not reach the network on an end user's machine, so a missing
+    model is an error here rather than a download.
+    """
+    if active_runtime(cfg) != DEFAULT_RUNTIME:
+        return
+    raw = active_model_ref(cfg)
+    if not raw:
+        raise RuntimeError(
+            "No local model is configured. Run `openjet project` in this project to "
+            "provision one. OpenJet does not download models at runtime."
+        )
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        raise RuntimeError(
+            f"Configured model is missing: {path}\n"
+            "Run `openjet project` to provision it. OpenJet does not download models at runtime."
+        )
 
 
 def create_runtime_client(

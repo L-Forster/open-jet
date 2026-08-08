@@ -1,22 +1,26 @@
 # OpenJet
 
-## The local agent for your own GPU
+## Run local LLMs in your terminal and in your code
 
-**Files -> tools -> shell approval -> workflows -> local model.**
+**A terminal coding agent, and a Python SDK for embedding on-device models in your own apps.**
 
-OpenJet runs the agent loop locally. No API calls. No code or data upload.
+OpenJet runs the model and the agent loop on your machine. No API keys. No code or data upload.
 
 RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP. Open source.
 
 [Discord](https://discord.gg/pspKHtExSa)
 
-Someone built a local AI agent that runs on your own GPU.
-
-OpenJet runs the agent loop locally:
+**In your terminal**, OpenJet is a local coding agent:
 
 ```text
 files -> tools -> shell approval -> workflows -> local model
 ```
+
+**In your code**, it is a way to ship an on-device model inside your own application —
+an in-app assistant, an NPC that talks, a classifier, an extraction pipeline. Run
+`openjet project` in your project at build time and the model is chosen for your target
+device, downloaded into the project, and bundled with your build. The SDK never
+downloads at runtime, so your users never fetch a file or see a config.
 
 No API calls. No code or data upload.
 
@@ -55,7 +59,9 @@ Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14G
 The primary entrypoint is the `openjet` command:
 
 ```bash
-openjet                  # start interactive session
+openjet                     # start interactive session
+openjet setup               # provision a coding model for this machine
+openjet project             # provision the model your application ships with
 openjet benchmark --sweep   # run a hardware benchmark sweep
 ```
 
@@ -69,12 +75,52 @@ The CLI is a full terminal agent that can:
 - **Connect to devices** — cameras, microphones, GPIO, and remote devices for edge and embedded workflows
 - **Connect tools** — trusted MCP servers are exposed through the normal OpenJet tool registry
 
+## Embed a local LLM in your own application
+
+Provision the model once, at build time, in the project that will ship it:
+
+```bash
+cd your-project
+openjet project --use-case dialogue --target handheld --budget 4
+```
+
+Selection is driven by what the model is for, the device you ship to (declared, not
+detected — the machine you build on is not the machine your users have), and the memory
+your application can concede. The weights land in `.openjet/models/` so your build can
+bundle them, and `.openjet/config.yaml` pins them for the SDK.
+
+```python
+import asyncio
+
+from openjet.sdk import create_inference_session
+
+
+async def main() -> None:
+    session = await create_inference_session()
+    try:
+        result = await session.run("Summarise this support ticket in one line.")
+        print(result.text)
+    finally:
+        await session.close()
+
+
+asyncio.run(main())
+```
+
+`create_inference_session()` refuses every tool — text in, text out — so an embedded model
+cannot reach the shell or the filesystem no matter what it generates. Use `create_agent()`
+when you do want the full agent surface.
+
+Nothing downloads at runtime. A missing model raises immediately rather than reaching for
+the network on a user's machine, so your users never fetch a file, see a config, or need
+an internet connection.
+
 ## Python SDK
 
 Use `openjet.sdk` to embed the same runtime in your own Python application.
 
 ```python
-from openjet.sdk import OpenJetSession, recommend_hardware_config
+from openjet.sdk import OpenJetSession, create_inference_session, recommend_hardware_config
 ```
 
 ### Session API
@@ -161,6 +207,7 @@ from openjet.sdk import (
     SDKResponse,
     ToolResult,
     create_agent,
+    create_inference_session,
     recommend_hardware_config,
 )
 ```

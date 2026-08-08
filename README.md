@@ -5,19 +5,19 @@
 ![Qwen3.6-27B Terminal-Bench 2.0](https://img.shields.io/badge/Qwen3.6--27B%20Terminal--Bench%202.0-59.3-blue)
 
 <p align="center">
-  <img width="1672" height="941" alt="OpenJet screenshot" src="https://github.com/user-attachments/assets/b06b0b8f-1bbc-443d-920e-bd70bff1479c" />
+  <img width="1672" height="941" alt="OpenJet running a local LLM coding agent in a terminal" src="https://github.com/user-attachments/assets/b06b0b8f-1bbc-443d-920e-bd70bff1479c" />
 </p>
 
 <br />
 
-<h1 align="center">The local agent for your own GPU</h1>
+<h1 align="center">Run local LLMs in your terminal and in your code</h1>
 
 <h3 align="center">
-  Files -> tools -> shell approval -> workflows -> local model.
+  A terminal coding agent, and a Python SDK for embedding on-device models in your own apps.
 </h3>
 
 <p align="center">
-  OpenJet runs the agent loop locally. No API calls. No code or data upload.
+  OpenJet runs the model and the agent loop on your machine. No API keys. No code or data upload.
 </p>
 
 <p align="center">
@@ -28,12 +28,35 @@
   <a href="https://discord.com/invite/pspKHtExSa">Discord</a>
 </p>
 
+**An agent in your terminal:**
+
 ```bash
 pipx install open-jet
 openjet setup
 ```
 
-Setup profiles your hardware, picks a model that fits, downloads it, configures `llama.cpp`, and drops you into the agent. Then run `openjet`.
+Setup profiles your hardware, picks a coding model that fits, downloads it, configures `llama.cpp`, and drops you into the agent. Then run `openjet`.
+
+**A model inside your own application:**
+
+```bash
+pip install open-jet
+cd your-project
+openjet project
+```
+
+`openjet project` provisions a model for what you are shipping — chosen by use case, target device, and the memory budget your app can spare — and downloads it into your project so the build can bundle it. The SDK never downloads at runtime.
+
+```python
+from openjet.sdk import create_inference_session
+
+session = await create_inference_session(system_prompt="You are a shopkeeper. Two sentences max.")
+print((await session.run("The player asks what you have for sale.")).text)
+```
+
+Text in, text out, with every tool refused — an embedded model cannot reach the shell or the filesystem no matter what it generates.
+
+New here? [Getting started](docs/getting-started.md) forks by which one you want.
 
 ## Built for small models, not shrunk down from big ones
 
@@ -68,7 +91,8 @@ Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14G
 ### Recommended hardware and models
 
 The tables below list the setup catalog entries from `src/config.py`. `max_ram_gb`
-is the configured setup target for that row.
+is the configured setup target for that row. For embedding a model in your own
+application, see [Choosing a model](docs/models.md).
 
 **General (any GPU/RAM — no `unified_memory_only` flag):**
 
@@ -85,8 +109,8 @@ is the configured setup target for that row.
 | Model | Configured `max_ram_gb` |
 |---|---|
 | Gemma 4 26B A4B | 24.0 |
-| Qwen3.6 35B A3B UD-Q3_K_XL MTP | 24.0 |
-| Qwen3.6 35B A3B MTP | 32.0 |
+| Qwen3.6 35B A3B UD-IQ2_XXS MTP | 24.0 |
+| Qwen3.6 35B A3B UD-Q3_K_XL MTP | 32.0 |
 
 Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
 
@@ -109,6 +133,51 @@ openjet fix
 ```python
 from openjet.sdk import OpenJetSession, recommend_hardware_config
 ```
+
+## Embed a local LLM in your own application
+
+The terminal agent is one half. The other is shipping an on-device model inside something you build — an in-app assistant, a game NPC that talks, an offline classifier, a document extraction pipeline. No API keys, no per-token bill, no user data leaving the device.
+
+```bash
+pip install open-jet
+cd your-project
+openjet project --use-case dialogue --target handheld --budget 4
+```
+
+That is a build-time step, and it is different from `openjet setup` in the questions it asks:
+
+| | `openjet setup` | `openjet project` |
+|---|---|---|
+| Hardware | detected on this machine | declared: the device you ship to |
+| Memory for the model | whatever the machine has | the slice your application concedes |
+| Optimises for | coding capability | use case and first-token latency |
+| Model lands in | a machine-wide store | `.openjet/models/` in the project, so your build bundles it |
+
+Then, in your code:
+
+```python
+import asyncio
+
+from openjet.sdk import create_inference_session
+
+
+async def main() -> None:
+    session = await create_inference_session()
+    try:
+        result = await session.run("Summarise this support ticket in one line.")
+        print(result.text)
+    finally:
+        await session.close()
+
+
+asyncio.run(main())
+```
+
+**Nothing downloads at runtime.** If the provisioned model is missing, the session raises immediately rather than reaching for the network on a user's machine. Your users never fetch a file, never see a config, and never need an internet connection.
+
+- [SDK quickstart](docs/sdk/quickstart.md) — provision, embed, ship
+- [Choosing a model](docs/models.md) — use cases, target devices, and the embedded catalog
+- [Project configuration](docs/configuration.md#project-configuration-openjetconfigyaml) — the `.openjet/` overlay and config precedence
 
 ## Why OpenJet
 
@@ -172,10 +241,10 @@ An agent in your terminal that can actually do useful work:
 Interactive local agent work in the terminal.
 
 ### Python SDK
-Embed sessions, profile hardware, and automate workflows from Python.
+Ship an on-device model inside your own application, embed sessions, profile hardware, and automate workflows from Python.
 
 ```python
-from openjet.sdk import OpenJetSession, recommend_hardware_config
+from openjet.sdk import OpenJetSession, create_inference_session, recommend_hardware_config
 ```
 
 ### Benchmarking tools
@@ -195,9 +264,45 @@ OpenJet closes that gap. It is built for people who want the speed, control, and
 
 Everything runs on your machine.
 
+## FAQ
+
+### How do I run an LLM locally without an API key?
+
+`pipx install open-jet && openjet setup`. Setup profiles your GPU and RAM, picks a GGUF model that fits, downloads it, builds or reuses `llama-server` from `llama.cpp`, and drops you into the agent. There is no account, no key, and no hosted endpoint anywhere in the path.
+
+### Can I embed a local LLM in an app I ship to users?
+
+Yes — that is what `openjet project` and `openjet.sdk` are for. You provision the model once at build time, bundle the weights with your build, and call `create_inference_session()` from your code. See [Embed a local LLM in your own application](#embed-a-local-llm-in-your-own-application).
+
+### Will my users have to download a model?
+
+No. Model acquisition happens once, on your machine, before you ship. The SDK never fetches anything at runtime; a missing model is an error, not a download.
+
+### Does it work offline / air-gapped?
+
+Yes. Once the model is on disk, inference is entirely local. `airgapped: true` additionally blocks every non-loopback network path, including cloud runtimes and remote MCP servers. See [Configuration](docs/configuration.md).
+
+### What hardware do I need?
+
+Apple silicon with 24GB+ unified memory or a GPU with 14GB+ VRAM for the terminal coding agent. Embedded models go much smaller — a 4B at Q4_K_M is about 2.8GB resident at 4k context and runs on an 8GB laptop or a handheld. CPU-only works too; see [Deployment: CPU-only](docs/deployment/cpu-only.md).
+
+### Which models are supported?
+
+Any GGUF that `llama.cpp` can load. The curated catalogs cover Qwen3.5 4B / 9B, Qwen3.6 27B and 35B-A3B with MTP, and Gemma 4 26B A4B — see [Choosing a model](docs/models.md). Point setup at a `.gguf` you already have and it will use that instead.
+
+### Can it use a cloud model too?
+
+Optionally, and never automatically. `/connect` plus a model profile routes to OpenAI, Anthropic, OpenRouter, or Codex OAuth when you switch to it by hand. Local `llama.cpp` remains the default.
+
+### Is my code or data sent anywhere?
+
+No. The model, the agent loop, tool execution, and session state all stay on your machine.
+
 ## Docs
 
 ### Start here
+- [Getting started](docs/getting-started.md) — terminal agent, or a model inside your app
+- [Choosing a model](docs/models.md)
 - [Quickstart](docs/quickstart.md)
 - [Installation](docs/installation.md)
 - [Configuration](docs/configuration.md)
@@ -214,6 +319,7 @@ Everything runs on your machine.
 - [Usage: Session state and logging](docs/usage/session-state-and-logging.md)
 
 ### SDK
+- [SDK quickstart](docs/sdk/quickstart.md)
 - [Python SDK](docs/sdk/python-sdk.md)
 
 ### Benchmarking

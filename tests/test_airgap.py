@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import open_jet
@@ -164,22 +166,27 @@ class SDKAirgapTests(AirgapBaseTestCase):
 
     def test_create_agent_supports_airgapped_sessions(self) -> None:
         fake_client = _CreateSessionClient()
+        # The session refuses to start against a model that is not on disk, so this
+        # stands in for one a build-time `open-jet project` run would have provisioned.
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "model.gguf"
+            model_path.write_bytes(b"")
 
-        async def _run() -> None:
-            with patch("src.sdk.create_runtime_client", return_value=fake_client) as create_client, patch(
-                "src.sdk.build_system_prompt",
-                new=AsyncMock(return_value="system prompt"),
-            ):
-                session = await create_agent(
-                    cfg={"llama_model": "model.gguf"},
-                    airgapped=True,
-                )
+            async def _run() -> None:
+                with patch("src.sdk.create_runtime_client", return_value=fake_client) as create_client, patch(
+                    "src.sdk.build_system_prompt",
+                    new=AsyncMock(return_value="system prompt"),
+                ):
+                    session = await create_agent(
+                        cfg={"llama_model": str(model_path)},
+                        airgapped=True,
+                    )
 
-            self.assertTrue(session.airgapped)
-            self.assertTrue(create_client.call_args.args[0]["airgapped"])
-            fake_client.start.assert_not_awaited()
+                self.assertTrue(session.airgapped)
+                self.assertTrue(create_client.call_args.args[0]["airgapped"])
+                fake_client.start.assert_not_awaited()
 
-        asyncio.run(_run())
+            asyncio.run(_run())
 
 
 if __name__ == "__main__":

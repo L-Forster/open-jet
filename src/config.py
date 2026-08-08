@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from .app_paths import openjet_install_root
+from .app_paths import find_project_root, openjet_install_root, project_config_path
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
@@ -209,16 +209,88 @@ HARDWARE_OVERRIDE_OPTIONS: tuple[tuple[str, str, float, bool], ...] = (
 )
 
 
+# Keys a project overlay is allowed to own. Everything else — device profile, telemetry
+# consent, MCP servers — stays machine-wide, so provisioning a project never freezes a
+# snapshot of the developer's machine that then drifts.
+PROJECT_CONFIG_KEYS = frozenset(
+    {
+        "project",
+        "model_source",
+        "llama_model",
+        "context_window_tokens",
+        "llama_mtp",
+        "llama_cpu_moe",
+        "llama_n_cpu_moe",
+        "model_download_url",
+        "model_download_path",
+        "model_size_mb",
+        "filename",
+    }
+)
+
+
+def load_project_config(root: Path | None = None) -> tuple[Path, dict] | None:
+    """Project overlay and the file it came from, or None outside a provisioned project."""
+    project_root = find_project_root(root)
+    if project_root is None:
+        return None
+    path = project_config_path(project_root)
+    if not path.exists():
+        return None
+    return path, yaml.safe_load(path.read_text()) or {}
+
+
+def _merge_overlay(base: dict, overlay: Mapping[str, Any]) -> dict:
+    merged = dict(base)
+    for key, value in overlay.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, Mapping):
+            merged[key] = {**current, **value}
+        else:
+            merged[key] = value
+    return merged
+
+
+def active_config_sources(root: Path | None = None) -> list[Path]:
+    """Config files feeding the active config, lowest precedence first."""
+    sources: list[Path] = []
+    for candidate in [Path("config.yaml"), CONFIG_PATH]:
+        if candidate.exists():
+            sources.append(candidate)
+            break
+    project = load_project_config(root)
+    if project is not None:
+        sources.append(project[0])
+    return sources
+
+
 def load_config() -> dict:
+    raw: dict = {}
     for candidate in [Path("config.yaml"), CONFIG_PATH]:
         if candidate.exists():
             raw = yaml.safe_load(candidate.read_text()) or {}
-            return normalize_config(raw)
-    return {}
+            break
+    project = load_project_config()
+    if project is None:
+        return normalize_config(raw)
+    overlay = project[1]
+    normalized = normalize_config(_merge_overlay(raw, overlay))
+    # Release migrations re-derive the model from whatever managed paths survive in the
+    # global config. A project pin is explicit and has to outrank that.
+    return _merge_overlay(normalized, overlay)
 
 
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(yaml.dump(cfg, default_flow_style=False))
+
+
+def save_project_config(overlay: Mapping[str, Any], root: Path | None = None) -> Path:
+    """Write the project overlay, keeping it to project-owned keys."""
+    path = project_config_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scoped = {key: value for key, value in overlay.items() if key in PROJECT_CONFIG_KEYS}
+    path.write_text(yaml.dump(scoped, default_flow_style=False, sort_keys=True))
+    return path
 
 
 def normalize_config(cfg: dict) -> dict:

@@ -1,5 +1,8 @@
 # Product Surfaces
 
+New to OpenJet? [Getting started](getting-started.md) forks by what you are building —
+an agent in your terminal, or a model inside your own application.
+
 OpenJet is one product with three primary surfaces.
 
 ## 1. CLI + Chat TUI
@@ -34,19 +37,35 @@ or agent system.
 
 Primary entrypoints:
 
+```bash
+openjet project    # build-time: provision the model this application ships with
+```
+
 ```python
-from openjet.sdk import OpenJetSession, create_agent, recommend_hardware_config
+from openjet.sdk import (
+    OpenJetSession,
+    create_agent,
+    create_inference_session,
+    recommend_hardware_config,
+)
 ```
 
 This surface is for:
 
+- shipping an on-device model inside an application of your own — an in-app assistant, an
+  NPC that talks, a classifier, an extraction pipeline
 - embedding bounded-memory local sessions in another app
 - reusing OpenJet's approval and tool-execution model
 - hardware profiling and auto-`llama.cpp` configuration
 
+Model acquisition belongs to `openjet project` and happens once, at build time. Nothing in
+the SDK downloads at runtime; a missing model raises instead.
+
 Related docs:
 
+- [SDK quickstart](sdk/quickstart.md)
 - [Python SDK](sdk/python-sdk.md)
+- [Choosing a model](models.md)
 - [Configuration](configuration.md)
 - [Runtime: llama.cpp](runtimes/llama-cpp.md)
 

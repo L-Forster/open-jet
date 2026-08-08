@@ -19,6 +19,7 @@ from ..memory_reflection import (
 )
 from ..multimodal import build_user_content, content_to_plain_text
 from ..runtime_limits import derive_context_budget, estimate_tokens
+from ..runtime_registry import require_provisioned_model
 from ..runtime_protocol import ToolCall
 from ..tool_executor import ToolExecutionResult, execute_tool
 from ..harness import (
@@ -363,6 +364,7 @@ class OpenJetSession:
         resolved_root = Path(root or Path.cwd()).resolve()
         resolved_cfg["airgapped"] = airgapped_from_cfg(resolved_cfg, override=airgapped)
         set_airgapped(bool(resolved_cfg["airgapped"]))
+        require_provisioned_model(resolved_cfg)
         client = create_runtime_client(resolved_cfg)
         from ..mcp_support.manager import MCPManager
 
@@ -1015,5 +1017,27 @@ async def create_agent(
         root=root,
         approval_handler=approval_handler,
         allowed_tools=allowed_tools,
+        airgapped=airgapped,
+    )
+
+
+async def create_inference_session(
+    *,
+    cfg: dict | None = None,
+    system_prompt: str | None = None,
+    root: Path | None = None,
+    airgapped: bool | None = None,
+) -> OpenJetSession:
+    """Session with every tool refused: text in, text out.
+
+    For a model embedded in an application you ship, where it must not reach the shell or
+    the filesystem no matter what it generates. `create_agent` keeps the full tool surface
+    and is unchanged.
+    """
+    return await OpenJetSession.create(
+        cfg=cfg,
+        system_prompt=system_prompt,
+        root=root,
+        allowed_tools=set(),
         airgapped=airgapped,
     )

@@ -33,7 +33,15 @@ from .tok_s import (
     list_hardware_performance_profiles,
     list_model_performance_profiles,
 )
-from .session import OpenJetSession, SDKEvent, SDKEventKind, SDKResponse, ToolResult, create_agent
+from .session import (
+    OpenJetSession,
+    SDKEvent,
+    SDKEventKind,
+    SDKResponse,
+    ToolResult,
+    create_agent,
+    create_inference_session,
+)
 
 __all__ = [
     "HardwareRecommendation",
@@ -57,6 +65,7 @@ __all__ = [
     "ToolResult",
     "build_token_generation_workload",
     "create_agent",
+    "create_inference_session",
     "detect_runtime_processes",
     "estimate_token_generation_speed_for_profiles",
     "estimate_recommended_token_generation_speed",

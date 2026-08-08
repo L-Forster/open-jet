@@ -1,4 +1,12 @@
-from .sdk import OpenJetSession, SDKEvent, SDKEventKind, SDKResponse, ToolResult, create_agent
+from .sdk import (
+    OpenJetSession,
+    SDKEvent,
+    SDKEventKind,
+    SDKResponse,
+    ToolResult,
+    create_agent,
+    create_inference_session,
+)
 
 __all__ = [
     "OpenJetSession",
@@ -7,4 +15,5 @@ __all__ = [
     "SDKResponse",
     "ToolResult",
     "create_agent",
+    "create_inference_session",
 ]

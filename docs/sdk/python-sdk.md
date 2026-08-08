@@ -5,13 +5,77 @@ Use the Python SDK when you want to embed OpenJet inside another app, agent, wor
 Primary imports:
 
 ```python
-from openjet.sdk import OpenJetSession, create_agent, recommend_hardware_config
+from openjet.sdk import (
+    OpenJetSession,
+    create_agent,
+    create_inference_session,
+    recommend_hardware_config,
+)
 ```
 
-The SDK surface has two main jobs:
+The SDK surface has three main jobs:
 
+- run a local model as plain text in, text out, inside an application you ship
 - embed OpenJet sessions and tool execution in another Python application
 - profile hardware and recommend local `llama.cpp` settings
+
+If you are shipping a model inside your own application, start with the
+[SDK quickstart](quickstart.md) — the model has to be provisioned into the project with
+`openjet project` before any session will start.
+
+## Three ways to create a session
+
+| Constructor | Tools | Use it for |
+|---|---|---|
+| `create_inference_session()` | none — every tool refused | a model embedded in something you ship |
+| `OpenJetSession.create()` | whatever `allowed_tools` permits | your own policy, explicitly stated |
+| `create_agent()` | the full agent surface | the same loop the terminal agent runs |
+
+### Inference-only sessions
+
+```python
+import asyncio
+
+from openjet.sdk import create_inference_session
+
+
+async def main() -> None:
+    session = await create_inference_session(
+        system_prompt="You are a shopkeeper in a fantasy village. Two sentences maximum.",
+    )
+    try:
+        result = await session.run("The player asks what you have for sale.")
+        print(result.text)
+    finally:
+        await session.close()
+
+
+asyncio.run(main())
+```
+
+`create_inference_session()` passes an empty `allowed_tools` set, so the model cannot
+reach the shell or the filesystem no matter what it generates. That is the shape you want
+for anything facing your users. It accepts `cfg`, `system_prompt`, `root`, and
+`airgapped`; there is no `approval_handler`, because nothing can be approved.
+
+Sessions pick up `.openjet/config.yaml` from anywhere inside the project, so behaviour is
+the same from `src/`, from a test, or from your app's entrypoint. See
+[Configuration](../configuration.md#project-configuration-openjetconfigyaml).
+
+### Models are never fetched at runtime
+
+`OpenJetSession.create()` verifies the configured local model exists and raises if it
+does not. It does not download it:
+
+```
+RuntimeError: Configured model is missing: /app/.openjet/models/Qwen3.5-4B-Q4_K_M.gguf
+Run `openjet project` to provision it. OpenJet does not download models at runtime.
+```
+
+Acquisition is a build-time step. An application you ship must not reach the network on a
+user's machine, and a user must never be asked to fetch a file and put it somewhere. The
+check applies to the local `llama.cpp` runtime; remote runtimes have no local model to
+verify.
 
 ## Basic local session
 
@@ -110,13 +174,18 @@ and TUI experience.
 
 ## Session creation options
 
-`OpenJetSession.create()` and `create_agent()` accept:
+`OpenJetSession.create()`, `create_agent()`, and `create_inference_session()` accept:
 
 - `cfg`: explicit config override dict
 - `system_prompt`: replacement base system prompt
 - `approval_handler`: sync or async callback for gated tools
 - `allowed_tools`: explicit allowed tool-name set
 - `airgapped`: override air-gapped mode for the session
+- `root`: project root to resolve file work and the `.openjet/` overlay against
+
+`create_inference_session()` takes `cfg`, `system_prompt`, `root`, and `airgapped` only —
+it fixes `allowed_tools` to the empty set, which leaves nothing for an
+`approval_handler` to decide.
 
 ## Approval and tool limits
 
@@ -166,5 +235,8 @@ If you already have your own orchestrator, prefer:
 
 ## Related surfaces
 
+- If you are embedding a model in an application you ship, see the [SDK quickstart](quickstart.md).
+- For the embedded model catalog, use cases, and target devices, see [Choosing a model](../models.md).
+- For the project overlay and config precedence, see [Configuration](../configuration.md#project-configuration-openjetconfigyaml).
 - If you want the interactive terminal app, see [CLI usage](../usage/cli.md).
 - If you want throughput measurements for the active model profile, see [Benchmarking](../benchmarking.md).
