@@ -1164,7 +1164,11 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(payload["model_source"], "direct")
-        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.6-27B-Q4_K_M-MTP.gguf"))
+        self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.8-27B-Q4_K_M.gguf"))
+        self.assertEqual(
+            payload["model_download_url"],
+            "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf?download=true",
+        )
         self.assertTrue(payload["llama_mtp"])
         self.assertGreater(int(payload["context_window_tokens"]), 6144)
 
@@ -1471,7 +1475,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             recommend_direct_model(HardwareInfo(label="24GB", total_ram_gb=24.0, has_cuda=False))["label"],
-            "Qwen3.6 27B Q4_K_M MTP",
+            "Qwen3.8 27B Q4_K_M MTP",
         )
 
     def test_recommend_direct_model_uses_12gb_27b_quant_on_gpu(self) -> None:
@@ -1496,7 +1500,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.6 27B Q4_K_M MTP")
+        self.assertEqual(recommended["label"], "Qwen3.8 27B Q4_K_M MTP")
 
     def test_recommend_direct_model_uses_12gb_27b_quant_on_vulkan(self) -> None:
         recommended = recommend_direct_model(

@@ -46,9 +46,9 @@ setup_recommendations:
       model_size_mb: 12288
       kv_bytes_per_token: 34816
     - max_ram_gb: 20
-      label: Qwen3.6 27B Q4_K_M MTP
-      filename: Qwen3.6-27B-Q4_K_M-MTP.gguf
-      url: https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/resolve/main/Qwen3.6-27B-Q4_K_M.gguf?download=true
+      label: Qwen3.8 27B Q4_K_M MTP
+      filename: Qwen3.8-27B-Q4_K_M.gguf
+      url: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf?download=true
       llama_mtp: true
       model_size_mb: 16896
       kv_bytes_per_token: 34816

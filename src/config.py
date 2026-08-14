@@ -35,6 +35,9 @@ QWEN36_27B_MTP_UPDATE_ID = "qwen36-27b-mtp-unsloth"
 QWEN36_27B_PREFIX = "qwen3.6-27b-"
 QWEN36_35B_A3B_NON_MTP_REPO = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/"
 QWEN36_35B_A3B_MTP_UPDATE_ID = "qwen36-35b-a3b-mtp-unsloth"
+QWEN38_27B_REPO = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"
+QWEN38_27B_FILENAME = "Qwen3.8-27B-Q4_K_M.gguf"
+QWEN38_27B_URL = f"{QWEN38_27B_REPO}/resolve/main/{QWEN38_27B_FILENAME}?download=true"
 MANAGED_MODELS_DIR = openjet_install_root() / "models"
 
 
@@ -149,9 +152,9 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
     },
     {
         "max_ram_gb": 20.0,
-        "label": "Qwen3.6 27B Q4_K_M MTP",
-        "filename": QWEN36_27B_MTP_FILENAME,
-        "url": QWEN36_27B_MTP_URL,
+        "label": "Qwen3.8 27B Q4_K_M MTP",
+        "filename": QWEN38_27B_FILENAME,
+        "url": QWEN38_27B_URL,
         "llama_mtp": True,
         "model_size_mb": 16817,
         "resident_model_size_mb": 16896,

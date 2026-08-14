@@ -1267,7 +1267,14 @@ def _fmt_number(value: float | int | None) -> str:
     return f"{float(value):.1f}"
 
 
-def _probe_llama_cpp_decode(host: str, port: int, *, timeout: float = 60.0) -> float | None:
+def _probe_llama_cpp_decode(
+    host: str,
+    port: int,
+    *,
+    timeout: float = 60.0,
+    n_predict: int = 160,
+    repetitions: int = 2,
+) -> float | None:
     prompt = (
         "OpenJet runtime throughput probe. "
         "Write concise technical notes about local model performance, batching, "
@@ -1276,13 +1283,13 @@ def _probe_llama_cpp_decode(host: str, port: int, *, timeout: float = 60.0) -> f
     body = json.dumps(
         {
             "prompt": prompt,
-            "n_predict": 160,
+            "n_predict": max(1, int(n_predict)),
             "stream": False,
             "cache_prompt": False,
         }
     ).encode("utf-8")
     results: list[float] = []
-    for _ in range(2):
+    for _ in range(max(1, int(repetitions))):
         req = Request(
             f"http://{host}:{port}/completion",
             data=body,

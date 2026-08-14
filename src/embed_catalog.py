@@ -12,8 +12,8 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from .config import (
-    QWEN36_27B_MTP_FILENAME,
-    QWEN36_27B_MTP_URL,
+    QWEN38_27B_FILENAME,
+    QWEN38_27B_URL,
     _qwen36_27b_mtp_url,
     _qwen36_mtp_local_filename,
 )
@@ -135,11 +135,11 @@ EMBED_MODEL_CATALOG: tuple[dict[str, Any], ...] = (
         "use_cases": ("chat", "summarize"),
     },
     {
-        "id": "qwen36-27b-q4km",
-        "label": "Qwen3.6 27B Q4_K_M MTP",
+        "id": "qwen38-27b-q4km",
+        "label": "Qwen3.8 27B Q4_K_M MTP",
         "quant": "Q4_K_M",
-        "filename": QWEN36_27B_MTP_FILENAME,
-        "url": QWEN36_27B_MTP_URL,
+        "filename": QWEN38_27B_FILENAME,
+        "url": QWEN38_27B_URL,
         "model_size_mb": 16817,
         "resident_model_size_mb": 16896,
         "active_params_b": 27.0,

@@ -19,7 +19,7 @@ good trade. `max_ram_gb` is the configured setup target for that row.
 | Qwen3.5 9B | 12.0 | 5.7 GB |
 | Qwen3.6 27B UD-IQ2_XXS MTP | 12.0 | 9.4 GB |
 | Qwen3.6 27B UD-IQ3_XXS MTP | 16.0 | 12.0 GB |
-| Qwen3.6 27B Q4_K_M MTP | 20.0 | 16.4 GB |
+| Qwen3.8 27B Q4_K_M MTP | 20.0 | 16.4 GB |
 
 **Unified memory only:**
 
@@ -77,7 +77,7 @@ tolerate. A larger model at a quant below the floor loses to a smaller one above
 | Qwen3.5 4B | Q4_K_M | 2.8 GB | ~180 ms | ~55 tok/s | chat, dialogue, extract, classify, summarize |
 | Qwen3.5 9B | Q4_K_M | 5.7 GB | ~400 ms | ~32 tok/s | chat, extract, summarize |
 | Qwen3.6 27B UD-IQ3_XXS MTP | UD-IQ3_XXS | 12.1 GB | ~900 ms | ~18 tok/s | chat, summarize |
-| Qwen3.6 27B Q4_K_M MTP | Q4_K_M | 16.6 GB | ~1100 ms | ~15 tok/s | chat, summarize, extract |
+| Qwen3.8 27B Q4_K_M MTP | Q4_K_M | 16.6 GB | ~1100 ms | ~15 tok/s | chat, summarize, extract |
 
 Throughput and first-token figures are planning estimates scaled off active parameter
 count, not measured numbers. Run `openjet benchmark` on real target hardware before

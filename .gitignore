@@ -40,6 +40,7 @@ hello_world.py
 testfile
 .local-scripts/
 *.gguf
+*:Zone.Identifier
 .codex
 .claude/settings.local.json
 MEMORY.md

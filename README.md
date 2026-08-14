@@ -102,7 +102,7 @@ application, see [Choosing a model](docs/models.md).
 | Qwen3.5 9B | 12.0 |
 | Qwen3.6 27B UD-IQ2_XXS MTP | 12.0 |
 | Qwen3.6 27B UD-IQ3_XXS MTP | 16.0 |
-| Qwen3.6 27B Q4_K_M MTP | 20.0 |
+| Qwen3.8 27B Q4_K_M MTP | 20.0 |
 
 **Unified memory only (`unified_memory_only: True`, `llama_cpu_moe: True`):**
 

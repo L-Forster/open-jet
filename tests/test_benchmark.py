@@ -59,6 +59,28 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(run_completion.call_args.kwargs["n_prompt"], 512)
         self.assertEqual(run_completion.call_args.kwargs["n_gen"], 128)
 
+    def test_run_benchmark_uses_mtp_server_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "Qwen3.8-27B-Q4_K_M.gguf"
+            model.write_bytes(b"GGUF")
+            cfg = {
+                "llama_model": str(model),
+                "llama_server_path": "/opt/llama/bin/llama-server",
+                "device": "cuda",
+                "gpu_layers": 99,
+                "llama_mtp": True,
+            }
+
+            with patch("src.benchmark.load_config", return_value=cfg), patch(
+                "src.benchmark._print_header"
+            ), patch("src.benchmark._find_llama_bench", return_value="/opt/llama/bin/llama-bench"), patch(
+                "src.benchmark._run_mtp_benchmark"
+            ) as run_mtp, patch("src.benchmark._run_bench") as run_bench:
+                benchmark.run_benchmark()
+
+        run_mtp.assert_called_once_with(cfg, n_gen=128, repetitions=5)
+        run_bench.assert_not_called()
+
     def test_run_benchmark_maps_cpu_moe_to_all_gpu_layers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model = Path(tmp) / "model.gguf"

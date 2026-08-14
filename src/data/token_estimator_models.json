@@ -64,6 +64,25 @@
     ]
   },
   {
+    "key": "qwen38_27b_q4_k_m",
+    "label": "Qwen3.8 27B Q4_K_M MTP",
+    "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+    "parameter_count_billion": 27.0,
+    "model_size_mb": 16896.0,
+    "kv_bytes_per_token": 34816.0,
+    "decode_context_tokens": 8192,
+    "source_urls": [
+      "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"
+    ],
+    "aliases": [
+      "qwen3.8 27b",
+      "qwen3.8 27b q4_k_m",
+      "qwen3.8 27b q4_k_m mtp",
+      "qwen3.8-27b-q4_k_m.gguf",
+      "qwen3.8:27b"
+    ]
+  },
+  {
     "key": "gemma4_26b_a4b_q4_k_s",
     "label": "Gemma 4 26B A4B",
     "filename": "gemma-4-26B-A4B.i1-Q4_K_S.gguf",

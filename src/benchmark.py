@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
@@ -213,6 +214,31 @@ def _run_bench(cmd: list[str], env: dict[str, str]) -> None:
     subprocess.run(cmd, env=env)
 
 
+def _run_mtp_benchmark(cfg: dict, *, n_gen: int, repetitions: int) -> None:
+    from .runtime_registry import create_runtime_client
+    from .sdk.fix import _probe_llama_cpp_decode
+
+    async def measure() -> float | None:
+        client = create_runtime_client(cfg)
+        await client.start()
+        try:
+            return await asyncio.to_thread(
+                _probe_llama_cpp_decode,
+                client.host,
+                client.port,
+                n_predict=n_gen,
+                repetitions=repetitions,
+            )
+        finally:
+            await client.close()
+
+    print("Runner:  llama-server --spec-type draft-mtp")
+    speed = asyncio.run(measure())
+    if speed is None:
+        raise RuntimeError("MTP benchmark completed without decode timing data.")
+    print(f"MTP decode: {speed:.2f} tok/s")
+
+
 def _run_completion_process(cmd: list[str], env: dict[str, str]) -> None:
     print(f"{'─' * 60}\n$ {' '.join(cmd)}\n{'─' * 60}")
     sys.stdout.flush()
@@ -403,7 +429,14 @@ def run_benchmark(
     bench_bin, model_path, device, gpu_layers, env, base = _load_bench_context(cfg)
 
     _print_header("OpenJet Benchmark", model_path, device, gpu_layers)
-    print(f"Config:  fa=on, ctk=q8_0, ctv=q8_0, moe={_moe_label(cfg, gpu_layers, model_path)}")
+    mtp = "on" if bool(cfg.get("llama_mtp")) else "off"
+    print(f"Config:  fa=on, ctk=q8_0, ctv=q8_0, moe={_moe_label(cfg, gpu_layers, model_path)}, mtp={mtp}")
+
+    if bool(cfg.get("llama_mtp")):
+        print(f"Test:    MTP tg{n_gen} x{repetitions} reps")
+        _run_mtp_benchmark(cfg, n_gen=n_gen, repetitions=repetitions)
+        return
+
     print(f"Test:    pp{n_prompt} / tg{n_gen} x{repetitions} reps")
 
     if _is_moe_benchmark(cfg, model_path):
