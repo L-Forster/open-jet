@@ -1,16 +1,20 @@
 # OpenJet
 
-## Run local LLMs in your terminal and in your code
+## Self-hosted local AI coding agent for Ollama, LM Studio, and llama.cpp
 
-**A terminal coding agent, and a Python SDK for embedding on-device models in your own apps.**
+**Use your existing local LLM server, or let OpenJet provision and host the right GGUF
+model for your hardware. Then use the same runtime through the terminal agent or Python SDK.**
 
-OpenJet runs the model and the agent loop on your machine. No API keys. No code or data upload.
+OpenJet is an open-source, private AI coding assistant that reads and edits files, runs
+approved shell commands, uses tools, and keeps sessions on your machine. It connects to
+Ollama, LM Studio, llama.cpp, and other OpenAI-compatible local servers. If you do not
+already have a local AI stack, `openjet setup` downloads, configures, and serves one for you.
 
 RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP. Open source.
 
 [Discord](https://discord.gg/pspKHtExSa)
 
-**In your terminal**, OpenJet is a local coding agent:
+**In your terminal**, OpenJet is a self-hosted coding agent:
 
 ```text
 files -> tools -> shell approval -> workflows -> local model
@@ -22,7 +26,7 @@ an in-app assistant, an NPC that talks, a classifier, an extraction pipeline. Ru
 device, downloaded into the project, and bundled with your build. The SDK never
 downloads at runtime, so your users never fetch a file or see a config.
 
-No API calls. No code or data upload.
+No hosted API is required. With a local profile, no code or prompt data leaves your machine.
 
 RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP.
 

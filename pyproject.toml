@@ -1,7 +1,7 @@
 [project]
 name = "open-jet"
 version = "0.4.31"
-description = "Run local LLMs on your own hardware: a terminal coding agent, and a Python SDK for embedding on-device models in your own applications. No API keys, no data upload."
+description = "Self-hosted local AI coding agent for Ollama, LM Studio, and llama.cpp, with hardware-aware model provisioning and a Python SDK for on-device LLMs."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 authors = [
@@ -21,6 +21,20 @@ keywords = [
     "gguf",
     "ai-agent",
     "coding-agent",
+    "local-coding-agent",
+    "self-hosted-coding-agent",
+    "ai-coding-assistant",
+    "local-ai",
+    "self-hosted-ai",
+    "private-ai",
+    "air-gapped-ai",
+    "ollama",
+    "lm-studio",
+    "llama-cpp",
+    "openai-compatible",
+    "model-provisioning",
+    "local-inference",
+    "python-sdk",
     "tui",
     "jetson",
     "edge-ai",

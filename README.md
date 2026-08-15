@@ -5,19 +5,19 @@
 ![Qwen3.6-27B Terminal-Bench 2.0](https://img.shields.io/badge/Qwen3.6--27B%20Terminal--Bench%202.0-59.3-blue)
 
 <p align="center">
-  <img width="1672" height="941" alt="OpenJet running a local LLM coding agent in a terminal" src="https://github.com/user-attachments/assets/b06b0b8f-1bbc-443d-920e-bd70bff1479c" />
+  <img width="1672" height="941" alt="OpenJet self-hosted local AI coding agent running in a terminal" src="https://github.com/user-attachments/assets/b06b0b8f-1bbc-443d-920e-bd70bff1479c" />
 </p>
 
 <br />
 
-<h1 align="center">Run local LLMs in your terminal and in your code</h1>
+<h1 align="center">The self-hosted AI coding agent for local LLMs</h1>
 
 <h3 align="center">
-  A terminal coding agent, and a Python SDK for embedding on-device models in your own apps.
+  Use Ollama, LM Studio, or llama.cpp — or let OpenJet provision and host the right GGUF model for your hardware.
 </h3>
 
 <p align="center">
-  OpenJet runs the model and the agent loop on your machine. No API keys. No code or data upload.
+  A private, offline coding assistant, hardware-aware local inference host, and Python SDK for embedding on-device models in your own applications.
 </p>
 
 <p align="center">
@@ -28,35 +28,122 @@
   <a href="https://discord.com/invite/pspKHtExSa">Discord</a>
 </p>
 
-**An agent in your terminal:**
+OpenJet is an open-source local AI coding agent that reads and edits files, runs approved
+shell commands, uses tools, and keeps sessions on your machine. Connect an existing local
+LLM server or let OpenJet download, configure, and serve a model itself—without requiring
+an OpenJet account, subscription, or hosted API.
+
+## Local AI coding agent for Ollama, LM Studio, and llama.cpp
+
+OpenJet does not make you rebuild your local LLM setup. Use the server you already run,
+or let OpenJet provision the complete stack for you.
+
+| You have | How OpenJet uses it |
+|---|---|
+| **Nothing installed yet** | Profiles your hardware, selects and downloads a GGUF, provisions `llama-server`, and starts the agent |
+| **Ollama** | Connects to Ollama's local OpenAI-compatible endpoint |
+| **LM Studio** | Connects to the local server exposed by LM Studio |
+| **llama.cpp + a GGUF** | Reuses your model and `llama-server`, with native lifecycle and KV-cache integration |
+| **Any OpenAI-compatible local server** | Uses its loopback `/v1` endpoint without requiring a real API key |
+
+### Let OpenJet provision and host the model
 
 ```bash
 pipx install open-jet
 openjet setup
 ```
 
-Setup profiles your hardware, picks a coding model that fits, downloads it, configures `llama.cpp`, and drops you into the agent. Then run `openjet`.
-
-**A model inside your own application:**
+Setup profiles your GPU and memory, picks a coding model that fits, downloads it, provisions
+or reuses `llama-server`, and configures the context window and GPU offload. OpenJet then
+starts and manages the model server itself.
 
 ```bash
-pip install open-jet
-cd your-project
-openjet project
+openjet
 ```
 
-`openjet project` provisions a model for what you are shipping — chosen by use case, target device, and the memory budget your app can spare — and downloads it into your project so the build can bundle it. The SDK never downloads at runtime.
+Already have a GGUF? Choose **Use a local .gguf model file** during setup. If
+`llama-server` is on `PATH` or installed under `~/llama.cpp/build/bin/`, OpenJet reuses it.
 
-```python
-from openjet.sdk import create_inference_session
+This native path gives OpenJet control of the full model lifecycle: server startup, streaming,
+reasoning mode, KV-cache reset/save/restore, and unload/reload on memory-constrained machines.
 
-session = await create_inference_session(system_prompt="You are a shopkeeper. Two sentences max.")
-print((await session.run("The player asks what you have for sale.")).text)
+### Use Ollama, LM Studio, or a running llama.cpp server
+
+Install the OpenAI-compatible runtime adapter:
+
+```bash
+pipx install 'open-jet[cloud]'
 ```
 
-Text in, text out, with every tool refused — an embedded model cannot reach the shell or the filesystem no matter what it generates.
+Run `openjet status` to see which `config.yaml` OpenJet is using. Add one of these
+profiles to that file, start OpenJet, then select it with `/model <profile-name>`.
 
-New here? [Getting started](docs/getting-started.md) forks by which one you want.
+#### Ollama local coding agent
+
+First run a tool-capable model, for example `ollama run qwen3.5:9b`:
+
+```yaml
+model_profiles:
+  - name: ollama-qwen
+    runtime: litellm
+    provider: openai-compatible
+    model: openai/qwen3.5:9b
+    base_url: http://127.0.0.1:11434/v1
+    context_window_tokens: 32768
+```
+
+#### LM Studio local coding agent
+
+Start the LM Studio local server and replace the model ID below with the one it exposes:
+
+```yaml
+model_profiles:
+  - name: lm-studio
+    runtime: litellm
+    provider: openai-compatible
+    model: "openai/<lm-studio-model-id>"
+    base_url: http://127.0.0.1:1234/v1
+    context_window_tokens: 32768
+```
+
+#### llama.cpp local coding agent
+
+Connect a running `llama-server`; its default port is normally `8080`:
+
+```yaml
+model_profiles:
+  - name: llama-server
+    runtime: litellm
+    provider: openai-compatible
+    model: openai/local
+    base_url: http://127.0.0.1:8080/v1
+    context_window_tokens: 32768
+```
+
+Loopback servers receive a local placeholder key automatically; OpenJet does not require or
+store a real API key for them. Set `airgapped: true` if you want OpenJet to reject every
+non-loopback model and tool endpoint.
+
+> Connecting to an already-running server gives OpenJet the agent interface while that server
+> owns the model process. Use the native managed `llama.cpp` path when you want OpenJet to
+> provision, start, stop, unload, reload, and optimize the model itself.
+
+## Why OpenJet
+
+- **Use your runtime or bring none.** Connect Ollama, LM Studio, llama.cpp, or another local
+  OpenAI-compatible server. If you have no stack yet, one setup command creates it.
+- **Own the model and the agent loop.** Files, commands, sessions, inference, and model weights
+  can all remain on your machine, with no hosted OpenJet service in the path.
+- **Built for local models.** The harness uses bounded context, automatic condensing, persistent
+  step state, and low-memory model swapping instead of assuming frontier-model resources.
+- **Hardware-aware provisioning.** OpenJet selects a model, quantization, context window, and GPU
+  offload for the memory actually available on the machine.
+- **Local inference hosting included.** On the native llama.cpp path, OpenJet provisions and manages
+  `llama-server`; you do not need a separate model manager or inference service.
+- **An SDK, not only a terminal.** Use the same local runtime from Python, or provision and bundle
+  an on-device model inside software you ship.
+- **Tools without surrendering control.** Work with files and shell commands, connect MCP tools
+  and devices, and keep side effects visible and permission-gated.
 
 ## Built for small models, not shrunk down from big ones
 
@@ -64,31 +151,17 @@ Most coding agents assume a frontier model with a huge context window, then let 
 
 So the harness does the work — `chat` / `code` / `review` / `debug` modes, step-oriented state that persists across turns, project and skill docs loaded into bounded turn context, automatic context condensing, and model unload/reload on constrained hardware. The point is that the loop still knows what it is doing at step twenty.
 
-No API calls. No code or data upload.
+No hosted API is required. With a local profile, no code or prompt data leaves your machine.
 
 If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config. If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
 
-## Install
+## Managed llama.cpp hardware and models
 
-### Recommended
+For the native managed runtime, recommended hardware is Apple silicon with 24GB+ unified
+memory or a GPU with 14GB+ VRAM. Existing Ollama, LM Studio, and OpenAI-compatible servers
+remain responsible for their own model requirements.
 
-```bash
-pipx install open-jet
-openjet setup
-```
-
-If you do not use `pipx`, install with Python directly:
-
-```bash
-python -m pip install --user open-jet
-openjet setup
-```
-
-The PyPI package is `open-jet`; the installed command is `openjet`.
-
-Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14GB+ VRAM.
-
-### Recommended hardware and models
+### Provisioning catalog
 
 The tables below list the setup catalog entries from `src/config.py`. `max_ram_gb`
 is the configured setup target for that row. For embedding a model in your own
@@ -112,13 +185,8 @@ application, see [Choosing a model](docs/models.md).
 | Qwen3.6 35B A3B UD-IQ2_XXS MTP | 24.0 |
 | Qwen3.6 35B A3B UD-Q3_K_XL MTP | 32.0 |
 
-Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
-
-Then run:
-
-```bash
-openjet
-```
+Setup detects your hardware, picks a model that fits your RAM, downloads it, and gets
+everything running. Already have a `.gguf`? It finds that too.
 
 Other entrypoints from the same install:
 
@@ -179,23 +247,11 @@ asyncio.run(main())
 - [Choosing a model](docs/models.md) — use cases, target devices, and the embedded catalog
 - [Project configuration](docs/configuration.md#project-configuration-openjetconfigyaml) — the `.openjet/` overlay and config precedence
 
-## Why OpenJet
-
-| What it does | Why it matters |
-|---|---|
-| **Easy local LLM setup** | Get a working local agent without manually learning the entire backend and runtime stack first |
-| **Unified backend + harness** | One local system instead of separately wiring together a model runtime, config layer, frontend, and agent workflow |
-| **Local agent loop** | Work with files, approve shell commands, connect tools, and iterate against a local model |
-| **Hardware-aware setup** | OpenJet picks sensible defaults for your machine instead of leaving you to trial-and-error every setting |
-| **No API calls or data upload** | Keep the agent loop on your machine instead of sending work to a hosted model provider |
-| **Remote execution support** | Run the model on one machine and execute on another |
-| **SDK + benchmarks included** | Script the same runtime from Python and measure performance on your own hardware |
-
 ## What OpenJet combines
 
 | Layer | What OpenJet provides |
 | --- | --- |
-| Local model runtime | Model discovery, download, and `llama.cpp` configuration |
+| Local model runtime | Managed model discovery, download, and `llama.cpp` hosting, or connection to Ollama, LM Studio, and OpenAI-compatible servers |
 | Agent interface | Terminal TUI for file work, commands, tools, and session continuity |
 | Hardware setup | RAM / VRAM profiling and sensible defaults for the current machine |
 | Workflow harness | Repeatable runs from the CLI, SDK, or background workflow runner |
@@ -270,6 +326,24 @@ Everything runs on your machine.
 
 `pipx install open-jet && openjet setup`. Setup profiles your GPU and RAM, picks a GGUF model that fits, downloads it, builds or reuses `llama-server` from `llama.cpp`, and drops you into the agent. There is no account, no key, and no hosted endpoint anywhere in the path.
 
+### Does OpenJet work with Ollama and LM Studio?
+
+Yes. OpenJet connects to the local OpenAI-compatible endpoints exposed by Ollama and
+LM Studio, as well as a running `llama-server` or another compatible server. See
+[Use Ollama, LM Studio, or a running llama.cpp server](#use-ollama-lm-studio-or-a-running-llamacpp-server).
+
+### What is the difference between OpenJet and Ollama or LM Studio?
+
+Ollama and LM Studio primarily run and serve models. OpenJet adds the coding-agent loop:
+file editing, approved shell commands, tools, persistent sessions, bounded context, workflows,
+and an SDK. OpenJet can use those servers, or replace that layer by provisioning and managing
+`llama-server` itself.
+
+### Is OpenJet fully self-hosted and offline?
+
+Yes when you select a local profile. The model, agent loop, tool execution, and session state
+remain on hardware you control. `airgapped: true` additionally rejects non-loopback endpoints.
+
 ### Can I embed a local LLM in an app I ship to users?
 
 Yes — that is what `openjet project` and `openjet.sdk` are for. You provision the model once at build time, bundle the weights with your build, and call `create_inference_session()` from your code. See [Embed a local LLM in your own application](#embed-a-local-llm-in-your-own-application).
@@ -296,7 +370,9 @@ Optionally, and never automatically. `/connect` plus a model profile routes to O
 
 ### Is my code or data sent anywhere?
 
-No. The model, the agent loop, tool execution, and session state all stay on your machine.
+Not when you use a local profile. The model, agent loop, tool execution, and session state
+stay on your machine. If you manually select an optional cloud profile, prompts are sent only
+to that profile's configured provider.
 
 ## Docs
 
