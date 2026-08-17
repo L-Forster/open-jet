@@ -362,7 +362,7 @@ export class OpenJetPiAgent {
   }
 
   private async runLocalWorker(parentCallId: string, params: Record<string, unknown>): Promise<{ content: TextContent[]; details: Record<string, unknown> }> {
-    if (!this.localModel || !this.modelsPath) throw new Error("Hybrid local model is not configured.");
+    if (!this.localModel || !this.modelsPath) throw new Error("Slipstream local model is not configured.");
     const runtime = await ModelRuntime.create({ modelsPath: this.modelsPath, allowModelNetwork: false, refreshOnCreate: true });
     const model = runtime.getModel(this.localModel.provider, this.localModel.id);
     if (!model) throw new Error(`Pi could not load local worker ${this.localModel.provider}/${this.localModel.id}`);

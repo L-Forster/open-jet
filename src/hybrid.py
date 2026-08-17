@@ -17,7 +17,7 @@ TARGET_CODEX_SHARE = 0.20
 TARGET_QUALITY_RETENTION = 0.99
 
 ORCHESTRATOR_SYSTEM_PROMPT = """
-You are the primary reasoning and quality agent in OpenJet Hybrid mode. Act as an
+You are the primary reasoning and quality agent in OpenJet Slipstream mode. Act as an
 orchestrator: own intent, architecture, risk decisions, task decomposition, and final
 review. Delegate the high-volume implementation loop to delegate_local whenever the
 work can be described with concrete acceptance criteria. This includes repository
@@ -112,7 +112,7 @@ class HybridWorker:
             harness_state=state,
         )
         try:
-            # Hybrid mode is deliberately warm: selecting it starts and health-checks
+            # Slipstream is deliberately warm: selecting it starts and health-checks
             # llama.cpp now, rather than on the first delegated call.
             await session.agent.client.start()
             session.agent.trace_hook = trace_hook

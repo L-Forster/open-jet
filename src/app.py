@@ -1004,7 +1004,7 @@ class OpenJetApp:
         client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
         hybrid_enabled = execution_mode(self.cfg) == HYBRID_MODE
         if hybrid_enabled and active_runtime(self.cfg) != CODEX_RUNTIME:
-            raise ValueError("Hybrid mode requires an OpenAI Codex profile as the primary model.")
+            raise ValueError("Slipstream mode requires an OpenAI Codex profile as the primary model.")
         base_system_prompt = ORCHESTRATOR_SYSTEM_PROMPT if hybrid_enabled else ""
         system_prompt = await build_system_prompt(base_system_prompt, Path.cwd(), cfg=self.cfg)
         if active_runtime(self.cfg) != DEFAULT_RUNTIME:
@@ -1054,7 +1054,7 @@ class OpenJetApp:
                     await client.close()
                 self.client = None
                 self.agent = None
-                raise ValueError("Hybrid mode needs a saved local model profile. Run /setup to add one.")
+                raise ValueError("Slipstream mode needs a saved local model profile. Run /setup to add one.")
             try:
                 self.hybrid_worker = await HybridWorker.start(
                     base_cfg=self.cfg,
@@ -1315,11 +1315,11 @@ class OpenJetApp:
         codex_profile = get_model_profile(self.cfg, codex_profile_name)
         local_profile = get_model_profile(self.cfg, local_profile_name)
         if not codex_profile or active_runtime(codex_profile) != CODEX_RUNTIME:
-            log.write("[yellow]Hybrid mode needs an OpenAI Codex profile.[/]")
+            log.write("[yellow]Slipstream mode needs an OpenAI Codex profile.[/]")
             log.write("")
             return False
         if not local_profile or active_runtime(local_profile) != DEFAULT_RUNTIME:
-            log.write("[yellow]Hybrid mode needs a saved local model profile.[/]")
+            log.write("[yellow]Slipstream mode needs a saved local model profile.[/]")
             log.write("")
             return False
 
@@ -1360,7 +1360,7 @@ class OpenJetApp:
                         replay_history=False,
                         use_current_system_prompt=True,
                     )
-            log.write(f"[bold red]Hybrid start failed:[/] {_format_error(exc)}")
+            log.write(f"[bold red]Slipstream start failed:[/] {_format_error(exc)}")
             log.write("")
             return False
         status.update("")
@@ -1369,7 +1369,7 @@ class OpenJetApp:
         self._start_new_chat_session()
         self.persist_session_state(reason="hybrid_switch")
         self._render_token_counter()
-        log.write("[bold bright_white]Hybrid ready. Codex and the local implementation worker are warm.[/]")
+        log.write("[bold bright_white]Slipstream ready. Codex and the local implementation worker are warm.[/]")
         log.write("")
         return True
 

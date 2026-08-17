@@ -641,7 +641,7 @@ class SlashCommandHandler:
             log.write(f"[bold bright_white]Active model preset: {active or 'none'}[/]")
             self._write_model_profile_list(log, profiles, active=active)
             if not arg:
-                log.write("[dim]Use /model <preset> to switch models, or /mode to pick Local, Codex, or Hybrid.[/]")
+                log.write("[dim]Use /model <preset> to switch models, or /mode to pick Local, Codex, or Slipstream.[/]")
             log.write("")
             return
 
@@ -663,7 +663,7 @@ class SlashCommandHandler:
     async def _runtime(self, log: Any, raw_arg: str) -> None:
         arg = raw_arg.strip().lower()
         if arg not in {"", "status", "list"}:
-            log.write("[yellow]/runtime reports the inference engine. Use /mode for Local, Codex, or Hybrid.[/]")
+            log.write("[yellow]/runtime reports the inference engine. Use /mode for Local, Codex, or Slipstream.[/]")
             log.write("")
             return
         runtime = active_runtime(self.app.cfg)
@@ -682,18 +682,18 @@ class SlashCommandHandler:
                 self.app.console,
                 "Mode",
                 [
-                    ("Hybrid — Codex orchestrates, local model implements", "hybrid"),
+                    ("Slipstream — Codex orchestrates, local model implements", "hybrid"),
                     ("Codex — frontier model only", "codex"),
                     ("Local — local model only", "local"),
                 ],
                 default_index={"hybrid": 0, "codex": 1, "local": 2}.get(
                     current_mode, 0
                 ),
-                detail="Selecting Hybrid starts and health-checks both models immediately.",
+                detail="Selecting Slipstream starts and health-checks both models immediately.",
             )
             arg = str(selected)
         arg = arg or "status"
-        if arg in {"hybrid", "orchestrator", "orchestrated"}:
+        if arg in {"slipstream", "hybrid", "orchestrator", "orchestrated"}:
             await self._configure_hybrid(log)
             return
         if arg in {"cloud", "codex", "openai-codex"}:
@@ -719,7 +719,7 @@ class SlashCommandHandler:
         self._write_model_profile_list(log, local_profiles, active=active, empty="none")
         log.write("[bold bright_white]Cloud profiles:[/]")
         self._write_model_profile_list(log, cloud_profiles, active=active, empty="none")
-        log.write("[dim]Use /mode to pick Local, Codex, or Hybrid.[/]")
+        log.write("[dim]Use /mode to pick Local, Codex, or Slipstream.[/]")
         log.write("")
 
     async def _configure_hybrid(self, log: Any) -> None:
@@ -758,7 +758,7 @@ class SlashCommandHandler:
             codex_name = await _prompt_choice(
                 self.app._session,
                 self.app.console,
-                "Hybrid Codex profile",
+                "Slipstream Codex profile",
                 [(f"{p['name']} · {p.get('model', '')}", str(p["name"])) for p in codex_profiles],
                 default_index=codex_default,
             )
@@ -968,7 +968,7 @@ class SlashCommandHandler:
             target = float(hybrid["target_codex_share"]) * 100
             state = "on target" if hybrid.get("on_target") else "above target"
             log.write(
-                f"[bold bright_white]Hybrid session: {share:.1f}% Codex tokens "
+                f"[bold bright_white]Slipstream session: {share:.1f}% Codex tokens "
                 f"(target ≤{target:.0f}%, {state})[/]"
             )
         log.write("")

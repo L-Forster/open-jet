@@ -8,7 +8,7 @@ export const bootstrapSlashCommands: SlashCommand[] = [
   { name: "setup", description: "Configure the local model runtime" },
   { name: "runtime", description: "Inspect or change the runtime" },
   { name: "model", description: "Inspect or change the active model" },
-  { name: "mode", description: "Choose Local, Codex, or Hybrid mode" },
+  { name: "mode", description: "Choose Local, Codex, or Slipstream mode" },
   { name: "effort", description: "Set Codex reasoning effort" },
   { name: "exit", description: "Exit OpenJet" },
   { name: "quit", description: "Exit OpenJet" },

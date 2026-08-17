@@ -12,13 +12,13 @@
 - `/load <path>` load a file into context
 - `/resume` pick a saved chat checkpoint from `.openjet/state/` and load it back into the TUI
 - `/setup` reopen setup wizard
-- `/model` configure the active mode's model selection (both models in Hybrid)
+- `/model` configure the active mode's model selection (both models in Slipstream)
 - `/model [status|list|<name>]` show or switch saved model presets
 - `/models` alias for `/model`
-- `/mode` open the Local / Codex / Hybrid mode picker
-- `/mode [status|local|codex|hybrid]` inspect or directly switch mode (`/agent` remains an alias)
+- `/mode` open the Local / Codex / Slipstream mode picker
+- `/mode [status|local|codex|slipstream]` inspect or directly switch mode (`slipstream` pairs Codex with the local model; `hybrid` remains accepted, and `/agent` remains an alias)
 - `/model` configure the active mode's model setup (Codex model and effort; local model and reasoning)
-- `/model codex=gpt-5.6-sol effort=high local=local reasoning=on` apply a Hybrid model configuration directly
+- `/model codex=gpt-5.6-sol effort=high local=local reasoning=on` apply a Slipstream model configuration directly
 - `/effort [none|low|medium|high|xhigh|max]` change Codex reasoning effort
 - `/runtime [status]` inspect the inference engine (for example llama.cpp)
 - `/local` switch to the local runtime profile

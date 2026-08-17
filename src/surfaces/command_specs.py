@@ -76,7 +76,7 @@ COMMANDS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec(
         name="mode",
-        description="Pick Local, Codex, or Hybrid mode: /mode [local|codex|hybrid|status]",
+        description="Pick Local, Codex, or Slipstream mode: /mode [local|codex|slipstream|status]",
         aliases=(),
     ),
     CommandSpec(name="local", description="Switch to the local runtime profile"),

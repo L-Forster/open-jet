@@ -81,8 +81,8 @@ let activeLocalReasoning = true;
 let codexModelOptions = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const serviceCommands = new Set(["status", "device", "devices", "sources", "setup", "runtime", "model", "mode", "agent", "strategy", "effort", "reasoning", "exit", "quit"]);
 const AGENT_TIPS = [
-  "Tip: Use /mode to switch between Local, Codex, and Hybrid. Hybrid keeps Codex on orchestration and visibly delegates the implementation loop to your warm local model.",
-  "Tip: Use /model to change the model for the active Local or Codex lane; Hybrid shows both models in the footer.",
+  "Tip: Use /mode to switch between Local, Codex, and Slipstream. Slipstream keeps Codex on orchestration and visibly delegates the implementation loop to your warm local model, targeting a 20% Codex token share.",
+  "Tip: Use /model to change the model for the active Local or Codex lane; Slipstream shows both models in the footer.",
 ];
 
 function clearActiveImages(): void {
@@ -591,7 +591,7 @@ editor.onSubmit = (value) => {
   if (text === "/mode" || text === "/agent" || text === "/strategy") {
     editor.addToHistory(text);
     const picker = new SelectList([
-      { value: "hybrid", label: "Hybrid", description: "Codex plans and reviews; the local model implements" },
+      { value: "hybrid", label: "Slipstream", description: "Codex plans and reviews; the local model implements — around 5x more work per Codex plan" },
       { value: "codex", label: "Codex", description: "Codex handles the complete task" },
       { value: "local", label: "Local", description: "The local model handles the complete task" },
     ], 3, selectTheme);

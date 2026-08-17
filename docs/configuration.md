@@ -218,7 +218,7 @@ model_profiles:
     text_verbosity: medium
 ```
 
-Use `/connect openai-codex` to sign in through the official Codex CLI ChatGPT OAuth flow, or `/connect openai-codex --device-auth` for Codex CLI's device-code flow on SSH/headless systems, then `/agent` to choose Local, Codex, or Hybrid. Codex OAuth is not API-key auth: OpenJet reads the Codex CLI OAuth session from `$CODEX_HOME/auth.json` or `~/.codex/auth.json` and sends requests to the Codex backend. `airgapped: true` disables Codex login and Codex agent modes while preserving local llama.cpp profiles.
+Use `/connect openai-codex` to sign in through the official Codex CLI ChatGPT OAuth flow, or `/connect openai-codex --device-auth` for Codex CLI's device-code flow on SSH/headless systems, then `/agent` to choose Local, Codex, or Slipstream. Codex OAuth is not API-key auth: OpenJet reads the Codex CLI OAuth session from `$CODEX_HOME/auth.json` or `~/.codex/auth.json` and sends requests to the Codex backend. `airgapped: true` disables Codex login and Codex agent modes while preserving local llama.cpp profiles.
 
 API-key providers use the optional LiteLLM runtime. Install it with `pip install open-jet[cloud]`, save credentials with `/connect openai`, `/connect anthropic`, or `/connect openrouter`, then switch manually with `/cloud <name>` or `/model <name>`:
 

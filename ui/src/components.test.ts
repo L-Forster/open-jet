@@ -125,7 +125,8 @@ describe("OpenJet visual hierarchy", () => {
       status: "ready",
     });
     const first = footer.render(140)[0];
-    expect(first.trimStart()).toMatch(/^HYBRID/);
+    // The wire value stays "hybrid"; the footer shows the user-facing name.
+    expect(first.trimStart()).toMatch(/^SLIPSTREAM/);
     expect(first).toContain("gpt-5.6-sol medium + Qwen3.8-27B");
   });
 

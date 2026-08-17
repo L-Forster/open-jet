@@ -144,6 +144,33 @@ non-loopback model and tool endpoint.
   an on-device model inside software you ship.
 - **Tools without surrendering control.** Work with files and shell commands, connect MCP tools
   and devices, and keep side effects visible and permission-gated.
+- **Stretch a frontier plan with Slipstream.** Pair Codex with your local model so the frontier
+  model plans and reviews while the local model implements — around 5x more work per Codex plan.
+
+## Slipstream: frontier results, a fraction of the frontier tokens
+
+Slipstream pairs a frontier Codex model with your warm local model. Codex keeps the work that
+determines whether the result is any good — intent, architecture, risk decisions, decomposition,
+and independent final review. Your local model does the work that actually burns the tokens:
+reading the repository, editing files, running tests, and grinding through failures.
+
+The saving comes from the handoff. The local worker's exploration, dead ends, and test output
+never enter the Codex context — only its concise conclusion does.
+
+```text
+SLIPSTREAM · gpt-5.6-sol medium + Qwen3.5-27B · Codex 18%
+```
+
+Slipstream targets a **20% Codex token share**, which is roughly **5x more work from the same
+Codex plan**. The footer measures your real share every session, so the claim is something you
+check rather than something you take on faith.
+
+Two things worth saying plainly: 20% is an optimization target, not a guarantee — small or
+high-risk tasks will use a larger Codex share, and the footer will show it. And the local side
+is not free, it costs GPU time and memory. Slipstream trades a resource you own for one you
+meter.
+
+Start it with `/mode` and choose **Slipstream**. See [Usage: Slipstream](docs/usage/slipstream.md).
 
 ## Built for small models, not shrunk down from big ones
 
@@ -373,7 +400,7 @@ Any GGUF that `llama.cpp` can load. The curated catalogs cover Qwen3.5 4B / 9B, 
 
 ### Can it use a cloud model too?
 
-Optionally, and never automatically. `/connect` plus a model profile routes to OpenAI, Anthropic, OpenRouter, or Codex OAuth when you switch to it by hand. Local `llama.cpp` remains the default.
+Optionally, and never automatically. `/connect` plus a model profile routes to OpenAI, Anthropic, OpenRouter, or Codex OAuth when you switch to it by hand. Local `llama.cpp` remains the default. Slipstream mode combines the two, keeping a frontier Codex model on planning and review while your local model implements, for roughly 5x more work per Codex plan.
 
 ### Is my code or data sent anywhere?
 
@@ -395,7 +422,7 @@ to that profile's configured provider.
 ### CLI + chat TUI
 - [Usage: CLI](docs/usage/cli.md)
 - [Usage: Slash commands](docs/usage/slash-commands.md)
-- [Usage: Hybrid mode](docs/usage/hybrid-mode.md)
+- [Usage: Slipstream](docs/usage/slipstream.md)
 - [Usage: Skills](docs/usage/skills.md)
 - [Usage: MCP](docs/usage/mcp.md)
 - [Usage: Device sources](docs/usage/device-sources.md)

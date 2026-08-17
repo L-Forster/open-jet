@@ -166,6 +166,8 @@ export class StatusFooter implements Component {
   invalidate(): void {}
   render(width: number): string[] {
     const mode = (this.state.agentMode || "local").toUpperCase();
+    // The wire value stays "hybrid"; Slipstream is the user-facing name.
+    const modeLabel = mode === "HYBRID" ? "SLIPSTREAM" : mode;
     const context = this.state.contextWindow
       ? `${compactNumber(this.state.contextTokens ?? 0)} / ${compactNumber(this.state.contextWindow)}`
       : "ctx —";
@@ -203,7 +205,7 @@ export class StatusFooter implements Component {
       : /working|starting|running|initializing|streaming/i.test(status) ? palette.warning : palette.greenSoft;
     const identityParts = width >= 120
       ? [
-          chalk.hex(palette.green).bold(mode),
+          chalk.hex(palette.green).bold(modeLabel),
           chalk.hex(palette.muted)(modelPair),
           chalk.hex(palette.muted)(workspace),
           chalk.hex(palette.dim)(runtime),
@@ -214,13 +216,13 @@ export class StatusFooter implements Component {
         ]
       : width >= 80
         ? [
-            chalk.hex(palette.green).bold(mode),
+            chalk.hex(palette.green).bold(modeLabel),
             chalk.hex(palette.muted)(modelPair),
             chalk.hex(palette.dim)(context),
             chalk.hex(statusColor)(status),
           ]
         : [
-            chalk.hex(palette.green).bold(mode),
+            chalk.hex(palette.green).bold(modeLabel),
             chalk.hex(palette.muted)(modelPair),
             chalk.hex(statusColor)(status),
           ];

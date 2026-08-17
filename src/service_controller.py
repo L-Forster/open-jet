@@ -170,7 +170,7 @@ class OpenJetServiceController:
         if mode in {"local", "hybrid"}:
             local = self._profile_for_runtime(DEFAULT_RUNTIME, "agent_local_profile")
             if local is None:
-                raise ServiceError("Local and Hybrid agent modes require a saved local model profile.")
+                raise ServiceError("Local and Slipstream agent modes require a saved local model profile.")
             # Re-apply the selected profile even when its model path is unchanged;
             # reasoning and sampling settings are part of the model configuration.
             apply_model_profile(self.cfg, local)
@@ -182,7 +182,7 @@ class OpenJetServiceController:
         if mode in {"codex", "hybrid"}:
             codex = self._profile_for_runtime(CODEX_RUNTIME, "agent_codex_profile")
             if codex is None:
-                raise ServiceError("Codex and Hybrid agent modes require a Codex profile. Run /connect openai-codex.")
+                raise ServiceError("Codex and Slipstream agent modes require a Codex profile. Run /connect openai-codex.")
             self.cfg["agent_codex_profile"] = str(codex["name"])
             try:
                 self._codex_credentials = await CodexOAuthProvider().credentials()
@@ -564,7 +564,7 @@ class OpenJetServiceController:
                 + "Saved profiles: " + (", ".join(str(item["name"]) for item in profiles) or "none")
             }
         if command == "runtime" and argument.strip():
-            raise ServiceError("/runtime controls inference engines such as llama.cpp; use /mode for Local, Codex, or Hybrid.")
+            raise ServiceError("/runtime controls inference engines such as llama.cpp; use /mode for Local, Codex, or Slipstream.")
         if command == "model" and "=" in argument:
             try:
                 options = dict(token.split("=", 1) for token in shlex.split(argument))
