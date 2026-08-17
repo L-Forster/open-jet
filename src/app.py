@@ -10,6 +10,7 @@ import re
 import signal
 import sys
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,13 @@ from .harness import (
     update_state_for_user_message,
 )
 from .harness_debug import write_debug_context_snapshot, write_debug_runtime_messages
+from .hybrid import (
+    HYBRID_MODE,
+    ORCHESTRATOR_SYSTEM_PROMPT,
+    TARGET_CODEX_SHARE,
+    HybridWorker,
+    execution_mode,
+)
 from .hardware import (
     detect_hardware_info,
     effective_hardware_info,
@@ -118,7 +126,7 @@ from .provisioning import pending_direct_model_download_summary, provision_setup
 from .skills_registry import resolve_skill_path
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
-from .runtime_registry import DEFAULT_RUNTIME, active_model_ref, active_runtime, create_runtime_client
+from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, active_model_ref, active_runtime, create_runtime_client
 from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
@@ -375,6 +383,7 @@ class OpenJetApp:
         set_airgapped(bool(self.cfg["airgapped"]))
         self.client: RuntimeClient | None = None
         self.agent: Agent | None = None
+        self.hybrid_worker: HybridWorker | None = None
         self.mcp_manager = None
         self.session_logger: SessionLogger | None = None
         self.console = Console(theme=RICH_THEME)
@@ -812,12 +821,30 @@ class OpenJetApp:
         if self.session_logger:
             self.session_logger.record_agent_trace(event, data, turn_id=self._active_turn_id)
 
-    def _record_runtime_token_usage(self, *, prompt_tokens: int, completion_tokens: int) -> None:
+    def _hybrid_agent_trace(self, model_ref: str, event: str, data: dict[str, object]) -> None:
+        if event == "runtime_exchange_complete":
+            self._record_runtime_token_usage(
+                prompt_tokens=self._coerce_token_count(data.get("prompt_tokens")),
+                completion_tokens=self._coerce_token_count(data.get("completion_tokens")),
+                model_ref=model_ref,
+            )
+        if self.session_logger:
+            self.session_logger.record_agent_trace(
+                f"hybrid_local.{event}", data, turn_id=self._active_turn_id
+            )
+
+    def _record_runtime_token_usage(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        model_ref: str | None = None,
+    ) -> None:
         self._session_prompt_tokens += prompt_tokens
         self._session_completion_tokens += completion_tokens
         self._session_runtime_requests += 1
 
-        model_ref = self._active_model_ref() or "unknown"
+        model_ref = str(model_ref or self._active_model_ref() or "unknown")
         entry = self._session_model_usage.setdefault(
             model_ref,
             {
@@ -969,12 +996,17 @@ class OpenJetApp:
         return bool(self._active_model_ref())
 
     async def _init_client(self, *, persist_config_updates: bool = True) -> None:
+        await self._close_hybrid_worker()
         await self._close_mcp_manager()
         mem_cfg = self.cfg.get("memory_guard", {})
         configured_ctx = int(self.cfg.get("context_window_tokens", 2048))
         configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
         client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
-        system_prompt = await build_system_prompt("", Path.cwd(), cfg=self.cfg)
+        hybrid_enabled = execution_mode(self.cfg) == HYBRID_MODE
+        if hybrid_enabled and active_runtime(self.cfg) != CODEX_RUNTIME:
+            raise ValueError("Hybrid mode requires an OpenAI Codex profile as the primary model.")
+        base_system_prompt = ORCHESTRATOR_SYSTEM_PROMPT if hybrid_enabled else ""
+        system_prompt = await build_system_prompt(base_system_prompt, Path.cwd(), cfg=self.cfg)
         if active_runtime(self.cfg) != DEFAULT_RUNTIME:
             try:
                 await client.start(
@@ -1002,7 +1034,7 @@ class OpenJetApp:
         self.agent = Agent(
             client=self.client,
             system_prompt=system_prompt,
-            base_system_prompt="",
+            base_system_prompt=base_system_prompt,
             project_root=Path.cwd(),
             prompt_cfg=self.cfg,
             context_window_tokens=self.client.context_window_tokens,
@@ -1015,7 +1047,51 @@ class OpenJetApp:
             keep_last_messages=int(mem_cfg.get("keep_last_messages", 6)),
             trace_hook=self._agent_trace,
         )
+        if hybrid_enabled:
+            local_profile = self._hybrid_local_profile()
+            if local_profile is None:
+                with suppress(Exception):
+                    await client.close()
+                self.client = None
+                self.agent = None
+                raise ValueError("Hybrid mode needs a saved local model profile. Run /setup to add one.")
+            try:
+                self.hybrid_worker = await HybridWorker.start(
+                    base_cfg=self.cfg,
+                    local_profile=local_profile,
+                    root=Path.cwd(),
+                    approval_handler=lambda tc: self._approve_tool_call_via_session(
+                        tc, self.query_one("#chat-log")
+                    ),
+                    trace_hook=lambda event, data: self._hybrid_agent_trace(
+                        str(local_profile.get("llama_model") or "local"), event, data
+                    ),
+                )
+            except Exception:
+                with suppress(Exception):
+                    await client.close()
+                await self._close_mcp_manager()
+                self.client = None
+                self.agent = None
+                raise
         self._init_swap_manager()
+
+    def _hybrid_local_profile(self) -> dict[str, Any] | None:
+        preferred = str(self.cfg.get("hybrid_local_profile") or "").strip().lower()
+        local_profiles = [
+            profile for profile in self.model_profiles() if active_runtime(profile) == DEFAULT_RUNTIME
+        ]
+        for profile in local_profiles:
+            if str(profile.get("name") or "").strip().lower() == preferred:
+                return profile
+        return local_profiles[0] if local_profiles else None
+
+    async def _close_hybrid_worker(self) -> None:
+        worker = self.hybrid_worker
+        self.hybrid_worker = None
+        if worker is not None:
+            with suppress(Exception):
+                await worker.close()
 
     async def _init_mcp_manager(self) -> None:
         from .mcp_support.manager import MCPManager
@@ -1155,6 +1231,7 @@ class OpenJetApp:
         self._render_token_counter()
 
         apply_model_profile(self.cfg, selected)
+        self.cfg["execution_mode"] = "local" if active_runtime(selected) == DEFAULT_RUNTIME else "codex"
         try:
             resolved = await self._materialize_setup_model(dict(self.cfg), log)
             self._persist_setup_result({**resolved, "model_profile_name": selected["name"]})
@@ -1226,6 +1303,73 @@ class OpenJetApp:
             log.write("[bold bright_white]Model switched. Runtime restarted with transcript context preserved.[/]")
         else:
             log.write("[bold bright_white]Model switched. Runtime restarted and context reset.[/]")
+        log.write("")
+        return True
+
+    async def activate_hybrid_mode(
+        self,
+        codex_profile_name: str,
+        local_profile_name: str,
+        log: LogView,
+    ) -> bool:
+        codex_profile = get_model_profile(self.cfg, codex_profile_name)
+        local_profile = get_model_profile(self.cfg, local_profile_name)
+        if not codex_profile or active_runtime(codex_profile) != CODEX_RUNTIME:
+            log.write("[yellow]Hybrid mode needs an OpenAI Codex profile.[/]")
+            log.write("")
+            return False
+        if not local_profile or active_runtime(local_profile) != DEFAULT_RUNTIME:
+            log.write("[yellow]Hybrid mode needs a saved local model profile.[/]")
+            log.write("")
+            return False
+
+        previous_cfg = dict(self.cfg)
+        previous_session = self._build_session_payload(reason="hybrid_switch_start") if self.agent else None
+        if self.agent:
+            self.persist_session_state(reason="hybrid_switch_start")
+        await self._close_hybrid_worker()
+        await self._close_mcp_manager()
+        if self.client:
+            with suppress(Exception):
+                await self.client.close()
+        self.client = None
+        self.agent = None
+
+        apply_model_profile(self.cfg, codex_profile)
+        self.cfg["execution_mode"] = HYBRID_MODE
+        self.cfg["hybrid_codex_profile"] = str(codex_profile["name"])
+        self.cfg["hybrid_local_profile"] = str(local_profile["name"])
+        status = self.query_one("#assistant-status")
+        status.update("[bold green]starting Codex + local worker...[/]")
+        status.remove_class("hidden")
+        try:
+            await self._init_client(persist_config_updates=False)
+            save_config(self.cfg)
+        except Exception as exc:
+            status.update("")
+            status.add_class("hidden")
+            self.cfg = previous_cfg
+            with suppress(Exception):
+                await self._init_client(persist_config_updates=False)
+                if previous_session is not None:
+                    self._apply_session_payload(
+                        previous_session,
+                        log,
+                        summary_label="Previous context restored",
+                        restore_airgapped=False,
+                        replay_history=False,
+                        use_current_system_prompt=True,
+                    )
+            log.write(f"[bold red]Hybrid start failed:[/] {_format_error(exc)}")
+            log.write("")
+            return False
+        status.update("")
+        status.add_class("hidden")
+        self.loaded_files.clear()
+        self._start_new_chat_session()
+        self.persist_session_state(reason="hybrid_switch")
+        self._render_token_counter()
+        log.write("[bold bright_white]Hybrid ready. Codex and the local implementation worker are warm.[/]")
         log.write("")
         return True
 
@@ -1492,6 +1636,7 @@ class OpenJetApp:
         self.persist_session_state(reason="quit")
         if self._generation_worker and not self._generation_worker.done():
             self._generation_worker.cancel()
+        await self._close_hybrid_worker()
         await self._close_mcp_manager()
         if self.client:
             await self.client.close()
@@ -1865,7 +2010,16 @@ class OpenJetApp:
         label = Path(model_ref).name or model_ref or "not configured"
         if label.endswith(".gguf"):
             label = label[:-5]
+        if execution_mode(self.cfg) == HYBRID_MODE and self.hybrid_worker is not None:
+            local_label = Path(self.hybrid_worker.model_ref).name or self.hybrid_worker.model_ref
+            if local_label.endswith(".gguf"):
+                local_label = local_label[:-5]
+            effort = str(self.cfg.get("reasoning_effort") or "medium")
+            label = f"{label} {effort} + {local_label}"
         return self._shorten_middle(label, max_len)
+
+    def _execution_mode_label(self) -> str:
+        return execution_mode(self.cfg).upper()
 
     def _context_compact_label(self) -> str:
         current_fn = getattr(self.agent, "estimated_context_tokens", None) if self.agent else None
@@ -1877,9 +2031,9 @@ class OpenJetApp:
         air_state = "air-gapped" if self.is_airgapped() else "network-ok"
         air_style = "chrome_warning" if self.is_airgapped() else "chrome_value"
         return [
-            ("mode", self.harness_state.mode or "chat", "chrome_accent"),
+            ("mode", self._execution_mode_label(), "chrome_accent"),
             ("model", self._model_label(), "chrome_value"),
-            ("backend", active_runtime(self.cfg).replace("_", "."), "chrome_value"),
+            ("task", self.harness_state.mode or "chat", "chrome_value"),
             ("workspace", self._workspace_label(26), "chrome_value"),
             ("", "local", "chrome_accent"),
             ("", air_state, air_style),
@@ -1900,17 +2054,16 @@ class OpenJetApp:
             net_state = "air-gap" if self.is_airgapped() else "net-ok"
             net_style = "chrome_warning" if self.is_airgapped() else "chrome_value"
             cells = [
-                Text("OpenJet", style="chrome_brand_text"),
-                Text(self.harness_state.mode or "chat", style="chrome_accent"),
-                Text(self._model_label(22), style="chrome_value"),
-                Text(active_runtime(self.cfg).replace("_", "."), style="chrome_value"),
+                Text(self._execution_mode_label(), style="chrome_accent"),
+                Text(self._model_label(34), style="chrome_value"),
+                Text(self.harness_state.mode or "chat", style="chrome_value"),
                 Text(self._workspace_label(20), style="chrome_value"),
                 Text("local", style="chrome_accent"),
                 Text(net_state, style=net_style),
                 Text(self._context_compact_label(), style="chrome_value"),
             ]
         else:
-            cells = [Text("OpenJet", style="chrome_brand_text")]
+            cells = []
             for label, value, style in self._chrome_status_cells():
                 if label:
                     cells.append(Text.assemble((f"{label}: ", "chrome_label"), (str(value), style)))
@@ -2180,6 +2333,10 @@ class OpenJetApp:
                 reasoning_mode = None
         return {
             "ready": True,
+            "execution_mode": execution_mode(self.cfg),
+            "primary_model": self._active_model_ref(),
+            "local_worker_ready": bool(self.hybrid_worker and self.hybrid_worker.ready),
+            "local_worker_model": self.hybrid_worker.model_ref if self.hybrid_worker else None,
             "messages": self.agent.conversation_message_count(),
             "airgapped": self.is_airgapped(),
             "generating": self._thinking_timer is not None,
@@ -2238,10 +2395,40 @@ class OpenJetApp:
         return {
             "total": total,
             "models": models,
+            "hybrid": self.hybrid_usage_snapshot(models),
             "api_cost": _format_openjet_api_spend(
                 self._session_prompt_tokens,
                 self._session_completion_tokens,
             ),
+        }
+
+    def hybrid_usage_snapshot(
+        self, models: list[dict[str, object]] | None = None
+    ) -> dict[str, object] | None:
+        if execution_mode(self.cfg) != HYBRID_MODE:
+            return None
+        rows = models if models is not None else list(self.token_usage_snapshot()["models"])
+        primary_ref = self._active_model_ref()
+        local_ref = self.hybrid_worker.model_ref if self.hybrid_worker else ""
+        primary_tokens = sum(
+            int(row.get("total_tokens", 0))
+            for row in rows
+            if str(row.get("model_ref") or "") == primary_ref
+        )
+        local_tokens = sum(
+            int(row.get("total_tokens", 0))
+            for row in rows
+            if str(row.get("model_ref") or "") == local_ref
+        )
+        combined = primary_tokens + local_tokens
+        share = (primary_tokens / combined) if combined else None
+        return {
+            "primary_tokens": primary_tokens,
+            "local_tokens": local_tokens,
+            "combined_tokens": combined,
+            "codex_share": share,
+            "target_codex_share": TARGET_CODEX_SHARE,
+            "on_target": None if share is None else share <= TARGET_CODEX_SHARE,
         }
 
     def lifetime_token_usage_snapshot(self) -> dict[str, object]:

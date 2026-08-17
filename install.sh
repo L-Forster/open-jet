@@ -223,6 +223,11 @@ else
   echo "Skipping pip install: ${INSTALL_REASON}"
 fi
 
+if [ ! -x "${ROOT_DIR}/ui/dist/openjet-tui" ]; then
+  echo "Installing the OpenJet terminal frontend"
+  "${VENV_DIR}/bin/python" "${ROOT_DIR}/scripts/install_tui_asset.py"
+fi
+
 "${VENV_DIR}/bin/python" -m pip install --quiet --disable-pip-version-check hf_transfer 'huggingface_hub>=0.25' || \
   echo "warning: could not install hf_transfer; downloads will fall back to single-stream"
 

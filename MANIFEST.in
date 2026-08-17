@@ -1,0 +1,5 @@
+recursive-include protocol *.json
+recursive-include ui *.json *.ts *.md NOTICE
+prune ui/node_modules
+prune ui/dist
+recursive-include src/tui_bin *

@@ -144,6 +144,7 @@ EMBED_MODEL_CATALOG: tuple[dict[str, Any], ...] = (
         "resident_model_size_mb": 16896,
         "active_params_b": 27.0,
         "kv_bytes_per_token": 34816,
+        "max_context_tokens": 262144,
         "ttft_ms": 1100,
         "tokens_per_sec": 15,
         "llama_mtp": True,

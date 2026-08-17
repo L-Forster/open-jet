@@ -35,7 +35,7 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["logging"]["directory"], "custom/logs")
         self.assertEqual(normalized["state"]["path"], "custom/state.yaml")
 
-    def test_normalize_config_preserves_active_cloud_runtime(self) -> None:
+    def test_normalize_config_migrates_legacy_codex_model_to_current_default(self) -> None:
         cfg = {
             "runtime": "openai_codex",
             "model": "gpt-5.5",
@@ -45,7 +45,27 @@ class ConfigNormalizationTests(unittest.TestCase):
         normalized = normalize_config(cfg)
 
         self.assertEqual(normalized["runtime"], "openai_codex")
-        self.assertEqual(normalized["model"], "gpt-5.5")
+        self.assertEqual(normalized["model"], "gpt-5.6-sol")
+
+    def test_normalize_config_migrates_saved_codex_profiles(self) -> None:
+        normalized = normalize_config({
+            "model_profiles": [
+                {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.5"},
+                {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/qwen.gguf"},
+            ],
+        })
+
+        self.assertEqual(normalized["model_profiles"][0]["model"], "gpt-5.6-sol")
+        self.assertEqual(normalized["model_profiles"][1]["llama_model"], "/models/qwen.gguf")
+
+    def test_normalize_config_replaces_unsupported_minimal_codex_effort(self) -> None:
+        normalized = normalize_config({
+            "runtime": "openai_codex",
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "minimal",
+        })
+
+        self.assertEqual(normalized["reasoning_effort"], "low")
 
     def test_normalize_config_maps_legacy_qwen_mtp_filename_to_unsloth_asset(self) -> None:
         legacy_model = str(MANAGED_MODELS_DIR / "Qwen3.6-27B-Q4_K_M-mtp.gguf")

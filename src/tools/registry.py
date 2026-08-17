@@ -463,5 +463,9 @@ def bind_tool_executor(name: str, executor: ToolExecutor) -> None:
     TOOL_REGISTRY.bind_executor(name, executor)
 
 
+def register_tool(spec: ToolSpec) -> None:
+    TOOL_REGISTRY.register(spec)
+
+
 def unregister_tool(name: str) -> None:
     TOOL_REGISTRY.unregister(name)

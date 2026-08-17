@@ -80,6 +80,12 @@ set "OPENJET_BUILD_EXTENSIONS=0"
 ".venv\Scripts\python.exe" -m pip install --no-build-isolation -e .
 if errorlevel 1 exit /b 1
 
+if not exist "ui\dist\openjet-tui.exe" (
+    echo Installing the OpenJet terminal frontend
+    ".venv\Scripts\python.exe" "scripts\install_tui_asset.py"
+    if errorlevel 1 exit /b 1
+)
+
 ".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check hf_transfer "huggingface_hub>=0.25"
 if errorlevel 1 echo warning: could not install hf_transfer; downloads will fall back to single-stream
 

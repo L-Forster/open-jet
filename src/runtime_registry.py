@@ -10,6 +10,7 @@ from .runtime_client import RuntimeClient
 
 DEFAULT_RUNTIME = "llama_cpp"
 CODEX_RUNTIME = "openai_codex"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 LITELLM_RUNTIME = "litellm"
 RUNTIME_LABEL = "Local model: llama.cpp (GGUF)"
 CODEX_RUNTIME_LABEL = "OpenAI Codex OAuth"
@@ -69,13 +70,11 @@ def create_runtime_client(
             raise ValueError("Cloud model profiles are disabled in air-gapped mode.")
         from .openai_codex_client import OpenAICodexClient
 
-        model = active_model_ref(cfg)
-        if not model:
-            raise ValueError("Missing model for OpenAI Codex runtime (`model`).")
+        model = active_model_ref(cfg) or DEFAULT_CODEX_MODEL
         return OpenAICodexClient(
             model=model,
             base_url=str(cfg.get("codex_base_url") or cfg.get("base_url") or "https://chatgpt.com/backend-api/codex"),
-            context_window_tokens=int(cfg.get("context_window_tokens", 272000)),
+            context_window_tokens=int(cfg.get("context_window_tokens", 1050000)),
             reasoning_effort=str(cfg.get("reasoning_effort") or "medium"),
             reasoning_summary=str(cfg.get("reasoning_summary") or "auto"),
             text_verbosity=str(cfg.get("text_verbosity") or "medium"),

@@ -65,6 +65,7 @@ fi
 python scripts/sync_pypi_readme.py
 
 python -m pip install --upgrade "build" "twine" "Cython>=3.0" "setuptools>=68,<80" "wheel"
+python scripts/build_tui.py
 
 rm -rf build dist ./*.egg-info ./*/*.egg-info
 

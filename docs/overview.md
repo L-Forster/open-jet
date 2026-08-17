@@ -27,6 +27,7 @@ Related docs:
 
 - [CLI usage](usage/cli.md)
 - [Slash commands](usage/slash-commands.md)
+- [Hybrid mode](usage/hybrid-mode.md)
 - [Device sources](usage/device-sources.md)
 - [Workflow harness](usage/workflow-harness.md)
 

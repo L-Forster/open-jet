@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openjet.dev/schemas/openjet-tui-v1.schema.json",
+  "title": "OpenJet TUI protocol v1",
+  "x-requestTypes": ["initialize", "command", "tool_execute", "generation_metrics", "agent_trace", "status", "resize", "shutdown"],
+  "type": "object",
+  "required": ["protocolVersion", "type"],
+  "properties": {
+    "protocolVersion": { "const": 1 },
+    "type": {
+      "enum": [
+        "initialize", "command", "tool_execute", "generation_metrics", "agent_trace", "status", "resize", "shutdown",
+        "ready", "state_snapshot", "text_delta", "reasoning_delta", "tool_request", "tool_result", "condense",
+        "notification", "status_update", "error", "turn_complete"
+      ]
+    },
+    "id": { "type": "string", "minLength": 1 },
+    "requestId": { "type": "string", "minLength": 1 },
+    "callId": { "type": "string", "minLength": 1 },
+    "text": { "type": "string" },
+    "approved": { "type": "boolean" },
+    "width": { "type": "integer", "minimum": 1 },
+    "height": { "type": "integer", "minimum": 1 },
+    "imagePaths": { "type": "array", "items": { "type": "string" } },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}

@@ -12,6 +12,8 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 TELEMETRY_CONSENT_VERSION = 1
 TELEMETRY_DEFAULT_ENDPOINT = "https://telemetry.openjet.dev"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+LEGACY_CODEX_MODELS = frozenset({"gpt-5.5"})
 
 
 def default_telemetry_endpoint() -> str:
@@ -159,6 +161,7 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "model_size_mb": 16817,
         "resident_model_size_mb": 16896,
         "kv_bytes_per_token": 34816,
+        "max_context_tokens": 262144,
     },
     {
         "max_ram_gb": 24.0,
@@ -221,12 +224,15 @@ PROJECT_CONFIG_KEYS = frozenset(
         "model_source",
         "llama_model",
         "context_window_tokens",
+        "max_tokens",
+        "reasoning",
         "llama_mtp",
         "llama_cpu_moe",
         "llama_n_cpu_moe",
         "model_download_url",
         "model_download_path",
         "model_size_mb",
+        "max_context_tokens",
         "filename",
     }
 )
@@ -456,6 +462,14 @@ def migrate_config_for_current_release(cfg: dict[str, Any]) -> bool:
 
     def normalize_row(row: dict[str, Any]) -> None:
         nonlocal changed
+        if str(row.get("runtime") or "").strip().lower() == "openai_codex":
+            configured_model = str(row.get("model") or "").strip()
+            if not configured_model or configured_model in LEGACY_CODEX_MODELS:
+                row["model"] = DEFAULT_CODEX_MODEL
+                changed = True
+            if str(row.get("reasoning_effort") or "").strip().lower() == "minimal":
+                row["reasoning_effort"] = "low"
+                changed = True
         replacement = resolve_model_path(row.get("llama_model"))
         replacement = replacement or resolve_model_path(row.get("model_download_path"))
         if not replacement and looks_like_qwen_mtp_update_target(row):

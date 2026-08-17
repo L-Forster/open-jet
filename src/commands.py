@@ -12,12 +12,14 @@ from prompt_toolkit.shortcuts import radiolist_dialog
 from .api_auth import ApiKeyStore, default_api_key_env, normalize_provider_id
 from .codex_auth import CodexAuthError, CodexOAuthProvider
 from .config import save_config
+from .hardware import recommended_context_window_tokens
 from .model_profiles import get_model_profile, list_model_profiles, replace_model_profile
 from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, LITELLM_RUNTIME, active_runtime
 from .memory_reflection import refresh_agent_system_prompt
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
-from .setup import _prompt_text
+from .provisioning import _model_path_looks_mtp
+from .setup import _prompt_choice, _prompt_text, discover_model_files
 from .skills_registry import skills_manifest_path, sync_skills_manifest
 from .surfaces.command_specs import COMMANDS, CommandSpec
 from .theme import rich_text
@@ -42,8 +44,8 @@ _DEFAULT_CODEX_PROFILE: dict[str, object] = {
     "name": "codex",
     "runtime": CODEX_RUNTIME,
     "provider": "openai-codex",
-    "model": "gpt-5.5",
-    "context_window_tokens": 272000,
+    "model": "gpt-5.6-sol",
+    "context_window_tokens": 1050000,
     "reasoning_effort": "medium",
     "reasoning_summary": "auto",
     "text_verbosity": "medium",
@@ -188,8 +190,11 @@ class SlashCommandHandler:
         if cmd == "runtime":
             await self._runtime(log, arg)
             return True
+        if cmd in {"mode", "agent"}:
+            await self._agent_mode(log, arg)
+            return True
         if cmd == "local":
-            await self._runtime(log, "local")
+            await self._agent_mode(log, "local")
             return True
         if cmd == "cloud":
             await self._cloud(log, arg)
@@ -197,7 +202,7 @@ class SlashCommandHandler:
         if cmd == "edit-model":
             await self._edit_model(log, arg)
             return True
-        if cmd == "mode":
+        if cmd == "harness":
             self._mode(log, arg)
             return True
         if cmd == "plan":
@@ -617,6 +622,17 @@ class SlashCommandHandler:
         profiles = self.app.model_profiles()
         active = str(self.app.cfg.get("active_model_profile") or "").strip()
 
+        if not arg and self.app._session is not None:
+            mode = str(self.app.cfg.get("execution_mode") or "").strip().lower()
+            if mode == "hybrid":
+                await self._configure_hybrid(log)
+                return
+            if active_runtime(self.app.cfg) == CODEX_RUNTIME:
+                await self._configure_codex_profile(log)
+                return
+            await self._pick_local_profile(log)
+            return
+
         if not arg or arg.lower() in {"status", "list"}:
             if not profiles:
                 log.write("[yellow]No saved model presets yet. Run /setup to add one.[/]")
@@ -625,7 +641,7 @@ class SlashCommandHandler:
             log.write(f"[bold bright_white]Active model preset: {active or 'none'}[/]")
             self._write_model_profile_list(log, profiles, active=active)
             if not arg:
-                log.write("[dim]Use /model <preset> to switch model preset, or /runtime local|cloud to switch runtime.[/]")
+                log.write("[dim]Use /model <preset> to switch models, or /mode to pick Local, Codex, or Hybrid.[/]")
             log.write("")
             return
 
@@ -645,7 +661,41 @@ class SlashCommandHandler:
             log.write("")
 
     async def _runtime(self, log: Any, raw_arg: str) -> None:
-        arg = raw_arg.strip().lower() or "status"
+        arg = raw_arg.strip().lower()
+        if arg not in {"", "status", "list"}:
+            log.write("[yellow]/runtime reports the inference engine. Use /mode for Local, Codex, or Hybrid.[/]")
+            log.write("")
+            return
+        runtime = active_runtime(self.app.cfg)
+        log.write(f"[bold bright_white]Inference runtime:[/] {runtime}")
+        log.write(f"[bold bright_white]Runtime model:[/] {self.app._active_model_ref() or 'not configured'}")
+        log.write("")
+
+    async def _agent_mode(self, log: Any, raw_arg: str) -> None:
+        arg = raw_arg.strip().lower()
+        if not arg and self.app._session is not None:
+            current_mode = str(self.app.cfg.get("execution_mode") or "").lower()
+            if current_mode not in {"hybrid", "codex", "local"}:
+                current_mode = "local" if active_runtime(self.app.cfg) == DEFAULT_RUNTIME else "codex"
+            selected = await _prompt_choice(
+                self.app._session,
+                self.app.console,
+                "Mode",
+                [
+                    ("Hybrid — Codex orchestrates, local model implements", "hybrid"),
+                    ("Codex — frontier model only", "codex"),
+                    ("Local — local model only", "local"),
+                ],
+                default_index={"hybrid": 0, "codex": 1, "local": 2}.get(
+                    current_mode, 0
+                ),
+                detail="Selecting Hybrid starts and health-checks both models immediately.",
+            )
+            arg = str(selected)
+        arg = arg or "status"
+        if arg in {"hybrid", "orchestrator", "orchestrated"}:
+            await self._configure_hybrid(log)
+            return
         if arg in {"cloud", "codex", "openai-codex"}:
             await self._switch_runtime_kind(log, "cloud")
             return
@@ -653,22 +703,232 @@ class SlashCommandHandler:
             await self._switch_runtime_kind(log, "local")
             return
         if arg not in {"status", "list"}:
-            log.write("[yellow]Usage:[/] /runtime [status|local|cloud]")
+            log.write("[yellow]Usage:[/] /mode [status|local|codex|hybrid]")
             log.write("")
             return
 
         profiles = self.app.model_profiles()
         active = str(self.app.cfg.get("active_model_profile") or "").strip()
         active_runtime_name = active_runtime(self.app.cfg)
-        log.write(f"[bold bright_white]Active runtime:[/] {active_runtime_name} ({active or 'no preset'})")
+        configured_mode = str(self.app.cfg.get("execution_mode") or "").strip()
+        inferred_mode = "local" if active_runtime_name == DEFAULT_RUNTIME else "codex" if active_runtime_name == CODEX_RUNTIME else "cloud"
+        log.write(f"[bold bright_white]Active mode:[/] {configured_mode or inferred_mode}")
         local_profiles = [profile for profile in profiles if _runtime_kind(profile) == "local"]
         cloud_profiles = [profile for profile in profiles if _runtime_kind(profile) == "cloud"]
         log.write("[bold bright_white]Local profiles:[/]")
         self._write_model_profile_list(log, local_profiles, active=active, empty="none")
         log.write("[bold bright_white]Cloud profiles:[/]")
         self._write_model_profile_list(log, cloud_profiles, active=active, empty="none")
-        log.write("[dim]Use /runtime local or /runtime cloud. Shortcuts: /local, /cloud.[/]")
+        log.write("[dim]Use /mode to pick Local, Codex, or Hybrid.[/]")
         log.write("")
+
+    async def _configure_hybrid(self, log: Any) -> None:
+        if self.app._awaiting_approval or self.app._thinking_timer:
+            log.write("[yellow]Wait for the active turn or approval to finish before changing runtime.[/]")
+            log.write("")
+            return
+        self._ensure_connected_codex_profile()
+        profiles = self.app.model_profiles()
+        codex_profiles = [p for p in profiles if active_runtime(p) == CODEX_RUNTIME]
+        local_profiles = [p for p in profiles if active_runtime(p) == DEFAULT_RUNTIME]
+        if not codex_profiles:
+            log.write("[yellow]No Codex profile is available. Run /connect openai-codex first.[/]")
+            log.write("")
+            return
+        if not local_profiles and not discover_model_files() and self.app._session is None:
+            log.write("[yellow]No local GGUF model was found. Run /setup or install one first.[/]")
+            log.write("")
+            return
+
+        codex = codex_profiles[0]
+        preferred_codex = str(self.app.cfg.get("hybrid_codex_profile") or "").lower()
+        codex_default = next(
+            (i for i, p in enumerate(codex_profiles) if str(p.get("name") or "").lower() == preferred_codex),
+            0,
+        )
+        local_default = next(
+            (
+                i for i, p in enumerate(local_profiles)
+                if str(p.get("name") or "").lower()
+                == str(self.app.cfg.get("hybrid_local_profile") or "").lower()
+            ),
+            0,
+        )
+        if self.app._session is not None:
+            codex_name = await _prompt_choice(
+                self.app._session,
+                self.app.console,
+                "Hybrid Codex profile",
+                [(f"{p['name']} · {p.get('model', '')}", str(p["name"])) for p in codex_profiles],
+                default_index=codex_default,
+            )
+            codex = get_model_profile(self.app.cfg, str(codex_name)) or codex
+            codex = await self._pick_codex_settings(codex)
+            local_name = await self._choose_local_model_profile(
+                log,
+                preferred_name=(
+                    str(local_profiles[local_default]["name"]) if local_profiles else ""
+                ),
+            )
+        else:
+            local_name = str(local_profiles[local_default]["name"]) if local_profiles else ""
+
+        if not local_name:
+            return
+
+        stored = replace_model_profile(
+            self.app.cfg,
+            codex,
+            previous_name=str(codex.get("name") or ""),
+        )
+        await self.app.activate_hybrid_mode(str(stored["name"]), str(local_name), log)
+
+    async def _pick_codex_settings(self, profile: dict[str, Any]) -> dict[str, Any]:
+        if self.app._session is None:
+            return profile
+        current_model = str(profile.get("model") or "gpt-5.6-sol")
+        model_values = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        if current_model not in model_values:
+            model_values.insert(0, current_model)
+        model = await _prompt_choice(
+            self.app._session,
+            self.app.console,
+            "Codex model",
+            [(value, value) for value in model_values] + [("Custom model…", "__custom__")],
+            default_index=model_values.index(current_model),
+        )
+        if model == "__custom__":
+            model = await _prompt_text(
+                self.app._session,
+                "Codex model> ",
+                default=current_model,
+            )
+        efforts = ["medium", "high", "xhigh", "max", "low", "none"]
+        current_effort = str(profile.get("reasoning_effort") or "medium")
+        effort = await _prompt_choice(
+            self.app._session,
+            self.app.console,
+            "Codex reasoning effort",
+            [(value, value) for value in efforts],
+            default_index=efforts.index(current_effort) if current_effort in efforts else 2,
+        )
+        updated = dict(profile)
+        updated["model"] = str(model)
+        updated["reasoning_effort"] = str(effort)
+        if str(model).startswith("gpt-5.6"):
+            updated["context_window_tokens"] = 1050000
+        return updated
+
+    async def _configure_codex_profile(self, log: Any) -> None:
+        profile = get_model_profile(
+            self.app.cfg, str(self.app.cfg.get("active_model_profile") or "")
+        )
+        if not profile or active_runtime(profile) != CODEX_RUNTIME:
+            profile, _ = _ensure_codex_model_profile(self.app.cfg)
+        updated = await self._pick_codex_settings(profile)
+        stored = replace_model_profile(
+            self.app.cfg, updated, previous_name=str(profile.get("name") or "")
+        )
+        if await self.app.activate_model_profile(str(stored["name"]), log):
+            save_config(self.app.cfg)
+
+    async def _pick_local_profile(self, log: Any) -> None:
+        profiles = [p for p in self.app.model_profiles() if active_runtime(p) == DEFAULT_RUNTIME]
+        selected = await self._choose_local_model_profile(
+            log,
+            preferred_name=str(self.app.cfg.get("active_model_profile") or ""),
+        )
+        if selected:
+            await self.app.activate_model_profile(selected, log)
+
+    async def _choose_local_model_profile(
+        self,
+        log: Any,
+        *,
+        preferred_name: str = "",
+    ) -> str | None:
+        profiles = [p for p in self.app.model_profiles() if active_runtime(p) == DEFAULT_RUNTIME]
+        profile_paths = {
+            str(Path(str(p.get("llama_model") or "")).expanduser().resolve(strict=False))
+            for p in profiles
+            if str(p.get("llama_model") or "").strip()
+        }
+        detected = [
+            path
+            for path in discover_model_files()
+            if str(Path(path).expanduser().resolve(strict=False)) not in profile_paths
+        ]
+        if not profiles and not detected and self.app._session is None:
+            log.write("[yellow]No local GGUF model was found. Run /setup or install one first.[/]")
+            log.write("")
+            return None
+        if self.app._session is None:
+            return str(profiles[0]["name"]) if profiles else None
+
+        options: list[tuple[str, object]] = [
+            (
+                f"{p['name']} · {Path(str(p.get('llama_model') or '')).name}",
+                ("profile", str(p["name"])),
+            )
+            for p in profiles
+        ]
+        options.extend(
+            (f"{Path(path).name} · detected", ("file", path)) for path in detected
+        )
+        options.append(("Choose another GGUF path…", ("manual", "")))
+        default_index = next(
+            (
+                index
+                for index, (_label, value) in enumerate(options)
+                if value == ("profile", preferred_name)
+            ),
+            0,
+        )
+        choice = await _prompt_choice(
+            self.app._session,
+            self.app.console,
+            "Local model",
+            options,
+            default_index=default_index,
+            detail="Choose a saved profile, a detected GGUF, or a model path.",
+        )
+        kind, value = choice if isinstance(choice, tuple) and len(choice) == 2 else ("", "")
+        if kind == "profile":
+            return str(value)
+        if kind == "manual":
+            value = await _prompt_text(self.app._session, "GGUF path> ", default="")
+        model_path = Path(str(value)).expanduser().resolve(strict=False)
+        if model_path.suffix.lower() != ".gguf" or not model_path.is_file():
+            log.write(f"[yellow]Local model must be an existing GGUF file:[/] {model_path}")
+            log.write("")
+            return None
+
+        template = dict(profiles[0]) if profiles else {
+            "runtime": DEFAULT_RUNTIME,
+            "device": self.app.cfg.get("device", "auto"),
+            "context_window_tokens": recommended_context_window_tokens(),
+            "gpu_layers": int(self.app.cfg.get("gpu_layers", 99)),
+        }
+        template["name"] = _unique_profile_name(self.app.cfg, model_path.stem)
+        template["runtime"] = DEFAULT_RUNTIME
+        template["llama_model"] = str(model_path)
+        template["model_source"] = "local"
+        template["llama_mtp"] = _model_path_looks_mtp(model_path.name)
+        template.pop("model", None)
+        template.pop("provider", None)
+        for key in (
+            "model_download_url",
+            "model_download_path",
+            "model_update_target",
+            "model_size_mb",
+            "active_model_size_mb",
+            "resident_model_size_mb",
+            "max_context_tokens",
+        ):
+            template.pop(key, None)
+        stored = replace_model_profile(self.app.cfg, template)
+        save_config(self.app.cfg)
+        return str(stored["name"])
 
     def _usage(self, log: Any) -> None:
         snapshot = self.app.lifetime_token_usage_snapshot()
@@ -702,6 +962,15 @@ class SlashCommandHandler:
             )
         if not snapshot["models"]:
             log.write("[dim]Per-model breakdown starts after this version records model-level usage.[/]")
+        hybrid = self.app.token_usage_snapshot().get("hybrid")
+        if isinstance(hybrid, dict) and hybrid.get("codex_share") is not None:
+            share = float(hybrid["codex_share"]) * 100
+            target = float(hybrid["target_codex_share"]) * 100
+            state = "on target" if hybrid.get("on_target") else "above target"
+            log.write(
+                f"[bold bright_white]Hybrid session: {share:.1f}% Codex tokens "
+                f"(target ≤{target:.0f}%, {state})[/]"
+            )
         log.write("")
 
     async def _switch_runtime_kind(self, log: Any, kind: str) -> None:
@@ -852,9 +1121,9 @@ class SlashCommandHandler:
             provider_id = "openai-codex"
 
         is_codex = provider_id == "openai-codex"
-        default_model = "gpt-5.5" if is_codex else f"{provider_id}/"
+        default_model = "gpt-5.6-sol" if is_codex else f"{provider_id}/"
         model_value = await _prompt_text(self.app._session, "model> ", default=default_model)
-        context_default = "272000" if is_codex else "128000"
+        context_default = "1050000" if is_codex else "128000"
         context_value = await _prompt_text(self.app._session, "context window> ", default=context_default)
         try:
             context_tokens = int(context_value.strip())

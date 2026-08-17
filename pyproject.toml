@@ -105,4 +105,4 @@ include-package-data = false
 include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*"]
 
 [tool.setuptools.package-data]
-src = ["app.tcss", "data/*.json"]
+src = ["data/*.json", "tui_bin/**/*"]

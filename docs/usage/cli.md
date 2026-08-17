@@ -144,6 +144,10 @@ Workflow files are Markdown files under `workflows/` or `.openjet/workflows/`. S
 - Use `@image.png` or paste local image file paths to attach images to the next turn
 - Type `/` to open slash-command suggestions
 - `Tab`/`Enter` can autocomplete slash commands and file mentions
-- `Ctrl+C` or `/exit` quits
+- `Ctrl+C` clears a non-empty input; when the input is already empty, it closes OpenJet
+- `Ctrl+V` or `Alt+V` pastes clipboard text or an image
+- `Esc` stops the active turn
+- Press `Esc` twice within 500 ms to clear the input and pending attachments
+- `/exit` or `/quit` closes OpenJet
 
 For slash command reference, see [slash-commands.md](slash-commands.md).

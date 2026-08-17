@@ -10,6 +10,7 @@ from src.hardware import HardwareInfo
 from src.provisioning import (
     LLAMA_CPP_MTP_REF,
     LLAMA_SERVER_EXE_NAME,
+    _clamp_context_for_device,
     _llama_cmake_args,
     _path_without_windows_interop_entries,
     _subprocess_env,
@@ -584,3 +585,38 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["device"], "cuda")
         install_prebuilt.assert_not_awaited()
         build_source.assert_not_awaited()
+
+
+class VulkanContextClampTests(unittest.TestCase):
+    """A device override must not leave behind a context sized for the old device.
+
+    `ensure_llama_server` can resolve to the prebuilt Vulkan runtime on a Linux
+    CUDA host. Vulkan caps a single allocation at 2 GB under Dozen, so a context
+    carried over from the CUDA sizing asks for a KV buffer that cannot be
+    allocated and llama-server dies on startup.
+    """
+
+    def _clamp(self, **overrides: object) -> dict[str, object]:
+        merged: dict[str, object] = {
+            "device": "vulkan",
+            "context_window_tokens": 210767,
+            "llama_model": "/models/demo.gguf",
+        }
+        merged.update(overrides)
+        with patch("src.provisioning._model_gguf_path", return_value=Path("/models/demo.gguf")), \
+             patch("src.provisioning._kv_bytes_per_token_from_gguf", return_value=36992.0):
+            return _clamp_context_for_device(merged)
+
+    def test_lowers_context_past_the_vulkan_allocation_cap(self) -> None:
+        self.assertEqual(self._clamp()["context_window_tokens"], 55150)
+
+    def test_leaves_context_already_within_the_cap(self) -> None:
+        self.assertEqual(self._clamp(context_window_tokens=20000)["context_window_tokens"], 20000)
+
+    def test_ignores_non_vulkan_devices(self) -> None:
+        self.assertEqual(self._clamp(device="cuda")["context_window_tokens"], 210767)
+
+    def test_leaves_context_alone_when_the_model_cannot_be_read(self) -> None:
+        merged = {"device": "vulkan", "context_window_tokens": 210767}
+        with patch("src.provisioning._model_gguf_path", return_value=None):
+            self.assertEqual(_clamp_context_for_device(merged)["context_window_tokens"], 210767)

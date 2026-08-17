@@ -12,10 +12,15 @@
 - `/load <path>` load a file into context
 - `/resume` pick a saved chat checkpoint from `.openjet/state/` and load it back into the TUI
 - `/setup` reopen setup wizard
-- `/model` show saved model presets inline
+- `/model` configure the active mode's model selection (both models in Hybrid)
 - `/model [status|list|<name>]` show or switch saved model presets
 - `/models` alias for `/model`
-- `/runtime [status|local|cloud]` switch local/cloud runtime
+- `/mode` open the Local / Codex / Hybrid mode picker
+- `/mode [status|local|codex|hybrid]` inspect or directly switch mode (`/agent` remains an alias)
+- `/model` configure the active mode's model setup (Codex model and effort; local model and reasoning)
+- `/model codex=gpt-5.6-sol effort=high local=local reasoning=on` apply a Hybrid model configuration directly
+- `/effort [none|low|medium|high|xhigh|max]` change Codex reasoning effort
+- `/runtime [status]` inspect the inference engine (for example llama.cpp)
 - `/local` switch to the local runtime profile
 - `/cloud [status|model <model>|add|<profile>]` switch to cloud, list/edit cloud profiles, or add one
 - `/edit-model [name]` edit a saved model preset

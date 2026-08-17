@@ -1964,7 +1964,7 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Active model preset: base", entries)
         self.assertIn("- base (active)", entries)
         self.assertIn("- alt", entries)
-        self.assertIn("/runtime local|cloud", entries)
+        self.assertIn("/mode", entries)
 
     async def test_runtime_cloud_switches_to_codex_profile(self) -> None:
         app = OpenJetApp()
@@ -1975,7 +1975,7 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         ]
 
         with patch.object(app, "activate_model_profile", AsyncMock(return_value=True)) as activate:
-            handled = await app.commands.maybe_handle("/runtime cloud")
+            handled = await app.commands.maybe_handle("/mode codex")
 
         self.assertTrue(handled)
         activate.assert_awaited_once_with("codex", app.query_one("#chat-log"))
@@ -2012,6 +2012,7 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
         app = OpenJetApp()
         app.cfg["active_model_profile"] = "local"
         app.cfg["runtime"] = "llama_cpp"
+        app.cfg["llama_model"] = "/models/local.gguf"
         app.cfg["model_profiles"] = [
             {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/local.gguf"},
             {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.5"},
@@ -2021,10 +2022,9 @@ class ModelCommandTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(handled)
         entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
-        self.assertIn("Active runtime", entries)
-        self.assertIn("Local profiles", entries)
-        self.assertIn("Cloud profiles", entries)
-        self.assertIn("/runtime local", entries)
+        self.assertIn("Inference runtime", entries)
+        self.assertIn("llama_cpp", entries)
+        self.assertIn("/models/local.gguf", entries)
 
     async def test_activate_model_profile_preserves_transcript_context(self) -> None:
         app = OpenJetApp()
@@ -2238,7 +2238,8 @@ class ConnectCommandTests(unittest.IsolatedAsyncioTestCase):
         save_cfg.assert_called_once_with(app.cfg)
         self.assertEqual(app.cfg["model_profiles"][0]["name"], "codex")
         self.assertEqual(app.cfg["model_profiles"][0]["runtime"], "openai_codex")
-        self.assertEqual(app.cfg["model_profiles"][0]["model"], "gpt-5.5")
+        self.assertEqual(app.cfg["model_profiles"][0]["model"], "gpt-5.6-sol")
+        self.assertEqual(app.cfg["model_profiles"][0]["reasoning_effort"], "medium")
         self.assertNotEqual(app.cfg.get("active_model_profile"), "codex")
         entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)
         self.assertIn("Model preset 'codex' added", entries)
@@ -2824,7 +2825,7 @@ class CliCommandTests(unittest.TestCase):
     def test_format_slash_commands_summary_includes_models_alias(self) -> None:
         text = _format_slash_commands_summary()
 
-        self.assertIn("/model: Show or switch saved model presets", text)
+        self.assertIn("/model: Configure the active mode's models and reasoning", text)
         self.assertIn("/models", text)
         self.assertIn("/cloud", text)
         self.assertIn("/local", text)

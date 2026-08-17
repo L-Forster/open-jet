@@ -29,7 +29,7 @@ else:
 from .app_paths import openjet_install_root
 from .config import setup_direct_model_catalog
 from .hardware import HardwareInfo, _darwin_sysctl, is_jetson_label, recommended_context_window_tokens_from_total, running_on_jetson
-from .setup_memory import recommend_context_window_for_model
+from .setup_memory import _kv_bytes_per_token_from_gguf, _model_gguf_path, _vulkan_max_alloc_ctx, recommend_context_window_for_model
 
 def _fmt_size(nbytes: int) -> str:
     if nbytes >= 1 << 30:
@@ -194,6 +194,7 @@ def _context_window_for_model(
     hardware_info: HardwareInfo,
     model_size_mb: float,
     kv_bytes_per_token: float,
+    max_context_tokens: int | None = None,
 ) -> int:
     has_gpu = (
         hardware_info.has_cuda or hardware_info.has_rocm
@@ -221,6 +222,7 @@ def _context_window_for_model(
             fallback_tokens=fallback_tokens,
             model_size_mb=model_size_mb,
             kv_bytes_per_token=kv_bytes_per_token,
+            model_max_context=max_context_tokens,
             total_vram_mb=vram_mb,
         )
     return fallback_tokens
@@ -346,6 +348,7 @@ def recommend_direct_model(
         "model_size_mb": model_size_mb,
         "active_model_size_mb": _active_model_size_mb(selected) if _is_moe_catalog_row(selected) else 0.0,
         "kv_bytes_per_token": kv_bytes_per_token,
+        "max_context_tokens": int(selected.get("max_context_tokens") or 0),
         "llama_cpu_moe": bool(selected.get("llama_cpu_moe", False)),
         "llama_n_cpu_moe": int(selected.get("llama_n_cpu_moe", 0) or 0),
         "llama_cpp_ref": str(selected.get("llama_cpp_ref") or ""),
@@ -355,6 +358,7 @@ def recommend_direct_model(
             hardware_info,
             context_model_size_mb,
             kv_bytes_per_token,
+            int(selected.get("max_context_tokens") or 0) or None,
         ),
     }
 
@@ -1158,7 +1162,53 @@ async def _build_llama_server_from_source(
     return built, synced_ref
 
 
+def _clamp_context_for_device(merged: dict[str, Any]) -> dict[str, Any]:
+    """Re-clamp the context window after the runtime device was overridden.
+
+    The context window is sized during setup against the device chosen back
+    then. `ensure_llama_server` can land on a different device (a Linux CUDA box
+    resolves to the prebuilt Vulkan runtime, for instance), and Vulkan carries a
+    per-allocation limit the original figure never accounted for. Leaving the
+    stale figure in place hands llama-server a KV buffer it cannot allocate, so
+    it dies on startup. Only ever lowers the value.
+    """
+    if str(merged.get("device") or "").strip().lower() != "vulkan":
+        return merged
+    current = int(merged.get("context_window_tokens") or 0)
+    if current <= 0:
+        return merged
+    gguf = _model_gguf_path([merged.get("llama_model"), merged.get("model_download_path")])
+    if gguf is None:
+        return merged
+    kv_bpt = _kv_bytes_per_token_from_gguf(gguf)
+    if not kv_bpt:
+        return merged
+    cap = _vulkan_max_alloc_ctx(kv_bpt)
+    if cap is not None and current > cap:
+        merged["context_window_tokens"] = cap
+    return merged
+
+
 async def ensure_llama_server(
+    setup_result: dict[str, Any],
+    *,
+    hardware_info: HardwareInfo,
+    log: Any,
+    set_status: Callable[[str], None],
+    clear_status: Callable[[], None],
+) -> dict[str, Any]:
+    return _clamp_context_for_device(
+        await _ensure_llama_server(
+            setup_result,
+            hardware_info=hardware_info,
+            log=log,
+            set_status=set_status,
+            clear_status=clear_status,
+        )
+    )
+
+
+async def _ensure_llama_server(
     setup_result: dict[str, Any],
     *,
     hardware_info: HardwareInfo,

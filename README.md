@@ -294,6 +294,13 @@ An agent in your terminal that can actually do useful work:
 ## One runtime, three interfaces
 
 ### CLI + chat TUI
+
+Interactive `openjet` sessions use the bundled OpenJet-branded TypeScript TUI,
+built on the Earendil Works Pi terminal framework and native `AgentSession`. Pi
+owns turns, coding tools, retries, compaction, and interactive session state;
+Python is retained as a narrow hardware, device, provisioning, and llama.cpp
+lifecycle service. Release wheels include the native frontend, so Node.js and Bun
+are not required at runtime. See [TypeScript terminal UI](docs/architecture/typescript-tui.md).
 Interactive local agent work in the terminal.
 
 ### Python SDK
@@ -388,6 +395,7 @@ to that profile's configured provider.
 ### CLI + chat TUI
 - [Usage: CLI](docs/usage/cli.md)
 - [Usage: Slash commands](docs/usage/slash-commands.md)
+- [Usage: Hybrid mode](docs/usage/hybrid-mode.md)
 - [Usage: Skills](docs/usage/skills.md)
 - [Usage: MCP](docs/usage/mcp.md)
 - [Usage: Device sources](docs/usage/device-sources.md)

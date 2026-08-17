@@ -475,6 +475,7 @@ def _recommended_local_payload(
         "kv_bytes_per_token",
         "resident_model_size_mb",
         "active_model_size_mb",
+        "max_context_tokens",
         "llama_mtp",
         "setup_update_model",
     ):
@@ -497,6 +498,7 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
         "kv_bytes_per_token",
         "resident_model_size_mb",
         "active_model_size_mb",
+        "max_context_tokens",
         "llama_mtp",
         "setup_update_model",
     ):
@@ -561,6 +563,7 @@ def _recommended_context_for_payload(
                 fallback_tokens=fallback_tokens,
                 model_size_mb=model_size_mb,
                 kv_bytes_per_token=kv_bytes_per_token,
+                model_max_context=int(payload.get("max_context_tokens") or 0) or None,
                 total_vram_mb=context_vram_mb,
             )
     return recommend_setup_context_window(
@@ -618,6 +621,7 @@ def build_recommended_payload(
             "kv_bytes_per_token",
             "resident_model_size_mb",
             "active_model_size_mb",
+            "max_context_tokens",
             "unified_memory_only",
             "llama_cpu_moe",
             "llama_n_cpu_moe",

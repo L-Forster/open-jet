@@ -7,6 +7,11 @@ from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.command.build_py import build_py as _build_py
 
+try:
+    from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
+except ImportError:  # pragma: no cover - wheel is a declared build dependency
+    _bdist_wheel = None
+
 
 PACKAGE_NAME = "src"
 PACKAGE_DIR = Path(PACKAGE_NAME)
@@ -53,6 +58,24 @@ class build_ext(_build_ext):
             )
 
 
+if _bdist_wheel is not None:
+    class bdist_wheel(_bdist_wheel):
+        """Mark wheels containing the standalone TUI as platform-specific."""
+
+        def finalize_options(self) -> None:
+            super().finalize_options()
+            if (PACKAGE_DIR / "tui_bin").exists():
+                self.root_is_pure = False
+
+        def get_tag(self):
+            python_tag, abi_tag, platform_tag = super().get_tag()
+            if (PACKAGE_DIR / "tui_bin").exists() and not self.distribution.ext_modules:
+                return "py3", "none", os.getenv("OPENJET_WHEEL_PLATFORM", platform_tag)
+            return python_tag, abi_tag, platform_tag
+else:  # pragma: no cover
+    bdist_wheel = None
+
+
 def build_extensions() -> list[Extension]:
     if not BUILD_EXTENSIONS:
         return []
@@ -72,6 +95,10 @@ def build_extensions() -> list[Extension]:
 
 setup(
     ext_modules=build_extensions(),
-    cmdclass={"build_py": build_py, "build_ext": build_ext},
+    cmdclass={
+        "build_py": build_py,
+        "build_ext": build_ext,
+        **({"bdist_wheel": bdist_wheel} if bdist_wheel is not None else {}),
+    },
     zip_safe=False,
 )

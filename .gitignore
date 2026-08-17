@@ -4,6 +4,12 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+ui/node_modules/
+ui/dist/
+*.bun-build
+ui/src/protocol.generated.ts
+src/tui_bin/
+release/
 src/*.c
 src/*.so
 src/*.pyd

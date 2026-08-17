@@ -17,7 +17,7 @@ class OpenAICodexClient:
         self,
         *,
         model: str,
-        context_window_tokens: int = 272000,
+        context_window_tokens: int = 1050000,
         base_url: str = "https://chatgpt.com/backend-api/codex",
         auth_provider: CodexOAuthProvider | None = None,
         reasoning_effort: str | None = "medium",
@@ -31,7 +31,10 @@ class OpenAICodexClient:
         self.gpu_layers = 0
         self.base_url = str(base_url or "https://chatgpt.com/backend-api/codex").rstrip("/")
         self.auth_provider = auth_provider or CodexOAuthProvider()
-        self.reasoning_effort = _optional_enum(reasoning_effort, {"none", "minimal", "low", "medium", "high", "xhigh"})
+        self.reasoning_effort = _optional_enum(
+            reasoning_effort,
+            {"none", "minimal", "low", "medium", "high", "xhigh", "max"},
+        )
         self.reasoning_summary = _optional_enum(reasoning_summary, {"auto", "detailed"})
         self.text_verbosity = _optional_enum(text_verbosity, {"low", "medium", "high"})
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0))
@@ -74,7 +77,7 @@ class OpenAICodexClient:
                 yield chunk
         except RuntimeError as exc:
             if not _looks_like_auth_expired(str(exc)):
-                raise
+                raise RuntimeError(_format_codex_error(exc, model=self.model, stage="request")) from exc
             credentials = self.auth_provider.store.load()
             if credentials is None:
                 raise CodexAuthError("Not logged in to OpenAI Codex. Run /connect openai-codex first.") from exc
@@ -136,15 +139,35 @@ def _looks_like_auth_expired(text: str) -> bool:
     return any(token in lowered for token in (" 401", "unauthorized", "expired", "invalid_token"))
 
 
-def _format_codex_error(exc: Exception, *, model: str) -> str:
+def _format_codex_error(exc: Exception, *, model: str, stage: str = "preflight") -> str:
     text = str(exc).strip() or type(exc).__name__
     lowered = text.lower()
+    if _looks_like_quota_exhausted(lowered):
+        return (
+            "OpenAI Codex has run out of tokens for this account (usage limit reached). "
+            "Switch to your local model with `/mode local`, or `/mode hybrid` once quota resets. "
+            f"Details: {text}"
+        )
     if "unsupported parameter" in lowered:
-        return f"OpenAI Codex preflight failed: {text}"
+        return f"OpenAI Codex {stage} failed: {text}"
     if "model not supported" in lowered or "unsupported model" in lowered or ("model" in lowered and "400" in lowered):
         return f"OpenAI Codex rejected model `{model}`. Change it with `/cloud model <model>`. Details: {text}"
     if "401" in lowered or "unauthorized" in lowered or "invalid_token" in lowered:
         return "OpenAI Codex authentication failed. Run /connect openai-codex again."
-    if "quota" in lowered or "rate limit" in lowered or "429" in lowered or "plan" in lowered:
-        return f"OpenAI Codex is unavailable for this account or quota: {text}"
-    return f"OpenAI Codex preflight failed: {text}"
+    return f"OpenAI Codex {stage} failed: {text}"
+
+
+def _looks_like_quota_exhausted(lowered: str) -> bool:
+    return any(
+        token in lowered
+        for token in (
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "429",
+            "usage limit",
+            "usage_limit",
+            "too many requests",
+            "insufficient_quota",
+        )
+    )

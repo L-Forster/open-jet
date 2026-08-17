@@ -15,7 +15,7 @@ import httpx
 from .airgap import apply_airgap_env, assert_endpoint_allowed
 from .app_paths import openjet_install_root
 from .runtime_protocol import StreamChunk, stream_openai_chat
-from .setup_memory import _max_context_tokens_from_gguf
+from .setup_memory import _kv_bytes_per_token_from_gguf, _max_context_tokens_from_gguf, _vulkan_max_alloc_ctx
 
 
 _FRAGMENTED_LFB_MB = 64
@@ -308,6 +308,15 @@ class LlamaServerClient:
                 model_max_context = _max_context_tokens_from_gguf(model_path)
                 if model_max_context is not None and model_max_context > 0:
                     requested_ctx = min(requested_ctx, model_max_context)
+                if resolved_device == "vulkan":
+                    # Vulkan caps a single allocation (2 GB under Dozen on WSL2).
+                    # A context carried over from a config written for another
+                    # device can ask for a KV buffer past that limit, which fails
+                    # the allocation and takes the server down on startup.
+                    kv_bpt = _kv_bytes_per_token_from_gguf(model_path)
+                    alloc_cap = _vulkan_max_alloc_ctx(kv_bpt) if kv_bpt else None
+                    if alloc_cap is not None:
+                        requested_ctx = min(requested_ctx, alloc_cap)
             batch, ubatch, fit_mode, no_warmup, no_mmap = self._startup_profile_for_lfb(lfb_mb)
             no_mmap = self._should_disable_mmap_for_launch(
                 device=resolved_device,
