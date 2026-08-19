@@ -69,6 +69,26 @@ TOOLS: Sequence[dict[str, object]] = _DynamicTools()
 TOOL_NAMES = _DynamicToolNames()
 
 
+def _param_type_label(spec: dict) -> str:
+    """Render a parameter type, expanding array items so nested object fields are visible."""
+    param_type = str(spec.get("type", "")).strip()
+    if param_type != "array":
+        return param_type
+    items = spec.get("items")
+    if not isinstance(items, dict):
+        return param_type
+    item_type = str(items.get("type", "")).strip()
+    if item_type == "object":
+        item_properties = items.get("properties")
+        if isinstance(item_properties, dict) and item_properties:
+            item_required = set(items.get("required", []))
+            fields = ",".join(
+                f"{field_name}{'*' if field_name in item_required else ''}" for field_name in item_properties
+            )
+            return f"array<object{{{fields}}}>"
+    return f"array<{item_type}>" if item_type else param_type
+
+
 def tool_guidelines_xml() -> str:
     lines = [
         "<tool_guidelines>",
@@ -89,11 +109,9 @@ def tool_guidelines_xml() -> str:
         params = []
         if isinstance(properties, dict):
             for param_name, spec in properties.items():
-                param_type = str(spec.get("type", "")).strip() if isinstance(spec, dict) else ""
+                param_type = _param_type_label(spec) if isinstance(spec, dict) else ""
                 required_suffix = "*" if param_name in required else ""
-                params.append(
-                    f'{html.escape(str(param_name))}{required_suffix}{f":{html.escape(param_type)}" if param_type else ""}'
-                )
+                params.append(f'{param_name}{required_suffix}{f":{param_type}" if param_type else ""}')
         lines.append(f'    <tool name="{html.escape(name)}" params="{html.escape(", ".join(params))}">')
         if description:
             lines.append(f"      {html.escape(description)}")

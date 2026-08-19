@@ -263,6 +263,7 @@ TOOL_REGISTRY = ToolRegistry(
                     "description": "Todo items to store for the current session.",
                     "items": {
                         "type": "object",
+                        "required": ["id", "content"],
                         "properties": {
                             "id": _param("string", "Stable todo id"),
                             "content": _param("string", "Todo text"),
