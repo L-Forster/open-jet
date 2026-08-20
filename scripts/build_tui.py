@@ -38,9 +38,17 @@ def main() -> int:
     parser.add_argument("--skip-install", action="store_true")
     parser.add_argument("--target", choices=tuple(TARGETS), default=target_tag())
     args = parser.parse_args()
+    # The toolchain (typescript, bun) lives in devDependencies, so the build
+    # breaks on machines whose npm config or NODE_ENV omits dev installs.
+    env = {**os.environ, "NODE_ENV": "development", "NPM_CONFIG_OMIT": ""}
     if not args.skip_install:
-        subprocess.run(["npm", "ci", "--ignore-scripts", "--legacy-peer-deps"], cwd=UI, check=True)
-    subprocess.run(["npm", "run", "build"], cwd=UI, check=True)
+        subprocess.run(
+            ["npm", "ci", "--ignore-scripts", "--legacy-peer-deps", "--include=dev"],
+            cwd=UI,
+            check=True,
+            env=env,
+        )
+    subprocess.run(["npm", "run", "build"], cwd=UI, check=True, env=env)
     local_bun = UI / "node_modules" / ".bin" / ("bun.exe" if os.name == "nt" else "bun")
     bun = shutil.which("bun") or (str(local_bun) if local_bun.is_file() else None)
     if not bun:

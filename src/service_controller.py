@@ -198,6 +198,32 @@ class OpenJetServiceController:
                 f"The Pi loop adapter does not yet support the {runtime!r} profile. "
                 "Switch to a local llama.cpp or OpenAI-compatible profile."
             )
+        if runtime == DEFAULT_RUNTIME:
+            await self.emit(
+                "status_update",
+                {"text": "checking local llama.cpp runtime…", "payload": {"runtimeStarting": True}},
+            )
+            hardware_info = detect_hardware_info()
+            log = _SetupLog()
+            resolved = await provision_setup_artifacts(
+                dict(self.cfg),
+                hardware_info=hardware_info,
+                log=log,
+                set_status=lambda _text: None,
+                clear_status=lambda: None,
+            )
+            for key in (
+                "device",
+                "llama_server_path",
+                "llama_cpp_ref",
+                "llama_mtp",
+                "setup_missing_runtime",
+                "context_window_tokens",
+            ):
+                if key in resolved:
+                    self.cfg[key] = resolved[key]
+            sync_active_model_profile(self.cfg)
+            save_config(self.cfg)
         client = create_runtime_client(self.cfg)
         try:
             await self.emit("status_update", {"text": "starting OpenJet runtime…", "payload": {"runtimeStarting": True}})

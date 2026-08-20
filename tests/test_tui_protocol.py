@@ -153,6 +153,40 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("device_list", {tool["name"] for tool in snapshot["openjetTools"]})
         self.assertNotIn("shell", {tool["name"] for tool in snapshot["openjetTools"]})
 
+    async def test_prepare_runtime_reprovisions_llama_server_before_start(self) -> None:
+        self.controller.cfg.update(
+            {
+                "runtime": "llama_cpp",
+                "llama_model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
+                "device": "vulkan",
+                "llama_server_path": "/opt/openjet/bin/llama-server",
+                "llama_mtp": True,
+            }
+        )
+        client = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), base_url="http://127.0.0.1:18080")
+        resolved = {
+            **self.controller.cfg,
+            "device": "cuda",
+            "llama_server_path": "/opt/openjet/llama.cpp/build/bin/llama-server",
+        }
+        with patch("src.service_controller.detect_hardware_info"), patch(
+            "src.service_controller.provision_setup_artifacts",
+            AsyncMock(return_value=resolved),
+        ) as provision, patch(
+            "src.service_controller.create_runtime_client",
+            return_value=client,
+        ):
+            await self.controller._prepare_runtime()
+
+        provision.assert_awaited_once()
+        self.assertEqual(self.controller.cfg["device"], "cuda")
+        self.assertEqual(
+            self.controller.cfg["llama_server_path"],
+            "/opt/openjet/llama.cpp/build/bin/llama-server",
+        )
+        client.start.assert_awaited_once()
+        self.assertIs(self.controller.runtime_client, client)
+
     async def test_model_attribution_is_forwarded_to_session_trace(self) -> None:
         logger = SimpleNamespace(record_agent_trace=Mock())
         self.controller._session_logger = logger

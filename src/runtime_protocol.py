@@ -300,6 +300,15 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
             return int(value)
         if param_type == "boolean" and value.lower() in {"true", "false"}:
             return value.lower() == "true"
+        if param_type in {"array", "object"}:
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return value
+            if param_type == "array" and isinstance(parsed, list):
+                return parsed
+            if param_type == "object" and isinstance(parsed, dict):
+                return parsed
         return value
 
     tool_calls: list[ToolCall] = []

@@ -104,7 +104,14 @@ export class ReasoningBlock implements Component {
   setExpanded(expanded: boolean): void { this.expanded = expanded; }
   invalidate(): void {}
   render(width: number): string[] {
-    if (!this.expanded || !this.text) return [];
+    if (!this.text) return [];
+    if (!this.expanded) {
+      // A local model can think for minutes before its first visible token.
+      // Hiding the content is the point; hiding that anything is happening is
+      // not, so collapsed blocks still report how much thinking has arrived.
+      const tokens = Math.ceil(this.text.length / 4);
+      return [` ${chalk.hex(palette.dim)(`reasoning · ${compactNumber(tokens)} tokens · ctrl+t to expand`)}`];
+    }
     const contentWidth = Math.min(width, CONTENT_MAX_WIDTH);
     return [
       ` ${chalk.hex(palette.dim)("reasoning")}`,

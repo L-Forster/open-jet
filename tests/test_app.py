@@ -1118,6 +1118,18 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(payload)
         self.assertIs(payload["llama_mtp"], True)
 
+    async def test_run_setup_wizard_keeps_mtp_flag_for_qwen38_local_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            qwen38 = Path(tmp) / "Qwen3.8-27B-Q4_K_M.gguf"
+            qwen38.write_bytes(b"gguf")
+            payload, _defaults = await self._run_local_model_wizard(
+                typed_paths=[str(qwen38)],
+                current_cfg={},
+            )
+
+        self.assertIsNotNone(payload)
+        self.assertIs(payload["llama_mtp"], True)
+
     def test_clean_path_input_strips_quotes_and_whitespace(self) -> None:
         self.assertEqual(_clean_path_input('  "/models/a b.gguf"  '), "/models/a b.gguf")
         self.assertEqual(_clean_path_input("'/models/a.gguf'"), "/models/a.gguf")
@@ -3386,12 +3398,35 @@ class LlamaServerLaunchEnvTests(unittest.IsolatedAsyncioTestCase):
         cmd = create_proc.await_args.args
         self.assertNotIn("--spec-default", cmd)
         self.assertEqual(cmd[cmd.index("--spec-type") + 1], "draft-mtp")
-        self.assertEqual(cmd[cmd.index("--spec-draft-n-max") + 1], "3")
+        self.assertEqual(cmd[cmd.index("--spec-draft-n-max") + 1], "2")
 
     def test_mtp_model_name_enables_speculative_decoding(self) -> None:
         client = LlamaServerClient(model="/models/Qwen3.6-27B-Q4_K_M-MTP.gguf")
 
         self.assertTrue(client.llama_mtp)
+
+    def test_qwen38_filename_enables_mtp_without_mtp_suffix(self) -> None:
+        client = LlamaServerClient(model="/models/Qwen3.8-27B-Q4_K_M.gguf")
+
+        self.assertTrue(client.llama_mtp)
+
+    def test_stale_vulkan_config_resolves_to_cuda_on_nvidia(self) -> None:
+        client = LlamaServerClient(model="/models/Qwen3.8-27B-Q4_K_M.gguf", device="vulkan")
+
+        with patch("src.hardware.recommended_device", return_value="cuda"):
+            self.assertEqual(client._resolve_device(), "cuda")
+
+    def test_vulkan_prebuilt_keeps_vulkan_on_cuda_host(self) -> None:
+        client = LlamaServerClient(
+            model="/models/Qwen3.8-27B-Q4_K_M.gguf",
+            binary="/opt/openjet/bin/llama-server",
+            device="vulkan",
+        )
+
+        with patch("src.hardware.recommended_device", return_value="cuda"), patch(
+            "src.llama_server._binary_is_vulkan_only", return_value=True
+        ):
+            self.assertEqual(client._resolve_device(), "vulkan")
 
 class DebugPromptLoggingTests(unittest.TestCase):
     def test_prepare_turn_context_saves_full_runtime_messages_in_debug_mode(self) -> None:

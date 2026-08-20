@@ -222,6 +222,7 @@ class LlamaCppFixer(RuntimeFixer):
                 context_window_tokens=recommended_ctx,
                 batch_size=recommended_batch,
                 ubatch_size=recommended_ubatch,
+                llama_mtp=_model_has_mtp_suffix(str(cfg.get("llama_model") or "")),
             )
             return findings, tuple(args), FixEstimate(
                 confidence="none",
@@ -272,6 +273,7 @@ class LlamaCppFixer(RuntimeFixer):
             context_window_tokens=recommended_ctx,
             batch_size=recommended_batch,
             ubatch_size=recommended_ubatch,
+            llama_mtp=bool(observation.metadata.get("model_has_mtp_suffix")),
         )
         estimate = _estimate_llama_speedup(
             observation,
@@ -767,7 +769,9 @@ def _model_has_mtp_suffix(model_path: str) -> bool:
         return False
     name = Path(model_path).name.lower()
     stem = Path(name).stem
-    return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", stem))
+    if re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", stem):
+        return True
+    return "qwen3.8" in stem.replace("_", ".")
 
 
 def _effective_llama_cpp_decode_speed(
@@ -813,6 +817,7 @@ def _llama_recommended_args(
     context_window_tokens: int,
     batch_size: int,
     ubatch_size: int,
+    llama_mtp: bool = False,
 ) -> list[str]:
     args: list[str] = []
     if device != "cpu":
@@ -828,6 +833,10 @@ def _llama_recommended_args(
             str(ubatch_size),
         ]
     )
+    if llama_mtp:
+        from ..llama_server import _MTP_SPEC_ARGS
+
+        args.extend(_MTP_SPEC_ARGS)
     return args
 
 

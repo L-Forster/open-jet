@@ -14,6 +14,7 @@ import httpx
 
 from .airgap import apply_airgap_env, assert_endpoint_allowed
 from .app_paths import openjet_install_root
+from .provisioning import _binary_is_vulkan_only, _model_path_looks_mtp
 from .runtime_protocol import StreamChunk, stream_openai_chat
 from .setup_memory import _kv_bytes_per_token_from_gguf, _max_context_tokens_from_gguf, _vulkan_max_alloc_ctx
 
@@ -23,11 +24,13 @@ _JETSON_VMM_CHUNK_MB = "1"
 _JETSON_VMM_RESERVE_MB = "4096"
 _LLAMA_SERVER_EXE_NAME = "llama-server.exe" if os.name == "nt" else "llama-server"
 _FULL_OFFLOAD_GPU_LAYERS = 99
+# Two draft tokens. Three adds verify cost on Ampere (3090-class) and
+# community llama.cpp benches for Qwen3.8 Q4_K_M sit in the 65–82 tok/s band at 2.
 _MTP_SPEC_ARGS: tuple[str, ...] = (
     "--spec-type",
     "draft-mtp",
     "--spec-draft-n-max",
-    "3",
+    "2",
 )
 
 
@@ -81,7 +84,7 @@ class LlamaServerClient:
         self.gpu_layers = max(0, int(gpu_layers))
         self.llama_cpu_moe = bool(llama_cpu_moe)
         self.llama_n_cpu_moe = max(0, int(llama_n_cpu_moe))
-        self.llama_mtp = bool(llama_mtp) or Path(str(model)).stem.lower().endswith("-mtp")
+        self.llama_mtp = bool(llama_mtp) or _model_path_looks_mtp(model)
         self.airgapped = bool(airgapped)
         self.base_url = f"http://{host}:{port}"
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=30.0))
@@ -257,11 +260,23 @@ class LlamaServerClient:
         # enough to warrant the small-footprint startup path.
         return (2048, 512, "on", False, False)
 
-    @staticmethod
-    def _should_disable_mmap_for_launch(*, device: str, gpu_layers: int, existing_no_mmap: bool) -> bool:
+    @classmethod
+    def _should_disable_mmap_for_launch(
+        cls, *, device: str, gpu_layers: int, existing_no_mmap: bool
+    ) -> bool:
         if existing_no_mmap:
             return True
-        return device in {"cuda", "rocm", "vulkan"} and gpu_layers >= _FULL_OFFLOAD_GPU_LAYERS
+        if device not in {"cuda", "rocm", "vulkan"}:
+            return False
+        if gpu_layers >= _FULL_OFFLOAD_GPU_LAYERS:
+            # Every weight ends up in VRAM, so the host copy only has to survive
+            # the upload. The file size against RAM does not matter here, and
+            # mmap actively hurts: a model larger than RAM has its pages evicted
+            # and re-read from disk on every forward pass.
+            return True
+        # Layers stay resident on the host, where `--no-mmap` would copy them
+        # into anonymous memory with no way to page them back to the model file.
+        return False
 
     async def _prepare_memory_for_launch(self) -> float | None:
         lfb_mb = self._largest_free_block_mb()
@@ -287,7 +302,7 @@ class LlamaServerClient:
             env["LD_LIBRARY_PATH"] = f"{bin_dir}:/usr/local/cuda/lib64:" + env.get("LD_LIBRARY_PATH", "")
             env.setdefault("CUDA_MODULE_LOADING", "LAZY")
 
-            resolved_device = self._resolve_device()
+            resolved_device = self._resolve_device(binary=binary)
             is_jetson = resolved_device == "cuda" and self._is_jetson_platform()
             if is_jetson:
                 self._ensure_jetson_clocks_sudoers()
@@ -638,11 +653,20 @@ class LlamaServerClient:
                 self._proc.kill()
         self._proc = None
 
-    def _resolve_device(self) -> str:
-        if self.device in {"cuda", "cpu", "vulkan", "rocm", "metal"}:
-            return self.device
+    def _resolve_device(self, binary: str | None = None) -> str:
         from .hardware import recommended_device
-        return recommended_device()
+
+        recommended = recommended_device()
+        configured = self.device if self.device in {"cuda", "cpu", "vulkan", "rocm", "metal"} else recommended
+        # A Linux CUDA install used to persist device=vulkan from the Ubuntu zip.
+        # That must not pin ngl/context to the Vulkan path on a CUDA GPU.
+        # A Vulkan-only prebuilt (source-build fallback) must keep Vulkan policy.
+        if recommended == "cuda" and configured == "vulkan":
+            candidate = binary or self.binary
+            if candidate and _binary_is_vulkan_only(candidate):
+                return "vulkan"
+            return "cuda"
+        return configured
 
     async def save_kv_cache(self, path: Path) -> bool:
         """Save KV cache for slot 0 to *path* via llama-server slot API.

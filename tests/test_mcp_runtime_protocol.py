@@ -36,6 +36,24 @@ class MCPRuntimeProtocolTests(unittest.TestCase):
         finally:
             unregister_tool(name)
 
+    def test_todo_write_guidelines_include_nested_item_fields(self) -> None:
+        xml = tool_guidelines_xml()
+        self.assertIn('name="todo_write"', xml)
+        self.assertIn("todos*:array&lt;object{id*,content*,status,kind,files,acceptance}&gt;", xml)
+
+    def test_parse_tool_calls_deserializes_todo_write_todos_array(self) -> None:
+        calls = parse_tool_calls(
+            '<tool_call><function=todo_write><parameter=todos>'
+            '[{"id":"t1","content":"Inspect","status":"in_progress","kind":"inspect"}]'
+            "</parameter></function></tool_call>"
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "todo_write")
+        self.assertEqual(
+            calls[0].arguments["todos"],
+            [{"id": "t1", "content": "Inspect", "status": "in_progress", "kind": "inspect"}],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

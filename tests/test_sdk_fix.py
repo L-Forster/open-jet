@@ -223,7 +223,7 @@ class SDKFixTests(unittest.TestCase):
                 "-m", "/models/Qwen3.6-27B-Q4_K_M.gguf",
                 "--spec-default",
                 "--spec-type", "draft-mtp",
-                "--spec-draft-n-max", "3",
+                "--spec-draft-n-max", "2",
                 "--port", "18080",
             ),
             executable="llama-server",

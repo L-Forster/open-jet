@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ..airgap import airgapped_from_cfg, set_airgapped
 from ..agent import ActionKind, Agent
-from ..config import load_config
+from ..config import load_config, save_config
 from ..memory_reflection import (
     build_recorded_turn_payload,
     reflect_agent_persistent_memory,
@@ -19,7 +19,7 @@ from ..memory_reflection import (
 )
 from ..multimodal import build_user_content, content_to_plain_text
 from ..runtime_limits import derive_context_budget, estimate_tokens
-from ..runtime_registry import require_provisioned_model
+from ..runtime_registry import DEFAULT_RUNTIME, active_runtime, require_provisioned_model
 from ..runtime_protocol import ToolCall
 from ..tool_executor import ToolExecutionResult, execute_tool
 from ..harness import (
@@ -360,8 +360,26 @@ class OpenJetSession:
     ) -> OpenJetSession:
         from . import build_system_prompt, create_runtime_client
 
+        from_disk = cfg is None
         resolved_cfg = dict(cfg or load_config())
         resolved_root = Path(root or Path.cwd()).resolve()
+        if active_runtime(resolved_cfg) == DEFAULT_RUNTIME:
+            from ..hardware import detect_hardware_info
+            from ..provisioning import provision_setup_artifacts
+
+            class _Log:
+                def write(self, text: object) -> None:
+                    return
+
+            resolved_cfg = await provision_setup_artifacts(
+                resolved_cfg,
+                hardware_info=detect_hardware_info(),
+                log=_Log(),
+                set_status=lambda _text: None,
+                clear_status=lambda: None,
+            )
+            if from_disk:
+                save_config(resolved_cfg)
         resolved_cfg["airgapped"] = airgapped_from_cfg(resolved_cfg, override=airgapped)
         set_airgapped(bool(resolved_cfg["airgapped"]))
         require_provisioned_model(resolved_cfg)

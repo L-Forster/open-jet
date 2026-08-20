@@ -176,6 +176,9 @@ class SDKAirgapTests(AirgapBaseTestCase):
                 with patch("src.sdk.create_runtime_client", return_value=fake_client) as create_client, patch(
                     "src.sdk.build_system_prompt",
                     new=AsyncMock(return_value="system prompt"),
+                ), patch(
+                    "src.provisioning.provision_setup_artifacts",
+                    new=AsyncMock(side_effect=lambda setup_result, **_kwargs: dict(setup_result)),
                 ):
                     session = await create_agent(
                         cfg={"llama_model": str(model_path)},
@@ -185,6 +188,46 @@ class SDKAirgapTests(AirgapBaseTestCase):
                 self.assertTrue(session.airgapped)
                 self.assertTrue(create_client.call_args.args[0]["airgapped"])
                 fake_client.start.assert_not_awaited()
+
+            asyncio.run(_run())
+
+    def test_create_agent_reprovisions_stale_vulkan_llama_runtime(self) -> None:
+        fake_client = _CreateSessionClient()
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "Qwen3.8-27B-Q4_K_M.gguf"
+            model_path.write_bytes(b"")
+            resolved = {
+                "llama_model": str(model_path),
+                "device": "cuda",
+                "llama_mtp": True,
+                "llama_server_path": "/opt/openjet/llama.cpp/build/bin/llama-server",
+            }
+
+            async def _run() -> None:
+                with patch("src.sdk.create_runtime_client", return_value=fake_client) as create_client, patch(
+                    "src.sdk.build_system_prompt",
+                    new=AsyncMock(return_value="system prompt"),
+                ), patch(
+                    "src.provisioning.provision_setup_artifacts",
+                    new=AsyncMock(return_value=resolved),
+                ) as provision:
+                    await create_agent(
+                        cfg={
+                            "llama_model": str(model_path),
+                            "device": "vulkan",
+                            "llama_mtp": False,
+                            "llama_server_path": "/opt/openjet/bin/llama-server",
+                        }
+                    )
+
+                provision.assert_awaited_once()
+                launched = create_client.call_args.args[0]
+                self.assertEqual(launched["device"], "cuda")
+                self.assertTrue(launched["llama_mtp"])
+                self.assertEqual(
+                    launched["llama_server_path"],
+                    "/opt/openjet/llama.cpp/build/bin/llama-server",
+                )
 
             asyncio.run(_run())
 

@@ -16,6 +16,7 @@ from src.provisioning import (
     _subprocess_env,
     _sync_managed_llama_cpp_checkout,
     ensure_llama_server,
+    provision_setup_artifacts,
     recommend_direct_model,
 )
 
@@ -52,7 +53,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(direct["llama_mtp"])
         self.assertTrue(direct["llama_cpu_moe"])
 
-    def test_llama_cmake_args_honor_selected_vulkan_on_cuda_host(self) -> None:
+    def test_llama_cmake_args_prefer_cuda_when_vulkan_selected_on_cuda_host(self) -> None:
         hardware = HardwareInfo(
             label="RTX 3090",
             total_ram_gb=64.0,
@@ -63,8 +64,16 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         args = _llama_cmake_args(hardware, device="vulkan")
 
-        self.assertIn("-DGGML_VULKAN=ON", args)
-        self.assertNotIn("-DGGML_CUDA=ON", args)
+        self.assertIn("-DGGML_CUDA=ON", args)
+        self.assertIn("-DGGML_VULKAN=OFF", args)
+        self.assertNotIn("-DGGML_VULKAN=ON", args)
+
+    def test_model_path_looks_mtp_for_qwen38_without_mtp_suffix(self) -> None:
+        from src.provisioning import _model_path_looks_mtp
+
+        self.assertTrue(_model_path_looks_mtp("Qwen3.8-27B-Q4_K_M.gguf"))
+        self.assertTrue(_model_path_looks_mtp("Qwen3.6-27B-Q4_K_M-MTP.gguf"))
+        self.assertFalse(_model_path_looks_mtp("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"))
 
     def test_llama_cmake_args_falls_back_to_cuda_when_vulkan_selected_without_vulkan(self) -> None:
         hardware = HardwareInfo(
@@ -348,12 +357,13 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         build_source.assert_not_awaited()
 
-    async def test_ensure_llama_server_reuses_configured_runtime_path_for_mtp_model(self) -> None:
+    async def test_ensure_llama_server_rebuilds_untracked_cuda_binary_for_mtp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             configured = Path(tmp) / "custom" / "llama-server"
             configured.parent.mkdir(parents=True)
             configured.write_text("binary", encoding="utf-8")
             llama_dir = Path(tmp) / "llama.cpp"
+            new_built = llama_dir / "build" / "bin" / LLAMA_SERVER_EXE_NAME
             bin_dir = Path(tmp) / "bin"
             log = Mock()
             hardware = HardwareInfo(label="RTX 5090", total_ram_gb=64.0, has_cuda=True, vram_mb=32768.0)
@@ -365,7 +375,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             ), patch(
                 "src.provisioning.LLAMA_CPP_TAG_FILE", bin_dir / "llama-server.tag"
             ), patch(
-                "src.provisioning._needs_rebuild", return_value=True
+                "src.provisioning._needs_rebuild", return_value=False
             ), patch(
                 "src.provisioning.current_llama_server_path", return_value=None
             ), patch(
@@ -373,7 +383,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 AsyncMock(),
             ) as install_prebuilt, patch(
                 "src.provisioning._build_llama_server_from_source",
-                AsyncMock(),
+                AsyncMock(return_value=(new_built, LLAMA_CPP_MTP_REF)),
             ) as build_source:
                 payload = await ensure_llama_server(
                     {
@@ -389,10 +399,10 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         self.assertEqual(payload["llama_cpp_ref"], LLAMA_CPP_MTP_REF)
-        self.assertEqual(payload["llama_server_path"], str(configured))
+        self.assertEqual(payload["llama_server_path"], str(new_built))
         self.assertEqual(payload["device"], "cuda")
         install_prebuilt.assert_not_awaited()
-        build_source.assert_not_awaited()
+        build_source.assert_awaited_once()
 
     async def test_ensure_llama_server_builds_cuda_source_for_mtp_on_linux_nvidia(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -487,36 +497,39 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         install_prebuilt.assert_not_awaited()
         build_source.assert_not_awaited()
 
-    async def test_ensure_llama_server_does_not_reuse_cuda_source_runtime_for_explicit_vulkan_mtp(self) -> None:
+    async def test_ensure_llama_server_upgrades_stale_vulkan_config_to_cuda_on_nvidia(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             llama_dir = Path(tmp) / "llama.cpp"
-            old_built = llama_dir / "build" / "bin" / LLAMA_SERVER_EXE_NAME
-            old_built.parent.mkdir(parents=True)
-            old_built.write_text("binary", encoding="utf-8")
-            new_built = llama_dir / "new-build" / "bin" / LLAMA_SERVER_EXE_NAME
-            (llama_dir / "build" / "openjet-llama-server.json").write_text(
-                f'{{"device": "cuda", "ref": "{LLAMA_CPP_MTP_REF}"}}',
-                encoding="utf-8",
-            )
             bin_dir = Path(tmp) / "bin"
+            vulkan_bin = bin_dir / "llama-server"
+            vulkan_bin.parent.mkdir(parents=True)
+            vulkan_bin.write_text("vulkan-prebuilt", encoding="utf-8")
+            (bin_dir / "llama-server.tag").write_text("b10488", encoding="utf-8")
+            new_built = llama_dir / "build" / "bin" / LLAMA_SERVER_EXE_NAME
             log = Mock()
-            hardware = HardwareInfo(label="RTX 5090", total_ram_gb=64.0, has_cuda=True, vram_mb=32768.0)
+            hardware = HardwareInfo(
+                label="RTX 3090",
+                total_ram_gb=64.0,
+                has_cuda=True,
+                has_vulkan=True,
+                vram_mb=24576.0,
+            )
 
             with patch("src.provisioning.sys.platform", "linux"), patch(
                 "src.provisioning.platform.machine", return_value="x86_64"
             ), patch("src.provisioning.LLAMA_CPP_DIR", llama_dir), patch(
                 "src.provisioning.BIN_DIR", bin_dir
             ), patch(
-                "src.provisioning.LLAMA_SERVER_BIN", bin_dir / "llama-server"
+                "src.provisioning.LLAMA_SERVER_BIN", vulkan_bin
             ), patch(
                 "src.provisioning.LLAMA_CPP_TAG_FILE", bin_dir / "llama-server.tag"
             ), patch(
                 "src.provisioning._needs_rebuild", return_value=True
             ), patch(
-                "src.provisioning.current_llama_server_path", return_value=str(old_built)
+                "src.provisioning.current_llama_server_path", return_value=str(vulkan_bin)
             ), patch(
                 "src.provisioning._install_prebuilt_llama_server",
-                AsyncMock(return_value=None),
+                AsyncMock(),
             ) as install_prebuilt, patch(
                 "src.provisioning._build_llama_server_from_source",
                 AsyncMock(return_value=(new_built, LLAMA_CPP_MTP_REF)),
@@ -524,7 +537,8 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
                 payload = await ensure_llama_server(
                     {
                         "device": "vulkan",
-                        "llama_model": "/models/Qwen3.6-27B-Q4_K_M-MTP.gguf",
+                        "llama_server_path": str(vulkan_bin),
+                        "llama_model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
                         "llama_mtp": True,
                     },
                     hardware_info=hardware,
@@ -535,9 +549,9 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["llama_cpp_ref"], LLAMA_CPP_MTP_REF)
         self.assertEqual(payload["llama_server_path"], str(new_built))
-        self.assertEqual(payload["device"], "vulkan")
+        self.assertEqual(payload["device"], "cuda")
         install_prebuilt.assert_not_awaited()
-        self.assertEqual(build_source.await_args.kwargs["device"], "vulkan")
+        self.assertEqual(build_source.await_args.kwargs["device"], "cuda")
 
     async def test_ensure_llama_server_reuses_source_runtime_when_checkout_ref_matches_without_tag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -586,14 +600,44 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         install_prebuilt.assert_not_awaited()
         build_source.assert_not_awaited()
 
+    async def test_provision_setup_artifacts_enables_mtp_for_qwen38(self) -> None:
+        hardware = HardwareInfo(
+            label="RTX 3090",
+            total_ram_gb=64.0,
+            has_cuda=True,
+            has_vulkan=True,
+            vram_mb=24576.0,
+        )
+        with patch(
+            "src.provisioning.ensure_direct_model",
+            AsyncMock(side_effect=lambda setup_result, **_kwargs: dict(setup_result)),
+        ), patch(
+            "src.provisioning.ensure_llama_server",
+            AsyncMock(side_effect=lambda setup_result, **_kwargs: {**setup_result, "device": "cuda"}),
+        ):
+            payload = await provision_setup_artifacts(
+                {
+                    "llama_model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
+                    "llama_mtp": False,
+                    "device": "vulkan",
+                },
+                hardware_info=hardware,
+                log=Mock(),
+                set_status=lambda _message: None,
+                clear_status=lambda: None,
+            )
+
+        self.assertTrue(payload["llama_mtp"])
+        self.assertEqual(payload["device"], "cuda")
+
 
 class VulkanContextClampTests(unittest.TestCase):
     """A device override must not leave behind a context sized for the old device.
 
-    `ensure_llama_server` can resolve to the prebuilt Vulkan runtime on a Linux
-    CUDA host. Vulkan caps a single allocation at 2 GB under Dozen, so a context
-    carried over from the CUDA sizing asks for a KV buffer that cannot be
-    allocated and llama-server dies on startup.
+    `ensure_llama_server` can still resolve to Vulkan when a Linux CUDA host
+    has no toolkit and falls back to the Ubuntu zip. Vulkan caps a single
+    allocation at 2 GB under Dozen, so a context carried over from CUDA sizing
+    asks for a KV buffer that cannot be allocated and llama-server dies.
     """
 
     def _clamp(self, **overrides: object) -> dict[str, object]:

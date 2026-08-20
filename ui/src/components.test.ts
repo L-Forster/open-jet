@@ -69,12 +69,16 @@ describe("OpenJet visual hierarchy", () => {
     expect(visibleWidth(rendered)).toBe(80);
   });
 
-  it("keeps reasoning invisible until explicitly expanded", () => {
+  it("keeps reasoning content hidden but reports progress until expanded", () => {
     const reasoning = new ReasoningBlock(false);
-    reasoning.setText("I should inspect the relevant source.");
     expect(reasoning.render(80)).toEqual([]);
+    reasoning.setText("I should inspect the relevant source.");
+    const collapsed = reasoning.render(80);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed.join("\n")).toContain("reasoning · ");
+    expect(collapsed.join("\n")).not.toContain("inspect the relevant source");
     reasoning.setExpanded(true);
-    expect(reasoning.render(80).join("\n")).toContain("reasoning");
+    expect(reasoning.render(80).join("\n")).toContain("inspect the relevant source");
   });
 
   it("prioritizes concise footer information responsively", () => {

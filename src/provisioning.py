@@ -119,7 +119,12 @@ def _is_mtp_llama_cpp_ref(ref: str) -> bool:
 
 def _model_path_looks_mtp(value: object) -> bool:
     stem = Path(str(value or "")).name.lower()
-    return bool(re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", stem))
+    if re.search(r"(?:^|[-_.])mtp(?:[-_.]|$)", stem):
+        return True
+    # Qwen3.8 GGUFs ship native next-n / MTP tensors. Unsloth's filenames do
+    # not include `-mtp`, so a name-only check would leave the 3090-class
+    # CUDA path on a Vulkan prebuilt at ~10 tok/s.
+    return "qwen3.8" in stem.replace("_", ".")
 
 
 def _setup_uses_mtp_model(setup_result: Mapping[str, Any]) -> bool:
@@ -693,11 +698,44 @@ async def _run_hf_cli_download(
     return proc.returncode or 0, out, err
 
 
+def _preferred_runtime_device(
+    hardware_info: HardwareInfo,
+    *,
+    configured: str | None = None,
+) -> str | None:
+    """Fastest backend this host can run.
+
+    A Linux CUDA box used to persist `device: vulkan` after installing the
+    official Ubuntu Vulkan zip. That config then stuck: later MTP/CUDA source
+    builds were skipped, and decode dropped from GPU rates to ~6–10 tok/s.
+    CUDA-capable machines always prefer CUDA. CPU remains an explicit opt-out.
+    """
+    configured_device = str(configured or "").strip().lower() or None
+    if configured_device == "cpu":
+        return "cpu"
+    if hardware_info.has_cuda:
+        return "cuda"
+    if hardware_info.has_rocm:
+        return "rocm"
+    if hardware_info.has_metal:
+        return "metal"
+    if hardware_info.has_vulkan:
+        return "vulkan"
+    return configured_device
+
+
+def _linux_cuda_requires_source_build(hardware_info: HardwareInfo) -> bool:
+    """llama.cpp ships no Linux CUDA zip; Vulkan is only a compile-fail fallback."""
+    return sys.platform.startswith("linux") and bool(hardware_info.has_cuda)
+
+
 def _llama_cmake_args(hardware_info: HardwareInfo, *, device: str | None = None) -> list[str]:
     args = ["cmake", ".."]
     selected_device = (device or "").strip().lower()
     if not selected_device or selected_device == "auto":
         selected_device = "cuda" if hardware_info.has_cuda else "vulkan" if hardware_info.has_vulkan else ""
+    if hardware_info.has_cuda and selected_device != "cpu":
+        selected_device = "cuda"
     if selected_device == "vulkan" and not hardware_info.has_vulkan and hardware_info.has_cuda:
         selected_device = "cuda"
     if selected_device == "cuda" and hardware_info.has_cuda:
@@ -710,6 +748,21 @@ def _llama_cmake_args(hardware_info: HardwareInfo, *, device: str | None = None)
     return args
 
 
+def _ldd_output(existing_binary: str) -> str:
+    try:
+        return os.popen(f"ldd {shlex.quote(existing_binary)} 2>/dev/null").read().lower()
+    except Exception:
+        return ""
+
+
+def _binary_is_vulkan_only(existing_binary: str) -> bool:
+    """True when ldd shows Vulkan and no CUDA — the Ubuntu zip, not a CUDA build."""
+    text = _ldd_output(existing_binary)
+    if not text:
+        return False
+    return "libvulkan" in text and "cuda" not in text
+
+
 def _needs_rebuild(hardware_info: HardwareInfo, existing_binary: str, *, device: str | None = None) -> bool:
     """Check if the existing llama-server needs rebuilding for GPU support."""
     desired_device = (device or "").strip().lower()
@@ -719,10 +772,7 @@ def _needs_rebuild(hardware_info: HardwareInfo, existing_binary: str, *, device:
         desired_device = "cuda" if hardware_info.has_cuda else "vulkan" if hardware_info.has_vulkan else "cpu"
     if desired_device not in {"cuda", "vulkan"}:
         return False
-    try:
-        ldd_output = os.popen(f"ldd {shlex.quote(existing_binary)} 2>/dev/null").read().lower()
-    except Exception:
-        return False
+    ldd_output = _ldd_output(existing_binary)
     if desired_device == "cuda" and "cuda" not in ldd_output:
         return True
     if desired_device == "vulkan" and "libvulkan" not in ldd_output:
@@ -918,7 +968,9 @@ def _prebuilt_asset_candidates(hardware_info: HardwareInfo) -> list[str]:
             return ["bin-win-cpu-arm64"]
     if sys.platform.startswith("linux"):
         if machine in {"x86_64", "amd64"}:
-            if hardware_info.has_cuda or hardware_info.has_vulkan:
+            if hardware_info.has_vulkan or hardware_info.has_cuda:
+                # Official releases have no Linux CUDA zip. This asset is the
+                # fallback when a CUDA source build is impossible (no nvcc).
                 return ["bin-ubuntu-vulkan-x64"]
             return ["bin-ubuntu-x64"]
         if hardware_info.has_cuda:
@@ -1166,8 +1218,8 @@ def _clamp_context_for_device(merged: dict[str, Any]) -> dict[str, Any]:
     """Re-clamp the context window after the runtime device was overridden.
 
     The context window is sized during setup against the device chosen back
-    then. `ensure_llama_server` can land on a different device (a Linux CUDA box
-    resolves to the prebuilt Vulkan runtime, for instance), and Vulkan carries a
+    then. `ensure_llama_server` can still land on Vulkan (Linux CUDA host with
+    no toolkit, so the Ubuntu Vulkan zip is the fallback), and Vulkan carries a
     per-allocation limit the original figure never accounted for. Leaving the
     stale figure in place hands llama-server a KV buffer it cannot allocate, so
     it dies on startup. Only ever lowers the value.
@@ -1208,6 +1260,25 @@ async def ensure_llama_server(
     )
 
 
+def _merged_prebuilt_runtime(
+    setup_result: Mapping[str, Any],
+    prebuilt: tuple[Any, ...],
+    prebuilt_device: str | None,
+) -> dict[str, Any]:
+    if len(prebuilt) == 2:
+        installed_path, tag = prebuilt
+        runtime_device = prebuilt_device
+    else:
+        installed_path, tag, runtime_device = prebuilt
+    merged = dict(setup_result)
+    merged["llama_server_path"] = str(installed_path)
+    merged["setup_missing_runtime"] = False
+    merged["llama_cpp_ref"] = tag
+    if runtime_device:
+        merged["device"] = runtime_device
+    return merged
+
+
 async def _ensure_llama_server(
     setup_result: dict[str, Any],
     *,
@@ -1220,16 +1291,38 @@ async def _ensure_llama_server(
     required_ref = _llama_cpp_ref_for_setup(setup_result)
     requires_mtp_runtime = _setup_uses_mtp_model(setup_result) or _is_mtp_llama_cpp_ref(required_ref)
     configured_device = str(setup_result.get("device") or "").strip().lower() or None
-    source_desired_device = configured_device or _source_build_default_device(hardware_info)
-    prebuilt_desired_device = prebuilt_device or configured_device
+    source_desired_device = _preferred_runtime_device(
+        hardware_info, configured=configured_device
+    ) or _source_build_default_device(hardware_info)
+    skip_prebuilt = _linux_cuda_requires_source_build(hardware_info) or (
+        requires_mtp_runtime and source_desired_device in {"cuda", "metal"}
+    )
     configured_server = _configured_llama_server_path(setup_result)
-    if configured_server:
+    reuse_configured = bool(
+        configured_server
+        and not _needs_rebuild(
+            hardware_info, configured_server, device=source_desired_device
+        )
+    )
+    if reuse_configured and requires_mtp_runtime:
+        # CUDA linkage is not enough: draft-mtp needs the MTP llama.cpp ref.
+        managed = _managed_source_llama_server_path()
+        reuse_configured = (
+            managed.is_file()
+            and Path(configured_server).resolve() == managed.resolve()
+            and _source_build_matches(
+                hardware_info=hardware_info,
+                required_ref=required_ref,
+                desired_device=source_desired_device,
+            )
+        )
+    if reuse_configured:
         merged = dict(setup_result)
         merged["llama_server_path"] = configured_server
         merged["setup_missing_runtime"] = False
         merged["llama_cpp_ref"] = required_ref
-        if configured_device:
-            merged["device"] = configured_device
+        if source_desired_device:
+            merged["device"] = source_desired_device
         return merged
     if _source_build_matches(
         hardware_info=hardware_info,
@@ -1244,11 +1337,12 @@ async def _ensure_llama_server(
         if source_device:
             merged["device"] = source_device
         return merged
-    # Cache hit: managed binary + tag file present and binary doesn't need a GPU rebuild.
+    # Cache hit: managed binary + tag file present and binary matches the
+    # desired backend. A Vulkan zip on a CUDA Linux host must not win here.
     if (
-        not requires_mtp_runtime
+        not skip_prebuilt
         and LLAMA_SERVER_BIN.is_file()
-        and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN), device=prebuilt_desired_device)
+        and not _needs_rebuild(hardware_info, str(LLAMA_SERVER_BIN), device=source_desired_device)
     ):
         cached_tag = _installed_llama_server_tag()
         if cached_tag:
@@ -1267,10 +1361,10 @@ async def _ensure_llama_server(
         existing is not None and Path(existing).resolve() == managed_source_binary.resolve()
     )
     if (
-        not requires_mtp_runtime
+        not skip_prebuilt
         and existing
         and not existing_is_source_managed
-        and not _needs_rebuild(hardware_info, existing, device=prebuilt_desired_device)
+        and not _needs_rebuild(hardware_info, existing, device=source_desired_device)
     ):
         merged = dict(setup_result)
         merged["llama_server_path"] = existing
@@ -1282,41 +1376,45 @@ async def _ensure_llama_server(
     rebuilding = existing is not None
 
     prebuilt = None
-    if not requires_mtp_runtime:
+    if not skip_prebuilt:
         prebuilt = await _install_prebuilt_llama_server(
             hardware_info,
             log=log,
             set_status=set_status,
         )
         # macOS ships no source-build toolchain expectation, so a failed prebuilt
-        # install is terminal there. An MTP runtime never reaches this branch: it
-        # needs the source build below, not the prebuilt binary.
+        # install is terminal there. CUDA Linux and MTP never reach this branch:
+        # they need the source build below.
         if prebuilt is None and sys.platform == "darwin":
             raise RuntimeError("Failed to install the macOS prebuilt llama-server.")
     if prebuilt is not None:
         clear_status()
-        if len(prebuilt) == 2:
-            installed_path, tag = prebuilt
-            runtime_device = prebuilt_device
-        else:
-            installed_path, tag, runtime_device = prebuilt
-        merged = dict(setup_result)
-        merged["llama_server_path"] = str(installed_path)
-        merged["setup_missing_runtime"] = False
-        merged["llama_cpp_ref"] = tag
-        if runtime_device:
-            merged["device"] = runtime_device
-        return merged
+        return _merged_prebuilt_runtime(setup_result, prebuilt, prebuilt_device)
 
-    built, synced_ref = await _build_llama_server_from_source(
-        hardware_info=hardware_info,
-        device=source_desired_device,
-        target_ref=required_ref,
-        rebuilding=rebuilding,
-        log=log,
-        set_status=set_status,
-        clear_status=clear_status,
-    )
+    try:
+        built, synced_ref = await _build_llama_server_from_source(
+            hardware_info=hardware_info,
+            device=source_desired_device,
+            target_ref=required_ref,
+            rebuilding=rebuilding,
+            log=log,
+            set_status=set_status,
+            clear_status=clear_status,
+        )
+    except RuntimeError as exc:
+        if skip_prebuilt and hardware_info.has_vulkan:
+            log.write(
+                f"  [yellow]CUDA source build failed ({exc}). Falling back to Vulkan prebuilt.[/]"
+            )
+            prebuilt = await _install_prebuilt_llama_server(
+                hardware_info,
+                log=log,
+                set_status=set_status,
+            )
+            if prebuilt is not None:
+                clear_status()
+                return _merged_prebuilt_runtime(setup_result, prebuilt, prebuilt_device)
+        raise
     merged = dict(setup_result)
     merged["llama_server_path"] = str(built)
     merged["setup_missing_runtime"] = False
@@ -1447,5 +1545,7 @@ async def provision_setup_artifacts(
         set_status=set_status,
         clear_status=clear_status,
     )
+    if _setup_uses_mtp_model(resolved):
+        resolved["llama_mtp"] = True
     clear_status()
     return resolved

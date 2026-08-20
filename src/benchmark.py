@@ -15,6 +15,7 @@ from pathlib import Path
 from .config import load_config
 from .hardware import detect_hardware_info, read_device_model, recommended_device
 from .llama_server import _find_built_llama_binary
+from .provisioning import _binary_is_vulkan_only, _model_path_looks_mtp
 from .setup_memory import _read_gguf_metadata
 
 
@@ -81,10 +82,19 @@ def _get_gpu_name() -> str | None:
 
 
 def _resolve_device(cfg: dict) -> str:
+    recommended = recommended_device()
     device = str(cfg.get("device") or "auto").strip().lower()
-    if device in ("cuda", "cpu", "vulkan", "rocm", "metal"):
-        return device
-    return recommended_device()
+    configured = device if device in ("cuda", "cpu", "vulkan", "rocm", "metal") else recommended
+    if recommended == "cuda" and configured == "vulkan":
+        server = str(cfg.get("llama_server_path") or "").strip()
+        if server and _binary_is_vulkan_only(server):
+            return "vulkan"
+        return "cuda"
+    return configured
+
+
+def _cfg_uses_mtp(cfg: dict, model_path: str = "") -> bool:
+    return bool(cfg.get("llama_mtp")) or _model_path_looks_mtp(cfg.get("llama_model") or model_path)
 
 
 def _bench_env(bench_bin: str) -> dict[str, str]:
@@ -232,7 +242,7 @@ def _run_mtp_benchmark(cfg: dict, *, n_gen: int, repetitions: int) -> None:
         finally:
             await client.close()
 
-    print("Runner:  llama-server --spec-type draft-mtp")
+    print("Runner:  llama-server --spec-type draft-mtp --spec-draft-n-max 2")
     speed = asyncio.run(measure())
     if speed is None:
         raise RuntimeError("MTP benchmark completed without decode timing data.")
@@ -429,10 +439,11 @@ def run_benchmark(
     bench_bin, model_path, device, gpu_layers, env, base = _load_bench_context(cfg)
 
     _print_header("OpenJet Benchmark", model_path, device, gpu_layers)
-    mtp = "on" if bool(cfg.get("llama_mtp")) else "off"
+    mtp_enabled = _cfg_uses_mtp(cfg, model_path)
+    mtp = "on" if mtp_enabled else "off"
     print(f"Config:  fa=on, ctk=q8_0, ctv=q8_0, moe={_moe_label(cfg, gpu_layers, model_path)}, mtp={mtp}")
 
-    if bool(cfg.get("llama_mtp")):
+    if mtp_enabled:
         print(f"Test:    MTP tg{n_gen} x{repetitions} reps")
         _run_mtp_benchmark(cfg, n_gen=n_gen, repetitions=repetitions)
         return
