@@ -9,6 +9,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -33,6 +34,26 @@ def target_tag() -> str:
     return f"{systems[system]}-{machines[machine]}"
 
 
+def copy_pi_theme_assets(next_to_binary: Path) -> None:
+    """Pi's compiled TUI reads theme/dark.json next to the executable."""
+    source = (
+        UI
+        / "node_modules"
+        / "@earendil-works"
+        / "pi-coding-agent"
+        / "dist"
+        / "modes"
+        / "interactive"
+        / "theme"
+    )
+    if not source.is_dir():
+        raise SystemExit(f"Pi theme assets are missing: {source}")
+    destination = next_to_binary / "theme"
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("dark.json", "light.json"):
+        shutil.copy2(source / name, destination / name)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-install", action="store_true")
@@ -41,6 +62,11 @@ def main() -> int:
     # The toolchain (typescript, bun) lives in devDependencies, so the build
     # breaks on machines whose npm config or NODE_ENV omits dev installs.
     env = {**os.environ, "NODE_ENV": "development", "NPM_CONFIG_OMIT": ""}
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from src.openrouter_catalog import write_openrouter_catalog_ts
+
+    write_openrouter_catalog_ts()
     if not args.skip_install:
         subprocess.run(
             ["npm", "ci", "--ignore-scripts", "--legacy-peer-deps", "--include=dev"],
@@ -63,6 +89,7 @@ def main() -> int:
     built = UI / "dist" / executable
     if not built.is_file():
         raise SystemExit(f"TUI build did not produce {built}")
+    copy_pi_theme_assets(UI / "dist")
     destination = ROOT / "src" / "tui_bin" / args.target
     if destination.exists():
         shutil.rmtree(destination)
@@ -71,6 +98,7 @@ def main() -> int:
     shutil.copy2(built, target)
     if os.name != "nt":
         target.chmod(0o755)
+    copy_pi_theme_assets(destination)
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     (destination / "SHA256").write_text(f"{digest}  {executable}\n", encoding="utf-8")
     release_dir = ROOT / "release"

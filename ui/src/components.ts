@@ -125,6 +125,8 @@ export interface FooterState {
   localModel?: string;
   codexModel?: string;
   codexEffort?: string;
+  orchestratorModel?: string;
+  orchestratorKind?: string;
   codexShare?: number;
   airgapped?: boolean;
   workspace?: string;
@@ -173,8 +175,13 @@ export class StatusFooter implements Component {
   invalidate(): void {}
   render(width: number): string[] {
     const mode = (this.state.agentMode || "local").toUpperCase();
+    const orchestratorKind = this.state.orchestratorKind || "";
     // The wire value stays "hybrid"; Slipstream is the user-facing name.
-    const modeLabel = mode === "HYBRID" ? "SLIPSTREAM" : mode;
+    const modeLabel = mode === "HYBRID"
+      ? "SLIPSTREAM"
+      : orchestratorKind === "openrouter" && mode !== "LOCAL"
+        ? "OPENROUTER"
+        : mode;
     const context = this.state.contextWindow
       ? `${compactNumber(this.state.contextTokens ?? 0)} / ${compactNumber(this.state.contextWindow)}`
       : "ctx —";
@@ -183,9 +190,17 @@ export class StatusFooter implements Component {
     const runtime = compactRuntime(this.state.runtime || "local");
     const localModel = compactModel(this.state.localModel || this.state.model || "no local model");
     const codexModel = compactModel(this.state.codexModel || "Codex");
+    const orchestratorModel = compactModel(
+      this.state.orchestratorModel || this.state.codexModel || "orchestrator",
+    );
+    const orchestratorLabel = this.state.orchestratorKind === "openrouter"
+      ? orchestratorModel
+      : `${codexModel} ${this.state.codexEffort || "medium"}`;
     const modelPair = mode === "HYBRID"
-      ? `${codexModel} ${this.state.codexEffort || "medium"} + ${localModel}`
-      : mode === "CODEX" ? `${codexModel} ${this.state.codexEffort || "medium"}` : localModel;
+      ? `${orchestratorLabel} + ${localModel}`
+      : orchestratorKind === "openrouter"
+        ? orchestratorModel
+        : mode === "CODEX" ? `${codexModel} ${this.state.codexEffort || "medium"}` : localModel;
     const output = `${compactNumber(this.state.completionTokens ?? 0)} out${this.state.cost ? ` · ${this.state.cost}` : ""}`;
     const savedTotal = this.state.savedTokenUsage
       ? this.state.savedTokenUsage.input + this.state.savedTokenUsage.cache + this.state.savedTokenUsage.output
@@ -194,8 +209,9 @@ export class StatusFooter implements Component {
     const savedDetail = this.state.savedTokenUsage
       ? `${saved} · ${compactNumber(this.state.savedTokenUsage.input)} input, ${compactNumber(this.state.savedTokenUsage.cache)} cached, ${compactNumber(this.state.savedTokenUsage.output)} output`
       : "";
+    const shareLabel = this.state.orchestratorKind === "openrouter" ? "Orchestrator" : "Codex";
     const share = mode === "HYBRID" && this.state.codexShare != null
-      ? `Codex ${(this.state.codexShare * 100).toFixed(0)}%`
+      ? `${shareLabel} ${(this.state.codexShare * 100).toFixed(0)}%`
       : "";
     const performance = this.state.tps == null ? "tok/s —" : `${this.state.tps.toFixed(1)} tok/s`;
     const hardware = [

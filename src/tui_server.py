@@ -69,7 +69,12 @@ class ProtocolServer:
             snapshot = await self.controller.initialize()
             await self.emit("ready", {"requestId": request_id, "payload": snapshot})
         elif request_type == "command":
-            result = await self.controller.command(str(message.get("text", "")))
+            raw_key = message.get("apiKey")
+            api_key = raw_key.strip() if isinstance(raw_key, str) else ""
+            result = await self.controller.command(
+                str(message.get("text", "")),
+                api_key=api_key or None,
+            )
             await self.emit("notification", {"requestId": request_id, **result})
         elif request_type == "tool_execute":
             payload = message.get("payload")

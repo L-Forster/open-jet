@@ -1,4 +1,6 @@
-#!/usr/bin/env node
+import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
+registerBunOAuthFlows();
+
 import chalk from "chalk";
 import * as clipboard from "@mariozechner/clipboard";
 import { randomUUID } from "node:crypto";
@@ -30,12 +32,16 @@ import { OpenJetRpcClient } from "./rpc-client.js";
 import type { ProtocolMessage } from "./protocol.js";
 import { editorTheme, palette, selectTheme } from "./theme.js";
 import { promptDisposition } from "./startup-queue.js";
-import { bootstrapSlashCommands, ctrlCAction, isRapidSecondEscape, slashCommandsFromPayload } from "./editor-features.js";
+import { bootstrapSlashCommands, ctrlCAction, isRapidSecondEscape, isUnknownSlashCommand, slashCommandsFromPayload } from "./editor-features.js";
+import { enrichPiModel, setOpenRouterPickerModels, type OpenRouterPickerModel } from "./openrouter-models.js";
+import { loginOpenRouter, pickOpenRouterModel, storedOpenRouterApiKey } from "./pi-openrouter.js";
 
 const terminal = new ProcessTerminal();
 const tui: TUI = new TuiMainScreen(terminal);
 const transcript = new Container();
-const editor = new Editor(tui, editorTheme);
+const editorContainer = new Container();
+const editor = new Editor(tui, editorTheme, { autocompleteMaxVisible: 12 });
+editorContainer.addChild(editor);
 editor.setAutocompleteProvider(new CombinedAutocompleteProvider(bootstrapSlashCommands, process.cwd()));
 const footer = new StatusFooter({ workspace: process.cwd(), status: "starting…" });
 const rpc = new OpenJetRpcClient();
@@ -78,11 +84,16 @@ let activeLocalProfile = "";
 let activeCodexModel = "gpt-5.6-sol";
 let activeCodexEffort = "medium";
 let activeLocalReasoning = true;
+let activeOpenrouterModel = "openrouter/stealth/ox-alpha";
+let activeOrchestratorKind = "codex";
+let openrouterConnected = false;
 let codexModelOptions = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
-const serviceCommands = new Set(["status", "device", "devices", "sources", "setup", "runtime", "model", "mode", "agent", "strategy", "effort", "reasoning", "exit", "quit"]);
+const serviceCommands = new Set(["status", "device", "devices", "sources", "setup", "runtime", "model", "mode", "agent", "strategy", "effort", "reasoning", "cloud", "connect", "login", "exit", "quit"]);
+// Until the backend command list arrives, pass slash commands through instead of
+// rejecting them — the bootstrap list is only a subset of what the backend knows.
+let backendCommandsLoaded = false;
 const AGENT_TIPS = [
-  "Tip: Use /mode to switch between Local, Codex, and Slipstream. Slipstream keeps Codex on orchestration and visibly delegates the implementation loop to your warm local model, targeting a 20% Codex token share.",
-  "Tip: Use /model to change the model for the active Local or Codex lane; Slipstream shows both models in the footer.",
+  "Tip: /login is Pi's OpenRouter login (account or API key). /cloud is Pi's OpenRouter model list.",
 ];
 
 function clearActiveImages(): void {
@@ -190,6 +201,19 @@ function updateFooter(payload: Record<string, unknown> = {}, status?: string): v
   if (Array.isArray(payload.codexModelOptions)) {
     codexModelOptions = payload.codexModelOptions.filter((value): value is string => typeof value === "string");
   }
+  if (typeof payload.openrouterConnected === "boolean") openrouterConnected = payload.openrouterConnected;
+  if (Array.isArray(payload.openrouterModels)) {
+    const models = payload.openrouterModels.filter((row): row is OpenRouterPickerModel => (
+      Boolean(row) && typeof row === "object"
+      && typeof (row as OpenRouterPickerModel).id === "string"
+      && typeof (row as OpenRouterPickerModel).name === "string"
+    ));
+    if (models.length) setOpenRouterPickerModels(models);
+  }
+  if (typeof payload.orchestratorKind === "string") {
+    activeOrchestratorKind = payload.orchestratorKind;
+    next.orchestratorKind = payload.orchestratorKind;
+  }
   if (payload.agentChanged === true) next.codexShare = undefined;
   if (payload.agentChanged === true) next.savedTokenUsage = undefined;
   if (Array.isArray(payload.modelProfiles)) {
@@ -205,7 +229,14 @@ function updateFooter(payload: Record<string, unknown> = {}, status?: string): v
   }
   const localModel = payload.localModel as Record<string, unknown> | undefined;
   const codexModel = payload.codexModel as Record<string, unknown> | undefined;
+  const orchestratorModel = payload.orchestratorModel as Record<string, unknown> | undefined;
   if (typeof localModel?.name === "string") next.localModel = localModel.name;
+  if (typeof orchestratorModel?.name === "string") {
+    next.orchestratorModel = orchestratorModel.name;
+    if (activeOrchestratorKind === "openrouter") {
+      activeOpenrouterModel = orchestratorModel.id as string || orchestratorModel.name;
+    }
+  }
   if (typeof codexModel?.name === "string") {
     next.codexModel = codexModel.name;
     activeCodexModel = codexModel.name;
@@ -236,6 +267,7 @@ function updateFooter(payload: Record<string, unknown> = {}, status?: string): v
 function configureCommands(payload: Record<string, unknown>): void {
   const commands = slashCommandsFromPayload(payload);
   for (const command of commands) serviceCommands.add(command.name.toLowerCase());
+  backendCommandsLoaded = true;
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider(commands, process.cwd()));
 }
 
@@ -267,45 +299,128 @@ function pickValue(
 }
 
 async function configureCurrentModel(): Promise<void> {
+  const source = await pickValue("Choose a model", [
+    { value: "openrouter", label: "OpenRouter", description: "Pi hosted models. /login then /cloud." },
+    { value: "local", label: "Local", description: "llama.cpp GGUF on this machine" },
+    { value: "codex", label: "Codex", description: "ChatGPT subscription via /connect openai-codex" },
+    { value: "hybrid-local", label: "Slipstream local worker", description: "Change only the local implementer" },
+  ], activeAgentMode === "hybrid" ? "hybrid-local" : activeOrchestratorKind === "openrouter" ? "openrouter" : activeAgentMode);
+  if (!source) return;
+  if (source === "openrouter") {
+    await configureOpenRouterModel();
+    return;
+  }
+  if (source === "codex") {
+    await configureCodexModel();
+    return;
+  }
   const options: string[] = [];
-  if (activeAgentMode === "codex" || activeAgentMode === "hybrid") {
-    const model = await pickValue(
-      "Configure model · Codex model",
-      codexModelOptions.map((value) => ({ value, label: `Codex · ${value}`, description: "Orchestrator model" })),
-      activeCodexModel,
-    );
-    if (!model) return;
-    const effort = await pickValue(
-      "Configure model · Codex effort",
-      ["none", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value, label: value, description: "Codex reasoning effort" })),
-      activeCodexEffort,
-    );
-    if (!effort) return;
-    options.push(`codex=${model}`, `effort=${effort}`);
+  const localProfiles = modelProfiles.filter((profile) => profile.kind === "local");
+  if (!localProfiles.length) {
+    addNotice("No saved local model profiles. Run /setup first.", "warning");
+    return;
   }
-  if (activeAgentMode === "local" || activeAgentMode === "hybrid") {
-    const localProfiles = modelProfiles.filter((profile) => profile.kind === "local");
-    if (!localProfiles.length) {
-      addNotice("No saved local model profiles. Run /setup first.", "warning");
-      return;
-    }
-    const local = await pickValue("Configure model · Local model", localProfiles.map((profile) => ({
-      value: profile.name,
-      label: `Local · ${profile.name}`,
-      description: profile.model,
-    })), activeLocalProfile);
-    if (!local) return;
-    const reasoning = await pickValue("Configure model · Local reasoning", [
-      { value: "on", label: "Reasoning on", description: "Use the local model's thinking mode" },
-      { value: "off", label: "Reasoning off", description: "Use the local instruct response mode" },
-    ], activeLocalReasoning ? "on" : "off");
-    if (!reasoning) return;
-    options.push(`local=${JSON.stringify(local)}`, `reasoning=${reasoning}`);
-  }
+  const local = await pickValue("Configure model · Local model", localProfiles.map((profile) => ({
+    value: profile.name,
+    label: `Local · ${profile.name}`,
+    description: profile.model,
+  })), activeLocalProfile);
+  if (!local) return;
+  const reasoning = await pickValue("Configure model · Local reasoning", [
+    { value: "on", label: "Reasoning on", description: "Use the local model's thinking mode" },
+    { value: "off", label: "Reasoning off", description: "Use the local instruct response mode" },
+  ], activeLocalReasoning ? "on" : "off");
+  if (!reasoning) return;
+  options.push(`local=${JSON.stringify(local)}`, `reasoning=${reasoning}`);
   rpc.request("command", { text: `/model ${options.join(" ")}` });
 }
 
+async function configureCodexModel(): Promise<void> {
+  const model = await pickValue(
+    "Configure model · Codex model",
+    codexModelOptions.map((value) => ({ value, label: `Codex · ${value}`, description: "ChatGPT subscription model" })),
+    activeCodexModel,
+  );
+  if (!model) return;
+  const effort = await pickValue(
+    "Configure model · Codex effort",
+    ["none", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value, label: value, description: "Codex reasoning effort" })),
+    activeCodexEffort,
+  );
+  if (!effort) return;
+  rpc.request("command", { text: `/model codex=${model} effort=${effort}` });
+}
+
+const piUi = () => ({ tui, editorContainer, editor });
+
+async function saveOpenRouterKey(key: string): Promise<boolean> {
+  try {
+    const response = await rpc.call("command", { text: "/connect openrouter", apiKey: key });
+    const payload = (response.payload ?? {}) as Record<string, unknown>;
+    updateFooter(payload);
+    if (response.text) addNotice(response.text);
+    return openrouterConnected;
+  } catch (error) {
+    addNotice(error instanceof Error ? error.message : String(error), "error");
+    return false;
+  }
+}
+
+async function ensureOpenRouterKey(): Promise<boolean> {
+  const existing = storedOpenRouterApiKey();
+  if (existing) return saveOpenRouterKey(existing);
+  if (openrouterConnected) return true;
+  try {
+    const key = await loginOpenRouter(piUi());
+    if (!key) return false;
+    return saveOpenRouterKey(key);
+  } catch (error) {
+    addNotice(error instanceof Error ? error.message : String(error), "error");
+    return false;
+  }
+}
+
+async function handleLoginCommand(): Promise<void> {
+  try {
+    const key = await loginOpenRouter(piUi());
+    if (!key) return;
+    const saved = await saveOpenRouterKey(key);
+    if (saved) addNotice("OpenRouter login saved. Use /cloud to pick a model.");
+  } catch (error) {
+    addNotice(error instanceof Error ? error.message : String(error), "error");
+  }
+}
+
+async function configureOpenRouterModel(): Promise<void> {
+  const selected = await pickOpenRouterModel({
+    ...piUi(),
+    cwd: process.cwd(),
+    currentModelId: activeOpenrouterModel.replace(/^openrouter\//, ""),
+  });
+  if (!selected) return;
+  if (!openrouterConnected && !(await ensureOpenRouterKey())) return;
+  rpc.request("command", { text: `/cloud ${selected}` });
+}
+
+async function handleConnectCommand(text: string): Promise<void> {
+  const rest = text.slice("/connect".length).trim();
+  if (!rest || rest === "openrouter" || rest.startsWith("openrouter ")) {
+    const key = rest.startsWith("openrouter ") ? rest.slice("openrouter ".length).trim() : "";
+    if (key) {
+      await saveOpenRouterKey(key);
+      return;
+    }
+    await handleLoginCommand();
+    return;
+  }
+  rpc.request("command", { text });
+}
+
 async function configureCodexEffort(): Promise<void> {
+  if (activeOrchestratorKind !== "codex") {
+    addNotice("Codex effort applies only when Codex is the orchestrator.", "warning");
+    return;
+  }
   const effort = await pickValue(
     "Codex effort",
     ["none", "low", "medium", "high", "xhigh", "max"].map((value) => ({ value, label: value, description: "Codex reasoning effort" })),
@@ -391,6 +506,17 @@ function handlePiEvent(event: PiUiEvent): void {
   } else if (event.type === "compaction_end") {
     addNotice(event.text, event.ok ? "info" : "error");
     updateFooter({}, event.ok ? (event.willRetry ? "retrying…" : "working…") : "compaction failed");
+  } else if (event.type === "history_user") {
+    beginSection("response");
+    finishActiveSection();
+    add(new UserMessage(event.text));
+    hasSubmittedTurn = true;
+  } else if (event.type === "history_assistant") {
+    beginSection("response");
+    const restored = new AssistantMessage();
+    restored.setText(event.text);
+    add(restored);
+    finishActiveSection();
   } else if (event.type === "notice") {
     addNotice(event.text, event.level ?? "info");
   } else if (event.type === "turn_complete") {
@@ -486,8 +612,12 @@ function initializePi(payload: Record<string, unknown>, replace = false): Promis
     return Promise.resolve();
   }
   if (piInitialization) return piInitialization;
-  const model = payload.piModel as OpenJetPiModel | undefined;
-  if (!model) return Promise.resolve();
+  const rawModel = payload.piModel as OpenJetPiModel | undefined;
+  if (!rawModel) return Promise.resolve();
+  const model = enrichPiModel(rawModel);
+  const localModel = payload.localModel
+    ? enrichPiModel(payload.localModel as OpenJetPiModel)
+    : undefined;
   if (replace) piAgent.dispose();
   updateFooter(payload, "initializing…");
   const openjetTools = Array.isArray(payload.openjetTools)
@@ -498,7 +628,7 @@ function initializePi(payload: Record<string, unknown>, replace = false): Promis
     typeof payload.workspace === "string" ? payload.workspace : process.cwd(),
     openjetTools,
     (payload.agentMode ?? "local") as AgentMode,
-    payload.localModel as OpenJetPiModel | undefined,
+    localModel,
   ).then(() => {
     updateFooter(payload, "ready");
     if (!showedStartupTip) {
@@ -542,6 +672,12 @@ function handleMessage(message: ProtocolMessage): void {
     case "notification":
       if (message.text) addNotice(message.text, (payload.level as "info" | "warning" | "error") ?? "info");
       if (payload && typeof payload === "object") updateFooter(payload, turnActive ? "working…" : "ready");
+      if (payload.openCloudPicker === true) {
+        void configureOpenRouterModel();
+      }
+      if (payload.openConnectPicker === true || payload.needsApiKey === "openrouter") {
+        void handleLoginCommand();
+      }
       if (payload.piModel && payload.agentChanged === true) {
         setupRequired = false;
         hybridLocalTokenUsage = { input: 0, cache: 0, output: 0 };
@@ -553,7 +689,7 @@ function handleMessage(message: ProtocolMessage): void {
         setupRequired = false;
         void initializePi(payload);
       } else if (payload.piModel && payload.modelChanged === true) {
-        void piAgent.switchModel(payload.piModel as unknown as OpenJetPiModel).then(
+        void piAgent.switchModel(enrichPiModel(payload.piModel as unknown as OpenJetPiModel)).then(
           () => addNotice("Model switched; the current session context was preserved."),
           (error) => addNotice(`Model switch failed: ${error instanceof Error ? error.message : String(error)}`, "error"),
         );
@@ -585,16 +721,102 @@ function handleMessage(message: ProtocolMessage): void {
   }
 }
 
+function busyTurnBlocks(action: string): boolean {
+  if (!turnActive) return false;
+  addNotice(`Wait for the current turn to finish before ${action}.`, "warning");
+  return true;
+}
+
+async function resetConversation(): Promise<void> {
+  if (busyTurnBlocks("starting a new conversation")) return;
+  transcript.clear();
+  toolDetails.length = 0;
+  assistant = undefined;
+  assistantText = "";
+  reasoningText = "";
+  reasoningComponent = undefined;
+  reasoningExpanded = false;
+  turnReasoningBlocks = [];
+  hasSubmittedTurn = false;
+  queuedPrompt = undefined;
+  clearActiveImages();
+  try {
+    await piAgent.reset();
+    addNotice("Started a new conversation.");
+  } catch (error) {
+    addNotice(`Could not start a new conversation: ${error instanceof Error ? error.message : String(error)}`, "error");
+  }
+}
+
+async function resumeConversation(): Promise<void> {
+  if (busyTurnBlocks("resuming a chat")) return;
+  let sessions;
+  try {
+    sessions = await piAgent.listSessions();
+  } catch (error) {
+    addNotice(`Could not list saved chats: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return;
+  }
+  if (!sessions.length) {
+    addNotice("No saved chats found for this workspace.", "warning");
+    return;
+  }
+  const picker = new SelectList(
+    sessions.slice(0, 20).map((session) => ({
+      value: session.path,
+      label: session.timestamp ? new Date(session.timestamp).toLocaleString() : session.id,
+      description: session.preview || session.id,
+    })),
+    8,
+    selectTheme,
+  );
+  const overlay = tui.showOverlay(picker, { width: 72, maxHeight: 10, anchor: "center" });
+  picker.onSelect = (item) => {
+    overlay.hide();
+    void applyResume(item.value);
+  };
+  picker.onCancel = () => overlay.hide();
+}
+
+async function applyResume(path: string): Promise<void> {
+  if (busyTurnBlocks("resuming a chat")) return;
+  transcript.clear();
+  toolDetails.length = 0;
+  toolCards.clear();
+  assistant = undefined;
+  assistantText = "";
+  reasoningText = "";
+  reasoningComponent = undefined;
+  reasoningExpanded = false;
+  turnReasoningBlocks = [];
+  hasSubmittedTurn = false;
+  queuedPrompt = undefined;
+  clearActiveImages();
+  try {
+    await piAgent.openSession(path);
+    addNotice("Chat restored.");
+  } catch (error) {
+    addNotice(`Could not resume chat: ${error instanceof Error ? error.message : String(error)}`, "error");
+  }
+}
+
 editor.onSubmit = (value) => {
   const text = value.trim();
   if (!text || turnActive) return;
+  if (backendCommandsLoaded && isUnknownSlashCommand(text, serviceCommands)) {
+    const token = text.slice(1).split(/\s+/, 1)[0] || "";
+    editor.addToHistory(text);
+    addNotice(token ? `Unknown command /${token}.` : "Unknown command.", "warning");
+    return;
+  }
   if (text === "/mode" || text === "/agent" || text === "/strategy") {
     editor.addToHistory(text);
     const picker = new SelectList([
-      { value: "hybrid", label: "Slipstream", description: "Codex plans and reviews; the local model implements — around 5x more work per Codex plan" },
+      { value: "hybrid", label: "Slipstream", description: "Codex or OpenRouter plans and reviews; the local model implements" },
+      { value: "openrouter", label: "OpenRouter", description: "Hosted models via API key, with pricing in /model and /cloud" },
       { value: "codex", label: "Codex", description: "Codex handles the complete task" },
       { value: "local", label: "Local", description: "The local model handles the complete task" },
-    ], 3, selectTheme);
+    ], 4, selectTheme);
     const overlay = tui.showOverlay(picker, { width: 72, maxHeight: 8, anchor: "center" });
     picker.onSelect = (item) => {
       overlay.hide();
@@ -606,6 +828,33 @@ editor.onSubmit = (value) => {
   if (text === "/model") {
     editor.addToHistory(text);
     void configureCurrentModel();
+    return;
+  }
+  if (/^\/(?:clear|new)$/i.test(text)) {
+    editor.addToHistory("/clear");
+    void resetConversation();
+    return;
+  }
+  if (/^\/resume$/i.test(text)) {
+    editor.addToHistory("/resume");
+    void resumeConversation();
+    return;
+  }
+  if (/^\/cloud$/i.test(text)) {
+    editor.addToHistory("/cloud");
+    void configureOpenRouterModel();
+    return;
+  }
+  if (/^\/login(?:\s|$)/i.test(text)) {
+    editor.addToHistory("/login");
+    void handleLoginCommand();
+    return;
+  }
+  if (/^\/connect(?:\s|$)/i.test(text)) {
+    // History stores the bare command only so an inline API key never lands in
+    // the editor history or any transcript echo.
+    editor.addToHistory("/connect");
+    void handleConnectCommand(text);
     return;
   }
   if (text === "/effort") {
@@ -698,7 +947,7 @@ tui.addChild(new BrandHeader());
 tui.addChild(new Spacer(1));
 tui.addChild(transcript);
 tui.addChild(new Spacer(1));
-tui.addChild(editor);
+tui.addChild(editorContainer);
 tui.addChild(footer);
 tui.setFocus(editor);
 rpc.onMessage(handleMessage);

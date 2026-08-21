@@ -2837,9 +2837,10 @@ class CliCommandTests(unittest.TestCase):
     def test_format_slash_commands_summary_includes_models_alias(self) -> None:
         text = _format_slash_commands_summary()
 
-        self.assertIn("/model: Configure the active mode's models and reasoning", text)
+        self.assertIn("/model: Configure Local, Codex, or OpenRouter models: /model", text)
         self.assertIn("/models", text)
         self.assertIn("/cloud", text)
+        self.assertIn("/login", text)
         self.assertIn("/local", text)
         self.assertIn("/plan", text)
         self.assertIn("/todo", text)

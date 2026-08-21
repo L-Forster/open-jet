@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 
 
 DEFAULT_API_KEY_ENV: dict[str, str] = {
@@ -23,8 +25,34 @@ def default_api_key_env(provider: str) -> str:
     return DEFAULT_API_KEY_ENV.get(normalize_provider_id(provider), "")
 
 
+def pi_auth_json_path() -> Path:
+    env_dir = str(os.environ.get("PI_CODING_AGENT_DIR") or "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser() / "auth.json"
+    return Path.home() / ".pi" / "agent" / "auth.json"
+
+
+def key_from_pi_credential(row: object) -> str | None:
+    if not isinstance(row, dict):
+        return None
+    cred_type = str(row.get("type") or "").strip()
+    if cred_type == "api_key":
+        value = str(row.get("key") or "").strip()
+        return value or None
+    if cred_type == "oauth":
+        value = str(row.get("access") or "").strip()
+        return value or None
+    return None
+
+
 class ApiKeyStore:
-    """API-key store backed only by environment variables and OS keyring."""
+    """API keys from env, OS keyring, or credentials Pi wrote to auth.json.
+
+    OpenJet never stores plaintext keys in auth.json itself; that file is
+    owned by Pi's login flows. Our own saves go to the OS keyring only.
+    Logout may remove this provider's entry from auth.json, but never adds
+    or modifies credential contents there.
+    """
 
     def __init__(self, *, service_name: str = "openjet.api-keys") -> None:
         self.service_name = service_name
@@ -33,10 +61,7 @@ class ApiKeyStore:
         provider_id = normalize_provider_id(provider)
         if not provider_id:
             return None
-        value = self._load_keyring(provider_id)
-        if value:
-            return value
-        return None
+        return self._load_keyring(provider_id) or self._load_pi_auth(provider_id)
 
     def save_key(self, provider: str, api_key: str) -> None:
         provider_id = normalize_provider_id(provider)
@@ -51,10 +76,11 @@ class ApiKeyStore:
         provider_id = normalize_provider_id(provider)
         if not provider_id:
             return True
-        return self._clear_keyring(provider_id)
+        keyring_ok = self._clear_keyring(provider_id)
+        pi_ok = self._clear_pi_auth(provider_id)
+        return keyring_ok and pi_ok
 
     def providers(self) -> list[str]:
-        # Keyring enumeration is not portable.
         return []
 
     def status(self, providers: list[str] | tuple[str, ...]) -> dict[str, dict[str, object]]:
@@ -81,7 +107,36 @@ class ApiKeyStore:
         return self.load_key(provider_id)
 
     def _storage_label(self, provider_id: str) -> str:
-        return "keyring" if self._load_keyring(provider_id) else "keyring-unavailable"
+        if self._load_keyring(provider_id):
+            return "keyring"
+        if self._load_pi_auth(provider_id):
+            return "pi-auth"
+        return "missing"
+
+    def _load_pi_auth(self, provider_id: str) -> str | None:
+        path = pi_auth_json_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return key_from_pi_credential(data.get(provider_id))
+
+    def _clear_pi_auth(self, provider_id: str) -> bool:
+        path = pi_auth_json_path()
+        if not path.is_file():
+            return True
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or provider_id not in data:
+                return True
+            data.pop(provider_id, None)
+            path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            path.chmod(0o600)
+            return True
+        except Exception:
+            return False
 
     def _load_keyring(self, provider_id: str) -> str | None:
         try:

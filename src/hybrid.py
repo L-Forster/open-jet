@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable
 
 from .harness import HarnessState, allowed_tools_for_state
 from .model_profiles import apply_model_profile
+from .runtime_registry import CODEX_RUNTIME, LITELLM_RUNTIME
 from .sdk import OpenJetSession
 from .tool_executor import ToolExecutionResult
 from .tools.registry import ToolSpec, register_tool, unregister_tool
@@ -25,8 +26,8 @@ exploration, routine implementation, repetitive edits, test execution, debugging
 mechanical follow-up fixes. Keep direct work for ambiguous/high-risk decisions, small
 checks needed to direct the worker, and independent review of the resulting diff.
 
-Aim to keep frontier-model token use near 20% of the combined model tokens while
-targeting at least 99% of the quality of a Codex-only result. Do not ask the worker for
+Aim to keep orchestrator-model token use near 20% of the combined model tokens while
+targeting at least 99% of the quality of an orchestrator-only result. Do not ask the worker for
 its transcript or reproduce its exploration. Give it a bounded task and acceptance
 criteria, consume its concise result, inspect only the relevant diff/test evidence,
 and delegate corrections when needed. Never claim success until you have reviewed the
@@ -51,6 +52,11 @@ def execution_mode(cfg: dict[str, Any]) -> str:
     if runtime == "llama_cpp":
         return "local"
     return "codex" if runtime == "openai_codex" else "cloud"
+
+
+def is_hybrid_orchestrator_runtime(runtime: str) -> bool:
+    normalized = str(runtime or "").strip().lower()
+    return normalized in {CODEX_RUNTIME, LITELLM_RUNTIME}
 
 
 class HybridWorker:

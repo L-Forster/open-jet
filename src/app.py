@@ -97,6 +97,7 @@ from .hybrid import (
     TARGET_CODEX_SHARE,
     HybridWorker,
     execution_mode,
+    is_hybrid_orchestrator_runtime,
 )
 from .hardware import (
     detect_hardware_info,
@@ -126,7 +127,14 @@ from .provisioning import pending_direct_model_download_summary, provision_setup
 from .skills_registry import resolve_skill_path
 from .runtime_client import RuntimeClient
 from .runtime_limits import derive_context_budget, estimate_tokens, read_memory_snapshot
-from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, active_model_ref, active_runtime, create_runtime_client
+from .runtime_registry import (
+    CODEX_RUNTIME,
+    DEFAULT_RUNTIME,
+    LITELLM_RUNTIME,
+    active_model_ref,
+    active_runtime,
+    create_runtime_client,
+)
 from .sdk import OpenJetSession, SDKEventKind, ToolResult as SDKToolResult
 from .session_logging import BroadcastConfig, SessionLogger
 from .session_state import ChatArchiveStore, SessionStateStore, SavedChatEntry, build_saved_chat_entry
@@ -1003,8 +1011,10 @@ class OpenJetApp:
         configured_gpu_layers = int(self.cfg.get("gpu_layers", 99))
         client = create_runtime_client(self.cfg, diagnostics_hook=self._runtime_diagnostic)
         hybrid_enabled = execution_mode(self.cfg) == HYBRID_MODE
-        if hybrid_enabled and active_runtime(self.cfg) != CODEX_RUNTIME:
-            raise ValueError("Slipstream mode requires an OpenAI Codex profile as the primary model.")
+        if hybrid_enabled and not is_hybrid_orchestrator_runtime(active_runtime(self.cfg)):
+            raise ValueError(
+                "Slipstream mode requires a Codex or OpenRouter profile as the primary orchestrator model."
+            )
         base_system_prompt = ORCHESTRATOR_SYSTEM_PROMPT if hybrid_enabled else ""
         system_prompt = await build_system_prompt(base_system_prompt, Path.cwd(), cfg=self.cfg)
         if active_runtime(self.cfg) != DEFAULT_RUNTIME:
@@ -1231,7 +1241,13 @@ class OpenJetApp:
         self._render_token_counter()
 
         apply_model_profile(self.cfg, selected)
-        self.cfg["execution_mode"] = "local" if active_runtime(selected) == DEFAULT_RUNTIME else "codex"
+        selected_runtime = active_runtime(selected)
+        if selected_runtime == DEFAULT_RUNTIME:
+            self.cfg["execution_mode"] = "local"
+        elif selected_runtime == LITELLM_RUNTIME:
+            self.cfg["execution_mode"] = "cloud"
+        else:
+            self.cfg["execution_mode"] = "codex"
         try:
             resolved = await self._materialize_setup_model(dict(self.cfg), log)
             self._persist_setup_result({**resolved, "model_profile_name": selected["name"]})
@@ -1308,14 +1324,14 @@ class OpenJetApp:
 
     async def activate_hybrid_mode(
         self,
-        codex_profile_name: str,
+        orchestrator_profile_name: str,
         local_profile_name: str,
         log: LogView,
     ) -> bool:
-        codex_profile = get_model_profile(self.cfg, codex_profile_name)
+        orchestrator_profile = get_model_profile(self.cfg, orchestrator_profile_name)
         local_profile = get_model_profile(self.cfg, local_profile_name)
-        if not codex_profile or active_runtime(codex_profile) != CODEX_RUNTIME:
-            log.write("[yellow]Slipstream mode needs an OpenAI Codex profile.[/]")
+        if not orchestrator_profile or not is_hybrid_orchestrator_runtime(active_runtime(orchestrator_profile)):
+            log.write("[yellow]Slipstream mode needs a Codex or OpenRouter orchestrator profile.[/]")
             log.write("")
             return False
         if not local_profile or active_runtime(local_profile) != DEFAULT_RUNTIME:
@@ -1335,12 +1351,15 @@ class OpenJetApp:
         self.client = None
         self.agent = None
 
-        apply_model_profile(self.cfg, codex_profile)
+        apply_model_profile(self.cfg, orchestrator_profile)
         self.cfg["execution_mode"] = HYBRID_MODE
-        self.cfg["hybrid_codex_profile"] = str(codex_profile["name"])
+        orchestrator_name = str(orchestrator_profile["name"])
+        self.cfg["hybrid_orchestrator_profile"] = orchestrator_name
+        if active_runtime(orchestrator_profile) == CODEX_RUNTIME:
+            self.cfg["hybrid_codex_profile"] = orchestrator_name
         self.cfg["hybrid_local_profile"] = str(local_profile["name"])
         status = self.query_one("#assistant-status")
-        status.update("[bold green]starting Codex + local worker...[/]")
+        status.update("[bold green]starting orchestrator + local worker...[/]")
         status.remove_class("hidden")
         try:
             await self._init_client(persist_config_updates=False)
@@ -1369,7 +1388,9 @@ class OpenJetApp:
         self._start_new_chat_session()
         self.persist_session_state(reason="hybrid_switch")
         self._render_token_counter()
-        log.write("[bold bright_white]Slipstream ready. Codex and the local implementation worker are warm.[/]")
+        log.write(
+            "[bold bright_white]Slipstream ready. The orchestrator and local implementation worker are warm.[/]"
+        )
         log.write("")
         return True
 

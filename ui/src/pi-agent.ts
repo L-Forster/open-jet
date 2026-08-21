@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { extname, join } from "node:path";
 import {
@@ -71,11 +71,50 @@ type PiUiEventPayload =
   | { type: "tool_end"; callId: string; text: string; ok: boolean; details?: unknown }
   | { type: "compaction_start"; reason: string }
   | { type: "compaction_end"; ok: boolean; text: string; willRetry: boolean }
+  | { type: "history_user"; text: string }
+  | { type: "history_assistant"; text: string }
   | { type: "turn_complete"; stats: ReturnType<AgentSession["getSessionStats"]> }
   | { type: "notice"; text: string; level?: "info" | "warning" | "error" }
   | { type: "trace"; event: string; turnId: string; data: Record<string, unknown> };
 
 export type PiUiEvent = PiUiEventPayload & Partial<ModelAttribution>;
+
+export interface OpenJetSessionSummary {
+  path: string;
+  id: string;
+  timestamp: string;
+  preview: string;
+}
+
+async function summarizeSessionFile(path: string): Promise<OpenJetSessionSummary | null> {
+  const content = await readFile(path, "utf8");
+  let id = "";
+  let timestamp = "";
+  let preview = "";
+  for (const line of content.split("\n")) {
+    if (!line.trim()) continue;
+    let entry: Record<string, unknown>;
+    try {
+      entry = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!id && entry.type === "session") {
+      id = typeof entry.id === "string" ? entry.id : "";
+      timestamp = typeof entry.timestamp === "string" ? entry.timestamp : "";
+      continue;
+    }
+    if (!preview && entry.type === "message") {
+      const message = entry.message as Record<string, unknown> | undefined;
+      if (message && message.role === "user") {
+        preview = contentText(message.content).replace(/\s+/g, " ").trim().slice(0, 80);
+      }
+    }
+    if (id && preview) break;
+  }
+  if (!id) return null;
+  return { path, id, timestamp, preview };
+}
 
 export function modelConfigPayload(model: OpenJetPiModel): Record<string, unknown> {
   return {
@@ -226,6 +265,7 @@ export class OpenJetPiAgent {
     openjetTools: OpenJetToolDescriptor[] = [],
     mode: AgentMode = "local",
     localModel?: OpenJetPiModel,
+    sessionPath?: string,
   ): Promise<void> {
     const cwd = workspace || process.cwd();
     this.workspace = cwd;
@@ -256,7 +296,9 @@ export class OpenJetPiAgent {
       modelRuntime,
       model: selectedModel,
       thinkingLevel: model.reasoning ? model.thinkingLevel ?? "medium" : "off",
-      sessionManager: SessionManager.create(cwd, sessionsDir),
+      sessionManager: sessionPath
+        ? SessionManager.open(sessionPath, sessionsDir)
+        : SessionManager.create(cwd, sessionsDir),
       customTools,
     });
     this.session = created.session;
@@ -308,6 +350,63 @@ export class OpenJetPiAgent {
   }
 
   async abort(): Promise<void> { await this.session?.abort(); }
+
+  /** List saved Pi sessions for the current workspace, newest first. */
+  async listSessions(): Promise<OpenJetSessionSummary[]> {
+    const sessionsDir = join(this.workspace || process.cwd(), ".openjet", "pi", "sessions");
+    let names: string[] = [];
+    try {
+      names = await readdir(sessionsDir);
+    } catch {
+      return [];
+    }
+    const summaries: OpenJetSessionSummary[] = [];
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const path = join(sessionsDir, name);
+      try {
+        const summary = await summarizeSessionFile(path);
+        if (summary) summaries.push(summary);
+      } catch {
+        // Skip unreadable session files.
+      }
+    }
+    summaries.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    return summaries;
+  }
+
+  /** Dispose the current session and reopen a saved one, replaying its history. */
+  async openSession(path: string): Promise<void> {
+    if (!this.primaryModel) throw new Error("Pi agent session is not initialized.");
+    const model = this.primaryModel;
+    const workspace = this.workspace;
+    const openjetTools = this.openjetTools;
+    const mode = this.mode;
+    const localModel = this.localModel;
+    this.dispose();
+    await this.initialize(model, workspace, openjetTools, mode, localModel, path);
+    if (this.session) {
+      for (const message of this.session.messages as unknown as Array<Record<string, unknown>>) {
+        const role = message.role;
+        if (role !== "user" && role !== "assistant") continue;
+        const text = contentText(message.content).trim();
+        if (!text) continue;
+        this.emit(role === "user" ? { type: "history_user", text } : { type: "history_assistant", text });
+      }
+    }
+  }
+
+  /** Dispose the current session and start a fresh one with the same models/tools. */
+  async reset(): Promise<void> {
+    if (!this.primaryModel) throw new Error("Pi agent session is not initialized.");
+    const model = this.primaryModel;
+    const workspace = this.workspace;
+    const openjetTools = this.openjetTools;
+    const mode = this.mode;
+    const localModel = this.localModel;
+    this.dispose();
+    await this.initialize(model, workspace, openjetTools, mode, localModel);
+  }
 
   dispose(): void {
     this.unsubscribe?.();

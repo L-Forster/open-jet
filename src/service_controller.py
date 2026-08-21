@@ -11,10 +11,21 @@ from typing import Any
 
 from .airgap import airgapped_from_cfg, set_airgapped
 from .config import load_config, save_config
+from .api_auth import ApiKeyStore, default_api_key_env, normalize_provider_id
 from .codex_auth import CodexAuthError, CodexOAuthProvider
 from .device_sources import assign_device_alias, list_device_sources, set_device_enabled
 from .hardware import detect_hardware_info, recommended_context_window_tokens
 from .model_profiles import apply_model_profile, get_model_profile, list_model_profiles, replace_model_profile, sync_active_model_profile
+from .openrouter_catalog import (
+    OPENROUTER_API_KEY_ENV,
+    OPENROUTER_BASE_URL,
+    catalog_entry_for_model,
+    ensure_openrouter_model_profiles,
+    featured_openrouter_model,
+    openrouter_model_option_ids,
+    openrouter_picker_models,
+    upsert_openrouter_profile,
+)
 from .provisioning import provision_setup_artifacts
 from .runtime_registry import CODEX_RUNTIME, DEFAULT_CODEX_MODEL, DEFAULT_RUNTIME, LITELLM_RUNTIME, active_model_ref, active_runtime, create_runtime_client
 from .runtime_protocol import ToolCall
@@ -165,6 +176,132 @@ class OpenJetServiceController:
                 return profile
         return profiles[0] if profiles else None
 
+    def _orchestrator_profiles(self) -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        for profile in list_model_profiles(self.cfg):
+            if active_runtime(profile) in {CODEX_RUNTIME, LITELLM_RUNTIME}:
+                profiles.append(dict(profile))
+        return profiles
+
+    def _orchestrator_profile(self) -> dict[str, Any] | None:
+        preferred = str(
+            self.cfg.get("agent_orchestrator_profile")
+            or self.cfg.get("agent_codex_profile")
+            or ""
+        ).strip().lower()
+        profiles = self._orchestrator_profiles()
+        if preferred:
+            for profile in profiles:
+                if str(profile.get("name") or "").strip().lower() == preferred:
+                    return profile
+        if self._agent_mode() == "codex":
+            for profile in profiles:
+                if active_runtime(profile) == CODEX_RUNTIME:
+                    return profile
+            for profile in profiles:
+                if normalize_provider_id(str(profile.get("provider") or "")) == "openrouter":
+                    return profile
+            return None
+        return profiles[0] if profiles else None
+
+    def _orchestrator_kind(self, profile: dict[str, Any] | None = None) -> str:
+        selected = profile or self._orchestrator_profile()
+        if selected is None:
+            return "codex"
+        runtime = active_runtime(selected)
+        if runtime == CODEX_RUNTIME:
+            return "codex"
+        provider = normalize_provider_id(str(selected.get("provider") or ""))
+        if provider == "openrouter":
+            return "openrouter"
+        return "cloud"
+
+    def _openrouter_connected(self) -> bool:
+        return bool(self._resolved_openrouter_key())
+
+    def _resolved_openrouter_key(self) -> str | None:
+        # Re-read on every call so clearing/rotating the key takes effect
+        # immediately instead of serving a stale cached value.
+        return ApiKeyStore().resolve_key("openrouter", env_name=OPENROUTER_API_KEY_ENV)
+
+    @staticmethod
+    def _redact(secret: str, text: str) -> str:
+        value = str(secret or "").strip()
+        if not value:
+            return text
+        return text.replace(value, "<redacted>")
+
+    def _needs_openrouter_key(self) -> dict[str, Any]:
+        snapshot = self._snapshot()
+        snapshot["needsApiKey"] = "openrouter"
+        return {
+            "text": "OpenRouter is not logged in. Run /login.",
+            "payload": snapshot,
+        }
+
+    async def _activate_openrouter(self, model: str, *, cloud_only: bool = True) -> dict[str, Any]:
+        if airgapped_from_cfg(self.cfg):
+            raise ServiceError("Air-gapped mode blocks OpenRouter.")
+        if not self._openrouter_connected():
+            return self._needs_openrouter_key()
+        profile = upsert_openrouter_profile(self.cfg, model)
+        # Cloud-only must not stamp OpenRouter's 1M+ context onto the local llama.cpp
+        # profile, and must unload the GGUF so VRAM is released.
+        if cloud_only:
+            self.cfg["agent_mode"] = "codex"
+            if self.runtime_client is not None:
+                await self.runtime_client.close()
+                self.runtime_client = None
+        self.cfg["agent_orchestrator_profile"] = str(profile["name"])
+        await self._prepare_agent_mode()
+        save_config(self.cfg)
+        snapshot = self._snapshot(setup_required=False)
+        snapshot["agentChanged"] = True
+        return {
+            "text": f"OpenRouter model set to {profile.get('model')}. Local llama.cpp is not loaded.",
+            "payload": snapshot,
+        }
+
+    def _connect_command(self, argument: str, *, api_key: str | None = None) -> dict[str, Any]:
+        if not argument.strip():
+            snapshot = self._snapshot()
+            snapshot["openConnectPicker"] = True
+            return {"text": "", "payload": snapshot}
+        parts = argument.split(maxsplit=1)
+        action = (parts[0] if parts else "status").strip().lower() or "status"
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        secret = str(api_key or "").strip() or rest
+        if action in {"status", "list"}:
+            store = ApiKeyStore()
+            status = store.status(["openai", "anthropic", "openrouter"])
+            lines = []
+            for provider_id, row in status.items():
+                source = "env" if row.get("env_present") else ("stored" if row.get("stored") else "missing")
+                lines.append(f"{provider_id}: {source} ({row.get('env') or 'n/a'})")
+            return {"text": "\n".join(lines) or "No API providers configured.", "payload": self._snapshot()}
+        if action == "openrouter":
+            if airgapped_from_cfg(self.cfg):
+                raise ServiceError("Air-gapped mode blocks OpenRouter.")
+            if secret:
+                try:
+                    ApiKeyStore().save_key("openrouter", secret)
+                except ValueError as exc:
+                    return {
+                        "text": self._redact(secret, f"Could not save the OpenRouter API key: {exc}"),
+                        "payload": self._snapshot(),
+                    }
+                ensure_openrouter_model_profiles(self.cfg)
+                save_config(self.cfg)
+                snapshot = self._snapshot()
+                return {
+                    "text": "OpenRouter API key saved to the OS keyring.",
+                    "payload": snapshot,
+                }
+            if self._openrouter_connected():
+                return {"text": "OpenRouter is already connected.", "payload": self._snapshot()}
+            return self._needs_openrouter_key()
+        raise ServiceError("Usage: /connect [status|openrouter [api-key]]")
+
     async def _prepare_agent_mode(self) -> None:
         mode = self._agent_mode()
         if mode in {"local", "hybrid"}:
@@ -180,14 +317,37 @@ class OpenJetServiceController:
             await self.runtime_client.close()
             self.runtime_client = None
         if mode in {"codex", "hybrid"}:
-            codex = self._profile_for_runtime(CODEX_RUNTIME, "agent_codex_profile")
-            if codex is None:
-                raise ServiceError("Codex and Slipstream agent modes require a Codex profile. Run /connect openai-codex.")
-            self.cfg["agent_codex_profile"] = str(codex["name"])
-            try:
-                self._codex_credentials = await CodexOAuthProvider().credentials()
-            except CodexAuthError as exc:
-                raise ServiceError(str(exc)) from exc
+            orchestrator = self._orchestrator_profile()
+            if orchestrator is None:
+                raise ServiceError(
+                    "Codex and Slipstream agent modes require an orchestrator profile. "
+                    "Run /connect openai-codex or /connect openrouter."
+                )
+            orchestrator_name = str(orchestrator["name"])
+            self.cfg["agent_orchestrator_profile"] = orchestrator_name
+            runtime = active_runtime(orchestrator)
+            if runtime == CODEX_RUNTIME:
+                self.cfg["agent_codex_profile"] = orchestrator_name
+                try:
+                    self._codex_credentials = await CodexOAuthProvider().credentials()
+                except CodexAuthError as exc:
+                    raise ServiceError(str(exc)) from exc
+            elif runtime == LITELLM_RUNTIME:
+                self._codex_credentials = None
+                provider = normalize_provider_id(str(orchestrator.get("provider") or ""))
+                env_name = str(orchestrator.get("api_key_env") or default_api_key_env(provider))
+                api_key = (
+                    self._resolved_openrouter_key()
+                    if provider == "openrouter"
+                    else ApiKeyStore().resolve_key(provider, env_name=env_name)
+                )
+                if not api_key:
+                    raise ServiceError(
+                        f"{provider or 'cloud'} API key required. "
+                        f"Run /connect {provider or 'openrouter'} or set {env_name or 'the provider API key env'}."
+                    )
+            else:
+                raise ServiceError(f"Unsupported orchestrator runtime: {runtime}")
 
     async def _prepare_runtime(self) -> None:
         if self.runtime_client is not None:
@@ -283,12 +443,12 @@ class OpenJetServiceController:
             model["nativeContextWindow"] = QWEN38_NATIVE_CONTEXT_TOKENS
         return model
 
-    def _pi_codex_model(self) -> dict[str, Any] | None:
-        profile = self._profile_for_runtime(CODEX_RUNTIME, "agent_codex_profile")
+    def _pi_codex_model(self, profile: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        selected = profile or self._profile_for_runtime(CODEX_RUNTIME, "agent_codex_profile")
         credentials = self._codex_credentials
-        if profile is None or credentials is None:
+        if selected is None or credentials is None:
             return None
-        model_id = str(profile.get("model") or DEFAULT_CODEX_MODEL)
+        model_id = str(selected.get("model") or DEFAULT_CODEX_MODEL)
         headers = {"originator": "openjet"}
         if credentials.account_id:
             headers["ChatGPT-Account-Id"] = credentials.account_id
@@ -298,17 +458,77 @@ class OpenJetServiceController:
             "name": model_id,
             "api": "openai-codex-responses",
             "apiKey": credentials.access_token,
-            "baseUrl": str(profile.get("codex_base_url") or "https://chatgpt.com/backend-api"),
+            "baseUrl": str(selected.get("codex_base_url") or "https://chatgpt.com/backend-api"),
             "headers": headers,
             "reasoning": True,
-            "thinkingLevel": str(profile.get("reasoning_effort") or "medium"),
+            "thinkingLevel": str(selected.get("reasoning_effort") or "medium"),
             "input": ["text", "image"],
-            "contextWindow": int(profile.get("context_window_tokens") or 272000),
-            "maxTokens": int(profile.get("max_tokens") or 128000),
+            "contextWindow": int(selected.get("context_window_tokens") or 272000),
+            "maxTokens": int(selected.get("max_tokens") or 128000),
             "thinkingLevelMap": {"minimal": None, "xhigh": "xhigh", "max": "max"},
             "cost": {"input": 5, "output": 30, "cacheRead": 0.5, "cacheWrite": 6.25},
             "compat": {"supportsOpenAIGrammarTools": True, "supportsAdditionalTools": True, "supportsToolSearch": True},
         }
+
+    def _pi_litellm_model(self, profile: dict[str, Any]) -> dict[str, Any] | None:
+        provider = normalize_provider_id(str(profile.get("provider") or ""))
+        env_name = str(profile.get("api_key_env") or default_api_key_env(provider))
+        api_key = (
+            self._resolved_openrouter_key()
+            if provider == "openrouter"
+            else ApiKeyStore().resolve_key(provider, env_name=env_name)
+        )
+        if not api_key:
+            return None
+        model_full = str(profile.get("model") or "").strip()
+        if not model_full:
+            return None
+        model_id = model_full.removeprefix("openrouter/") if provider == "openrouter" else model_full
+        base_url = str(profile.get("base_url") or "").strip()
+        if not base_url and provider == "openrouter":
+            base_url = OPENROUTER_BASE_URL
+        if not base_url:
+            return None
+        context_window = max(1, int(profile.get("context_window_tokens") or 128000))
+        configured_max_tokens = profile.get("max_tokens")
+        max_tokens = (
+            int(configured_max_tokens)
+            if configured_max_tokens is not None
+            else min(131072, max(1, context_window - 4096))
+        )
+        max_tokens = min(max(1, max_tokens), max(1, context_window - 4096))
+        display_name = str(profile.get("name") or model_id)
+        catalog = catalog_entry_for_model(model_full) or {}
+        return {
+            "provider": provider or "openjet-compatible",
+            "id": model_id,
+            "name": str(catalog.get("label") or display_name),
+            "api": "openai-completions",
+            "apiKey": api_key,
+            "baseUrl": base_url.rstrip("/"),
+            "reasoning": True,
+            "input": ["text", "image"],
+            "contextWindow": int(catalog.get("context_window_tokens") or context_window),
+            "maxTokens": int(catalog.get("max_tokens") or max_tokens),
+            "cost": dict(catalog.get("cost") or {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}),
+            "compat": {
+                "supportsDeveloperRole": False,
+                "supportsReasoningEffort": False,
+                "supportsUsageInStreaming": True,
+                "maxTokensField": "max_tokens",
+            },
+        }
+
+    def _pi_orchestrator_model(self) -> dict[str, Any] | None:
+        orchestrator = self._orchestrator_profile()
+        if orchestrator is None:
+            return None
+        runtime = active_runtime(orchestrator)
+        if runtime == CODEX_RUNTIME:
+            return self._pi_codex_model(orchestrator)
+        if runtime == LITELLM_RUNTIME:
+            return self._pi_litellm_model(orchestrator)
+        return None
 
     def _snapshot(self, *, setup_required: bool | None = None) -> dict[str, Any]:
         power_watts, power_percent = self._metrics.read_power_metrics()
@@ -317,11 +537,15 @@ class OpenJetServiceController:
         thermal = self._metrics.read_thermal_metrics()
         mode = self._agent_mode()
         local_model = self._pi_model()
-        codex_model = self._pi_codex_model()
-        primary_model = local_model if mode == "local" else codex_model
+        orchestrator = self._orchestrator_profile()
+        orchestrator_kind = self._orchestrator_kind(orchestrator)
+        codex_model = self._pi_codex_model(orchestrator) if orchestrator_kind == "codex" else None
+        orchestrator_model = self._pi_orchestrator_model()
+        primary_model = local_model if mode == "local" else orchestrator_model
         return {
             "agentEngine": "pi",
             "agentMode": mode,
+            "orchestratorKind": orchestrator_kind,
             "workspace": str(self.root),
             "runtime": active_runtime(self.cfg),
             "model": active_model_ref(self.cfg),
@@ -330,6 +554,7 @@ class OpenJetServiceController:
             "piModel": primary_model,
             "localModel": local_model,
             "codexModel": codex_model,
+            "orchestratorModel": orchestrator_model,
             "openjetTools": self._pi_tools(),
             "modelProfiles": [
                 {
@@ -341,8 +566,13 @@ class OpenJetServiceController:
             ],
             "agentLocalProfile": str(self.cfg.get("agent_local_profile") or ""),
             "agentCodexProfile": str(self.cfg.get("agent_codex_profile") or ""),
+            "agentOrchestratorProfile": str(self.cfg.get("agent_orchestrator_profile") or ""),
+            "openrouterConnected": self._openrouter_connected(),
             "localReasoning": bool((self._profile_for_runtime(DEFAULT_RUNTIME, "agent_local_profile") or {}).get("reasoning", self.cfg.get("reasoning", True))),
             "codexModelOptions": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+            "openrouterModelOptions": openrouter_model_option_ids(),
+            "openrouterModels": openrouter_picker_models(),
+            "featuredOpenrouterModel": featured_openrouter_model(),
             "commands": [
                 {"name": spec.name, "description": spec.description, "aliases": list(spec.aliases)}
                 for spec in COMMANDS
@@ -473,12 +703,15 @@ class OpenJetServiceController:
         await self._prepare_runtime()
         return self._snapshot(setup_required=False)
 
-    async def command(self, text: str) -> dict[str, Any]:
+    async def command(self, text: str, *, api_key: str | None = None) -> dict[str, Any]:
         raw = text.strip().removeprefix("/")
         command, _, argument = raw.partition(" ")
         command = command.lower()
         if command == "status":
             return {"text": "OpenJet hardware/runtime status updated.", "payload": self._snapshot()}
+        if command == "help":
+            lines = [f"/{spec.name} — {spec.description}" for spec in COMMANDS if not spec.hidden]
+            return {"text": "\n".join(lines), "payload": self._snapshot()}
         if command in {"exit", "quit"}:
             return {"text": "Closing OpenJet.", "payload": {"exit": True}}
         if command == "setup":
@@ -490,12 +723,21 @@ class OpenJetServiceController:
         if command in {"mode", "agent", "strategy"}:
             mode = argument.strip().lower() or "status"
             if mode in {"status", "list"}:
+                mode_text = self._agent_mode()
+                if mode_text == "codex" and self._orchestrator_kind() == "openrouter":
+                    mode_text = "codex (OpenRouter orchestrator)"
                 return {
-                    "text": f"Mode: {self._agent_mode()}\nAvailable modes: local, codex, hybrid",
+                    "text": f"Mode: {mode_text}\nAvailable modes: local, codex, openrouter, hybrid",
                     "payload": self._snapshot(),
                 }
+            if mode in {"openrouter", "cloud"}:
+                current = self._orchestrator_profile()
+                model = featured_openrouter_model()
+                if current is not None and self._orchestrator_kind(current) == "openrouter":
+                    model = str(current.get("model") or model)
+                return await self._activate_openrouter(model, cloud_only=True)
             if mode not in {"local", "codex", "hybrid"}:
-                raise ServiceError("Usage: /mode [local|codex|hybrid|status]")
+                raise ServiceError("Usage: /mode [local|codex|openrouter|hybrid|status]")
             previous_mode = self._agent_mode()
             self.cfg["agent_mode"] = mode
             try:
@@ -508,6 +750,27 @@ class OpenJetServiceController:
             snapshot = self._snapshot(setup_required=False)
             snapshot["agentChanged"] = True
             return {"text": f"Mode switched to {mode}.", "payload": snapshot}
+        if command == "connect":
+            return self._connect_command(argument, api_key=api_key)
+        if command == "login":
+            snapshot = self._snapshot()
+            snapshot["openConnectPicker"] = True
+            return {"text": "", "payload": snapshot}
+        if command == "cloud":
+            arg = argument.strip()
+            if not arg:
+                snapshot = self._snapshot()
+                snapshot["openCloudPicker"] = True
+                return {"text": "", "payload": snapshot}
+            if arg.lower() in {"status", "list"}:
+                if self._openrouter_connected():
+                    text = "OpenRouter is connected. /cloud opens the model list."
+                else:
+                    text = (
+                        "OpenRouter is not logged in. Run /login, then /cloud to pick a model."
+                    )
+                return {"text": text, "payload": self._snapshot()}
+            return await self._activate_openrouter(arg)
         if command == "reasoning":
             mode = argument.strip().lower() or "status"
             if mode == "status":
@@ -574,12 +837,20 @@ class OpenJetServiceController:
             return {"text": message}
         if command == "model" and argument.strip().lower() in {"", "status", "list"}:
             local = self._profile_for_runtime(DEFAULT_RUNTIME, "agent_local_profile")
-            codex = self._profile_for_runtime(CODEX_RUNTIME, "agent_codex_profile")
+            orchestrator = self._orchestrator_profile()
+            orchestrator_kind = self._orchestrator_kind(orchestrator)
+            orchestrator_ref = active_model_ref(orchestrator or {}) or "not configured"
+            orchestrator_effort = (
+                str((orchestrator or {}).get("reasoning_effort") or "medium")
+                if orchestrator_kind == "codex"
+                else "n/a"
+            )
             return {
                 "text": (
                     f"Mode: {self._agent_mode()}\n"
-                    f"Codex: {active_model_ref(codex or {}) or 'not configured'} · effort {str((codex or {}).get('reasoning_effort') or 'medium')}\n"
-                    f"Local: {active_model_ref(local or {}) or 'not configured'} · reasoning {'on' if bool((local or {}).get('reasoning', True)) else 'off'}"
+                    f"Orchestrator ({orchestrator_kind}): {orchestrator_ref} · effort {orchestrator_effort}\n"
+                    f"Local: {active_model_ref(local or {}) or 'not configured'} · reasoning "
+                    f"{'on' if bool((local or {}).get('reasoning', True)) else 'off'}"
                 ),
                 "payload": self._snapshot(),
             }
@@ -595,15 +866,20 @@ class OpenJetServiceController:
             try:
                 options = dict(token.split("=", 1) for token in shlex.split(argument))
             except (ValueError, TypeError) as exc:
-                raise ServiceError("Usage: /model codex=<model> effort=<level> local=<profile> reasoning=<on|off>") from exc
-            allowed = {"codex", "effort", "local", "reasoning"}
+                raise ServiceError(
+                    "Usage: /model codex=<model> effort=<level> openrouter=<model> local=<profile> reasoning=<on|off>"
+                ) from exc
+            allowed = {"codex", "effort", "openrouter", "local", "reasoning"}
             if not options or set(options) - allowed or any(not value.strip() for value in options.values()):
-                raise ServiceError("Usage: /model codex=<model> effort=<level> local=<profile> reasoning=<on|off>")
+                raise ServiceError(
+                    "Usage: /model codex=<model> effort=<level> openrouter=<model> local=<profile> reasoning=<on|off>"
+                )
             previous_cfg = copy.deepcopy(self.cfg)
             restart_local = False
             try:
-                codex = self._profile_for_runtime(CODEX_RUNTIME, "agent_codex_profile")
+                orchestrator = self._orchestrator_profile()
                 if "codex" in options or "effort" in options:
+                    codex = orchestrator if orchestrator is not None and active_runtime(orchestrator) == CODEX_RUNTIME else self._profile_for_runtime(CODEX_RUNTIME, "agent_codex_profile")
                     if codex is None:
                         raise ServiceError("Configure a Codex profile first.")
                     codex = dict(codex)
@@ -618,6 +894,11 @@ class OpenJetServiceController:
                         codex["reasoning_effort"] = effort
                     replace_model_profile(self.cfg, codex, previous_name=str(codex["name"]))
                     self.cfg["agent_codex_profile"] = str(codex["name"])
+                    # Only re-point the orchestrator at Codex when Codex already is
+                    # the orchestrator (or none is configured); otherwise an
+                    # effort-only tweak would silently switch off OpenRouter.
+                    if orchestrator is None or active_runtime(orchestrator) == CODEX_RUNTIME:
+                        self.cfg["agent_orchestrator_profile"] = str(codex["name"])
 
                 local = self._profile_for_runtime(DEFAULT_RUNTIME, "agent_local_profile")
                 if "local" in options:
@@ -639,6 +920,18 @@ class OpenJetServiceController:
                 if restart_local and self.runtime_client is not None:
                     await self.runtime_client.close()
                     self.runtime_client = None
+
+                if "openrouter" in options:
+                    if "local" not in options:
+                        return await self._activate_openrouter(options["openrouter"], cloud_only=True)
+                    if not self._openrouter_connected():
+                        # The local/reasoning edits above were applied; keep them
+                        # persisted instead of silently dropping them.
+                        save_config(self.cfg)
+                        return self._needs_openrouter_key()
+                    openrouter = upsert_openrouter_profile(self.cfg, options["openrouter"])
+                    self.cfg["agent_orchestrator_profile"] = str(openrouter["name"])
+
                 await self._prepare_agent_mode()
             except Exception:
                 self.cfg = previous_cfg
@@ -655,10 +948,15 @@ class OpenJetServiceController:
                 raise ServiceError(f"Unknown model profile: {profile_name}")
             previous_cfg = dict(self.cfg)
             selected_runtime = active_runtime(selected)
-            key = "agent_local_profile" if selected_runtime == DEFAULT_RUNTIME else "agent_codex_profile"
+            if selected_runtime == DEFAULT_RUNTIME:
+                key = "agent_local_profile"
+            elif selected_runtime in {CODEX_RUNTIME, LITELLM_RUNTIME}:
+                key = "agent_orchestrator_profile"
+                if selected_runtime == CODEX_RUNTIME:
+                    self.cfg["agent_codex_profile"] = str(selected["name"])
+            else:
+                raise ServiceError("Pi agent modes support local, Codex, and OpenRouter model profiles.")
             self.cfg[key] = str(selected["name"])
-            if selected_runtime not in {DEFAULT_RUNTIME, CODEX_RUNTIME}:
-                raise ServiceError("Pi agent modes support local and Codex model profiles.")
             if selected_runtime == DEFAULT_RUNTIME:
                 if self.runtime_client is not None:
                     await self.runtime_client.close()
@@ -674,7 +972,17 @@ class OpenJetServiceController:
             snapshot = self._snapshot(setup_required=False)
             snapshot["agentChanged"] = True
             return {"text": f"Switched to model profile {selected['name']}.", "payload": snapshot}
-        raise ServiceError(f"/{command} is handled by the Pi agent UI, not the OpenJet hardware service.")
+        known_names = {spec.name for spec in COMMANDS}
+        for spec in COMMANDS:
+            known_names.update(spec.aliases)
+        if command in known_names:
+            # Advertised but not yet supported on this surface: degrade to a
+            # notice instead of an error so the session keeps working.
+            return {
+                "text": f"/{command} is not available in this interface yet.",
+                "payload": self._snapshot(),
+            }
+        raise ServiceError(f"Unknown command /{command}. Run /help for the command list.")
 
     def resize(self, width: int, height: int) -> None:
         self._terminal_size = (max(1, width), max(1, height))

@@ -134,6 +134,18 @@ describe("OpenJet visual hierarchy", () => {
     expect(first).toContain("gpt-5.6-sol medium + Qwen3.8-27B");
   });
 
+  it("labels OpenRouter cloud mode instead of Codex", () => {
+    const footer = new StatusFooter({
+      agentMode: "codex",
+      orchestratorKind: "openrouter",
+      orchestratorModel: "Ox Alpha",
+      runtime: "litellm",
+      status: "ready",
+    });
+    expect(footer.render(140)[0]).toContain("OPENROUTER");
+    expect(footer.render(140)[0]).toContain("Ox Alpha");
+  });
+
   it("formats model names and token counts without noisy precision", () => {
     expect(compactModel("/models/Qwen3.8-27B-Q4_K_M.gguf")).toBe("Qwen3.8-27B");
     expect(compactNumber(210767)).toBe("211k");

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from pathlib import Path
 
+from src.model_profiles import get_model_profile
 from src.service_controller import OpenJetServiceController, ServiceError
 from src.runtime_limits import MemorySnapshot
 from src.tui_server import PROTOCOL_VERSION, REQUEST_TYPES, ProtocolError, ProtocolServer
@@ -16,6 +17,7 @@ from src.tui_server import PROTOCOL_VERSION, REQUEST_TYPES, ProtocolError, Proto
 class _FakeController:
     def __init__(self) -> None:
         self.ids: set[str] = set()
+        self.commands: list[tuple[str, str | None]] = []
         self.tool_calls: list[tuple[str, object, str]] = []
         self.generation_metrics: list[dict] = []
         self.agent_traces: list[dict] = []
@@ -29,7 +31,8 @@ class _FakeController:
     async def initialize(self):
         return {"workspace": "/tmp/project", "commands": [], "tools": []}
 
-    async def command(self, text: str):
+    async def command(self, text: str, *, api_key: str | None = None):
+        self.commands.append((text, api_key))
         return {"text": f"handled {text}"}
 
     async def execute_openjet_tool(self, name: str, arguments: object, *, call_id: str):
@@ -110,6 +113,21 @@ class ProtocolServerTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(self.controller.generation_metrics, [{"phase": "start"}])
+
+    async def test_command_passes_api_key_outside_text(self) -> None:
+        await self.server.handle(
+            {
+                "protocolVersion": PROTOCOL_VERSION,
+                "type": "command",
+                "id": "connect-1",
+                "text": "/connect openrouter",
+                "apiKey": "sk-or-secret",
+            }
+        )
+        self.assertEqual(self.controller.commands, [("/connect openrouter", "sk-or-secret")])
+        encoded = json.dumps(self.events)
+        self.assertNotIn("sk-or-secret", encoded)
+        self.assertEqual(self.events[0][0], "notification")
 
     async def test_agent_trace_is_accepted_and_dispatched(self) -> None:
         payload = {"event": "model_tool_start", "turnId": "turn-1", "data": {"lane": "local"}}
@@ -408,6 +426,126 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
                 "repetition_penalty": 1.0,
             },
         )
+
+
+    async def test_help_lists_available_commands(self) -> None:
+        result = await self.controller.command("/help")
+        self.assertIn("/mode", result["text"])
+        self.assertIn("/cloud", result["text"])
+
+    async def test_advertised_but_unsupported_command_degrades_to_notice(self) -> None:
+        result = await self.controller.command("/resume")
+        self.assertIn("not available in this interface yet", result["text"])
+
+    async def test_unknown_command_reports_unknown(self) -> None:
+        with self.assertRaises(ServiceError):
+            await self.controller.command("/definitely-not-a-command")
+
+    async def test_bare_cloud_opens_the_model_picker(self) -> None:
+        result = await self.controller.command("/cloud")
+        self.assertTrue(result["payload"]["openCloudPicker"])
+        self.assertEqual(result["text"], "")
+
+    async def test_cloud_without_key_asks_for_openrouter_api_key(self) -> None:
+        with patch("src.service_controller.ApiKeyStore") as store:
+            store.return_value.resolve_key.return_value = None
+            result = await self.controller.command("/cloud stealth/ox-alpha")
+
+        self.assertEqual(result["payload"]["needsApiKey"], "openrouter")
+        self.assertIn("/login", result["text"])
+
+    async def test_cloud_switches_to_openrouter_when_key_is_present(self) -> None:
+        with patch("src.service_controller.ApiKeyStore") as store:
+            store.return_value.resolve_key.return_value = "or-key"
+            store.return_value.status.return_value = {}
+            result = await self.controller.command("/cloud stealth/ox-alpha")
+
+        payload = result["payload"]
+        self.assertTrue(payload["agentChanged"])
+        self.assertEqual(payload["orchestratorKind"], "openrouter")
+        self.assertEqual(payload["piModel"]["provider"], "openrouter")
+        self.assertEqual(payload["piModel"]["id"], "stealth/ox-alpha")
+        self.assertEqual(payload["piModel"]["apiKey"], "or-key")
+        self.assertIn("not loaded", result["text"])
+
+    async def test_model_effort_does_not_flip_openrouter_orchestrator_to_codex(self) -> None:
+        self.controller.cfg.update({
+            "agent_mode": "codex",
+            "model_profiles": [
+                {
+                    "name": "or",
+                    "runtime": "litellm",
+                    "provider": "openrouter",
+                    "model": "openrouter/stealth/ox-alpha",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                },
+                {"name": "cx", "runtime": "openai_codex", "model": "gpt-5.6-sol"},
+            ],
+            "agent_orchestrator_profile": "or",
+            "agent_codex_profile": "cx",
+        })
+        with patch.object(self.controller, "_prepare_agent_mode", AsyncMock()):
+            await self.controller.command("/model effort=high")
+
+        self.assertEqual(self.controller.cfg["agent_orchestrator_profile"], "or")
+        codex = get_model_profile(self.controller.cfg, "cx")
+        self.assertEqual(codex["reasoning_effort"], "high")
+
+    async def test_model_local_edit_survives_missing_openrouter_key(self) -> None:
+        self.controller.cfg.update({
+            "agent_mode": "codex",
+            "model_profiles": [
+                {"name": "loc", "runtime": "llama_cpp", "llama_model": "/models/a.gguf"},
+                {"name": "or", "runtime": "litellm", "provider": "openrouter",
+                 "model": "openrouter/stealth/ox-alpha", "api_key_env": "OPENROUTER_API_KEY"},
+            ],
+            "agent_orchestrator_profile": "or",
+        })
+        with patch("src.service_controller.ApiKeyStore") as store, patch.object(
+            self.controller, "_prepare_agent_mode", AsyncMock()
+        ):
+            store.return_value.resolve_key.return_value = None
+            result = await self.controller.command("/model openrouter=stealth/ox-alpha local=loc")
+
+        self.assertEqual(result["payload"]["needsApiKey"], "openrouter")
+        self.assertEqual(self.controller.cfg["agent_local_profile"], "loc")
+
+    async def test_bare_connect_opens_the_credential_picker(self) -> None:
+        result = await self.controller.command("/connect")
+        self.assertTrue(result["payload"]["openConnectPicker"])
+        self.assertEqual(result["text"], "")
+
+    async def test_connect_openrouter_saves_key_without_echoing_it(self) -> None:
+        with patch("src.service_controller.ApiKeyStore") as store:
+            store.return_value.save_key.return_value = None
+            store.return_value.resolve_key.return_value = "or-key"
+            result = await self.controller.command("/connect openrouter sk-or-secret")
+
+        store.return_value.save_key.assert_called_once_with("openrouter", "sk-or-secret")
+        self.assertNotIn("sk-or-secret", result["text"])
+        self.assertNotIn("sk-or-secret", json.dumps(result["payload"], default=str))
+        self.assertIn("API key saved", result["text"])
+
+    async def test_connect_openrouter_accepts_api_key_field(self) -> None:
+        with patch("src.service_controller.ApiKeyStore") as store:
+            store.return_value.save_key.return_value = None
+            store.return_value.resolve_key.return_value = "or-key"
+            result = await self.controller.command("/connect openrouter", api_key="sk-or-secret")
+
+        store.return_value.save_key.assert_called_once_with("openrouter", "sk-or-secret")
+        self.assertNotIn("sk-or-secret", result["text"])
+        self.assertNotIn("sk-or-secret", json.dumps(result["payload"], default=str))
+        self.assertIn("API key saved", result["text"])
+
+    async def test_connect_openrouter_reports_save_failure_without_leaking_key(self) -> None:
+        with patch("src.service_controller.ApiKeyStore") as store:
+            store.return_value.save_key.side_effect = ValueError("OS keyring is unavailable.")
+            result = await self.controller.command("/connect openrouter sk-or-secret")
+
+        self.assertIn("Could not save", result["text"])
+        self.assertIn("keyring", result["text"])
+        self.assertNotIn("sk-or-secret", result["text"])
+        self.assertNotIn("sk-or-secret", json.dumps(result["payload"], default=str))
 
 
 if __name__ == "__main__":

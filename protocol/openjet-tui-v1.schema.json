@@ -22,6 +22,7 @@
     "width": { "type": "integer", "minimum": 1 },
     "height": { "type": "integer", "minimum": 1 },
     "imagePaths": { "type": "array", "items": { "type": "string" } },
+    "apiKey": { "type": "string" },
     "payload": { "type": "object" }
   },
   "additionalProperties": false

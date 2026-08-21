@@ -12,6 +12,7 @@ export interface ProtocolMessage {
   width?: number;
   height?: number;
   imagePaths?: string[];
+  apiKey?: string;
   payload?: Record<string, unknown>;
 }
 

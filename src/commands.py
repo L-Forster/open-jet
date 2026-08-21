@@ -18,6 +18,12 @@ from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, LITELLM_RUNTIME, a
 from .memory_reflection import refresh_agent_system_prompt
 from .peripherals.system import device_discovery_hint
 from .persistent_memory import build_system_prompt, load_persistent_memory, update_persistent_memory
+from .openrouter_catalog import (
+    catalog_entry_for_model,
+    ensure_openrouter_model_profiles,
+    featured_openrouter_model,
+    openrouter_model_choices,
+)
 from .provisioning import _model_path_looks_mtp
 from .setup import _prompt_choice, _prompt_text, discover_model_files
 from .skills_registry import skills_manifest_path, sync_skills_manifest
@@ -80,6 +86,26 @@ def _unique_profile_name(cfg: dict[str, Any], preferred: str) -> str:
 
 def _runtime_kind(profile: dict[str, Any]) -> str:
     return "local" if active_runtime(profile) == DEFAULT_RUNTIME else "cloud"
+
+
+def _orchestrator_profiles(profiles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        profile
+        for profile in profiles
+        if active_runtime(profile) in {CODEX_RUNTIME, LITELLM_RUNTIME}
+    ]
+
+
+def _orchestrator_profile_label(profile: dict[str, Any]) -> str:
+    runtime = active_runtime(profile)
+    model_ref = str(profile.get("model") or profile.get("llama_model") or "")
+    name = str(profile.get("name") or "")
+    if runtime == CODEX_RUNTIME:
+        return f"Codex · {name} · {model_ref}"
+    provider = normalize_provider_id(str(profile.get("provider") or ""))
+    if provider == "openrouter":
+        return f"OpenRouter · {name} · {model_ref}"
+    return f"Cloud · {name} · {model_ref}"
 
 
 def _preferred_runtime_profile(
@@ -630,6 +656,9 @@ class SlashCommandHandler:
             if active_runtime(self.app.cfg) == CODEX_RUNTIME:
                 await self._configure_codex_profile(log)
                 return
+            if active_runtime(self.app.cfg) == LITELLM_RUNTIME:
+                await self._configure_openrouter_profile(log)
+                return
             await self._pick_local_profile(log)
             return
 
@@ -682,7 +711,7 @@ class SlashCommandHandler:
                 self.app.console,
                 "Mode",
                 [
-                    ("Slipstream — Codex orchestrates, local model implements", "hybrid"),
+                    ("Slipstream — orchestrator plans and reviews; local model implements", "hybrid"),
                     ("Codex — frontier model only", "codex"),
                     ("Local — local model only", "local"),
                 ],
@@ -728,11 +757,16 @@ class SlashCommandHandler:
             log.write("")
             return
         self._ensure_connected_codex_profile()
+        added_openrouter = ensure_openrouter_model_profiles(self.app.cfg)
+        if added_openrouter:
+            save_config(self.app.cfg)
         profiles = self.app.model_profiles()
-        codex_profiles = [p for p in profiles if active_runtime(p) == CODEX_RUNTIME]
+        orchestrator_profiles = _orchestrator_profiles(profiles)
         local_profiles = [p for p in profiles if active_runtime(p) == DEFAULT_RUNTIME]
-        if not codex_profiles:
-            log.write("[yellow]No Codex profile is available. Run /connect openai-codex first.[/]")
+        if not orchestrator_profiles:
+            log.write(
+                "[yellow]No orchestrator profile is available. Run /connect openai-codex or /connect openrouter.[/]"
+            )
             log.write("")
             return
         if not local_profiles and not discover_model_files() and self.app._session is None:
@@ -740,10 +774,17 @@ class SlashCommandHandler:
             log.write("")
             return
 
-        codex = codex_profiles[0]
-        preferred_codex = str(self.app.cfg.get("hybrid_codex_profile") or "").lower()
-        codex_default = next(
-            (i for i, p in enumerate(codex_profiles) if str(p.get("name") or "").lower() == preferred_codex),
+        preferred_orchestrator = str(
+            self.app.cfg.get("hybrid_orchestrator_profile")
+            or self.app.cfg.get("hybrid_codex_profile")
+            or ""
+        ).lower()
+        orchestrator_default = next(
+            (
+                index
+                for index, profile in enumerate(orchestrator_profiles)
+                if str(profile.get("name") or "").lower() == preferred_orchestrator
+            ),
             0,
         )
         local_default = next(
@@ -755,15 +796,22 @@ class SlashCommandHandler:
             0,
         )
         if self.app._session is not None:
-            codex_name = await _prompt_choice(
+            orchestrator_name = await _prompt_choice(
                 self.app._session,
                 self.app.console,
-                "Slipstream Codex profile",
-                [(f"{p['name']} · {p.get('model', '')}", str(p["name"])) for p in codex_profiles],
-                default_index=codex_default,
+                "Slipstream orchestrator",
+                [
+                    (_orchestrator_profile_label(profile), str(profile["name"]))
+                    for profile in orchestrator_profiles
+                ],
+                default_index=orchestrator_default,
+                detail="Choose Codex or an OpenRouter model as the planning and review orchestrator.",
             )
-            codex = get_model_profile(self.app.cfg, str(codex_name)) or codex
-            codex = await self._pick_codex_settings(codex)
+            orchestrator = get_model_profile(self.app.cfg, str(orchestrator_name)) or orchestrator_profiles[0]
+            if active_runtime(orchestrator) == CODEX_RUNTIME:
+                orchestrator = await self._pick_codex_settings(orchestrator)
+            else:
+                orchestrator = await self._pick_openrouter_settings(orchestrator)
             local_name = await self._choose_local_model_profile(
                 log,
                 preferred_name=(
@@ -771,6 +819,7 @@ class SlashCommandHandler:
                 ),
             )
         else:
+            orchestrator = orchestrator_profiles[orchestrator_default]
             local_name = str(local_profiles[local_default]["name"]) if local_profiles else ""
 
         if not local_name:
@@ -778,8 +827,8 @@ class SlashCommandHandler:
 
         stored = replace_model_profile(
             self.app.cfg,
-            codex,
-            previous_name=str(codex.get("name") or ""),
+            orchestrator,
+            previous_name=str(orchestrator.get("name") or ""),
         )
         await self.app.activate_hybrid_mode(str(stored["name"]), str(local_name), log)
 
@@ -819,6 +868,37 @@ class SlashCommandHandler:
             updated["context_window_tokens"] = 1050000
         return updated
 
+    async def _pick_openrouter_settings(self, profile: dict[str, Any]) -> dict[str, Any]:
+        if self.app._session is None:
+            return profile
+        current_model = str(profile.get("model") or featured_openrouter_model())
+        choices = list(openrouter_model_choices())
+        model_values = [value for _, value in choices]
+        if current_model not in model_values:
+            choices.insert(0, (f"Current · {current_model}", current_model))
+        model = await _prompt_choice(
+            self.app._session,
+            self.app.console,
+            "OpenRouter model",
+            choices + [("Custom model…", "__custom__")],
+            default_index=model_values.index(current_model) if current_model in model_values else 0,
+        )
+        if model == "__custom__":
+            model = await _prompt_text(
+                self.app._session,
+                "OpenRouter model> ",
+                default=current_model,
+            )
+        updated = dict(profile)
+        updated["runtime"] = LITELLM_RUNTIME
+        updated["provider"] = "openrouter"
+        updated["model"] = str(model).strip()
+        updated["api_key_env"] = default_api_key_env("openrouter")
+        entry = catalog_entry_for_model(updated["model"])
+        if entry is not None:
+            updated["context_window_tokens"] = int(entry.get("context_window_tokens") or 128000)
+        return updated
+
     async def _configure_codex_profile(self, log: Any) -> None:
         profile = get_model_profile(
             self.app.cfg, str(self.app.cfg.get("active_model_profile") or "")
@@ -826,6 +906,24 @@ class SlashCommandHandler:
         if not profile or active_runtime(profile) != CODEX_RUNTIME:
             profile, _ = _ensure_codex_model_profile(self.app.cfg)
         updated = await self._pick_codex_settings(profile)
+        stored = replace_model_profile(
+            self.app.cfg, updated, previous_name=str(profile.get("name") or "")
+        )
+        if await self.app.activate_model_profile(str(stored["name"]), log):
+            save_config(self.app.cfg)
+
+    async def _configure_openrouter_profile(self, log: Any) -> None:
+        ensure_openrouter_model_profiles(self.app.cfg)
+        profile = get_model_profile(
+            self.app.cfg, str(self.app.cfg.get("active_model_profile") or "")
+        )
+        if not profile or active_runtime(profile) != LITELLM_RUNTIME:
+            profile = get_model_profile(self.app.cfg, "ox-alpha")
+        if profile is None:
+            log.write("[yellow]No OpenRouter profile found. Run /connect openrouter first.[/]")
+            log.write("")
+            return
+        updated = await self._pick_openrouter_settings(profile)
         stored = replace_model_profile(
             self.app.cfg, updated, previous_name=str(profile.get("name") or "")
         )
@@ -986,6 +1084,8 @@ class SlashCommandHandler:
         profiles = self.app.model_profiles()
         if kind == "cloud" and not any(_runtime_kind(profile) == "cloud" for profile in profiles):
             self._ensure_connected_codex_profile()
+            if ensure_openrouter_model_profiles(self.app.cfg):
+                save_config(self.app.cfg)
             profiles = self.app.model_profiles()
         target = _preferred_runtime_profile(profiles, kind=kind, active=str(self.app.cfg.get("active_model_profile") or ""))
         if target is None:
@@ -1065,6 +1165,8 @@ class SlashCommandHandler:
         profiles = self.app.model_profiles()
         if not any(_runtime_kind(profile) == "cloud" for profile in profiles):
             self._ensure_connected_codex_profile()
+            if ensure_openrouter_model_profiles(self.app.cfg):
+                save_config(self.app.cfg)
             profiles = self.app.model_profiles()
         profile = _preferred_runtime_profile(
             profiles,
@@ -1511,7 +1613,13 @@ class SlashCommandHandler:
             log.write(f"[bold red]API key save failed:[/] {exc}")
             log.write("")
             return
-        log.write(f"[bold bright_white]{provider_id} API key saved.[/]")
+        profile_note = ""
+        if provider_id == "openrouter":
+            added = ensure_openrouter_model_profiles(self.app.cfg)
+            if added:
+                save_config(self.app.cfg)
+                profile_note = " OpenRouter model presets added."
+        log.write(f"[bold bright_white]{provider_id} API key saved.{profile_note}[/]")
         log.write("")
 
     def _ensure_connected_codex_profile(self) -> bool:

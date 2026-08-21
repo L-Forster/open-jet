@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import patch
 
 from src.airgap import AirgapViolationError, set_airgapped
@@ -215,11 +217,21 @@ class ApiKeyStoreTests(unittest.TestCase):
             self.assertTrue(status["anthropic"]["stored"])
             self.assertNotIn("secret-key", str(status))
 
-    def test_save_key_requires_keyring(self) -> None:
+    def test_save_key_requires_keyring_and_never_writes_plaintext_auth(self) -> None:
         store = ApiKeyStore()
 
         with patch.object(store, "_save_keyring", return_value=False), self.assertRaisesRegex(ValueError, "keyring"):
             store.save_key("openai", "sk-secret")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = Path(tmp) / "auth.json"
+            auth.write_text("{}", encoding="utf-8")
+            with patch.dict(os.environ, {"PI_CODING_AGENT_DIR": tmp}), patch.object(store, "_save_keyring", return_value=False):
+                try:
+                    store.save_key("openrouter", "sk-or-secret")
+                except ValueError:
+                    pass
+            self.assertEqual(auth.read_text(encoding="utf-8"), "{}", "OpenJet must not write plaintext keys into Pi's auth.json")
 
     def test_clear_key_reports_keyring_failure(self) -> None:
         store = ApiKeyStore()

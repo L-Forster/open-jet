@@ -15,12 +15,13 @@ class CommandSpec:
 
 COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(name="help", description="Show command help", aliases=("cmds", "commands", "?")),
+    CommandSpec(name="login", description="Pi OpenRouter login: /login"),
+    CommandSpec(name="cloud", description="Open the OpenRouter model list"),
+    CommandSpec(name="connect", description="OpenRouter login or Codex: /login, /connect openai-codex"),
+    CommandSpec(name="model", description="Configure Local, Codex, or OpenRouter models: /model", aliases=("models",)),
+    CommandSpec(name="mode", description="Pick Local, Codex, OpenRouter, or Slipstream: /mode [local|codex|openrouter|slipstream|status]"),
     CommandSpec(name="exit", description="Quit the app", aliases=("quit",)),
-    CommandSpec(
-        name="clear",
-        description="Clear chat and restart runtime (flush KV cache)",
-        aliases=("reset",),
-    ),
+    CommandSpec(name="clear", description="Start a new conversation", aliases=("new", "reset")),
     CommandSpec(
         name="clear-chat",
         description="Clear chat only (keep current server/KV state)",
@@ -60,27 +61,15 @@ COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec(name="reasoning", description="Legacy direct local reasoning control", hidden=True),
     CommandSpec(name="air-gapped", description="Show or set air-gapped mode: /air-gapped [status|true|false]", aliases=("airgapped",)),
     CommandSpec(name="telemetry", description="Show or set anonymous telemetry consent: /telemetry [status|on|off]"),
-    CommandSpec(name="connect", description="Connect external auth providers: /connect [status|openai-codex [--device-auth]|openai|anthropic|openrouter|logout <provider>]"),
     CommandSpec(name="resume", description="Pick and load a saved chat back into chat/runtime"),
     CommandSpec(name="setup", description="Open setup wizard and restart runtime"),
-    CommandSpec(
-        name="model",
-        description="Configure the active mode's models and reasoning: /model",
-        aliases=("models",),
-    ),
     CommandSpec(name="effort", description="Set Codex reasoning effort: /effort [none|low|medium|high|xhigh|max]"),
     CommandSpec(
         name="runtime",
         description="Show the inference engine/runtime: /runtime [status]",
         aliases=("backend", "provider"),
     ),
-    CommandSpec(
-        name="mode",
-        description="Pick Local, Codex, or Slipstream mode: /mode [local|codex|slipstream|status]",
-        aliases=(),
-    ),
     CommandSpec(name="local", description="Switch to the local runtime profile"),
-    CommandSpec(name="cloud", description="Switch or edit cloud profiles: /cloud [status|model <model>|add|<profile>]"),
     CommandSpec(name="edit-model", description="Edit a saved model preset: /edit-model [name]"),
     CommandSpec(name="harness", description="Show or set legacy harness behavior", hidden=True),
     CommandSpec(name="plan", description="Inspect or control plan mode: /plan [status|on|approve|reject]"),

@@ -13,4 +13,17 @@ describe("decodeMessage", () => {
   it("rejects non-object JSON", () => {
     expect(() => decodeMessage("[]")).toThrow(/must be an object/);
   });
+
+  it("preserves an apiKey on command requests", () => {
+    const message = decodeMessage(
+      JSON.stringify({
+        protocolVersion: PROTOCOL_VERSION,
+        type: "command",
+        text: "/connect openrouter",
+        apiKey: "sk-or-secret",
+      }),
+    );
+    expect(message.apiKey).toBe("sk-or-secret");
+    expect(message.text).toBe("/connect openrouter");
+  });
 });
