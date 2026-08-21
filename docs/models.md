@@ -111,9 +111,19 @@ Two consequences worth planning around:
 - The budget is what your application concedes, not what the device has. On a 16GB
   handheld with a 4GB budget, the other 12GB is your game, not headroom.
 
+## Optional cloud: OpenRouter
+
+Local GGUF catalogs above are the default. The Pi TUI can also use hosted OpenRouter
+models via `/login` (or `/connect openrouter`) and `/cloud`. Curated picker entries —
+including free Ox Alpha (`openrouter/stealth/ox-alpha`) — are defined in
+`src/openrouter_catalog.py` and documented under [Configuration](configuration.md#openrouter-and-other-api-keys).
+OpenRouter can run alone (`/mode openrouter`) or as the Slipstream orchestrator; see
+[Slipstream](usage/slipstream.md).
+
 ## Related
 
 - [SDK quickstart](sdk/quickstart.md) — provision, embed, and ship an on-device model
 - [CLI usage](usage/cli.md#start-commands) — every `openjet project` flag
 - [Project configuration](configuration.md#project-configuration-openjetconfigyaml) — the `.openjet/` overlay
+- [Slipstream](usage/slipstream.md) — Codex or OpenRouter + local
 - [Benchmarking](benchmarking.md) — replace these estimates with measurements

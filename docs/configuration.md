@@ -198,7 +198,7 @@ Behavior:
 
 Setup stores reusable model presets under `model_profiles`. The active preset is tracked by `active_model_profile`.
 
-Profiles may use the local `llama_cpp` runtime or the OpenAI Codex OAuth runtime:
+Profiles may use the local `llama_cpp` runtime, OpenAI Codex OAuth, or LiteLLM-hosted providers such as OpenRouter:
 
 ```yaml
 model_profiles:
@@ -216,13 +216,33 @@ model_profiles:
     reasoning_effort: medium
     reasoning_summary: auto
     text_verbosity: medium
+
+  - name: ox-alpha
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/stealth/ox-alpha
+    api_key_env: OPENROUTER_API_KEY
+    context_window_tokens: 1048576
 ```
 
-Use `/connect openai-codex` to sign in through the official Codex CLI ChatGPT OAuth flow, or `/connect openai-codex --device-auth` for Codex CLI's device-code flow on SSH/headless systems, then `/agent` to choose Local, Codex, or Slipstream. Codex OAuth is not API-key auth: OpenJet reads the Codex CLI OAuth session from `$CODEX_HOME/auth.json` or `~/.codex/auth.json` and sends requests to the Codex backend. `airgapped: true` disables Codex login and Codex agent modes while preserving local llama.cpp profiles.
+### Codex OAuth
 
-API-key providers use the optional LiteLLM runtime. Install it with `pip install open-jet[cloud]`, save credentials with `/connect openai`, `/connect anthropic`, or `/connect openrouter`, then switch manually with `/cloud <name>` or `/model <name>`:
+Use `/connect openai-codex` to sign in through the official Codex CLI ChatGPT OAuth flow, or `/connect openai-codex --device-auth` for Codex CLI's device-code flow on SSH/headless systems, then `/mode` to choose Local, Codex, OpenRouter, or Slipstream. Codex OAuth is not API-key auth: OpenJet reads the Codex CLI OAuth session from `$CODEX_HOME/auth.json` or `~/.codex/auth.json` and sends requests to the Codex backend. `airgapped: true` disables Codex login and cloud agent modes while preserving local llama.cpp profiles.
 
-OpenJet does not write provider secrets to OpenJet-owned JSON files. API-key `/connect` uses OS keyring storage; environment variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `OPENROUTER_API_KEY` take precedence and are the recommended path for headless systems.
+### OpenRouter and other API keys
+
+API-key providers use the optional LiteLLM runtime. Install it with `pip install open-jet[cloud]`.
+
+In the Pi TUI:
+
+- `/login` or `/connect openrouter` saves an OpenRouter API key to the OS keyring
+- `/cloud` opens the curated OpenRouter picker (featured free model: Ox Alpha)
+- `/mode openrouter` runs OpenRouter only (local llama.cpp is not loaded)
+- `/mode slipstream` (or `hybrid`) can use OpenRouter or Codex as the orchestrator with a local worker
+
+OpenJet does not write provider secrets to OpenJet-owned JSON files. API-key `/connect` uses OS keyring storage; environment variables such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `OPENROUTER_API_KEY` take precedence and are the recommended path for headless systems. The TUI sends OpenRouter keys on a dedicated `apiKey` RPC field rather than embedding them in slash-command text.
+
+Curated OpenRouter presets (also listed in `/cloud`) live in `src/openrouter_catalog.py` and are emitted into the TUI during `scripts/build_tui.py`:
 
 ```yaml
 model_profiles:
@@ -239,37 +259,56 @@ model_profiles:
     model: anthropic/claude-opus-4-8
     api_key_env: ANTHROPIC_API_KEY
 
-  - name: openrouter
+  - name: ox-alpha
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/stealth/ox-alpha
+    api_key_env: OPENROUTER_API_KEY
+    context_window_tokens: 1048576
+
+  - name: openrouter-free
+    runtime: litellm
+    provider: openrouter
+    model: openrouter/openrouter/free
+    api_key_env: OPENROUTER_API_KEY
+
+  - name: claude-opus-openrouter
     runtime: litellm
     provider: openrouter
     model: openrouter/anthropic/claude-opus-4.8
+    api_key_env: OPENROUTER_API_KEY
 
-  - name: gemini-api
+  - name: gemini-openrouter
     runtime: litellm
     provider: openrouter
     model: openrouter/google/gemini-3.1-pro-preview
+    api_key_env: OPENROUTER_API_KEY
 
-  - name: grok-api
+  - name: grok-openrouter
     runtime: litellm
     provider: openrouter
     model: openrouter/x-ai/grok-4.20
+    api_key_env: OPENROUTER_API_KEY
 
-  - name: deepseek-v4
+  - name: deepseek-v4-openrouter
     runtime: litellm
     provider: openrouter
     model: openrouter/deepseek/deepseek-v4-pro
+    api_key_env: OPENROUTER_API_KEY
 
-  - name: glm-5.1
+  - name: glm-openrouter
     runtime: litellm
     provider: openrouter
     model: openrouter/z-ai/glm-5.1
+    api_key_env: OPENROUTER_API_KEY
     context_window_tokens: 202752
 
-  - name: kimi-k2.5
+  - name: kimi-openrouter
     runtime: litellm
     provider: openrouter
     model: openrouter/moonshotai/kimi-k2.5
-    context_window_tokens: 262000
+    api_key_env: OPENROUTER_API_KEY
+    context_window_tokens: 262144
 ```
 
 `airgapped: true` blocks remote LiteLLM providers. Loopback `base_url` profiles remain allowed.

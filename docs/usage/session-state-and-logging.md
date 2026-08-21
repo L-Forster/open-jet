@@ -10,7 +10,14 @@ The session folder contains:
 - `.openjet/state/chats/<chat_id>/resume_state.yaml`: last resumable checkpoint for that chat
 - `.openjet/state/swap/resume_<chat_id>.bin`: llama.cpp KV cache snapshot for resumable checkpoints when available
 
-`/resume` now lists saved chats from `.openjet/state/` and prefers the `resume_state.yaml` checkpoint so the TUI and runtime can be restored together. If the active runtime/model does not match, open-jet loads the transcript and resets the runtime so the next turn can re-prompt cleanly.
+In the Pi TypeScript TUI, `/resume` lists Pi sessions from `.openjet/pi/sessions/` for the
+current workspace. `/clear` / `/new` start a fresh Pi conversation. Both are blocked while a
+turn is still streaming.
+
+The Textual app path still lists saved chats from `.openjet/state/` and prefers the
+`resume_state.yaml` checkpoint so the TUI and runtime can be restored together. If the active
+runtime/model does not match, open-jet loads the transcript and resets the runtime so the next
+turn can re-prompt cleanly.
 
 Normal chat turns do not dump full prompt payloads into the session directory. Full runtime prompt dumps are only written as YAML in debug mode under `.openjet/state/debug_prompts/`.
 

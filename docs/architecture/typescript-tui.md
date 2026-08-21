@@ -20,11 +20,21 @@ It also exposes OpenJet's device capture, GPIO/sensor, resource-inspection,
 persistent-memory, and skill tools as Pi custom tools. File access, editing, and
 shell execution remain Pi built-ins, so there is only one coding-tool stack.
 The narrow service protocol uses newline-delimited JSON over stdin/stdout; its v1
-contract lives in `protocol/openjet-tui-v1.schema.json`.
+contract lives in `protocol/openjet-tui-v1.schema.json`. Optional `apiKey` on
+`command` requests carries OpenRouter credentials outside slash-command text so
+editor history and command strings do not store the secret.
 
 `OpenJetServiceController` is the Python boundary. The frontend creates a Pi model
 definition from the prepared OpenJet endpoint, then owns the `AgentSession` and
-stores its data under `.openjet/pi/` rather than `.pi/`.
+stores its data under `.openjet/pi/` rather than `.pi/` (including sessions under
+`.openjet/pi/sessions/`). Workspace `.openjet/` is gitignored; Pi model config that
+must hold a live token for the agent is written owner-only (`0o600`).
+
+OpenRouter login is Pi-owned UI (`/login`, `/cloud`) backed by OpenJet's
+`ApiKeyStore` (OS keyring; `OPENROUTER_API_KEY` wins when set). Curated picker
+rows come from `src/openrouter_catalog.py` and are generated into
+`ui/src/openrouter-models.generated.ts` during the TUI build so Python and
+TypeScript cannot drift.
 
 The frontend is in `ui/`. It uses Pi's terminal lifecycle, editor, completion,
 markdown, layout, AgentSession, model runtime, session manager, coding tools,
@@ -42,13 +52,15 @@ python scripts/build_tui.py
 python -m build --wheel
 ```
 
-The native build supports Linux x86_64/aarch64, macOS x86_64/arm64, and Windows
-x86_64. Source installers either build with the available toolchain or download
-and checksum-verify the matching release asset.
+`scripts/build_tui.py` regenerates the OpenRouter TypeScript catalog from Python
+before `npm run build`. The native build supports Linux x86_64/aarch64, macOS
+x86_64/arm64, and Windows x86_64. Source installers either build with the available
+toolchain or download and checksum-verify the matching release asset.
 
 For frontend development:
 
 ```bash
+python -c "from src.openrouter_catalog import write_openrouter_catalog_ts; write_openrouter_catalog_ts()"
 cd ui
 npm ci --legacy-peer-deps
 npm run build

@@ -16,18 +16,18 @@ at the frontier model's altitude while your local model absorbs the drag.
 
 ## What it costs
 
-Slipstream targets a **20% Codex token share** across paired work, which is roughly
-**5x more work from the same Codex plan**. The target lives in code as
-`TARGET_CODEX_SHARE` in `src/hybrid.py`, and the footer measures your actual share from
-the current session's attributed model usage.
+Slipstream targets a **20% orchestrator token share** across paired work, which is roughly
+**5x more work from the same frontier plan**. The target lives in code as
+`TARGET_CODEX_SHARE` in `src/hybrid.py` (name kept for config compatibility), and the footer
+measures your actual share from the current session's attributed model usage.
 
 Two honest caveats:
 
 - 20% is an optimization target, not a guarantee. Small, ambiguous, or high-risk tasks
-  appropriately use a larger Codex share, and the footer will show that.
-- The quality goal is at least 99% of Codex-only result quality, achieved by keeping
-  planning and final review with Codex. That is a design target measured across paired
-  work, not a per-task promise.
+  appropriately use a larger orchestrator share, and the footer will show that.
+- The quality goal is at least 99% of orchestrator-only result quality, achieved by keeping
+  planning and final review with Codex or OpenRouter. That is a design target measured across
+  paired work, not a per-task promise.
 
 The local side is not free either — it costs you GPU time and memory rather than plan
 quota. Slipstream trades a resource you own for one you meter.
@@ -67,20 +67,20 @@ Existing OpenJet tool approvals still apply to the local worker. The delegation 
 registered only while Slipstream is healthy, and the local agent cannot recursively
 invoke it.
 
-The transcript inserts `CODEX · <model>` and `LOCAL · <model>` lane headers whenever
+The transcript inserts orchestrator and `LOCAL · <model>` lane headers whenever
 control changes models. Local reads, edits, commands, tests, and final handoff stay in
-the Local lane; Codex orchestration and review stay in the Codex lane. The same boundary
-is written to the standard OpenJet session trace with a shared turn ID and delegation
-call ID, including per-model tool activity and token usage without logging prompt
+the Local lane; Codex or OpenRouter orchestration and review stay in the orchestrator lane.
+The same boundary is written to the standard OpenJet session trace with a shared turn ID and
+delegation call ID, including per-model tool activity and token usage without logging prompt
 contents.
 
 ## Measuring savings
 
-The footer records Codex and local exchanges against their actual model references and
-shows the current session's Codex share alongside the tokens the local model absorbed:
+The footer records orchestrator and local exchanges against their actual model references and
+shows the current session's orchestrator share alongside the tokens the local model absorbed:
 
 ```text
-412K tokens saved by local model · Codex 18%
+412K tokens saved by local model · Orchestrator 18%
 ```
 
 Watch that share over a few sessions rather than a single task. If it sits well above
