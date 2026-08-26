@@ -322,6 +322,60 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["localModel"]["reasoning"])
         self.assertTrue(payload["agentChanged"])
 
+    async def test_selecting_codex_takes_over_an_openrouter_orchestrator(self) -> None:
+        self.controller.cfg.update({
+            "agent_mode": "hybrid",
+            "runtime": "llama_cpp",
+            "llama_model": "/models/qwen.gguf",
+            "agent_local_profile": "local",
+            "agent_codex_profile": "codex",
+            "agent_orchestrator_profile": "openrouter-ox-alpha",
+            "model_profiles": [
+                {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/qwen.gguf", "reasoning": True},
+                {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.6-sol", "reasoning_effort": "medium"},
+                {
+                    "name": "openrouter-ox-alpha",
+                    "runtime": "litellm",
+                    "provider": "openrouter",
+                    "model": "ox/alpha:free",
+                },
+            ],
+        })
+        self.controller.runtime_client = SimpleNamespace(base_url="http://127.0.0.1:18080")
+        credentials = SimpleNamespace(access_token="token", account_id="acct")
+        with patch("src.service_controller.CodexOAuthProvider") as provider:
+            provider.return_value.credentials = AsyncMock(return_value=credentials)
+            result = await self.controller.command("/model codex=gpt-5.6-terra effort=high")
+
+        self.assertEqual(self.controller.cfg["agent_orchestrator_profile"], "codex")
+        self.assertEqual(result["payload"]["orchestratorKind"], "codex")
+        self.assertEqual(result["payload"]["piModel"]["id"], "gpt-5.6-terra")
+
+    async def test_effort_only_change_keeps_the_openrouter_orchestrator(self) -> None:
+        self.controller.cfg.update({
+            "agent_mode": "hybrid",
+            "runtime": "llama_cpp",
+            "llama_model": "/models/qwen.gguf",
+            "agent_local_profile": "local",
+            "agent_codex_profile": "codex",
+            "agent_orchestrator_profile": "openrouter-ox-alpha",
+            "model_profiles": [
+                {"name": "local", "runtime": "llama_cpp", "llama_model": "/models/qwen.gguf", "reasoning": True},
+                {"name": "codex", "runtime": "openai_codex", "model": "gpt-5.6-sol", "reasoning_effort": "medium"},
+                {
+                    "name": "openrouter-ox-alpha",
+                    "runtime": "litellm",
+                    "provider": "openrouter",
+                    "model": "ox/alpha:free",
+                },
+            ],
+        })
+        self.controller.runtime_client = SimpleNamespace(base_url="http://127.0.0.1:18080")
+        with patch.object(self.controller, "_resolved_openrouter_key", return_value="sk-or-test"):
+            await self.controller.command("/model effort=high")
+
+        self.assertEqual(self.controller.cfg["agent_orchestrator_profile"], "openrouter-ox-alpha")
+
     def test_snapshot_exposes_live_local_runtime_metrics(self) -> None:
         self.controller.cfg["device"] = "cuda"
         self.controller._metrics = SimpleNamespace(

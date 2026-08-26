@@ -894,10 +894,14 @@ class OpenJetServiceController:
                         codex["reasoning_effort"] = effort
                     replace_model_profile(self.cfg, codex, previous_name=str(codex["name"]))
                     self.cfg["agent_codex_profile"] = str(codex["name"])
-                    # Only re-point the orchestrator at Codex when Codex already is
-                    # the orchestrator (or none is configured); otherwise an
-                    # effort-only tweak would silently switch off OpenRouter.
-                    if orchestrator is None or active_runtime(orchestrator) == CODEX_RUNTIME:
+                    # An explicit codex=<model> selection means the user picked
+                    # Codex, so it becomes the orchestrator. An effort-only tweak
+                    # must not silently switch off an OpenRouter orchestrator.
+                    if (
+                        "codex" in options
+                        or orchestrator is None
+                        or active_runtime(orchestrator) == CODEX_RUNTIME
+                    ):
                         self.cfg["agent_orchestrator_profile"] = str(codex["name"])
 
                 local = self._profile_for_runtime(DEFAULT_RUNTIME, "agent_local_profile")
