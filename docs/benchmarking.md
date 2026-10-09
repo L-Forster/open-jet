@@ -71,6 +71,13 @@ Benchmarking reuses the same configuration model as the CLI and SDK:
 That means the benchmark surface measures the same runtime shape that the TUI
 and SDK would use.
 
+## Megakernel benchmarks
+
+`openjet benchmark` measures `llama-bench`. The Qwen3.8 megakernel has its own benchmarks
+against `llama-server` in `megakernel/bench/`: `think_bench.py` (reasoning mode with OpenJet's
+sampling preset), `code_bench.py` (greedy decode, a context-length sweep and second-turn prompt
+time) and `bench.py`. See [megakernel/README.md](../megakernel/README.md).
+
 ## Related surfaces
 
 - If you want to **use** OpenJet interactively, go to [CLI usage](usage/cli.md).

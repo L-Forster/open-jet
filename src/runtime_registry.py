@@ -4,13 +4,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .airgap import AirgapViolationError, airgapped_from_cfg, endpoint_is_loopback
+from .config import DEFAULT_CODEX_MODEL
 from .llama_server import LlamaServerClient
 from .runtime_client import RuntimeClient
 
 
 DEFAULT_RUNTIME = "llama_cpp"
 CODEX_RUNTIME = "openai_codex"
-DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 LITELLM_RUNTIME = "litellm"
 RUNTIME_LABEL = "Local model: llama.cpp (GGUF)"
 CODEX_RUNTIME_LABEL = "OpenAI Codex OAuth"
@@ -113,4 +113,5 @@ def create_runtime_client(
         llama_mtp=bool(cfg.get("llama_mtp", False)),
         airgapped=airgapped_from_cfg(cfg),
         diagnostics_hook=diagnostics_hook,
+        backend=str(cfg.get("llama_backend") or "auto"),
     )

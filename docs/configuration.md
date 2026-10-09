@@ -169,6 +169,22 @@ memory_guard:
   keep_last_messages: 6
 ```
 
+### Local inference backend
+
+```yaml
+llama_backend: auto   # auto | megakernel | llama
+```
+
+With the `llama_cpp` runtime, `auto` (the default) serves Qwen3.8-27B Q4_K_M through the
+megakernel (`megakernel/`, a CUDA engine specialised for that model on RTX 3090-class sm_86 GPUs,
+~1.5x llama.cpp's decode speed in reasoning mode) when it is built (`make` in `megakernel/`), the GPU
+has at least 23 GB and `jinja2` is installed; otherwise, or if it fails to start, OpenJet runs
+`llama-server` as before. `megakernel` requires it (startup fails instead of falling back), `llama`
+never uses it. The megakernel samples with temperature, top_k (at most 32), top_p and min_p; it
+ignores presence and repetition penalties, so the non-thinking Qwen3.8 preset (presence penalty 1.5)
+runs without its penalty. Its KV cache is fp16, or q8_0 when the configured context would not fit
+in fp16 (about 80K tokens on a 24 GB card).
+
 ## Shell Targets
 
 You can expose named remote shell targets for the `shell` tool. OpenJet stays on the local machine, and when the model sets `target` on a shell call, OpenJet writes a temporary script locally, copies it to the target with `scp`, runs it with `ssh`, and returns stdout/stderr.
@@ -211,7 +227,7 @@ model_profiles:
   - name: codex
     runtime: openai_codex
     provider: openai-codex
-    model: gpt-5.6-sol
+    model: gpt-6-astra
     context_window_tokens: 1050000
     reasoning_effort: medium
     reasoning_summary: auto

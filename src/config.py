@@ -12,8 +12,18 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 TELEMETRY_CONSENT_VERSION = 1
 TELEMETRY_DEFAULT_ENDPOINT = "https://telemetry.openjet.dev"
-DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_CODEX_MODEL = "gpt-6-astra"
+CODEX_MODEL_OPTIONS = ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+CODEX_MODEL_CONTEXT_WINDOW = 1_050_000
 LEGACY_CODEX_MODELS = frozenset({"gpt-5.5"})
+
+
+def codex_context_window_tokens(model: object) -> int | None:
+    """Context window for curated Codex models, or None for custom models."""
+    name = str(model or "").strip()
+    if name in CODEX_MODEL_OPTIONS or name.startswith("gpt-5.6"):
+        return CODEX_MODEL_CONTEXT_WINDOW
+    return None
 
 
 def default_telemetry_endpoint() -> str:

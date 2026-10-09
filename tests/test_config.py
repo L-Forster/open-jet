@@ -3,9 +3,12 @@ from __future__ import annotations
 import unittest
 
 from src.config import (
+    CODEX_MODEL_CONTEXT_WINDOW,
+    DEFAULT_CODEX_MODEL,
     DEFAULT_LOG_DIRECTORY,
     DEFAULT_SESSION_STATE_PATH,
     MANAGED_MODELS_DIR,
+    codex_context_window_tokens,
     migrate_config_for_current_release,
     normalize_config,
     setup_direct_model_catalog,
@@ -45,7 +48,7 @@ class ConfigNormalizationTests(unittest.TestCase):
         normalized = normalize_config(cfg)
 
         self.assertEqual(normalized["runtime"], "openai_codex")
-        self.assertEqual(normalized["model"], "gpt-5.6-sol")
+        self.assertEqual(normalized["model"], "gpt-6-astra")
 
     def test_normalize_config_migrates_saved_codex_profiles(self) -> None:
         normalized = normalize_config({
@@ -55,8 +58,37 @@ class ConfigNormalizationTests(unittest.TestCase):
             ],
         })
 
-        self.assertEqual(normalized["model_profiles"][0]["model"], "gpt-5.6-sol")
+        self.assertEqual(normalized["model_profiles"][0]["model"], "gpt-6-astra")
         self.assertEqual(normalized["model_profiles"][1]["llama_model"], "/models/qwen.gguf")
+
+    def test_normalize_config_defaults_empty_codex_model_to_gpt_6_astra(self) -> None:
+        normalized = normalize_config({
+            "runtime": "openai_codex",
+            "model": "",
+            "model_profiles": [
+                {"name": "codex", "runtime": "openai_codex", "model": ""},
+            ],
+        })
+
+        self.assertEqual(DEFAULT_CODEX_MODEL, "gpt-6-astra")
+        self.assertEqual(normalized["model"], "gpt-6-astra")
+        self.assertEqual(normalized["model_profiles"][0]["model"], "gpt-6-astra")
+
+    def test_normalize_config_keeps_supported_codex_models(self) -> None:
+        normalized = normalize_config({
+            "model_profiles": [
+                {"name": "old", "runtime": "openai_codex", "model": "gpt-5.6-sol"},
+            ],
+        })
+
+        self.assertEqual(normalized["model_profiles"][0]["model"], "gpt-5.6-sol")
+
+    def test_codex_context_window_tokens_covers_curated_models_only(self) -> None:
+        self.assertEqual(codex_context_window_tokens("gpt-6-astra"), CODEX_MODEL_CONTEXT_WINDOW)
+        self.assertEqual(codex_context_window_tokens("gpt-5.6-sol"), CODEX_MODEL_CONTEXT_WINDOW)
+        self.assertEqual(codex_context_window_tokens("gpt-5.6"), CODEX_MODEL_CONTEXT_WINDOW)
+        self.assertIsNone(codex_context_window_tokens("custom/whatever"))
+        self.assertIsNone(codex_context_window_tokens(""))
 
     def test_normalize_config_replaces_unsupported_minimal_codex_effort(self) -> None:
         normalized = normalize_config({

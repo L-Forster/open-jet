@@ -11,7 +11,13 @@ from prompt_toolkit.shortcuts import radiolist_dialog
 
 from .api_auth import ApiKeyStore, default_api_key_env, normalize_provider_id
 from .codex_auth import CodexAuthError, CodexOAuthProvider
-from .config import save_config
+from .config import (
+    CODEX_MODEL_CONTEXT_WINDOW,
+    CODEX_MODEL_OPTIONS,
+    DEFAULT_CODEX_MODEL,
+    codex_context_window_tokens,
+    save_config,
+)
 from .hardware import recommended_context_window_tokens
 from .model_profiles import get_model_profile, list_model_profiles, replace_model_profile
 from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, LITELLM_RUNTIME, active_runtime
@@ -50,8 +56,8 @@ _DEFAULT_CODEX_PROFILE: dict[str, object] = {
     "name": "codex",
     "runtime": CODEX_RUNTIME,
     "provider": "openai-codex",
-    "model": "gpt-5.6-sol",
-    "context_window_tokens": 1050000,
+    "model": DEFAULT_CODEX_MODEL,
+    "context_window_tokens": CODEX_MODEL_CONTEXT_WINDOW,
     "reasoning_effort": "medium",
     "reasoning_summary": "auto",
     "text_verbosity": "medium",
@@ -835,8 +841,8 @@ class SlashCommandHandler:
     async def _pick_codex_settings(self, profile: dict[str, Any]) -> dict[str, Any]:
         if self.app._session is None:
             return profile
-        current_model = str(profile.get("model") or "gpt-5.6-sol")
-        model_values = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+        current_model = str(profile.get("model") or DEFAULT_CODEX_MODEL)
+        model_values = list(CODEX_MODEL_OPTIONS)
         if current_model not in model_values:
             model_values.insert(0, current_model)
         model = await _prompt_choice(
@@ -864,8 +870,9 @@ class SlashCommandHandler:
         updated = dict(profile)
         updated["model"] = str(model)
         updated["reasoning_effort"] = str(effort)
-        if str(model).startswith("gpt-5.6"):
-            updated["context_window_tokens"] = 1050000
+        context_window = codex_context_window_tokens(model)
+        if context_window is not None:
+            updated["context_window_tokens"] = context_window
         return updated
 
     async def _pick_openrouter_settings(self, profile: dict[str, Any]) -> dict[str, Any]:
@@ -1223,9 +1230,9 @@ class SlashCommandHandler:
             provider_id = "openai-codex"
 
         is_codex = provider_id == "openai-codex"
-        default_model = "gpt-5.6-sol" if is_codex else f"{provider_id}/"
+        default_model = DEFAULT_CODEX_MODEL if is_codex else f"{provider_id}/"
         model_value = await _prompt_text(self.app._session, "model> ", default=default_model)
-        context_default = "1050000" if is_codex else "128000"
+        context_default = str(CODEX_MODEL_CONTEXT_WINDOW) if is_codex else "128000"
         context_value = await _prompt_text(self.app._session, "context window> ", default=context_default)
         try:
             context_tokens = int(context_value.strip())

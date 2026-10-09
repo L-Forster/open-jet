@@ -8,7 +8,7 @@ Commands below match the Pi TypeScript TUI. Some older Textual-app spellings rem
 - `/mode [status|local|codex|openrouter|slipstream]` inspect or switch mode (`hybrid` remains accepted for Slipstream; `/agent` and `/strategy` remain aliases for `/mode`)
 - `/model` configure the active mode (Codex model and effort; OpenRouter model; local model and reasoning; both sides in Slipstream)
 - `/model openrouter=stealth/ox-alpha local=local reasoning=on` apply a Slipstream OpenRouter + local pair directly
-- `/model codex=gpt-5.6-sol effort=high local=local reasoning=on` apply a Slipstream Codex + local pair directly
+- `/model codex=gpt-6-astra effort=high local=local reasoning=on` apply a Slipstream Codex + local pair directly
 - `/effort [none|low|medium|high|xhigh|max]` change Codex reasoning effort (Codex orchestrator only)
 - `/runtime [status]` inspect the inference engine (for example llama.cpp)
 - `/local` switch to the local runtime profile

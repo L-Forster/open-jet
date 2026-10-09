@@ -2250,7 +2250,7 @@ class ConnectCommandTests(unittest.IsolatedAsyncioTestCase):
         save_cfg.assert_called_once_with(app.cfg)
         self.assertEqual(app.cfg["model_profiles"][0]["name"], "codex")
         self.assertEqual(app.cfg["model_profiles"][0]["runtime"], "openai_codex")
-        self.assertEqual(app.cfg["model_profiles"][0]["model"], "gpt-5.6-sol")
+        self.assertEqual(app.cfg["model_profiles"][0]["model"], "gpt-6-astra")
         self.assertEqual(app.cfg["model_profiles"][0]["reasoning_effort"], "medium")
         self.assertNotEqual(app.cfg.get("active_model_profile"), "codex")
         entries = "\n".join(str(entry) for entry in app.query_one("#chat-log")._entries)

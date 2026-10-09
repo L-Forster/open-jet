@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  RTX 3090 + Qwen 27B: <strong>33 tok/s -> 70 tok/s</strong> with MTP. Open source.
+  RTX 3090 + Qwen 27B: <strong>33 tok/s -> 70 tok/s</strong> with MTP, about <strong>1.5x more</strong> with the bundled Qwen3.8 megakernel. Open source.
 </p>
 
 <p align="center">
@@ -192,6 +192,15 @@ If you are new to local LLMs, OpenJet is the fastest way to get started without 
 For the native managed runtime, recommended hardware is Apple silicon with 24GB+ unified
 memory or a GPU with 14GB+ VRAM. Existing Ollama, LM Studio, and OpenAI-compatible servers
 remain responsible for their own model requirements.
+
+### Qwen3.8-27B megakernel (RTX 3090)
+
+On an RTX 3090-class GPU with Qwen3.8-27B Q4_K_M, OpenJet serves the model through
+[`megakernel/`](megakernel/README.md), a CUDA engine built for exactly that model and GPU, instead
+of `llama-server`: about 1.5x the decode speed in reasoning mode (78 vs 51 tok/s), 1.7x greedy, and
+1.3-1.5x faster prompt processing. Build it with `cd megakernel && make`; OpenJet picks it
+automatically when it applies (`llama_backend: auto`) and falls back to `llama-server` otherwise.
+See [llama.cpp runtime](docs/runtimes/llama-cpp.md#qwen38-27b-megakernel-backend-rtx-3090).
 
 ### Provisioning catalog
 

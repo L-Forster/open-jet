@@ -81,13 +81,13 @@ let lastEscapeAt = 0;
 let hybridLocalTokenUsage: ModelTokenUsage = { input: 0, cache: 0, output: 0 };
 let modelProfiles: Array<{ name: string; kind: string; model: string }> = [];
 let activeLocalProfile = "";
-let activeCodexModel = "gpt-5.6-sol";
+let activeCodexModel = "gpt-6-astra";
 let activeCodexEffort = "medium";
 let activeLocalReasoning = true;
 let activeOpenrouterModel = "openrouter/stealth/ox-alpha";
 let activeOrchestratorKind = "codex";
 let openrouterConnected = false;
-let codexModelOptions = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
+let codexModelOptions = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
 const serviceCommands = new Set(["status", "device", "devices", "sources", "setup", "runtime", "model", "mode", "agent", "strategy", "effort", "reasoning", "cloud", "connect", "login", "exit", "quit"]);
 // Until the backend command list arrives, pass slash commands through instead of
 // rejecting them — the bootstrap list is only a subset of what the backend knows.

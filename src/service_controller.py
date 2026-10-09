@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .airgap import airgapped_from_cfg, set_airgapped
-from .config import load_config, save_config
+from .config import CODEX_MODEL_OPTIONS, DEFAULT_CODEX_MODEL, codex_context_window_tokens, load_config, save_config
 from .api_auth import ApiKeyStore, default_api_key_env, normalize_provider_id
 from .codex_auth import CodexAuthError, CodexOAuthProvider
 from .device_sources import assign_device_alias, list_device_sources, set_device_enabled
@@ -27,7 +27,7 @@ from .openrouter_catalog import (
     upsert_openrouter_profile,
 )
 from .provisioning import provision_setup_artifacts
-from .runtime_registry import CODEX_RUNTIME, DEFAULT_CODEX_MODEL, DEFAULT_RUNTIME, LITELLM_RUNTIME, active_model_ref, active_runtime, create_runtime_client
+from .runtime_registry import CODEX_RUNTIME, DEFAULT_RUNTIME, LITELLM_RUNTIME, active_model_ref, active_runtime, create_runtime_client
 from .runtime_protocol import ToolCall
 from .runtime_limits import estimate_tokens, read_memory_snapshot
 from .setup import build_recommended_payload
@@ -569,7 +569,7 @@ class OpenJetServiceController:
             "agentOrchestratorProfile": str(self.cfg.get("agent_orchestrator_profile") or ""),
             "openrouterConnected": self._openrouter_connected(),
             "localReasoning": bool((self._profile_for_runtime(DEFAULT_RUNTIME, "agent_local_profile") or {}).get("reasoning", self.cfg.get("reasoning", True))),
-            "codexModelOptions": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+            "codexModelOptions": list(CODEX_MODEL_OPTIONS),
             "openrouterModelOptions": openrouter_model_option_ids(),
             "openrouterModels": openrouter_picker_models(),
             "featuredOpenrouterModel": featured_openrouter_model(),
@@ -885,8 +885,9 @@ class OpenJetServiceController:
                     codex = dict(codex)
                     if "codex" in options:
                         codex["model"] = options["codex"]
-                        if options["codex"].startswith("gpt-5.6"):
-                            codex["context_window_tokens"] = 1_050_000
+                        context_window = codex_context_window_tokens(options["codex"])
+                        if context_window is not None:
+                            codex["context_window_tokens"] = context_window
                     if "effort" in options:
                         effort = options["effort"].lower()
                         if effort not in {"none", "low", "medium", "high", "xhigh", "max"}:

@@ -14,6 +14,43 @@ Use the deployment-specific build guides:
 
 The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/bin/`.
 
+## Qwen3.8-27B megakernel backend (RTX 3090)
+
+For one specific setup, Qwen3.8-27B Q4_K_M on an RTX 3090-class GPU (sm_86, 24 GB), OpenJet ships a
+specialised CUDA engine in [`megakernel/`](../../megakernel/README.md) and serves the model through it
+instead of `llama-server`. Measured on an RTX 3090 against `llama-server` with OpenJet's flags:
+
+| | llama.cpp | megakernel |
+|---|---|---|
+| reasoning mode, OpenJet's thinking preset (decode) | 51 tok/s | 78 tok/s (1.5x) |
+| greedy decode, chat prompts (mean) | 63 tok/s | 107 tok/s (1.7x) |
+| prompt processing, 2-8K tokens | 1050-1140 tok/s | 1530-1600 tok/s (1.3-1.5x) |
+| pasting a 12K-token file into the next turn | 10.5 s | 8.1 s |
+
+Build it once (needs the CUDA toolkit and the `llama.cpp` build, for its tokenizer):
+
+```bash
+cd megakernel && make
+```
+
+With `llama_backend: auto` (the default) OpenJet then starts `megakernel/server/mk_server.py`
+whenever the configured model is Qwen3.8-27B Q4_K_M, the megakernel is built, the GPU is sm_86 with
+at least 23 GB and `jinja2` is installed; in every other case, or if the megakernel fails to start,
+it starts `llama-server` as usual. `llama_backend: llama` turns it off, `llama_backend: megakernel`
+makes it required. `OPENJET_MEGAKERNEL_DIR` points at a megakernel build elsewhere.
+
+The server speaks the parts of the OpenAI API OpenJet uses: streaming chat completions rendered with
+the model's own chat template, reasoning as `reasoning_content`, tool calls as structured
+`tool_calls`, and reuse of the processed conversation between turns. Differences from
+`llama-server`:
+
+- sampling supports temperature, top_k (at most 32), top_p and min_p; presence and repetition
+  penalties are ignored (OpenJet's non-thinking Qwen3.8 preset uses a presence penalty of 1.5)
+- the KV cache is fp16, or q8_0 when the configured context does not fit in fp16 (above about 80K
+  tokens on a 24 GB card; ~1-2% slower)
+- no slot save / restore: the low-memory shell swap below falls back to re-prompting
+- editing an earlier part of a conversation (e.g. context compaction) re-processes it (~1500 tok/s)
+
 ## What setup automates
 
 When you run `openjet setup`, OpenJet can:
@@ -29,7 +66,7 @@ Automatic provisioning still depends on local prerequisites like network access,
 
 When `llama.cpp` is the active runtime, OpenJet can:
 
-- stream chat and tool calls through `llama-server`
+- stream chat and tool calls through `llama-server` (or the megakernel server, see above)
 - toggle reasoning mode per request with `/reasoning`
 - clear or rebuild the KV cache with `/clear`
 - save and restore slot state for low-memory shell workflows

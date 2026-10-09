@@ -1,0 +1,4 @@
+Write a Python function that checks whether a number is prime, with a docstring and a few doctests.
+Explain how a hash map works internally, including collision handling and resizing, for a junior developer.
+Write a short story (about 300 words) about a lighthouse keeper who discovers a message in a bottle.
+Give me a step-by-step plan for migrating a Flask REST API to FastAPI, including testing and deployment.

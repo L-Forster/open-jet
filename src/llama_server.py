@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import shutil
 import signal
+import subprocess
+import sys
 from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
@@ -32,6 +35,84 @@ _MTP_SPEC_ARGS: tuple[str, ...] = (
     "--spec-draft-n-max",
     "2",
 )
+
+
+# The Qwen3.8-27B megakernel (<openjet>/megakernel): a specialised CUDA engine for this one model and
+# quantisation on sm_86 GPUs (RTX 3090 class) with an OpenAI-compatible server in front of it.
+_MEGAKERNEL_SERVER = Path("server") / "mk_server.py"
+_MEGAKERNEL_FILES = ("libqwen38mk.so", "draft_vocab_32k.bin", str(_MEGAKERNEL_SERVER))
+_MEGAKERNEL_MIN_VRAM_MIB = 23000
+
+
+def _megakernel_dir() -> Path | None:
+    override = os.environ.get("OPENJET_MEGAKERNEL_DIR", "").strip()
+    root = Path(override).expanduser() if override else openjet_install_root() / "megakernel"
+    return root if all((root / name).is_file() for name in _MEGAKERNEL_FILES) else None
+
+
+def _megakernel_model_supported(model: str) -> bool:
+    name = Path(model).name.lower()
+    return name.endswith(".gguf") and "qwen3.8-27b" in name and "q4_k_m" in name
+
+
+def _megakernel_gpu() -> str | None:
+    """nvidia-smi index of a GPU the megakernel can run on, or None.
+
+    The megakernel runs on CUDA device 0, so a CUDA_VISIBLE_DEVICES already in the
+    environment limits the choice to its first entry; otherwise any GPU qualifies
+    and _start_megakernel pins the one found here.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid,compute_cap,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip().splitlines()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pinned = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    for line in out:
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 4:
+            continue
+        index, uuid, cap, mem = fields
+        if pinned and pinned not in (index, uuid):
+            continue
+        try:
+            if cap == "8.6" and float(mem) >= _MEGAKERNEL_MIN_VRAM_MIB:
+                return index
+        except ValueError:
+            continue
+    return None
+
+
+def megakernel_unavailable_reason(model: str) -> str | None:
+    """None when the megakernel can serve *model* on this machine, else why not."""
+    if not _megakernel_model_supported(model):
+        return "the megakernel only supports Qwen3.8-27B Q4_K_M"
+    if _megakernel_dir() is None:
+        return "the megakernel is not built (<openjet>/megakernel: make)"
+    if importlib.util.find_spec("jinja2") is None:
+        return "the megakernel server needs jinja2"
+    if _megakernel_gpu() is None:
+        return f"the megakernel needs an sm_86 GPU with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB (RTX 3090 class)"
+    return None
+
+
+def _stderr_detail(lines: deque[str]) -> str:
+    err = "\n".join(lines).strip()
+    if len(err) > 8000:
+        keep = 4000
+        omitted = len(err) - (keep * 2)
+        err = f"{err[:keep]}\n... <{omitted} chars omitted> ...\n{err[-keep:]}"
+    return err or "no stderr output"
+
+
+async def _cancel_task(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 def _find_built_llama_binary(name: str) -> Path | None:
@@ -74,6 +155,7 @@ class LlamaServerClient:
         llama_mtp: bool = False,
         airgapped: bool = False,
         diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
+        backend: str = "auto",
     ) -> None:
         self.model = model
         self.binary = str(binary or "").strip() or None
@@ -92,6 +174,13 @@ class LlamaServerClient:
         self._start_lock = asyncio.Lock()
         self.reasoning_mode = "default"
         self._diagnostics_hook = diagnostics_hook
+        # "auto": the megakernel when it supports the model and GPU, else llama-server;
+        # "megakernel": the megakernel or fail; "llama": always llama-server
+        self.backend = (backend or "auto").strip().lower()
+        if self.backend not in {"auto", "megakernel", "llama"}:
+            raise ValueError("llama_backend must be one of: auto, megakernel, llama")
+        self.active_backend = "llama.cpp"
+        self._stderr_task: asyncio.Task[None] | None = None
 
     def set_reasoning_mode(self, mode: str) -> None:
         normalized = mode.strip().lower()
@@ -294,6 +383,7 @@ class LlamaServerClient:
                 return
             assert_endpoint_allowed(self.base_url, label="the llama.cpp runtime")
             await self._stop_server()
+            self.active_backend = "llama.cpp"
             await self._cleanup_stale_inference_processes()
             binary = self.binary or _find_llama_server()
             env = os.environ.copy()
@@ -332,6 +422,26 @@ class LlamaServerClient:
                     alloc_cap = _vulkan_max_alloc_ctx(kv_bpt) if kv_bpt else None
                     if alloc_cap is not None:
                         requested_ctx = min(requested_ctx, alloc_cap)
+            if self.backend != "llama":
+                if resolved_device != "cuda" or is_jetson:
+                    device_name = "jetson" if is_jetson else resolved_device
+                    reason = f"the megakernel needs a desktop CUDA GPU (resolved device: {device_name})"
+                else:
+                    reason = megakernel_unavailable_reason(self.model)
+                if reason is None:
+                    try:
+                        await self._start_megakernel(env=env, ctx=requested_ctx)
+                        self.context_window_tokens = requested_ctx
+                        self.active_backend = "megakernel"
+                        return
+                    except (RuntimeError, TimeoutError, OSError) as exc:
+                        self._emit_diagnostic("runtime_megakernel_start_failed", error=str(exc)[-4000:])
+                        if self.backend == "megakernel":
+                            raise
+                elif self.backend == "megakernel":
+                    raise RuntimeError(f"llama_backend is megakernel, but {reason}")
+                else:
+                    self._emit_diagnostic("runtime_megakernel_skipped", reason=reason)
             batch, ubatch, fit_mode, no_warmup, no_mmap = self._startup_profile_for_lfb(lfb_mb)
             no_mmap = self._should_disable_mmap_for_launch(
                 device=resolved_device,
@@ -444,75 +554,36 @@ class LlamaServerClient:
             ggml_cuda_vmm_chunk_mb=env.get("GGML_CUDA_VMM_CHUNK_MB", ""),
             ggml_cuda_vmm_reserve_mb=env.get("GGML_CUDA_VMM_RESERVE_MB", ""),
         )
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            env=env,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
         stderr_lines: deque[str] = deque(maxlen=120)
-        stderr_task = asyncio.create_task(self._capture_startup_stderr(stderr_lines))
-
-        deadline = asyncio.get_event_loop().time() + 120.0
-        while asyncio.get_event_loop().time() < deadline:
-            if self._proc.returncode is not None:
-                await stderr_task
-                err = "\n".join(stderr_lines).strip()
-                if len(err) > 8000:
-                    keep = 4000
-                    omitted = len(err) - (keep * 2)
-                    err = (
-                        f"{err[:keep]}\n"
-                        f"... <{omitted} chars omitted> ...\n"
-                        f"{err[-keep:]}"
-                    )
-                detail = err or "no stderr output"
-                self._emit_diagnostic(
-                    "runtime_llama_start_failed",
-                    error=detail,
-                    ctx=ctx,
-                    ngl=ngl,
-                    batch=batch,
-                    ubatch=ubatch,
-                    fit_mode=fit_mode,
-                    no_warmup=no_warmup,
-                    returncode=self._proc.returncode,
-                    stderr_line_count=len(stderr_lines),
-                    stderr_tail=list(stderr_lines)[-20:],
-                    **self._memory_snapshot(),
-                )
-                raise RuntimeError(
-                    f"llama-server exited with code {self._proc.returncode}: {detail}"
-                )
-            try:
-                r = await self._http.get(f"{self.base_url}/health")
-                if r.status_code == 200:
-                    stderr_task.cancel()
-                    try:
-                        await stderr_task
-                    except asyncio.CancelledError:
-                        pass
-                    self._emit_diagnostic(
-                        "runtime_llama_start_ready",
-                        pid=self._proc.pid if self._proc else 0,
-                        ctx=ctx,
-                        ngl=ngl,
-                        stderr_line_count=len(stderr_lines),
-                    )
-                    return
-            except (
-                httpx.ConnectError,
-                httpx.ReadError,
-                httpx.RemoteProtocolError,
-                httpx.TimeoutException,
-            ):
-                pass
-            await asyncio.sleep(1.0)
-        stderr_task.cancel()
-        try:
-            await stderr_task
-        except asyncio.CancelledError:
-            pass
+        outcome = await self._spawn_until_healthy(cmd, env=env, timeout=120.0, stderr_lines=stderr_lines)
+        if outcome == "exited":
+            detail = _stderr_detail(stderr_lines)
+            self._emit_diagnostic(
+                "runtime_llama_start_failed",
+                error=detail,
+                ctx=ctx,
+                ngl=ngl,
+                batch=batch,
+                ubatch=ubatch,
+                fit_mode=fit_mode,
+                no_warmup=no_warmup,
+                returncode=self._proc.returncode,
+                stderr_line_count=len(stderr_lines),
+                stderr_tail=list(stderr_lines)[-20:],
+                **self._memory_snapshot(),
+            )
+            raise RuntimeError(
+                f"llama-server exited with code {self._proc.returncode}: {detail}"
+            )
+        if outcome == "ready":
+            self._emit_diagnostic(
+                "runtime_llama_start_ready",
+                pid=self._proc.pid if self._proc else 0,
+                ctx=ctx,
+                ngl=ngl,
+                stderr_line_count=len(stderr_lines),
+            )
+            return
         self._emit_diagnostic(
             "runtime_llama_start_timeout",
             ctx=ctx,
@@ -523,11 +594,94 @@ class LlamaServerClient:
         )
         raise TimeoutError("llama-server did not become ready")
 
+    async def _start_megakernel(self, *, env: dict[str, str], ctx: int) -> None:
+        root = _megakernel_dir()
+        assert root is not None
+        cmd = [
+            sys.executable,
+            str(root / _MEGAKERNEL_SERVER),
+            "-m",
+            self.model,
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "-c",
+            str(ctx),
+        ]
+        if not env.get("CUDA_VISIBLE_DEVICES", "").strip():
+            gpu = _megakernel_gpu()
+            if gpu is not None:
+                # nvidia-smi indexes GPUs in PCI bus order; CUDA does too with this set
+                env = {**env, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": gpu}
+        self._emit_diagnostic("runtime_megakernel_launch_command", command=" ".join(cmd), ctx=ctx)
+        stderr_lines: deque[str] = deque(maxlen=120)
+        # keep draining stderr once ready: the server logs one line per request
+        outcome = await self._spawn_until_healthy(
+            cmd, env=env, timeout=180.0, stderr_lines=stderr_lines, keep_reading_stderr=True,
+        )
+        if outcome == "exited":
+            detail = _stderr_detail(stderr_lines)
+            self._proc = None
+            raise RuntimeError(f"megakernel server exited: {detail}")
+        if outcome == "ready":
+            self._emit_diagnostic("runtime_megakernel_start_ready", pid=self._proc.pid, ctx=ctx)
+            return
+        await self._stop_server()
+        raise TimeoutError("megakernel server did not become ready")
+
+    async def _spawn_until_healthy(
+        self,
+        cmd: list[str],
+        *,
+        env: dict[str, str],
+        timeout: float,
+        stderr_lines: deque[str],
+        keep_reading_stderr: bool = False,
+    ) -> str:
+        """Launch *cmd* as self._proc and poll /health until "ready", "exited" or "timeout".
+
+        Once ready, the stderr reader is kept for the server's lifetime when
+        *keep_reading_stderr* is set (_stop_server cancels it), else cancelled.
+        """
+        self._proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr_task = asyncio.create_task(self._capture_startup_stderr(stderr_lines))
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if self._proc.returncode is not None:
+                await stderr_task
+                return "exited"
+            try:
+                r = await self._http.get(f"{self.base_url}/health")
+                if r.status_code == 200:
+                    if keep_reading_stderr:
+                        self._stderr_task = stderr_task
+                    else:
+                        await _cancel_task(stderr_task)
+                    return "ready"
+            except (
+                httpx.ConnectError,
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpx.TimeoutException,
+            ):
+                pass
+            await asyncio.sleep(1.0)
+        await _cancel_task(stderr_task)
+        return "timeout"
+
     async def _capture_startup_stderr(self, sink: deque[str]) -> None:
         if not self._proc or not self._proc.stderr:
             return
+        # _stop_server clears self._proc while this may still be draining
+        stream = self._proc.stderr
         while True:
-            line = await self._proc.stderr.readline()
+            line = await stream.readline()
             if not line:
                 return
             text = line.decode(errors="replace").rstrip()
@@ -622,7 +776,8 @@ class LlamaServerClient:
             if not parts:
                 continue
             exe_name = Path(parts[0]).name.lower()
-            if exe_name != _LLAMA_SERVER_EXE_NAME:
+            is_megakernel = any(Path(part).as_posix().endswith(_MEGAKERNEL_SERVER.as_posix()) for part in parts[1:3])
+            if exe_name != _LLAMA_SERVER_EXE_NAME and not is_megakernel:
                 continue
 
             stale.append(pid)
@@ -645,6 +800,9 @@ class LlamaServerClient:
         await self.start()
 
     async def _stop_server(self) -> None:
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
         if self._proc and self._proc.returncode is None:
             self._proc.send_signal(signal.SIGTERM)
             try:

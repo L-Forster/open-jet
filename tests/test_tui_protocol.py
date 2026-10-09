@@ -171,6 +171,12 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("device_list", {tool["name"] for tool in snapshot["openjetTools"]})
         self.assertNotIn("shell", {tool["name"] for tool in snapshot["openjetTools"]})
 
+    async def test_snapshot_offers_gpt_6_astra_first_in_codex_model_options(self) -> None:
+        snapshot = self.controller._snapshot(setup_required=True)
+
+        self.assertEqual(snapshot["codexModelOptions"][0], "gpt-6-astra")
+        self.assertIn("gpt-5.6-sol", snapshot["codexModelOptions"])
+
     async def test_prepare_runtime_reprovisions_llama_server_before_start(self) -> None:
         self.controller.cfg.update(
             {
@@ -320,6 +326,34 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["piModel"]["thinkingLevel"], "high")
         self.assertFalse(payload["localReasoning"])
         self.assertFalse(payload["localModel"]["reasoning"])
+        self.assertTrue(payload["agentChanged"])
+
+    async def test_model_command_selects_gpt_6_astra_for_codex(self) -> None:
+        self.controller.cfg.update({
+            "agent_mode": "codex",
+            "agent_codex_profile": "codex",
+            "agent_orchestrator_profile": "codex",
+            "model_profiles": [{
+                "name": "codex",
+                "runtime": "openai_codex",
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium",
+                "context_window_tokens": 272000,
+            }],
+        })
+        credentials = SimpleNamespace(access_token="token", account_id="acct")
+        with patch("src.service_controller.CodexOAuthProvider") as provider:
+            provider.return_value.credentials = AsyncMock(return_value=credentials)
+            result = await self.controller.command("/model codex=gpt-6-astra effort=high")
+
+        self.assertEqual(self.controller.cfg["model_profiles"][0]["model"], "gpt-6-astra")
+        self.assertEqual(self.controller.cfg["model_profiles"][0]["context_window_tokens"], 1050000)
+        payload = result["payload"]
+        self.assertEqual(payload["agentMode"], "codex")
+        self.assertEqual(payload["piModel"]["id"], "gpt-6-astra")
+        self.assertEqual(payload["piModel"]["thinkingLevel"], "high")
+        self.assertEqual(payload["piModel"]["contextWindow"], 1050000)
+        self.assertEqual(payload["codexModelOptions"][0], "gpt-6-astra")
         self.assertTrue(payload["agentChanged"])
 
     async def test_selecting_codex_takes_over_an_openrouter_orchestrator(self) -> None:

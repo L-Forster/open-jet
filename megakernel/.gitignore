@@ -1,0 +1,16 @@
+# build outputs
+*.o
+qwen38_mk
+libqwen38mk.so
+ptxas*.log
+tools/vocab_freq
+# microbenchmark binaries (bench/*.cu) and benchmark scratch output
+bench/ffn_bench
+bench/ffn_bench_h*
+bench/gemv_bench
+bench/mmq_bench
+bench/mmq_e*
+bench/resid_bench
+bench/*_tmp/
+# experimental draft vocabulary (the engine uses draft_vocab_32k.bin)
+draft_vocab_48k.bin
