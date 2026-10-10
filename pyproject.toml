@@ -103,7 +103,10 @@ build-backend = "setuptools.build_meta"
 include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*"]
+include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*", "megakernel", "megakernel.server", "megakernel.tools"]
 
 [tool.setuptools.package-data]
 src = ["data/*.json", "tui_bin/**/*"]
+# megakernel source, compiled on the user's machine by `openjet setup` (src/megakernel_build.py)
+megakernel = ["Makefile", "README.md", "*.cu", "*.cuh", "*.h", "*.cpp", "draft_vocab_32k.bin"]
+"megakernel.tools" = ["*.cpp"]

@@ -1547,5 +1547,13 @@ async def provision_setup_artifacts(
     )
     if _setup_uses_mtp_model(resolved):
         resolved["llama_mtp"] = True
+    from .megakernel_build import ensure_megakernel  # imports llama_server, which imports this module
+
+    resolved = await ensure_megakernel(
+        resolved,
+        log=log,
+        set_status=set_status,
+        clear_status=clear_status,
+    )
     clear_status()
     return resolved

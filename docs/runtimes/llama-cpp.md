@@ -28,7 +28,10 @@ instead of `llama-server`. Measured on an RTX 3090 against `llama-server` with O
 | prompt processing, 2-8K tokens | 1050-1140 tok/s | 1530-1600 tok/s (1.3-1.5x) |
 | pasting a 12K-token file into the next turn | 10.5 s | 8.1 s |
 
-Build it once (needs the CUDA toolkit and the `llama.cpp` build, for its tokenizer):
+`openjet setup` builds it when it selects this model on a supported GPU: it compiles the megakernel
+source that ships in the wheel for that GPU's architecture, against the CUDA `llama.cpp` build setup
+makes (for its tokenizer). That needs the CUDA toolkit (`nvcc`) and takes about 2 minutes; without
+it, setup says so and OpenJet uses `llama-server`. In a source checkout you can also build by hand:
 
 ```bash
 cd megakernel && make

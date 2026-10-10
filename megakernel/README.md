@@ -78,7 +78,8 @@ the output can differ between `-d` settings.
 ## Build / run
 
 Requires CUDA 12+ (12.8+ for RTX 50 series; built with 13.2), an sm_86, sm_89 or sm_120 GPU with 24 GB, and the repo's llama.cpp build (only
-`libllama`, for tokenization, loaded vocab-only).
+`libllama`, for tokenization, loaded vocab-only). `openjet setup` builds `libqwen38mk.so` automatically
+(this source ships in the open-jet wheel); building by hand:
 
 ```sh
 cd megakernel

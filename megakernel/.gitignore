@@ -14,3 +14,5 @@ bench/resid_bench
 bench/*_tmp/
 # experimental draft vocabulary (the engine uses draft_vocab_32k.bin)
 draft_vocab_48k.bin
+# written by openjet setup (src/megakernel_build.py)
+.openjet-build.json

@@ -614,7 +614,10 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "src.provisioning.ensure_llama_server",
             AsyncMock(side_effect=lambda setup_result, **_kwargs: {**setup_result, "device": "cuda"}),
-        ):
+        ), patch(
+            "src.megakernel_build.ensure_megakernel",
+            AsyncMock(side_effect=lambda setup_result, **_kwargs: setup_result),
+        ) as ensure_megakernel:
             payload = await provision_setup_artifacts(
                 {
                     "llama_model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
@@ -629,6 +632,7 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(payload["llama_mtp"])
         self.assertEqual(payload["device"], "cuda")
+        ensure_megakernel.assert_awaited_once()
 
 
 class VulkanContextClampTests(unittest.TestCase):

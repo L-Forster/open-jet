@@ -47,9 +47,14 @@ _MEGAKERNEL_MIN_VRAM_MIB = 23000
 _MEGAKERNEL_COMPUTE_CAPS = frozenset({"8.6", "8.9", "12.0"})
 
 
-def _megakernel_dir() -> Path | None:
+def _megakernel_root() -> Path:
+    """Where the megakernel source and build live (built or not)."""
     override = os.environ.get("OPENJET_MEGAKERNEL_DIR", "").strip()
-    root = Path(override).expanduser() if override else openjet_install_root() / "megakernel"
+    return Path(override).expanduser() if override else openjet_install_root() / "megakernel"
+
+
+def _megakernel_dir() -> Path | None:
+    root = _megakernel_root()
     return root if all((root / name).is_file() for name in _MEGAKERNEL_FILES) else None
 
 
@@ -59,7 +64,13 @@ def _megakernel_model_supported(model: str) -> bool:
 
 
 def _megakernel_gpu() -> str | None:
-    """nvidia-smi index of a GPU the megakernel can run on, or None.
+    """nvidia-smi index of a GPU the megakernel can run on, or None."""
+    gpu = _megakernel_gpu_info()
+    return gpu[0] if gpu else None
+
+
+def _megakernel_gpu_info() -> tuple[str, str] | None:
+    """(nvidia-smi index, compute capability) of a GPU the megakernel can run on, or None.
 
     The megakernel runs on CUDA device 0, so a CUDA_VISIBLE_DEVICES already in the
     environment limits the choice to its first entry; otherwise any GPU qualifies
@@ -82,7 +93,7 @@ def _megakernel_gpu() -> str | None:
             continue
         try:
             if cap in _MEGAKERNEL_COMPUTE_CAPS and float(mem) >= _MEGAKERNEL_MIN_VRAM_MIB:
-                return index
+                return index, cap
         except ValueError:
             continue
     return None
@@ -93,7 +104,7 @@ def megakernel_unavailable_reason(model: str) -> str | None:
     if not _megakernel_model_supported(model):
         return "the megakernel only supports Qwen3.8-27B Q4_K_M"
     if _megakernel_dir() is None:
-        return "the megakernel is not built (<openjet>/megakernel: make)"
+        return "the megakernel is not built (rerun `openjet setup` with the CUDA toolkit installed)"
     if importlib.util.find_spec("jinja2") is None:
         return "the megakernel server needs jinja2"
     if _megakernel_gpu() is None:

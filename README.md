@@ -51,7 +51,8 @@ decode step runs as a single persistent kernel launch and verifies 4-5 drafted t
 Each figure is a single conversation, not a batch. llama.cpp runs with OpenJet's flags, including
 MTP speculative decoding.
 
-Build it once with `cd megakernel && make`. With the default `llama_backend: auto`, OpenJet uses it
+`openjet setup` compiles it for your GPU when it picks this model and the CUDA toolkit (`nvcc`) is
+installed; it takes about 2 minutes. With the default `llama_backend: auto`, OpenJet uses it
 whenever the model and GPU match and falls back to `llama-server` otherwise. See
 [the llama.cpp runtime docs](docs/runtimes/llama-cpp.md#qwen38-27b-megakernel-backend-rtx-3090).
 
@@ -200,7 +201,7 @@ running `llama-server` or the megakernel itself.
 OpenRouter and Slipstream; local llama.cpp is the default.
 
 **Does the megakernel work on other GPUs or models?** It serves Qwen3.8-27B Q4_K_M on RTX 30, 40 and
-50-series GPUs with 24 GB or more (sm_86, sm_89, sm_120). It's tuned on an RTX 3090; `make` builds it
+50-series GPUs with 24 GB or more (sm_86, sm_89, sm_120). It's tuned on an RTX 3090; `openjet setup` builds it
 for whichever of these GPUs you have. Everything else uses `llama-server`.
 
 ## Docs
