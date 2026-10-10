@@ -291,10 +291,26 @@ class Server:
         self.eng = Engine(args.lib, args.model, args.ctx, args.draft, args.draft_vocab,
                           {"f16": 0, "q8": 1, "auto": -1}[args.kv])
         self.template = make_template(self.eng.chat_template())
+        self.warm_up()
         self.model_id = os.path.basename(args.model)
         self.lock = threading.Lock()
         self.warned = set()
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts")
+
+    def warm_up(self):
+        """Runs one prefill and one decode cycle before the server listens.
+
+        Loading allocates the weights and the KV cache, but the first kernel launches still need
+        device memory of their own. When the context is too large for that, loading succeeds, /health
+        answers, and the first request ends the process with a CUDA out-of-memory (CK exits), which
+        the client sees as a dropped connection. Warming up here moves that failure to startup.
+        The prompt must be at least two tokens: only then does prefill take the batched path, whose
+        buffers are allocated on first use."""
+        toks = self.eng.tokenize("Hello, how are you today?")
+        assert len(toks) >= 2
+        self.eng.prefill(toks)
+        self.eng.step()
+        self.eng.reset()
 
     def warn_once(self, key, msg):
         if key not in self.warned:
