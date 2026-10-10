@@ -98,6 +98,31 @@ appended to the conversation), `--score ids.txt` (teacher-forced agreement), `MK
 users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
 megakernel instead).
 
+### The GGUF
+
+The kernels are compiled for unsloth's `Qwen3.8-27B-Q4_K_M.gguf` quant mix, and the loader checks
+every tensor against it:
+
+| tensors | type |
+|---|---|
+| `ffn_gate`, `ffn_up`, `attn_q`, `attn_k`, `attn_output`, `attn_gate`, `token_embd` | Q4_K |
+| `ffn_down`, `attn_v`, `attn_qkv` | Q4_K or Q6_K |
+| `ssm_out` | Q5_K |
+| `ssm_alpha`, `ssm_beta` | F32 |
+| `nextn.eh_proj` | Q8_0 |
+| `output` | Q6_K |
+
+A plain `llama-quantize ... Q4_K_M` from a recent llama.cpp gives `ssm_out`, `ssm_alpha`,
+`ssm_beta` and `nextn.eh_proj` Q4_K, which the loader now refuses by name. To build a compatible
+file from the BF16 GGUF (unsloth's imatrix optional):
+
+```sh
+llama-quantize --imatrix imatrix_unsloth.gguf \
+    --tensor-type ssm_out=q5_k --tensor-type ssm_alpha=f32 --tensor-type ssm_beta=f32 \
+    --tensor-type nextn.eh_proj=q8_0 \
+    Qwen3.8-27B-BF16-00001-of-00002.gguf Qwen3.8-27B-Q4_K_M.gguf Q4_K_M
+```
+
 Benchmarks: `bench/think_bench.py` (reasoning mode, both engines), `bench/code_bench.py` (greedy
 decode, context sweep, second turn), `bench/bench.py` (decode on the 4 chat prompts);
 `bench/*_bench.cu` are GEMV / GEMM microbenchmarks.
@@ -180,8 +205,8 @@ processing the whole conversation as one fresh prompt.
 
 ## Limitations
 
-- Specialised to this model's shapes and quant mix (27B, Q4_K_M as published by unsloth); the loader
-  rejects any other model. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
+- Specialised to this model's shapes and quant mix (27B, Q4_K_M as published by unsloth, see
+  [The GGUF](#the-gguf)); the loader rejects any other model or mix. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
   GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
   repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).

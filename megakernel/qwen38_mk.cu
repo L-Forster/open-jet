@@ -2219,6 +2219,29 @@ struct MKEngine::Impl {
         nsm = prop.multiProcessorCount;
 
         auto blk = [](int i, const char * s) { return "blk." + std::to_string(i) + "." + s; };
+        // The decode kernels are compiled for one quant type per tensor role (resid32 / gemv_pairs
+        // take it as a template argument), so a GGUF quantized with a different per-tensor recipe
+        // loads without complaint and then reads past its weights on the first token. Check every
+        // role against the type its kernel was built for.
+        auto tname = [](int t) -> std::string {
+            switch (t) {
+                case gguf::F32: return "F32";
+                case gguf::F16: return "F16";
+                case gguf::Q8_0: return "Q8_0";
+                case gguf::Q4_K: return "Q4_K";
+                case gguf::Q5_K: return "Q5_K";
+                case gguf::Q6_K: return "Q6_K";
+                default: return "type " + std::to_string(t);
+            }
+        };
+        auto need = [&](const std::string & name, int got, std::initializer_list<int> ok) {
+            for (int t : ok)
+                if (got == t) return;
+            std::string want;
+            for (int t : ok) want += (want.empty() ? "" : " or ") + tname(t);
+            throw std::runtime_error(name + " is " + tname(got) + ", the kernel needs " + want +
+                                     " (see README: the GGUF)");
+        };
         for (int i = 0; i < NLA; i++) {
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
@@ -2230,12 +2253,19 @@ struct MKEngine::Impl {
                 L.k = up_mat(blk(i, "attn_k.weight"), D, KVD);
                 L.v = up_mat(blk(i, "attn_v.weight"), D, KVD);
                 L.o = up_mat(blk(i, "attn_output.weight"), VD, D);
+                need(blk(i, "attn_q.weight"), L.q.type, {T_Q4K});
+                need(blk(i, "attn_k.weight"), L.k.type, {T_Q4K});
+                need(blk(i, "attn_v.weight"), L.v.type, {T_Q4K, T_Q6K});
+                need(blk(i, "attn_output.weight"), L.o.type, {T_Q4K});
                 L.qn = up_f32(blk(i, "attn_q_norm.weight"), HD);
                 L.kn = up_f32(blk(i, "attn_k_norm.weight"), HD);
             } else {
                 L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
                 L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
                 L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D);
+                need(blk(i, "attn_qkv.weight"), L.qkv.type, {T_Q4K, T_Q6K});
+                need(blk(i, "attn_gate.weight"), L.gate.type, {T_Q4K});
+                need(blk(i, "ssm_out.weight"), L.sout.type, {T_Q5K});
                 L.conv = up_f32(blk(i, "ssm_conv1d.weight"), 4 * QKV);
                 L.dt = up_f32(blk(i, "ssm_dt.bias"), NVH);
                 L.A = up_f32(blk(i, "ssm_a"), NVH);
@@ -2244,6 +2274,11 @@ struct MKEngine::Impl {
                 const auto & ta = file.get(blk(i, "ssm_alpha.weight"));
                 const auto & tb = file.get(blk(i, "ssm_beta.weight"));
                 const auto & tn = file.get(blk(i, "attn_norm.weight"));
+                // read below as raw floats, so anything but F32 would be reinterpreted silently
+                need(blk(i, "ssm_alpha.weight"), (int) ta.type, {T_F32});
+                need(blk(i, "ssm_beta.weight"), (int) tb.type, {T_F32});
+                if (ta.ne[0] != D || ta.ne[1] != NVH || tb.ne[0] != D || tb.ne[1] != NVH)
+                    throw std::runtime_error(blk(i, "ssm_alpha/beta.weight") + " bad shape");
                 std::vector<float> ab((size_t) 2 * NVH * D);
                 const float * fa = (const float *) ta.data;
                 const float * fb = (const float *) tb.data;
@@ -2262,8 +2297,10 @@ struct MKEngine::Impl {
             L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF);
             L.fd = up_mat(blk(i, "ffn_down.weight"), FF, D);
             if (L.fg.type != T_Q4K || L.fu.type != T_Q4K) throw std::runtime_error("ffn gate/up must be Q4_K");
+            need(blk(i, "ffn_down.weight"), L.fd.type, {T_Q4K, T_Q6K});
         }
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+        need(blk(NL, "nextn.eh_proj.weight"), hw.eh.type, {T_Q8_0});
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
         hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
         hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
