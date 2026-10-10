@@ -36,7 +36,7 @@ class MegakernelSelectionTests(unittest.TestCase):
     def test_unsupported_gpu_is_reported(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
                 mock.patch.object(llama_server, "_megakernel_gpu", return_value=None):
-            self.assertIn("sm_86", megakernel_unavailable_reason(MODEL))
+            self.assertIn("RTX 30/40/50", megakernel_unavailable_reason(MODEL))
 
     def test_supported_setup_has_no_reason(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
@@ -75,9 +75,15 @@ class MegakernelGpuDetectionTests(unittest.TestCase):
             self.assertEqual(llama_server._megakernel_gpu(), "0")
 
     def test_small_or_other_arch_gpus_do_not_qualify(self) -> None:
-        with _nvidia_smi("0, GPU-aaa, 8.6, 12288", "1, GPU-bbb, 8.9, 24576"), \
+        with _nvidia_smi("0, GPU-aaa, 8.6, 12288", "1, GPU-bbb, 7.5, 24576", "2, GPU-ccc, 9.0, 81559"), \
                 mock.patch.dict(llama_server.os.environ, {}, clear=True):
             self.assertIsNone(llama_server._megakernel_gpu())
+
+    def test_ada_and_blackwell_24gb_gpus_qualify(self) -> None:
+        for cap, mem in (("8.9", "24564"), ("12.0", "32607")):
+            with _nvidia_smi(f"0, GPU-aaa, {cap}, {mem}"), \
+                    mock.patch.dict(llama_server.os.environ, {}, clear=True):
+                self.assertEqual(llama_server._megakernel_gpu(), "0")
 
 
 class MegakernelStartTests(unittest.TestCase):

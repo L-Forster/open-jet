@@ -38,10 +38,13 @@ _MTP_SPEC_ARGS: tuple[str, ...] = (
 
 
 # The Qwen3.8-27B megakernel (<openjet>/megakernel): a specialised CUDA engine for this one model and
-# quantisation on sm_86 GPUs (RTX 3090 class) with an OpenAI-compatible server in front of it.
+# quantisation on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120) with an OpenAI-compatible
+# server in front of it.
 _MEGAKERNEL_SERVER = Path("server") / "mk_server.py"
 _MEGAKERNEL_FILES = ("libqwen38mk.so", "draft_vocab_32k.bin", str(_MEGAKERNEL_SERVER))
 _MEGAKERNEL_MIN_VRAM_MIB = 23000
+# Ampere (RTX 30 / A-series), Ada (RTX 40 / Ada workstation), Blackwell (RTX 50 / Pro).
+_MEGAKERNEL_COMPUTE_CAPS = frozenset({"8.6", "8.9", "12.0"})
 
 
 def _megakernel_dir() -> Path | None:
@@ -78,7 +81,7 @@ def _megakernel_gpu() -> str | None:
         if pinned and pinned not in (index, uuid):
             continue
         try:
-            if cap == "8.6" and float(mem) >= _MEGAKERNEL_MIN_VRAM_MIB:
+            if cap in _MEGAKERNEL_COMPUTE_CAPS and float(mem) >= _MEGAKERNEL_MIN_VRAM_MIB:
                 return index
         except ValueError:
             continue
@@ -94,7 +97,8 @@ def megakernel_unavailable_reason(model: str) -> str | None:
     if importlib.util.find_spec("jinja2") is None:
         return "the megakernel server needs jinja2"
     if _megakernel_gpu() is None:
-        return f"the megakernel needs an sm_86 GPU with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB (RTX 3090 class)"
+        return (f"the megakernel needs an RTX 30/40/50-series GPU (sm_86, sm_89 or sm_120) "
+                f"with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB")
     return None
 
 

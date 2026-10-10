@@ -1,8 +1,8 @@
-# Qwen3.8-27B megakernel (RTX 3090)
+# Qwen3.8-27B megakernel (RTX 30/40/50 series)
 
 A specialised CUDA inference engine for `Qwen3.8-27B-Q4_K_M.gguf` (llama.cpp arch `qwen35`:
-48 Gated-DeltaNet + 16 gated-attention layers, one MTP block) on RTX 3090-class GPUs (sm_86,
-24 GB), with an OpenAI-compatible server that open-jet uses in place of `llama-server`
+48 Gated-DeltaNet + 16 gated-attention layers, one MTP block) on RTX 30, 40 and 50-series GPUs
+with 24 GB+ (sm_86, sm_89, sm_120; tuned and benchmarked on an RTX 3090), with an OpenAI-compatible server that open-jet uses in place of `llama-server`
 (`llama_backend: auto`, see [docs/runtimes/llama-cpp.md](../docs/runtimes/llama-cpp.md)).
 
 Decoding runs an entire speculative cycle in one persistent cooperative kernel launch:
@@ -77,7 +77,7 @@ the output can differ between `-d` settings.
 
 ## Build / run
 
-Requires CUDA 12+ (built with 13.2), an sm_86 GPU with 24 GB, and the repo's llama.cpp build (only
+Requires CUDA 12+ (12.8+ for RTX 50 series; built with 13.2), an sm_86, sm_89 or sm_120 GPU with 24 GB, and the repo's llama.cpp build (only
 `libllama`, for tokenization, loaded vocab-only).
 
 ```sh
@@ -179,8 +179,9 @@ processing the whole conversation as one fresh prompt.
 
 ## Limitations
 
-- Specialised to this model's shapes and quant mix (27B, Q4_K_M as published by unsloth) and to
-  sm_86; the loader rejects anything else.
+- Specialised to this model's shapes and quant mix (27B, Q4_K_M as published by unsloth); the loader
+  rejects any other model. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
+  GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
   repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).
 - Text only; one sequence and one checkpoint: a conversation is reused while it grows (or diverges

@@ -12,8 +12,9 @@ OpenJet is a coding agent for local models, plus the runtime that serves them. I
 hardware, picks a model that fits, downloads it, runs the inference server, and gives you an agent
 that edits files and runs commands. No account, API key or hosted service.
 
-On an **RTX 3090**, OpenJet serves Qwen3.8-27B through its own CUDA engine at **1.5x the speed of
-llama.cpp**: 78 tok/s in reasoning mode, up to 140 tok/s writing code.
+On NVIDIA **RTX 30, 40 and 50-series GPUs with 24 GB+**, OpenJet serves Qwen3.8-27B through its own
+CUDA engine at **1.5x the speed of llama.cpp**. On an RTX 3090: 78 tok/s in reasoning mode, up to
+140 tok/s writing code.
 
 [Discord](https://discord.com/invite/pspKHtExSa)
 
@@ -32,10 +33,12 @@ GGUF, builds or reuses `llama-server`, and sets the context window and GPU offlo
 Recommended: a GPU with 14 GB+ VRAM, or Apple silicon with 24 GB+ unified memory. CPU-only works
 too ([Deployment: CPU-only](docs/deployment/cpu-only.md)).
 
-## RTX 3090: the megakernel
+## RTX 30/40/50-series GPUs: the megakernel
 
-For Qwen3.8-27B Q4_K_M on an RTX 3090 (sm_86, 24 GB), OpenJet replaces `llama-server` with
-[`megakernel/`](megakernel/README.md), a CUDA engine written for that one model and GPU. Each
+For Qwen3.8-27B Q4_K_M on an RTX 30, 40 or 50-series GPU with 24 GB or more (sm_86, sm_89, sm_120,
+including the matching RTX workstation cards), OpenJet replaces `llama-server` with
+[`megakernel/`](megakernel/README.md), a CUDA engine written for that one model. Benchmarks below are
+from an RTX 3090. Each
 decode step runs as a single persistent kernel launch and verifies 4-5 drafted tokens per pass.
 
 | RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet megakernel |
@@ -196,8 +199,9 @@ running `llama-server` or the megakernel itself.
 **Can it use a cloud model?** Only if you choose one. `/mode` switches between Local, Codex,
 OpenRouter and Slipstream; local llama.cpp is the default.
 
-**Does the megakernel work on other GPUs or models?** No. It's written for Qwen3.8-27B Q4_K_M on
-sm_86 with 24 GB. Everything else uses `llama-server`.
+**Does the megakernel work on other GPUs or models?** It serves Qwen3.8-27B Q4_K_M on RTX 30, 40 and
+50-series GPUs with 24 GB or more (sm_86, sm_89, sm_120). It's tuned on an RTX 3090; `make` builds it
+for whichever of these GPUs you have. Everything else uses `llama-server`.
 
 ## Docs
 

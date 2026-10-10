@@ -16,7 +16,8 @@ The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/b
 
 ## Qwen3.8-27B megakernel backend (RTX 3090)
 
-For one specific setup, Qwen3.8-27B Q4_K_M on an RTX 3090-class GPU (sm_86, 24 GB), OpenJet ships a
+For one specific setup, Qwen3.8-27B Q4_K_M on an RTX 30, 40 or 50-series GPU with 24 GB+ (sm_86, sm_89,
+sm_120), OpenJet ships a
 specialised CUDA engine in [`megakernel/`](../../megakernel/README.md) and serves the model through it
 instead of `llama-server`. Measured on an RTX 3090 against `llama-server` with OpenJet's flags:
 
@@ -34,8 +35,8 @@ cd megakernel && make
 ```
 
 With `llama_backend: auto` (the default) OpenJet then starts `megakernel/server/mk_server.py`
-whenever the configured model is Qwen3.8-27B Q4_K_M, the megakernel is built, the GPU is sm_86 with
-at least 23 GB and `jinja2` is installed; in every other case, or if the megakernel fails to start,
+whenever the configured model is Qwen3.8-27B Q4_K_M, the megakernel is built, the GPU is sm_86, sm_89 or
+sm_120 with at least 23 GB and `jinja2` is installed; in every other case, or if the megakernel fails to start,
 it starts `llama-server` as usual. `llama_backend: llama` turns it off, `llama_backend: megakernel`
 makes it required. `OPENJET_MEGAKERNEL_DIR` points at a megakernel build elsewhere.
 

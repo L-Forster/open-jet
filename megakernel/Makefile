@@ -1,6 +1,8 @@
 LLAMA ?= ../llama.cpp
 NVCC ?= /usr/local/cuda/bin/nvcc
-ARCH ?= sm_86
+# the first GPU's architecture (sm_86 RTX 30, sm_89 RTX 40, sm_120 RTX 50); sm_86 if nvidia-smi is missing
+ARCH ?= $(or $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | tr -d '. '),86)
+ARCH := sm_$(patsubst sm_%,%,$(ARCH))
 NVFLAGS = -O3 -std=c++17 -arch=$(ARCH) -lineinfo -Xptxas -dlcm=cg -Xptxas -v -Xcompiler -fPIC
 
 all: qwen38_mk libqwen38mk.so tools/vocab_freq
