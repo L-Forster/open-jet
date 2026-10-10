@@ -1,6 +1,7 @@
 // Qwen3.8-27B (llama.cpp arch "qwen35", shared with Qwen3.5/3.6) single-launch-per-cycle CUDA megakernel decoder.
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,13 @@ class MKEngine {
     // Teacher-forced greedy predictions: pred[i] = argmax of the next-token distribution after
     // tokens[0..i] (resets the sequence).
     std::vector<int> score(const std::vector<int> & tokens);
+    // Teacher-forced next-token logits (resets the sequence): sink(i0, n, logits) receives the logits
+    // ([n][n_vocab()], valid during the call) after tokens[0..i] for i = i0 .. i0 + n - 1, in position
+    // order, for all positions >= first.  Positions below mk_from are processed by the batched
+    // prefill kernels, the others by the decode megakernel.
+    using LogitSink = std::function<void(int i0, int n, const float * logits)>;
+    void score_logits(const std::vector<int> & tokens, int mk_from, int first, const LogitSink & sink);
+    static int n_vocab();
     void bench_phases();
     int n_draft() const { return n_draft_; }
     MKStats stats;

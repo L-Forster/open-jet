@@ -68,12 +68,50 @@ which add 1-8% to the megakernel's decode here.)
 With the q8_0 KV cache (chosen automatically for contexts above ~80K tokens, e.g. open-jet's 100K)
 decode is ~1-2% and prefill 2-7% slower than with fp16.
 
-**Correctness.** Teacher-forced on llama.cpp's own outputs, the megakernel's greedy prediction
-agrees at 99.3-100% of positions (`--score`: 99.6-100%); the few disagreements are near-ties from
-different float rounding. Speculative verification is exact: greedy output is the main model's
-greedy choice, and with sampling the token distribution is the same as without drafts (2000-sample
-test per position). Verifying 1 vs 4 tokens per pass rounds slightly differently, so on near-ties
-the output can differ between `-d` settings.
+**Correctness.** The output is not byte-identical to llama.cpp's: the arithmetic is ordered and
+rounded differently, so where two tokens are close the other one can win, and a generation then
+continues differently. Measured against llama.cpp's own next-token distributions (same GGUF,
+13,299 positions of code and prose from this repo, each after a 1024-token prompt; reference:
+llama.cpp generating token by token with its q8_0 KV cache, as open-jet runs it):
+
+| against llama.cpp generating token by token | top token agrees | KL divergence (mean, nats) | perplexity (reference 2.4263) |
+|---|---|---|---|
+| llama.cpp, batched instead | 98.68% | 0.0019 | 2.4283 |
+| llama.cpp, fp16 KV cache instead | 99.17% | 0.0007 | 2.4284 |
+| megakernel (prefill kernels, then the decode kernel), q8_0 KV | 99.08% | 0.0009 | 2.4274 |
+| megakernel, fp16 KV | 99.11% | 0.0008 | 2.4273 |
+| megakernel, prefill kernels only, q8_0 KV | 99.01% | 0.0009 | 2.4275 |
+
+The megakernel is as close to llama.cpp as llama.cpp's own configurations are to each other, and
+its log-loss differs by +0.0005 +- 0.0004 (not significant). Most top-token disagreements are
+near-ties (median lead of llama.cpp's token 0.03-0.04 nats); in 2-3 of ~120 it led by more than
+0.5 nats, as it does in llama.cpp against itself (4 of 176).
+
+At a 30K context (one sequence, 1,999 positions scored after a 28,000-token prompt, same
+reference setup) the megakernel agrees on 99.65% of top tokens with KL 0.0007 (q8_0 KV; fp16:
+99.55%, 0.0007), llama.cpp batched on 99.35% with KL 0.0009; log-loss against the reference is
++0.0018 +- 0.001 (fp16 KV +0.0027), llama.cpp batched +0.0017. At 96K (open-jet's setting; 1,999
+positions after a 94,000-token prompt, q8_0 KV) the megakernel agrees on 99.60% with KL 0.0008 and
+log-loss +0.0012 +- 0.001, llama.cpp batched on 99.45% with KL 0.0014 and +0.0015 +- 0.002. Each
+long-context figure is from a single sequence of this repo's code. To reproduce:
+
+```sh
+make tools/llama_ref
+tools/llama_ref -m model.gguf -f code.txt -f prose.txt --score-from 1024 -b 1 --ref-out llama.ref
+tools/llama_ref -m model.gguf --kld llama.ref                            # llama.cpp batched: the noise floor
+./qwen38_mk -m model.gguf --kld llama.ref --score-path mixed --kv q8     # the megakernel
+```
+
+`llama_ref` teacher-forces 2048-token chunks of the text (`--chunk`) and stores, per scored
+position, the 256 most likely tokens (`logit_stats.h`); `--kld` compares an engine with such a file
+(`--ref-out` also writes its own). `--score-path` selects the megakernel's batched prefill kernels
+(`prefill`, the default), the decode kernel (`decode`), or the prefill kernels for the unscored
+prompt and the decode kernel for the scored positions (`mixed`, what a generation runs).
+
+Speculative verification is exact: greedy output is the main model's greedy choice, and with
+sampling the token distribution is the same as without drafts (2000-sample test per position).
+Verifying 1 vs 4 tokens per pass rounds slightly differently, so on near-ties the output can differ
+between `-d` settings.
 
 ## Build / run
 
@@ -93,7 +131,8 @@ draft), `-c` KV capacity, `--kv f16|q8|auto` (KV cache format), `--think [xhigh|
 (reasoning mode; the chat template's default effort is xhigh), `--temp` / `--top-p` / `--top-k` /
 `--min-p` / `--seed` (sampling; default greedy), `--raw` (no chat template), `--ids`,
 `--prompt-ids f` (prompt as token ids), `--turn2 text` / `--turn2-file f` (a second user turn
-appended to the conversation), `--score ids.txt` (teacher-forced agreement), `MK_PROFILE=1`
+appended to the conversation), `--score ids.txt` (teacher-forced agreement), `--kld ref` (KL
+divergence, perplexity and agreement against a reference file, see Correctness), `MK_PROFILE=1`
 (per-phase timing, including a "min-composed" estimate that filters out time-slicing by other GPU
 users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
 megakernel instead).
@@ -225,4 +264,6 @@ processing the whole conversation as one fresh prompt.
 - `gguf.h` - minimal mmap GGUF reader
 - `draft_vocab_32k.bin` - MTP draft-head token subset (int32 ids)
 - `tools/vocab_freq.cpp` - builds a draft vocabulary from a list of text files
+- `tools/llama_ref.cpp` / `logit_stats.h` - llama.cpp's next-token distributions and the comparison
+  with them (KL divergence, perplexity, top-token agreement)
 - `bench/` - benchmarks (see Build / run)

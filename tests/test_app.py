@@ -1179,7 +1179,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(str(payload["model_download_path"]).endswith("Qwen3.8-27B-Q4_K_M.gguf"))
         self.assertEqual(
             payload["model_download_url"],
-            "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf?download=true",
+            "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf?download=true",
         )
         self.assertTrue(payload["llama_mtp"])
         self.assertGreater(int(payload["context_window_tokens"]), 6144)

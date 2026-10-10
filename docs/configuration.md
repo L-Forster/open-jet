@@ -48,7 +48,7 @@ setup_recommendations:
     - max_ram_gb: 20
       label: Qwen3.8 27B Q4_K_M MTP
       filename: Qwen3.8-27B-Q4_K_M.gguf
-      url: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q4_K_M.gguf?download=true
+      url: https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf?download=true
       llama_mtp: true
       model_size_mb: 16896
       kv_bytes_per_token: 34816

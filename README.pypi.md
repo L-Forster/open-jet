@@ -10,7 +10,7 @@ approved shell commands, uses tools, and keeps sessions on your machine. It conn
 Ollama, LM Studio, llama.cpp, and other OpenAI-compatible local servers. If you do not
 already have a local AI stack, `openjet setup` downloads, configures, and serves one for you.
 
-RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP. Open source.
+On NVIDIA RTX 30, 40 and 50-series GPUs with 24 GB+, OpenJet serves Qwen3.8-27B through its own CUDA engine at **1.5x the speed of llama.cpp** (measured on an RTX 3090). Open source.
 
 [Discord](https://discord.gg/pspKHtExSa)
 
@@ -28,7 +28,7 @@ downloads at runtime, so your users never fetch a file or see a config.
 
 No hosted API is required. With a local profile, no code or prompt data leaves your machine.
 
-RTX 3090 + Qwen 27B: **33 tok/s -> 70 tok/s** with MTP.
+On NVIDIA RTX 30, 40 and 50-series GPUs with 24 GB+, OpenJet serves Qwen3.8-27B through its own CUDA engine at **1.5x the speed of llama.cpp** (measured on an RTX 3090).
 
 Open source.
 
@@ -57,6 +57,24 @@ openjet
 `openjet setup` detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
 
 Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14GB+ VRAM.
+
+## Qwen3.8-27B megakernel (NVIDIA RTX, 24GB+)
+
+For Qwen3.8-27B Q4_K_M on Linux with an RTX 30, 40 or 50-series GPU that has 24GB or more, OpenJet serves the model through its own CUDA engine instead of `llama-server`. On an RTX 3090 it decodes at 1.5x llama.cpp's speed in the agent's reasoning mode (78 vs 51 tok/s) and up to 1.9x when writing code (140 vs 73 tok/s).
+
+The engine ships in this package as source, from version 0.4.32. `openjet setup` compiles it for your GPU:
+
+```bash
+pip install --upgrade open-jet
+openjet setup        # choose "Qwen3.8 27B Q4_K_M MTP"
+openjet
+```
+
+You need the CUDA toolkit installed, for `nvcc` (CUDA 12 or newer; 12.8 or newer for RTX 50). The compile takes about 2 minutes and ends with `Megakernel built: OpenJet will serve Qwen3.8-27B with it.` If you set OpenJet up before 0.4.32, upgrade and run `openjet setup` again.
+
+If setup can't build it, it prints `Skipping the Qwen3.8-27B megakernel (...)` with the reason and OpenJet uses `llama-server` instead, so setup still finishes. While OpenJet is running, `pgrep -af mk_server.py` prints a line when the megakernel is serving.
+
+It has been benchmarked on an RTX 3090 only. Benchmarks and details: [megakernel README](https://github.com/l-forster/open-jet/tree/master/megakernel).
 
 ## CLI
 
@@ -224,6 +242,7 @@ This wheel includes the full OpenJet package:
 - CLI entrypoint `openjet` (installed as `open-jet` on PyPI)
 - Benchmark entrypoints via `openjet benchmark`
 - The local/session runtime shared by the SDK and CLI
+- Source for the Qwen3.8-27B megakernel (`megakernel/`), compiled by `openjet setup`
 
 ## Repository
 

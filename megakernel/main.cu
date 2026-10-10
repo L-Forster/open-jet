@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "llama.h"
+#include "logit_stats.h"
 #include "qwen38_mk.h"
 
 static void usage() {
@@ -20,7 +21,9 @@ static void usage() {
             "                 [--prompt-ids f]   (prompt given as whitespace-separated token ids)\n"
             "                 [--think [xhigh|medium|low]]   (reasoning mode, the chat template's default effort is xhigh)\n"
             "                 [--temp t] [--top-p p] [--top-k k] [--min-p p] [--seed s]   (default: greedy)\n"
-            "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n");
+            "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n"
+            "                 [--kld ref [--ref-out f] [--score-path prefill|decode|mixed]]   (KL divergence, perplexity and\n"
+            "                     top-token agreement against a reference file of tools/llama_ref or of --ref-out)\n");
     exit(1);
 }
 
@@ -33,6 +36,10 @@ int main(int argc, char ** argv) {
     std::string turn2;      // optional second user turn
     std::string prompt_ids_file;
     std::string think;      // reasoning effort; empty: thinking disabled (empty think block)
+    // teacher-forced comparison with a reference file; its sequences go through the batched prefill
+    // kernels, the decode megakernel, or (mixed) the unscored prefix through the former, like a prompt,
+    // and the scored positions through the latter (the first half and the rest when all are scored)
+    std::string kld_file, ref_out, score_path = "prefill";
     float temp = 0.f, top_p = 1.f, min_p = 0.f;
     int top_k = 32;
     unsigned long long seed = 1;
@@ -52,6 +59,9 @@ int main(int argc, char ** argv) {
         else if (a == "--quiet") quiet = true;
         else if (a == "--bench-phases") bench_phases = true;
         else if (a == "--score") score_file = next();
+        else if (a == "--kld") kld_file = next();
+        else if (a == "--ref-out") ref_out = next();
+        else if (a == "--score-path") score_path = next();
         else if (a == "--turn2") turn2 = next();
         else if (a == "--prompt-ids") prompt_ids_file = next();
         else if (a == "--think") think = (i + 1 < argc && argv[i + 1][0] != '-') ? next() : "xhigh";
@@ -64,7 +74,8 @@ int main(int argc, char ** argv) {
         else if (a == "--turn2-file") { std::ifstream f(next()); std::stringstream ss; ss << f.rdbuf(); turn2 = ss.str(); }
         else usage();
     }
-    if (model.empty()) usage();
+    if (model.empty() || (kld_file.empty() && !ref_out.empty())) usage();
+    if (score_path != "prefill" && score_path != "decode" && score_path != "mixed") usage();
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
@@ -98,6 +109,23 @@ int main(int argc, char ** argv) {
         int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, false);
         return std::string(buf, n > 0 ? n : 0);
     };
+
+    if (!kld_file.empty()) {
+        ls::Session ses(kld_file, ref_out, {}, MKEngine::n_vocab());
+        size_t longest = 0;
+        for (const ls::Seq & q : ses.seqs()) longest = std::max(longest, q.tok.size());
+        MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode);
+        for (size_t s = 0; s < ses.seqs().size(); s++) {
+            const ls::Seq & q = ses.seqs()[s];
+            const int N = (int) q.tok.size();
+            const int mk_from = score_path == "decode" ? 0 : score_path == "prefill" ? N : q.first > 0 ? q.first : N / 2;
+            eng.score_logits(q.tok, mk_from, q.first, [&](int i0, int n, const float * l) { ses.rows((int) s, i0, n, l); });
+            fprintf(stderr, "\r%zu / %zu sequences", s + 1, ses.seqs().size());
+        }
+        fprintf(stderr, "\n");
+        ses.report(piece);
+        return 0;
+    }
 
     MKEngine eng(model, ctx, n_draft, draft_vocab, kv_mode);
     eng.set_sampling(temp, top_p, top_k, min_p, seed);

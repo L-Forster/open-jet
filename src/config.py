@@ -49,7 +49,8 @@ QWEN36_35B_A3B_NON_MTP_REPO = "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GG
 QWEN36_35B_A3B_MTP_UPDATE_ID = "qwen36-35b-a3b-mtp-unsloth"
 QWEN38_27B_REPO = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"
 QWEN38_27B_FILENAME = "Qwen3.8-27B-Q4_K_M.gguf"
-QWEN38_27B_URL = f"{QWEN38_27B_REPO}/resolve/main/{QWEN38_27B_FILENAME}?download=true"
+# pinned: unsloth deleted this file from main (2026-08-19); the last revision that had it still serves it
+QWEN38_27B_URL = f"{QWEN38_27B_REPO}/resolve/566347e99d832d31f6245a577198d10d5bdd389e/{QWEN38_27B_FILENAME}?download=true"
 MANAGED_MODELS_DIR = openjet_install_root() / "models"
 
 

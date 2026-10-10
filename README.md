@@ -51,9 +51,38 @@ decode step runs as a single persistent kernel launch and verifies 4-5 drafted t
 Each figure is a single conversation, not a batch. llama.cpp runs with OpenJet's flags, including
 MTP speculative decoding.
 
-`openjet setup` compiles it for your GPU when it picks this model and the CUDA toolkit (`nvcc`) is
-installed; it takes about 2 minutes. With the default `llama_backend: auto`, OpenJet uses it
-whenever the model and GPU match and falls back to `llama-server` otherwise. See
+### Getting the megakernel
+
+It ships as source in the PyPI package (0.4.32 and later) and `openjet setup` compiles it on your
+machine, for your GPU:
+
+```bash
+pipx install open-jet     # already installed? pipx upgrade open-jet
+openjet setup             # choose "Qwen3.8 27B Q4_K_M MTP"
+openjet
+```
+
+You need:
+
+- Linux with an NVIDIA RTX 30, 40 or 50-series GPU that has 24 GB or more
+- the CUDA toolkit, for `nvcc` (CUDA 12 or newer; 12.8 or newer for RTX 50)
+- the Qwen3.8 27B Q4_K_M model from the setup catalog
+
+Setup builds llama.cpp with CUDA, then compiles the megakernel against it. The compile takes about
+2 minutes and ends with `Megakernel built: OpenJet will serve Qwen3.8-27B with it.` If you set
+OpenJet up before 0.4.32, upgrade and run `openjet setup` again.
+
+If setup can't build it, it prints `Skipping the Qwen3.8-27B megakernel (...); using llama-server.`
+with the reason, most often a missing CUDA toolkit, and OpenJet serves the model with `llama-server`
+instead. To see which engine is serving while OpenJet is running:
+
+```bash
+pgrep -af mk_server.py    # prints a line when the megakernel is serving
+```
+
+`llama_backend` in `config.yaml` controls this: `auto` (the default) uses the megakernel whenever the
+model and GPU match, `llama` always uses `llama-server`, and `megakernel` fails instead of falling
+back. From a source checkout you can also build it by hand with `cd megakernel && make`. See
 [the llama.cpp runtime docs](docs/runtimes/llama-cpp.md#qwen38-27b-megakernel-backend-rtx-3090).
 
 ## Tuned to the hardware

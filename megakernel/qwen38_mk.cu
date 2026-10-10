@@ -144,6 +144,7 @@ struct Bufs {
     const float2 * rope; // [ctx][32] (cos, sin) of pos * base^(-2i/64)
     float2 * blk_best; // per block: best (logit, id) per row, or the TOPK_MAX best when sampling
     float2 * cand;     // [MAXT][TOPK_MAX] best (logit, id) of the main lm_head rows, descending (sampling)
+    float * logits;    // [MAXT][VOCAB] main lm_head logits of a scoring launch (Launch::score == 2)
     unsigned * bar;
     unsigned * cnt;
     Ctl * ctl;
@@ -156,7 +157,7 @@ __constant__ Bufs cB;
 
 struct Launch {
     int mode, T, last, ndraft;
-    int score; // prefill only: greedy argmax for every row (teacher-forced evaluation), no MTP
+    int score; // prefill only: greedy argmax for every row (teacher-forced evaluation), no MTP; 2: also their logits
     // sampling (temp > 0; greedy otherwise), applied in llama.cpp's order: top_k, top_p, min_p, temperature
     float temp, top_p, min_p;
     int top_k; // <= TOPK_MAX
@@ -1530,8 +1531,9 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
 
 // lm_head over TL rows (qn rows t0..t0+TL-1) with greedy argmax; returns true in the single
 // block that finished last, which holds the reduced argmax in s_tok.  TOPK: additionally keeps the
-// TOPK_MAX best logits of each row in cB.cand (for sampling).
-template <int TL, bool TOPK = false>
+// TOPK_MAX best logits of each row in cB.cand (for sampling).  FULL: additionally stores every
+// logit of each row in cB.logits (scoring).
+template <int TL, bool TOPK = false, bool FULL = false>
 __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok) {
     uint8_t * const sm = smem;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -1552,6 +1554,15 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
         zero_acc<TL, 2>(a);
         mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
         wsum_acc<TL, 2>(a);
+        if constexpr (FULL) {
+            if (lane == 0) {
+#pragma unroll
+                for (int t = 0; t < TL; t++) {
+                    cB.logits[(size_t) (t0 + t) * VOCAB + r] = a[0][t] * m[t];
+                    cB.logits[(size_t) (t0 + t) * VOCAB + r + 1] = a[1][t] * m[t];
+                }
+            }
+        }
 #pragma unroll
         for (int t = 0; t < TL; t++) {
             if constexpr (TOPK) { // true logits: apply the final RMS norm scale (irrelevant to the argmax)
@@ -1807,7 +1818,9 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
     int tl = 0;
     const bool sampling = P.temp > 0.0f && !P.score;
     if (P.mode == MODE_DECODE || P.score) {
-        am_last = sampling ? lm_head<T, true>(0, false, sm, s_tok) : lm_head<T>(0, false, sm, s_tok);
+        if (sampling) am_last = lm_head<T, true>(0, false, sm, s_tok);
+        else if (P.score == 2) am_last = lm_head<T, false, true>(0, false, sm, s_tok);
+        else am_last = lm_head<T>(0, false, sm, s_tok);
         tl = T;
     } else if (P.last) {
         am_last = sampling ? lm_head<1, true>(T - 1, false, sm, s_tok) : lm_head<1>(T - 1, false, sm, s_tok);
@@ -2395,6 +2408,7 @@ struct MKEngine::Impl {
         hb.hm = dalloc<float>(D);
         hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
         hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
+        hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
         hb.bar = dalloc<unsigned>(4);
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
@@ -2675,8 +2689,10 @@ struct MKEngine::Impl {
     }
 
     // Runs positions n0 .. n0 + toks.size() - 1 through the trunk (and the MTP block's K/V).
-    // score: instead of MTP, greedy argmax of every position -> pred.
-    void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred) {
+    // score: instead of MTP, greedy argmax of every position -> pred, and / or the logits of the
+    // positions >= first -> sink.
+    void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink = nullptr,
+                int first = 0) {
         pf_init();
         const int N = (int) toks.size(), cap = hp.cap;
         if (n0 == 0) CK(cudaMemset(hp.h, 0, D * sizeof(float)));
@@ -2712,16 +2728,26 @@ struct MKEngine::Impl {
                 pf_time("gemm_ffn_gu", [&] { gemm_glu(W.fg, W.fu, T); });
                 pf_time("gemm_ffn_down", [&] { gemm(W.fd, T, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
             }
-            if (pred) {
+            if (pred || sink) {
                 pk_norm_quant<<<T, 256>>>(hp.x, hw.onorm);
+                std::vector<float> rows;
                 for (int s = 0; s < T; s += 128) {
                     const int nt = std::min(128, T - s);
+                    const int lo = std::max(s, first - n); // rows from lo on are at positions >= first
+                    if (!pred && lo >= s + nt) continue;
                     gemm(hw.head, nt, hp.y0, VOCAB, pf::OUT_STORE, s);
-                    pk_argmax<<<nt, 256>>>(s);
+                    if (pred) pk_argmax<<<nt, 256>>>(s);
+                    if (sink && lo < s + nt) {
+                        rows.resize((size_t) (s + nt - lo) * VOCAB);
+                        CK(cudaMemcpy(rows.data(), hp.y0 + (size_t) (lo - s) * VOCAB, rows.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                        (*sink)(n + lo, s + nt - lo, rows.data());
+                    }
                 }
-                std::vector<int> am(T);
-                CK(cudaMemcpy(am.data(), hp.amax, T * sizeof(int), cudaMemcpyDeviceToHost));
-                pred->insert(pred->end(), am.begin(), am.end());
+                if (pred) {
+                    std::vector<int> am(T);
+                    CK(cudaMemcpy(am.data(), hp.amax, T * sizeof(int), cudaMemcpyDeviceToHost));
+                    pred->insert(pred->end(), am.begin(), am.end());
+                }
                 continue;
             }
             pf_time("mtp", [&] {
@@ -2865,6 +2891,36 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
         i += T;
     }
     return pred;
+}
+
+int MKEngine::n_vocab() { return VOCAB; }
+
+void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int first, const LogitSink & sink) {
+    const int N = (int) tokens.size();
+    if (N + 8 > p_->ctx) throw std::runtime_error("sequence exceeds context");
+    reset();
+    mk_from = std::min(std::max(mk_from, 0), N);
+    if (mk_from > 0)
+        p_->pf_run(std::vector<int>(tokens.begin(), tokens.begin() + mk_from), 0, nullptr, first < mk_from ? &sink : nullptr, first);
+    Ctl & c = p_->hctl;
+    CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+    c.dn_c = mk_from;
+    std::vector<float> rows((size_t) MAXT * VOCAB);
+    for (int i = mk_from; i < N;) {
+        const int T = std::min(MAXT, N - i);
+        c.n = i;
+        for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
+        CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
+        p_->launch(MODE_PREFILL, T, 0, 2);
+        CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        const int s = std::max(0, first - i);
+        if (s < T) {
+            CK(cudaMemcpy(rows.data(), p_->hb.logits + (size_t) s * VOCAB, (size_t) (T - s) * VOCAB * sizeof(float), cudaMemcpyDeviceToHost));
+            sink(i + s, T - s, rows.data());
+        }
+        i += T;
+    }
+    reset();
 }
 
 int MKEngine::step(std::vector<int> & out) {
