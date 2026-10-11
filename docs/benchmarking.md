@@ -129,6 +129,70 @@ Full logs, prompts and UUIDs under `benchmark_results/` remain ignored machine-l
 Save executable/library fingerprints and GPU UUIDs alongside repeat results rather than
 inferring a baseline version.
 
+### Fresh-context prefill comparison on two GPUs
+
+`megakernel/bench/prefill_bench.py` measures 2,048, 4,096 and 8,192 **actual input tokens**
+at a 16,384-token context capacity. Prepare shared token IDs once, then run each backend on its
+own GPU using the same workload file:
+
+```bash
+python megakernel/bench/prefill_bench.py --backend prepare \
+    --model models/Qwen3.8-27B-Q4_K_M.gguf --gpu "$MK_GPU_UUID" \
+    --output prefill-workloads.json
+python megakernel/bench/prefill_bench.py --backend llama \
+    --model models/Qwen3.8-27B-Q4_K_M.gguf \
+    --llama-server /path/to/llama.cpp/build/bin/llama-server --gpu "$LLAMA_GPU_UUID" \
+    --workload prefill-workloads.json --output prefill-llama.json
+python megakernel/bench/prefill_bench.py --backend megakernel \
+    --model models/Qwen3.8-27B-Q4_K_M.gguf --gpu "$MK_GPU_UUID" \
+    --workload prefill-workloads.json --output prefill-megakernel.json
+```
+
+The preparation command loads the existing megakernel library to tokenize an original CC0
+synthetic garden ledger/Python-code corpus; it does not run inference. The measured run's IDs
+were prepared with vocab-only libllama on CPU. Both use the same model tokenizer, with special
+tokens parsed and no automatic special-token insertion. Each length is a prefix of one raw
+tokenization; the JSON records exact IDs, model identity and token hashes. Keep the workload file
+when comparing different tokenizer/library builds.
+
+Each backend loads its model once. One excluded, same-process warmup per input length precedes
+three timed repetitions. The megakernel uses the existing synchronous C API, q8 KV, four initial
+MTP drafts and the 32K draft vocabulary; reset and empty-sequence checks precede every request.
+llama.cpp uses q8_0 KV, MTP 2, batch 2,048 and microbatch 512. Its owned server erases slot 0
+before every request, disables prompt caching and checks that the full input was evaluated
+without truncation. Port 8095 must be free. `--slot-save-path` is provided so slot erasure is
+enabled, not merely slot monitoring.
+
+These are **warmed, fresh-context prompt-processing timings**, not pure GEMM speed or
+end-to-end HTTP time-to-first-token. Both evaluate the whole input and produce one token, with
+no subsequent decode. llama.cpp's native prompt timer ends after synchronized first-token
+sampling in the available server source; the measured binary still reports an unknown version.
+The megakernel timer wraps synchronous `Engine.prefill`, including Python/ctypes input conversion,
+C++ vector copying, the last prompt token's persistent-kernel step, checkpoint work and initial
+draft setup. Model loading, reset/slot erase and warmup allocation are outside the timed samples.
+The scopes are not identical, so throughput ratios describe these paths rather than isolated
+prefill kernels.
+
+All three repetitions contribute to each result: total input tokens divided by total measured
+seconds, not best-of. Outputs retain raw samples and fingerprints. `--mk-mode cli` is an optional
+alternative with fresh processes; it includes per-process lazy allocation and is **not** the
+warmed C API method used here.
+
+Measured on GPU 2 (llama.cpp) and GPU 3 (megakernel), both Quadro RTX 8000:
+
+| Input tokens | llama.cpp mean s | llama.cpp tok/s | megakernel mean s | megakernel tok/s | Measured-path ratio |
+|---|---:|---:|---:|---:|---:|
+| 2,048 | 3.228 | 634.40 | 2.802 | 730.80 | 1.15x |
+| 4,096 | 6.906 | 593.12 | 6.281 | 652.17 | 1.10x |
+| 8,192 | 15.922 | 514.51 | 13.720 | 597.10 | 1.16x |
+
+The [sanitized prefill record](benchmarks/rtx8000-turing-prefill.json) contains all 18 timed
+samples, exact input hashes, settings and final-library fingerprints. The repeat preparation
+command was verified to reproduce the measured CPU-tokenized inputs exactly. These measurements
+use the final rebuilt megakernel library, unlike the earlier reasoning-decode measurements.
+Results from one synthetic workload do not establish KLD, output quality, long-context quality
+or universal speedups; cross-card clocks/load and the different timer overheads remain caveats.
+
 ## Related surfaces
 
 - If you want to **use** OpenJet interactively, go to [CLI usage](usage/cli.md).
