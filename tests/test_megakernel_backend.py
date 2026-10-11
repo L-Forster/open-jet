@@ -31,13 +31,20 @@ class MegakernelSelectionTests(unittest.TestCase):
             self.assertIn("only supports", megakernel_unavailable_reason(model))
 
     def test_setup_selector_names_the_runtime(self) -> None:
-        with mock.patch.object(llama_server, "_megakernel_gpu", return_value="0"):
+        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")):
             self.assertEqual(llama_server.model_runtime_label(MODEL), "OpenJet megakernel, 1.5x faster")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.8-27B-UD-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.5-9B-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/mmproj-Qwen3.8-27B-BF16.gguf"), "llama.cpp")
-        with mock.patch.object(llama_server, "_megakernel_gpu", return_value=None):
+        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=None):
             self.assertEqual(llama_server.model_runtime_label(MODEL), "llama.cpp")
+
+    def test_turing_selector_does_not_claim_ampere_benchmark_speed(self) -> None:
+        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("3", "7.5")):
+            self.assertEqual(llama_server.model_runtime_label(MODEL), llama_server.MEGAKERNEL_TURING_LABEL)
+            with mock.patch.object(llama_server.Path, "is_file", return_value=True), \
+                    mock.patch.object(llama_server, "_megakernel_quant_mix", return_value="native"):
+                self.assertEqual(llama_server.model_runtime_label(MODEL), llama_server.MEGAKERNEL_TURING_LABEL)
 
     def test_missing_build_is_reported(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=None):
@@ -45,12 +52,12 @@ class MegakernelSelectionTests(unittest.TestCase):
 
     def test_unsupported_gpu_is_reported(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
-                mock.patch.object(llama_server, "_megakernel_gpu", return_value=None):
+                mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=None):
             self.assertIn("RTX 30/40/50", megakernel_unavailable_reason(MODEL))
 
     def test_supported_setup_has_no_reason(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
-                mock.patch.object(llama_server, "_megakernel_gpu", return_value="0"):
+                mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")):
             self.assertIsNone(megakernel_unavailable_reason(MODEL))
 
     def test_backend_setting_is_validated(self) -> None:
@@ -85,7 +92,7 @@ class MegakernelGpuDetectionTests(unittest.TestCase):
             self.assertEqual(llama_server._megakernel_gpu(), "0")
 
     def test_small_or_other_arch_gpus_do_not_qualify(self) -> None:
-        with _nvidia_smi("0, GPU-aaa, 8.6, 12288", "1, GPU-bbb, 7.5, 24576", "2, GPU-ccc, 9.0, 81559"), \
+        with _nvidia_smi("0, GPU-aaa, 8.6, 12288", "1, GPU-bbb, 7.0, 24576", "2, GPU-ccc, 9.0, 81559"), \
                 mock.patch.dict(llama_server.os.environ, {}, clear=True):
             self.assertIsNone(llama_server._megakernel_gpu())
 
@@ -94,6 +101,66 @@ class MegakernelGpuDetectionTests(unittest.TestCase):
             with _nvidia_smi(f"0, GPU-aaa, {cap}, {mem}"), \
                     mock.patch.dict(llama_server.os.environ, {}, clear=True):
                 self.assertEqual(llama_server._megakernel_gpu(), "0")
+
+    def test_rtx_8000_can_be_pinned_without_selecting_another_gpu(self) -> None:
+        lines = ("2, GPU-baseline, 8.6, 24576", "3, GPU-turing, 7.5, 49152")
+        for visible in ("3", "GPU-turing"):
+            with _nvidia_smi(*lines), \
+                    mock.patch.dict(llama_server.os.environ, {"CUDA_VISIBLE_DEVICES": visible}, clear=True):
+                self.assertEqual(llama_server._megakernel_gpu_info(), ("3", "7.5"))
+
+    def test_nvml_failure_uses_cuda_instead_of_disabling_the_megakernel(self) -> None:
+        failed = subprocess.CompletedProcess([], 18, stdout="", stderr="Driver/library version mismatch")
+        with mock.patch.object(llama_server.subprocess, "run", return_value=failed), \
+                mock.patch.object(llama_server, "_cuda_megakernel_gpu_info", return_value=("GPU-turing", "7.5")):
+            self.assertEqual(llama_server._megakernel_gpu_info(), ("GPU-turing", "7.5"))
+
+    def test_cuda_fallback_uses_visible_device_uuid_and_respects_first_device(self) -> None:
+        driver = mock.Mock()
+        driver.cuInit.return_value = 0
+
+        def count(out):
+            out._obj.value = 2
+            return 0
+
+        def get(out, ordinal):
+            out._obj.value = ordinal
+            return 0
+
+        def capability(major, minor, device):
+            major._obj.value = 7 if device == 0 else 8
+            minor._obj.value = 5 if device == 0 else 6
+            return 0
+
+        def memory(out, device):
+            out._obj.value = (49152 if device == 0 else 24576) * 1024 * 1024
+            return 0
+
+        def uuid(out, device):
+            out._obj[:] = bytes.fromhex("00000000000000000000000000000003")
+            return 0
+
+        driver.cuDeviceGetCount.side_effect = count
+        driver.cuDeviceGet.side_effect = get
+        driver.cuDeviceComputeCapability.side_effect = capability
+        driver.cuDeviceTotalMem_v2.side_effect = memory
+        driver.cuDeviceGetUuid.side_effect = uuid
+        with mock.patch.object(llama_server.ctypes, "CDLL", return_value=driver), \
+                mock.patch.dict(llama_server.os.environ, {"CUDA_VISIBLE_DEVICES": "3,2"}, clear=True):
+            self.assertEqual(llama_server._cuda_megakernel_gpu_info(),
+                             ("GPU-00000000-0000-0000-0000-000000000003", "7.5"))
+            driver.cuDeviceGet.assert_called_once()
+            driver.cuDeviceTotalMem_v2.side_effect = lambda out, device: (
+                setattr(out._obj, "value", 8192 * 1024 * 1024) or 0)
+            self.assertIsNone(llama_server._cuda_megakernel_gpu_info())
+
+    def test_cuda_detection_failure_is_reported(self) -> None:
+        driver = mock.Mock()
+        driver.cuInit.return_value = 803
+        with mock.patch.object(llama_server.ctypes, "CDLL", return_value=driver), \
+                self.assertLogs(llama_server.__name__, level="WARNING") as logs:
+            self.assertIsNone(llama_server._cuda_megakernel_gpu_info())
+        self.assertIn("cuInit failed with error 803", logs.output[0])
 
 
 class MegakernelStartTests(unittest.TestCase):
@@ -149,6 +216,21 @@ class MegakernelStartTests(unittest.TestCase):
             stderr.feed_data(b"late line\n")
             with self.assertRaises(asyncio.CancelledError):
                 await task
+            await client._http.aclose()
+
+        self._run(scenario())
+
+    def test_megakernel_launch_preserves_the_pinned_rtx_8000(self) -> None:
+        async def scenario() -> None:
+            client = self._client("megakernel")
+            client._proc = mock.Mock(pid=123)
+            client._spawn_until_healthy = mock.AsyncMock(return_value="ready")
+            env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "GPU-turing"}
+            with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
+                    mock.patch.object(llama_server, "_megakernel_gpu") as choose_gpu:
+                await client._start_megakernel(env=env, ctx=4096)
+            choose_gpu.assert_not_called()
+            self.assertEqual(client._spawn_until_healthy.call_args.kwargs["env"], env)
             await client._http.aclose()
 
         self._run(scenario())

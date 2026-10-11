@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -80,6 +81,13 @@ class EnsureMegakernelTests(unittest.TestCase):
                 _run({"llama_model": self.model}, _Log())
         run.assert_not_called()
 
+    def test_builds_for_a_pinned_rtx_8000(self) -> None:
+        with self._fake_make() as run, \
+                mock.patch.object(mb, "_megakernel_gpu_info", return_value=("3", "7.5")):
+            _run({"llama_model": self.model}, _Log())
+        self.assertIn("ARCH=sm_75", run.call_args.args)
+        self.assertEqual(json.loads((self.root / ".openjet-build.json").read_text()), {"arch": "sm_75"})
+
     def test_missing_nvcc_or_llama_cpp_is_reported_not_raised(self) -> None:
         log = _Log()
         with self._fake_make() as run, mock.patch.object(mb, "_nvcc_path", return_value=None):
@@ -109,6 +117,15 @@ class EnsureMegakernelTests(unittest.TestCase):
                 _run({"llama_model": self.model}, _Log())
             self.assertEqual(run.call_count, 2)
             self.assertIn("ARCH=sm_120", run.call_args.args)
+
+    def test_turing_compatibility_header_change_invalidates_the_build(self) -> None:
+        with self._fake_make(), mock.patch.object(mb, "_megakernel_dir", return_value=self.root):
+            _run({"llama_model": self.model}, _Log())
+            header = self.root / "cuda_compat.cuh"
+            header.write_text("")
+            changed = (self.root / "libqwen38mk.so").stat().st_mtime + 1
+            os.utime(header, (changed, changed))
+            self.assertFalse(mb._build_is_current(self.root, "sm_89"))
 
 
 if __name__ == "__main__":

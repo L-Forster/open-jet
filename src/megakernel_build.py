@@ -16,6 +16,7 @@ from typing import Any, Callable
 from rich.markup import escape
 
 from .llama_server import (
+    _MEGAKERNEL_TURING_CAP,
     _megakernel_dir,
     _megakernel_gpu_info,
     _megakernel_library,
@@ -26,7 +27,8 @@ from .llama_server import (
 from .provisioning import LLAMA_CPP_DIR, _native_tool_path, _run_exec
 
 _BUILD_TAG = ".openjet-build.json"
-_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "prefill.cuh", "prefill_gemm.cuh", "gguf.h", "capi.cpp")
+_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "prefill.cuh", "prefill_gemm.cuh",
+            "cuda_compat.cuh", "gguf.h", "capi.cpp")
 
 
 def _nvcc_path() -> str | None:
@@ -98,6 +100,10 @@ async def ensure_megakernel(
     library = _megakernel_library(model)
     gpu = _megakernel_gpu_info()
     if gpu is None:
+        return setup_result
+    if variant == "mixed" and gpu[1] == _MEGAKERNEL_TURING_CAP:
+        log.write("[yellow]Skipping the megakernel: the mixed-quant engine does not support Turing GPUs; "
+                  "using llama-server.[/]")
         return setup_result
     root = _megakernel_root()
     if not (root / "Makefile").is_file():
