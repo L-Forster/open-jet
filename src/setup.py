@@ -22,7 +22,7 @@ from .hardware import (
     recommended_gpu_layers,
 )
 from .model_profiles import default_profile_name
-from .llama_server import _find_built_llama_binary
+from .llama_server import MEGAKERNEL_RUNTIME_LABEL, _find_built_llama_binary, model_runtime_label
 from .provisioning import (
     MODELS_DIR,
     OPENJET_HOME,
@@ -512,24 +512,11 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
     return payload
 
 
-def _direct_catalog_label(row: Mapping[str, object], recommended_url: str) -> str:
+def _direct_catalog_label(row: Mapping[str, object]) -> str:
     label = str(row.get("label") or row.get("filename") or "Model")
     filename = str(row.get("filename") or "").strip()
-    max_ram = float(row.get("max_ram_gb") or 0.0)
-    size_mb = float(row.get("model_size_mb") or 0.0)
-    details: list[str] = []
-    if max_ram > 0:
-        details.append(f"{max_ram:g}GB tier")
-    if size_mb > 0:
-        details.append(f"{size_mb / 1024.0:.1f}GB download")
-    if bool(row.get("unified_memory_only")):
-        details.append("unified memory")
-    if str(row.get("url") or "") == recommended_url:
-        details.append("recommended")
-    suffix = f" ({', '.join(details)})" if details else ""
-    if filename and filename != label:
-        return f"{label}: {filename}{suffix}"
-    return f"{label}{suffix}"
+    downloaded = MODELS_DIR / filename
+    return f"{label} ({model_runtime_label(str(downloaded) if downloaded.is_file() else filename)})"
 
 
 def _recommended_context_for_payload(
@@ -771,12 +758,22 @@ async def run_setup_wizard(
     )
 
     if model_plan == "__local__":
-        local_rows = [(Path(model).name, model) for model in model_files]
+        local_rows = [(f"{Path(model).name} ({model_runtime_label(model)})", model) for model in model_files]
         local_rows.extend(
-            (f"{Path(model).name} (saved)", model)
+            (f"{Path(model).name} (saved, {model_runtime_label(model)})", model)
             for model in saved_model_files
             if model not in model_files
         )
+        # on a GPU the megakernel runs on, offer its model when none of the local ones is it
+        megakernel_row = next(
+            (row for row in direct_catalog
+             if model_runtime_label(str(row.get("filename") or "")) == MEGAKERNEL_RUNTIME_LABEL),
+            None,
+        )
+        if megakernel_row is not None and not any(
+            model_runtime_label(str(model)) == MEGAKERNEL_RUNTIME_LABEL for _label, model in local_rows
+        ):
+            local_rows.append((f"Download {megakernel_row['label']} ({MEGAKERNEL_RUNTIME_LABEL})", "__megakernel__"))
         local_rows.append(("Manual path", "__manual__"))
         preferred_local_model = current_llama_model or None
         if setup_mode != "manual":
@@ -786,7 +783,11 @@ async def run_setup_wizard(
         if preferred_local_model and preferred_local_model not in option_values:
             local_rows.insert(
                 0,
-                (f"{Path(preferred_local_model).name or preferred_local_model} (current)", preferred_local_model),
+                (
+                    f"{Path(preferred_local_model).name or preferred_local_model} "
+                    f"(current, {model_runtime_label(preferred_local_model)})",
+                    preferred_local_model,
+                ),
             )
         local_choice = await _prompt_choice(
             session,
@@ -799,23 +800,31 @@ async def run_setup_wizard(
             ),
             detail="Select a detected GGUF file or choose Manual path.",
         )
-        if local_choice == "__manual__":
-            model_file = await _prompt_model_path(session, console, current_llama_model)
+        if local_choice == "__megakernel__" and megakernel_row is not None:
+            payload.update(_direct_catalog_payload(megakernel_row))
         else:
-            model_file = Path(str(local_choice)).expanduser()
-            if not model_file.is_file():
-                raise RuntimeError(f"Model file does not exist: {model_file}")
-        payload["model_source"] = "local"
-        payload["llama_model"] = str(model_file)
-        # A previously selected MTP model leaves llama_mtp set; a plain GGUF must clear it
-        # or the runtime keeps demanding an MTP llama.cpp build.
-        payload["llama_mtp"] = _model_path_looks_mtp(model_file.name)
-        _remember_model_ref(payload, current_cfg, "llama_cpp", str(model_file))
+            if local_choice == "__manual__":
+                model_file = await _prompt_model_path(session, console, current_llama_model)
+            else:
+                model_file = Path(str(local_choice)).expanduser()
+                if not model_file.is_file():
+                    raise RuntimeError(f"Model file does not exist: {model_file}")
+            payload["model_source"] = "local"
+            payload["llama_model"] = str(model_file)
+            # A previously selected MTP model leaves llama_mtp set; a plain GGUF must clear it
+            # or the runtime keeps demanding an MTP llama.cpp build.
+            payload["llama_mtp"] = _model_path_looks_mtp(model_file.name)
+            _remember_model_ref(payload, current_cfg, "llama_cpp", str(model_file))
     else:
         recommended_url = str(direct["url"])
+        # the models already on disk, the megakernel's model where this GPU runs it, and the
+        # recommendation for this hardware (so that the list is never empty)
         catalog_options = [
-            (_direct_catalog_label(row, recommended_url), row)
+            (_direct_catalog_label(row), row)
             for row in direct_catalog
+            if (MODELS_DIR / str(row.get("filename") or "")).is_file()
+            or model_runtime_label(str(row.get("filename") or "")).startswith("OpenJet megakernel")
+            or str(row.get("url") or "") == recommended_url
         ]
         selected_direct = await _prompt_choice(
             session,
@@ -830,7 +839,7 @@ async def run_setup_wizard(
                 ),
                 0,
             ),
-            detail="Select any configured GGUF catalog entry to download.",
+            detail="Downloaded models, and the ones recommended for this machine.",
         )
         if not isinstance(selected_direct, Mapping):
             raise RuntimeError("Invalid model catalog selection.")

@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import os
+import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 from collections import deque
@@ -59,8 +61,83 @@ def _megakernel_dir() -> Path | None:
 
 
 def _megakernel_model_supported(model: str) -> bool:
+    # the plain Q4_K_M only: UD-Q4_K_M, AP-Q4_K_M and the like are other quant mixes and run on llama-server
     name = Path(model).name.lower()
-    return name.endswith(".gguf") and "qwen3.8-27b" in name and "q4_k_m" in name
+    return name.endswith(".gguf") and re.search(r"qwen3\.8-27b[-.]q4_k_m", name) is not None
+
+
+# decode speed in the agent's reasoning mode on an RTX 3090, megakernel/README.md
+MEGAKERNEL_RUNTIME_LABEL = "OpenJet megakernel, 1.5x faster"
+
+
+MEGAKERNEL_SEMI_LABEL = "OpenJet megakernel, semi compatible"
+_GGUF_SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def _gguf_tensor_types(path: Path, names: tuple[str, ...]) -> dict[str, int]:
+    """ggml type ids of the named tensors, read from a GGUF header."""
+    found: dict[str, int] = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            return found
+        _version, n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
+
+        def skip_string() -> None:
+            f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+
+        def skip_value(kind: int) -> None:
+            if kind == 8:
+                skip_string()
+            elif kind == 9:
+                elem, count = struct.unpack("<IQ", f.read(12))
+                if elem in _GGUF_SCALAR_SIZES:
+                    f.seek(count * _GGUF_SCALAR_SIZES[elem], 1)
+                else:
+                    for _ in range(count):
+                        skip_value(elem)
+            else:
+                f.seek(_GGUF_SCALAR_SIZES[kind], 1)
+
+        for _ in range(n_kv):
+            skip_string()
+            skip_value(struct.unpack("<I", f.read(4))[0])
+        for _ in range(n_tensors):
+            name = f.read(struct.unpack("<Q", f.read(8))[0]).decode("utf-8", "replace")
+            f.seek(8 * struct.unpack("<I", f.read(4))[0], 1)
+            kind, _offset = struct.unpack("<IQ", f.read(12))
+            if name in names:
+                found[name] = kind
+                if len(found) == len(names):
+                    break
+    return found
+
+
+def _megakernel_quant_mix(model: str) -> str | None:
+    """"native" for the quant mix the megakernel's kernels are built for, "semi" for a plain
+    llama-quantize Q4_K_M (four tensor roles are re-encoded at load), None for anything else."""
+    names = ("blk.0.ssm_out.weight", "blk.0.ssm_alpha.weight", "blk.64.nextn.eh_proj.weight")
+    try:
+        types = _gguf_tensor_types(Path(model), names)
+    except (OSError, struct.error, KeyError):
+        return None
+    mix = tuple(types.get(name) for name in names)
+    if mix == (13, 0, 8):  # Q5_K, F32, Q8_0
+        return "native"
+    if mix == (12, 12, 12):  # all Q4_K
+        return "semi"
+    return None
+
+
+def model_runtime_label(model: str) -> str:
+    """The runtime OpenJet serves *model* with on this machine, as shown in the setup selectors."""
+    if not _megakernel_model_supported(model) or _megakernel_gpu() is None:
+        return "llama.cpp"
+    if not Path(model).is_file():  # a catalog model that is not downloaded yet
+        return MEGAKERNEL_RUNTIME_LABEL
+    mix = _megakernel_quant_mix(model)
+    if mix == "semi":
+        return MEGAKERNEL_SEMI_LABEL
+    return MEGAKERNEL_RUNTIME_LABEL if mix == "native" else "llama.cpp"
 
 
 def _megakernel_gpu() -> str | None:

@@ -26,8 +26,18 @@ def _load_mk_server():
 
 class MegakernelSelectionTests(unittest.TestCase):
     def test_other_models_are_not_served_by_the_megakernel(self) -> None:
-        for model in ("/m/Qwen3.6-27B-UD-IQ3_XXS.gguf", "/m/Qwen3.8-27B-Q6_K.gguf", "/m/qwen3.8-27b-q4_k_m.bin"):
+        for model in ("/m/Qwen3.6-27B-UD-IQ3_XXS.gguf", "/m/Qwen3.8-27B-Q6_K.gguf", "/m/qwen3.8-27b-q4_k_m.bin",
+                      "/m/Qwen3.8-27B-UD-Q4_K_M.gguf", "/m/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"):
             self.assertIn("only supports", megakernel_unavailable_reason(model))
+
+    def test_setup_selector_names_the_runtime(self) -> None:
+        with mock.patch.object(llama_server, "_megakernel_gpu", return_value="0"):
+            self.assertEqual(llama_server.model_runtime_label(MODEL), "OpenJet megakernel, 1.5x faster")
+            self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.8-27B-UD-Q4_K_M.gguf"), "llama.cpp")
+            self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.5-9B-Q4_K_M.gguf"), "llama.cpp")
+            self.assertEqual(llama_server.model_runtime_label("/m/mmproj-Qwen3.8-27B-BF16.gguf"), "llama.cpp")
+        with mock.patch.object(llama_server, "_megakernel_gpu", return_value=None):
+            self.assertEqual(llama_server.model_runtime_label(MODEL), "llama.cpp")
 
     def test_missing_build_is_reported(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=None):

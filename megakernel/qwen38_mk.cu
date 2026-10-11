@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <cmath>
 #include <cstdint>
@@ -27,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include "ggml.h"
 #include "gguf.h"
 #include "qwen38_mk.h"
 
@@ -2102,6 +2104,51 @@ struct MKEngine::Impl {
         return (T *) p;
     }
 
+    // A tensor of the file in the quant type `to` its kernel is built for. A plain
+    // `llama-quantize ... Q4_K_M` stores four roles as Q4_K that the kernels read as something
+    // else (ssm_out Q5_K, ssm_alpha / ssm_beta F32, nextn.eh_proj Q8_0): those are re-encoded here,
+    // dequantized and quantized again by ggml. 145 small tensors, a few seconds at load.
+    struct Src {
+        uint32_t type = 0;
+        std::vector<uint64_t> ne;
+        const uint8_t * data = nullptr;
+        uint64_t nbytes = 0;
+        std::vector<uint8_t> own; // the re-encoded copy, when there is one
+    };
+    int n_conv = 0;
+    double conv_s = 0;
+
+    Src want(const std::string & name, int to) {
+        const auto & t = file.get(name);
+        Src s;
+        s.type = t.type;
+        s.ne = t.ne;
+        s.data = t.data;
+        s.nbytes = t.nbytes;
+        if ((int) t.type == to || t.type != gguf::Q4_K) return s; // any other mix is refused by need() below
+        const int64_t K = (int64_t) t.ne[0];
+        int64_t rows = 1;
+        for (size_t d = 1; d < t.ne.size(); d++) rows *= (int64_t) t.ne[d];
+        const size_t rs_from = ggml_row_size(GGML_TYPE_Q4_K, K), rs_to = ggml_row_size((ggml_type) to, K);
+        const auto t0 = std::chrono::steady_clock::now();
+        s.own.resize(rs_to * (size_t) rows);
+        if (to != T_F32) ggml_quantize_init((ggml_type) to);
+        const auto * tr = ggml_get_type_traits(GGML_TYPE_Q4_K);
+        parallel_rows(rows, [&](int64_t r) {
+            thread_local std::vector<float> f;
+            f.resize((size_t) K);
+            tr->to_float(t.data + (size_t) r * rs_from, f.data(), K);
+            if (to == T_F32) memcpy(s.own.data() + (size_t) r * rs_to, f.data(), (size_t) K * 4);
+            else ggml_quantize_chunk((ggml_type) to, f.data(), s.own.data() + (size_t) r * rs_to, 0, 1, K, nullptr);
+        });
+        s.type = (uint32_t) to;
+        s.data = s.own.data();
+        s.nbytes = s.own.size();
+        n_conv++;
+        conv_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return s;
+    }
+
     const float * up_f32(const std::string & name, size_t expect) {
         const auto & t = file.get(name);
         if (t.type != gguf::F32) throw std::runtime_error(name + " not f32");
@@ -2113,8 +2160,8 @@ struct MKEngine::Impl {
         return d;
     }
 
-    Mat up_mat(const std::string & name, int K, int N) {
-        const auto & t = file.get(name);
+    Mat up_mat(const std::string & name, int K, int N, int to = -1) {
+        const Src t = want(name, to < 0 ? (int) file.get(name).type : to);
         if ((int) t.ne[0] != K || (int) t.ne[1] != N) throw std::runtime_error(name + " bad shape");
         Mat m{};
         m.K = K;
@@ -2275,7 +2322,7 @@ struct MKEngine::Impl {
             } else {
                 L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
                 L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
-                L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D);
+                L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D, T_Q5K);
                 need(blk(i, "attn_qkv.weight"), L.qkv.type, {T_Q4K, T_Q6K});
                 need(blk(i, "attn_gate.weight"), L.gate.type, {T_Q4K});
                 need(blk(i, "ssm_out.weight"), L.sout.type, {T_Q5K});
@@ -2284,8 +2331,8 @@ struct MKEngine::Impl {
                 L.A = up_f32(blk(i, "ssm_a"), NVH);
                 L.snorm = up_f32(blk(i, "ssm_norm.weight"), HK);
                 // alpha/beta projections in fp32 with the attn_norm weight folded in
-                const auto & ta = file.get(blk(i, "ssm_alpha.weight"));
-                const auto & tb = file.get(blk(i, "ssm_beta.weight"));
+                const Src ta = want(blk(i, "ssm_alpha.weight"), T_F32);
+                const Src tb = want(blk(i, "ssm_beta.weight"), T_F32);
                 const auto & tn = file.get(blk(i, "attn_norm.weight"));
                 // read below as raw floats, so anything but F32 would be reinterpreted silently
                 need(blk(i, "ssm_alpha.weight"), (int) ta.type, {T_F32});
@@ -2312,7 +2359,7 @@ struct MKEngine::Impl {
             if (L.fg.type != T_Q4K || L.fu.type != T_Q4K) throw std::runtime_error("ffn gate/up must be Q4_K");
             need(blk(i, "ffn_down.weight"), L.fd.type, {T_Q4K, T_Q6K});
         }
-        hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+        hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D, T_Q8_0);
         need(blk(NL, "nextn.eh_proj.weight"), hw.eh.type, {T_Q8_0});
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
         hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
@@ -2362,6 +2409,9 @@ struct MKEngine::Impl {
             hw.embd = d;
         }
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
+        if (n_conv)
+            fprintf(stderr, "[mk] %d tensors re-encoded in %.0f s: a plain Q4_K_M quant mix, not the one the kernels are built for "
+                            "(README: the GGUF)\n", n_conv, conv_s);
 
         hb.x = dalloc<float>(MAXT * D);
         hb.xm = dalloc<float>(MAXT * D);

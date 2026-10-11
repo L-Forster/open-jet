@@ -5,6 +5,22 @@ A specialised CUDA inference engine for `Qwen3.8-27B-Q4_K_M.gguf` (llama.cpp arc
 with 24 GB+ (sm_86, sm_89, sm_120; tuned and benchmarked on an RTX 3090), with an OpenAI-compatible server that open-jet uses in place of `llama-server`
 (`llama_backend: auto`, see [docs/runtimes/llama-cpp.md](../docs/runtimes/llama-cpp.md)).
 
+## Quick guide
+
+1. Run `openjet setup` and choose "Qwen3.8 27B Q4_K_M MTP". It downloads the model and builds the
+   megakernel (by hand: [Build / run](#build--run)).
+2. Run `openjet`. It serves the model through the megakernel.
+
+Which model file runs on it (details in [The GGUF](#the-gguf)):
+
+| Model file | Runs on |
+|---|---|
+| unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads | megakernel |
+| a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis | megakernel, semi compatible |
+| any other quant (unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
+
+## How it works
+
 Decoding runs an entire speculative cycle in one persistent cooperative kernel launch:
 
 ```
@@ -151,9 +167,12 @@ every tensor against it:
 | `nextn.eh_proj` | Q8_0 |
 | `output` | Q6_K |
 
-A plain `llama-quantize ... Q4_K_M` from a recent llama.cpp gives `ssm_out`, `ssm_alpha`,
-`ssm_beta` and `nextn.eh_proj` Q4_K, which the loader now refuses by name. To build a compatible
-file from the BF16 GGUF (unsloth's imatrix optional):
+A plain `llama-quantize ... Q4_K_M` stores `ssm_out`, `ssm_alpha`, `ssm_beta` and `nextn.eh_proj` as
+Q4_K; the loader re-encodes those to the table's types (145 tensors) and the file then runs the same
+kernels. A file with any other mix is refused, naming the first tensor that does not match, and
+open-jet starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
+
+To build a file with unsloth's mix from the BF16 GGUF (unsloth's imatrix optional):
 
 ```sh
 llama-quantize --imatrix imatrix_unsloth.gguf \
@@ -245,7 +264,7 @@ processing the whole conversation as one fresh prompt.
 ## Limitations
 
 - Specialised to this model's shapes and quant mix (27B, Q4_K_M as published by unsloth, see
-  [The GGUF](#the-gguf)); the loader rejects any other model or mix. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
+  [The GGUF](#the-gguf)), plus a plain `llama-quantize` Q4_K_M; the loader rejects any other model or mix. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
   GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
   repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).

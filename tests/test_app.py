@@ -950,7 +950,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                     current_cfg={"setup_model_history": {"llama_cpp": [saved_model]}},
                 )
 
-        self.assertIn((f"{Path(saved_model).name} (saved)", saved_model), captured_options)
+        self.assertIn((f"{Path(saved_model).name} (saved, llama.cpp)", saved_model), captured_options)
 
     async def test_run_setup_wizard_prefills_current_llama_defaults(self) -> None:
         console = Mock()
@@ -1344,7 +1344,16 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
                 "filename": "large.gguf",
                 "url": "https://huggingface.co/example/large-GGUF/resolve/main/large.gguf?download=true",
             },
+            {
+                "max_ram_gb": 32.0,
+                "label": "Huge",
+                "filename": "huge.gguf",
+                "url": "https://huggingface.co/example/huge-GGUF/resolve/main/huge.gguf?download=true",
+            },
         ]
+        # the list is the recommended model plus what is already on disk: Large is, Huge is not
+        models_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (models_dir / "large.gguf").touch()
         prompts: list[tuple[str, list[str]]] = []
         choices = iter(["manual", "auto", "__direct__", catalog[1], 2048, 0])
         texts = iter(["Large"])
@@ -1358,7 +1367,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
             "src.setup._prompt_text", side_effect=fake_text
-        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+        ), patch("src.setup.MODELS_DIR", models_dir), patch("src.setup.discover_model_files", return_value=[]), patch(
             "src.setup.setup_direct_model_catalog", return_value=tuple(catalog)
         ), patch("src.setup.recommend_direct_model", return_value={**catalog[0], "target_path": "/models/small.gguf"}), patch(
             "src.setup.recommended_context_window_tokens", return_value=2048
@@ -1377,6 +1386,7 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model_download_prompt), 2)
         self.assertTrue(any("Small" in label for label in model_download_prompt))
         self.assertTrue(any("Large" in label for label in model_download_prompt))
+        self.assertFalse(any("Huge" in label for label in model_download_prompt))
         self.assertEqual(payload["model_download_url"], catalog[1]["url"])
         self.assertTrue(str(payload["model_download_path"]).endswith("large.gguf"))
 

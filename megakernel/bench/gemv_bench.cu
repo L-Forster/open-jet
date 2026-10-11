@@ -1,8 +1,10 @@
 // Microbenchmark for Q4_K GEMV variants (T tokens, int8 activations) on a ~1 GB matrix.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 #include <cstdint>
 
@@ -34,6 +36,23 @@ __device__ __forceinline__ void q4k_scales(const int4 & h, int p, float & fA, fl
         m0 = ((w >> 4) & 0xF) | ((z >> 2) & 0x30); m1 = ((w >> 12) & 0xF) | ((z >> 10) & 0x30);
     }
     fA = dm.x * (float) sc0; fB = dm.x * (float) sc1; gA = dm.y * (float) m0; gB = dm.y * (float) m1;
+}
+
+// IQ4_XS (GGUF type 23), re-laid-out at load into Q4_K-shaped 144-byte blocks so that it shares
+// Q4_K's unit / activation layout: 16-byte header (fp16 d | 2 pad | int8 ls - 32 of the eight
+// 32-weight sub-blocks | 4 pad), then the 128 index bytes in Q4_K order (low nibbles = weights
+// 64p .. 64p+31, high nibbles = 64p+32 .. 64p+63). A weight is d * (ls - 32) * kvalues_iq4nl[index].
+constexpr unsigned long long IQ4_LO = 0xF6EADDCFBFAD9881ull, IQ4_HI = 0x7159453526190D01ull; // kvalues_iq4nl, one per byte
+__device__ __forceinline__ unsigned iq4nl(unsigned i) { return (unsigned) ((i & 8 ? IQ4_HI : IQ4_LO) >> (8 * (i & 7))) & 0xffu; }
+// four index bytes -> their 4 + 4 int8 weights; tab[byte] holds the low nibble's value in byte 0, the high nibble's in byte 4
+__device__ __forceinline__ void iq4_words_tab(const unsigned long long * tab, unsigned w, int & a, int & b) {
+    const unsigned long long t = tab[w & 0xff] | (tab[(w >> 8) & 0xff] << 8) | (tab[(w >> 16) & 0xff] << 16) | (tab[w >> 24] << 24);
+    a = (int) (unsigned) t; b = (int) (t >> 32);
+}
+// the same from registers only (no table loads)
+__device__ __forceinline__ void iq4_words_reg(unsigned w, int & a, int & b) {
+    a = (int) (iq4nl(w & 15) | iq4nl((w >> 8) & 15) << 8 | iq4nl((w >> 16) & 15) << 16 | iq4nl((w >> 24) & 15) << 24);
+    b = (int) (iq4nl((w >> 4) & 15) | iq4nl((w >> 12) & 15) << 8 | iq4nl((w >> 20) & 15) << 16 | iq4nl(w >> 28) << 24);
 }
 
 // ---------------- V0: current (uint2 xf, 1 row per row_dot, rows in pairs) ----------------
@@ -166,15 +185,21 @@ __global__ void __launch_bounds__(NT, 1) gemv_v1(const uint8_t * W, int N, float
 template <int KK, int TYPE, int T, int R, int UF = KK / 1024>
 __global__ void __launch_bounds__(NT, 1) gemv_v2(const uint8_t * W, const __half * Dq, int N, float * out) {
     constexpr int UU = KK / 32, IT = UU / 32, NBB = KK / 256;
-    constexpr int RBB = TYPE == 12 ? NBB * 144 : (TYPE == 18 ? NBB * 224 : NBB * 208);
+    // TYPE 23: IQ4_XS decoded through a 2 KB shared-memory table, 24: IQ4_XS decoded in registers (faster).
+    // A 256 KB global table (two index bytes -> four weights, 8 gathers per unit) ran at a third of Q4_K's speed.
+    constexpr bool IQ4 = TYPE == 23 || TYPE == 24;
+    constexpr int RBB = TYPE == 12 || IQ4 ? NBB * 144 : (TYPE == 18 ? NBB * 224 : NBB * 208);
     extern __shared__ __align__(16) uint8_t sm[];
     int4 * xa = (int4 *) sm; int4 * xb = xa + T * UU; float2 * xd = (float2 *) (xb + T * UU); int * xq = (int *) (xd + T * UU);
+    unsigned long long * tab = (unsigned long long *) (xq + T * UU);
     for (int i = threadIdx.x; i < T * UU; i += NT) {
         xa[i] = make_int4(0x01020304 * (i & 7), 0x05060708, 0x01010101, 0x7f7f7f7f);
         xb[i] = make_int4(0x02020202, 0x03030303, 0x04040404, 0x05050505);
         xd[i] = make_float2(0.01f, 0.02f);
         xq[i] = 0x00050003;
     }
+    if (TYPE == 23)
+        for (int i = threadIdx.x; i < 256; i += NT) tab[i] = iq4nl(i & 15) | (unsigned long long) iq4nl(i >> 4) << 32;
     __syncthreads();
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int gw = warp * gridDim.x + blockIdx.x, W_ = NW * gridDim.x;
@@ -202,6 +227,28 @@ __global__ void __launch_bounds__(NT, 1) gemv_v2(const uint8_t * W, const __half
                     q4k_scales(h[k], p, fA[k], gA[k], fB[k], gB[k]);
                     A[k][0] = q[k].x & M4; A[k][1] = q[k].y & M4; A[k][2] = q[k].z & M4; A[k][3] = q[k].w & M4;
                     B[k][0] = (q[k].x >> 4) & M4; B[k][1] = (q[k].y >> 4) & M4; B[k][2] = (q[k].z >> 4) & M4; B[k][3] = (q[k].w >> 4) & M4;
+                }
+            } else if (IQ4) {
+                int4 h[R], q[R];
+#pragma unroll
+                for (int k = 0; k < R; k++) {
+                    const uint8_t * blk = W + (size_t) (r0 + k) * RBB + b * 144;
+                    h[k] = ldw4(blk);
+                    q[k] = ldw4(blk + 16 + 32 * p + 16 * hh);
+                }
+#pragma unroll
+                for (int k = 0; k < R; k++) {
+                    const float d = __half2float(__ushort_as_half((unsigned short) (h[k].x & 0xffff)));
+                    const int sw = (p < 2 ? h[k].y : h[k].z) >> ((p & 1) * 16);
+                    fA[k] = d * (float) (int8_t) sw; fB[k] = d * (float) (int8_t) (sw >> 8);
+                    gA[k] = gB[k] = 0.f;
+                    if (TYPE == 23) {
+                        iq4_words_tab(tab, q[k].x, A[k][0], B[k][0]); iq4_words_tab(tab, q[k].y, A[k][1], B[k][1]);
+                        iq4_words_tab(tab, q[k].z, A[k][2], B[k][2]); iq4_words_tab(tab, q[k].w, A[k][3], B[k][3]);
+                    } else {
+                        iq4_words_reg(q[k].x, A[k][0], B[k][0]); iq4_words_reg(q[k].y, A[k][1], B[k][1]);
+                        iq4_words_reg(q[k].z, A[k][2], B[k][2]); iq4_words_reg(q[k].w, A[k][3], B[k][3]);
+                    }
                 }
             } else if (TYPE == 18) {
                 int4 q[R]; int2 hb[R]; int2 meta[R];
@@ -256,7 +303,8 @@ __global__ void __launch_bounds__(NT, 1) gemv_v2(const uint8_t * W, const __half
                 for (int k = 0; k < R; k++) {
                     int sa = __dp4a(A[k][0], va.x, 0); sa = __dp4a(A[k][1], va.y, sa); sa = __dp4a(A[k][2], va.z, sa); sa = __dp4a(A[k][3], va.w, sa);
                     int sb = __dp4a(B[k][0], vb.x, 0); sb = __dp4a(B[k][1], vb.y, sb); sb = __dp4a(B[k][2], vb.z, sb); sb = __dp4a(B[k][3], vb.w, sb);
-                    acc[k][t] += fA[k] * (dx.x * (float) sa) + fB[k] * (dx.y * (float) sb) - gA[k] * sqA - gB[k] * sqB;
+                    if (IQ4) acc[k][t] += fA[k] * (dx.x * (float) sa) + fB[k] * (dx.y * (float) sb); // signed weights, no min term
+                    else acc[k][t] += fA[k] * (dx.x * (float) sa) + fB[k] * (dx.y * (float) sb) - gA[k] * sqA - gB[k] * sqB;
                 }
             }
         }
@@ -291,6 +339,79 @@ template <class F> float timeit(F f, int reps = 25) {
     return best;
 }
 
+// GGUF IQ4_XS blocks (136 bytes: fp16 d, u16 scales_h, u8 scales_l[4], u8 qs[128]) -> the 144-byte
+// layout the kernels read; this is what the loader would do
+static void repack_iq4xs(const uint8_t * src, uint8_t * dst, size_t nblocks) {
+    for (size_t i = 0; i < nblocks; i++) {
+        const uint8_t * s = src + i * 136, * qs = s + 8;
+        uint8_t * o = dst + i * 144;
+        uint16_t sh;
+        memcpy(&sh, s + 2, 2);
+        memset(o, 0, 16);
+        memcpy(o, s, 2);
+        for (int ib = 0; ib < 8; ib++) o[4 + ib] = (uint8_t) ((((s[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4)) - 32);
+        auto idx = [&](int v) { const int ib = v >> 5, j = v & 31; return j < 16 ? qs[16 * ib + j] & 0xf : qs[16 * ib + j - 16] >> 4; };
+        for (int p = 0; p < 4; p++)
+            for (int l = 0; l < 32; l++) o[16 + 32 * p + l] = (uint8_t) (idx(64 * p + l) | (idx(64 * p + 32 + l) << 4));
+    }
+}
+
+// Random GGUF-format IQ4_XS rows, dequantised on the host as llama.cpp does and multiplied with the
+// kernel's activations, against the kernel reading the repacked rows.
+template <int TYPE> static void check_iq4xs(int nsm, const char * name) {
+    constexpr int KK = 17408, T = 4, R = 2, UU = KK / 32, NBB = KK / 256;
+    static const int8_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    const int n = 4096;
+    std::vector<uint8_t> g((size_t) n * NBB * 136), m((size_t) n * NBB * 144);
+    uint32_t s = 12345;
+    for (auto & v : g) { s = s * 1664525u + 1013904223u; v = (uint8_t) (s >> 24); }
+    for (size_t i = 0; i < (size_t) n * NBB; i++) { __half d = __float2half(0.0005f * (float) (1 + i % 5)); memcpy(&g[i * 136], &d, 2); }
+    repack_iq4xs(g.data(), m.data(), (size_t) n * NBB);
+    uint8_t * dM; float * dO;
+    CK(cudaMalloc(&dM, m.size())); CK(cudaMalloc(&dO, (size_t) T * n * 4));
+    CK(cudaMemcpy(dM, m.data(), m.size(), cudaMemcpyHostToDevice));
+    const int smem = 100 * 1024 - 1024;
+    CK(cudaFuncSetAttribute(gemv_v2<KK, TYPE, T, R>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    gemv_v2<KK, TYPE, T, R><<<nsm, NT, smem>>>(dM, nullptr, n, dO);
+    CK(cudaGetLastError());
+    std::vector<float> out((size_t) T * n);
+    CK(cudaMemcpy(out.data(), dO, out.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<float> w(KK);
+    double max_err = 0, max_ref = 0;
+    for (int row = 0; row < n; row++) {
+        for (int b = 0; b < NBB; b++) {
+            const uint8_t * blk = &g[((size_t) row * NBB + b) * 136], * qs = blk + 8;
+            __half dh; uint16_t sh;
+            memcpy(&dh, blk, 2); memcpy(&sh, blk + 2, 2);
+            for (int ib = 0; ib < 8; ib++) {
+                const int ls = ((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+                const float dl = __half2float(dh) * (float) (ls - 32);
+                for (int j = 0; j < 16; j++) {
+                    w[256 * b + 32 * ib + j] = dl * (float) kv[qs[16 * ib + j] & 0xf];
+                    w[256 * b + 32 * ib + j + 16] = dl * (float) kv[qs[16 * ib + j] >> 4];
+                }
+            }
+        }
+        for (int t = 0; t < T; t++) {
+            double sum = 0;
+            for (int u = 0; u < UU; u++) {
+                const int i = t * UU + u, k0 = 256 * (u >> 3) + 64 * ((u >> 1) & 3) + 16 * (u & 1);
+                const int xa[4] = {0x01020304 * (i & 7), 0x05060708, 0x01010101, 0x7f7f7f7f}, xb[4] = {0x02020202, 0x03030303, 0x04040404, 0x05050505};
+                for (int j = 0; j < 16; j++) {
+                    sum += (double) w[k0 + j] * (double) 0.01f * (double) (int8_t) (xa[j / 4] >> (8 * (j % 4)));
+                    sum += (double) w[k0 + 32 + j] * (double) 0.02f * (double) (int8_t) (xb[j / 4] >> (8 * (j % 4)));
+                }
+            }
+            const double e = fabs(sum - (double) out[(size_t) t * n + row]);
+            max_err = e > max_err ? e : max_err;
+            max_ref = fabs(sum) > max_ref ? fabs(sum) : max_ref;
+        }
+    }
+    printf("%s vs host dequantisation, %d rows x %d tokens: max |error| %.3g at max |value| %.3g -> %s\n", name, n, T, max_err, max_ref,
+           max_err < 1e-4 * max_ref ? "ok" : "MISMATCH");
+    cudaFree(dM); cudaFree(dO);
+}
+
 int main() {
     const int N = 248320 / 2 * 2 + 2 * 105472; // ~ 1.3 GB of Q4_K rows
     const size_t bytes = (size_t) N * RB;
@@ -323,19 +444,30 @@ int main() {
     run0(gemv_v1<1, 4>, 1, "v1 R4"); run0(gemv_v1<4, 4>, 4, "v1 R4");
     __half * dD; CK(cudaMalloc(&dD, bytes / 100)); CK(cudaMemset(dD, 0x11, bytes / 100));
     auto run2 = [&](auto kern, int KK, int TYPE, int T, int R) {
-        const int rb = TYPE == 12 ? KK / 256 * 144 : (TYPE == 18 ? KK / 256 * 224 : KK / 256 * 208);
+        const bool iq4 = TYPE == 23 || TYPE == 24;
+        const int rb = TYPE == 12 || iq4 ? KK / 256 * 144 : (TYPE == 18 ? KK / 256 * 224 : KK / 256 * 208);
         const int n = (int) (bytes / rb) / 64 * 64;
         const int smem = 100 * 1024 - 1024;
         CK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         float ms = timeit([&] { kern<<<nsm, NT, smem>>>(dW, (const __half *) dD, n, dout); });
         CK(cudaGetLastError());
-        const double eff = TYPE == 18 ? (double) n * (KK / 256 * 210) / 1e9 / ms * 1e3 : (double) n * rb / 1e9 / ms * 1e3;
-        printf("v2 K=%5d %s T=%d R=%d: %.3f ms  %.1f GB/s raw, %.1f GB/s gguf-equivalent\n", KK, TYPE == 12 ? "q4k" : (TYPE == 18 ? "q6k-pad" : "q6k"), T, R, ms, (double) n * rb / 1e9 / ms * 1e3, eff);
+        const double eff = (double) n * (KK / 256 * (TYPE == 18 ? 210 : iq4 ? 136 : rb / (KK / 256))) / 1e9 / ms * 1e3;
+        printf("v2 K=%5d %-9s T=%d R=%d: %.3f ms  %.1f GB/s raw, %.1f GB/s gguf-equivalent, %.2f G weights/s\n", KK,
+               TYPE == 12 ? "q4k" : TYPE == 18 ? "q6k-pad" : TYPE == 23 ? "iq4xs-tab" : TYPE == 24 ? "iq4xs-reg" : "q6k", T, R, ms,
+               (double) n * rb / 1e9 / ms * 1e3, eff, (double) n * KK / 1e9 / ms * 1e3);
     };
+    check_iq4xs<23>(nsm, "iq4xs-tab");
+    check_iq4xs<24>(nsm, "iq4xs-reg");
     for (int rep = 0; rep < 2; rep++) {
     run2(gemv_v2<17408, 18, 4, 2>, 17408, 18, 4, 2); run2(gemv_v2<17408, 18, 4, 2, 4>, 17408, 18, 4, 2); run2(gemv_v2<17408, 18, 4, 2, 2>, 17408, 18, 4, 2);
     run2(gemv_v2<17408, 12, 4, 2>, 17408, 12, 4, 2); run2(gemv_v2<17408, 12, 4, 2, 4>, 17408, 12, 4, 2); run2(gemv_v2<17408, 12, 4, 2, 2>, 17408, 12, 4, 2);
+    run2(gemv_v2<17408, 23, 4, 2>, 17408, 23, 4, 2); run2(gemv_v2<17408, 23, 4, 2, 4>, 17408, 23, 4, 2); run2(gemv_v2<17408, 23, 4, 2, 2>, 17408, 23, 4, 2);
+    run2(gemv_v2<17408, 24, 4, 2>, 17408, 24, 4, 2); run2(gemv_v2<17408, 24, 4, 2, 4>, 17408, 24, 4, 2); run2(gemv_v2<17408, 24, 4, 2, 2>, 17408, 24, 4, 2);
     run2(gemv_v2<17408, 18, 1, 2>, 17408, 18, 1, 2); run2(gemv_v2<17408, 12, 1, 2>, 17408, 12, 1, 2);
+    run2(gemv_v2<17408, 23, 1, 2>, 17408, 23, 1, 2); run2(gemv_v2<17408, 24, 1, 2>, 17408, 24, 1, 2);
+    // K = 5120: the shape of the FFN gate / up and the attention / DeltaNet projections
+    run2(gemv_v2<5120, 12, 4, 2>, 5120, 12, 4, 2); run2(gemv_v2<5120, 23, 4, 2>, 5120, 23, 4, 2); run2(gemv_v2<5120, 24, 4, 2>, 5120, 24, 4, 2);
+    run2(gemv_v2<5120, 12, 1, 2>, 5120, 12, 1, 2); run2(gemv_v2<5120, 23, 1, 2>, 5120, 23, 1, 2); run2(gemv_v2<5120, 24, 1, 2>, 5120, 24, 1, 2);
     }
     return 0;
 }

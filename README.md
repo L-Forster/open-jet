@@ -68,6 +68,16 @@ You need:
 - the CUDA toolkit, for `nvcc` (CUDA 12 or newer; 12.8 or newer for RTX 50)
 - the Qwen3.8 27B Q4_K_M model from the setup catalog
 
+Which model file runs on it — `openjet setup` shows the engine in brackets next to each model:
+
+| In setup | Model file |
+|---|---|
+| `(OpenJet megakernel, 1.5x faster)` | unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads |
+| `(OpenJet megakernel, semi compatible)` | a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis |
+| `(llama.cpp)` | everything else, including other Qwen3.8-27B quants (unsloth `UD-*`, bartowski, GSQ-RCO) |
+
+If none of your models is the megakernel's own, setup offers to download it.
+
 Setup builds llama.cpp with CUDA, then compiles the megakernel against it. The compile takes about
 2 minutes and ends with `Megakernel built: OpenJet will serve Qwen3.8-27B with it.` If you set
 OpenJet up before 0.4.32, upgrade and run `openjet setup` again.
