@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TARGET = ROOT / "README.pypi.md"
-BASE = "https://github.com/l-forster/open-jet/blob/main/"
+BASE = "https://github.com/l-forster/open-jet/blob/master/"
 LINK_RE = re.compile(r"(?P<prefix>!?\[[^\]]*\]\()(?P<target>[^)]+)(?P<suffix>\))")
 
 

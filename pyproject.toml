@@ -1,7 +1,7 @@
 [project]
 name = "open-jet"
 version = "0.5.0"
-description = "Self-hosted local AI coding agent for Ollama, LM Studio, and llama.cpp, with hardware-aware model provisioning and a Python SDK for on-device LLMs."
+description = "Local AI coding agent and LLM inference engine with a Python SDK, CUDA acceleration, and support for llama.cpp, Ollama and LM Studio."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 authors = [
@@ -10,23 +10,16 @@ authors = [
 keywords = [
     "llm",
     "local-llm",
-    "run-llm-locally",
     "on-device-llm",
-    "private-llm",
     "embedded-llm",
-    "edge-llm",
     "offline-llm",
     "llm-inference",
-    "llm-sdk",
     "gguf",
     "ai-agent",
     "coding-agent",
     "local-coding-agent",
-    "self-hosted-coding-agent",
     "ai-coding-assistant",
     "local-ai",
-    "self-hosted-ai",
-    "private-ai",
     "air-gapped-ai",
     "ollama",
     "lm-studio",
@@ -34,12 +27,15 @@ keywords = [
     "openai-compatible",
     "model-provisioning",
     "local-inference",
+    "inference-engine",
+    "cuda",
+    "nvidia",
+    "qwen",
+    "speculative-decoding",
     "python-sdk",
     "tui",
     "jetson",
     "edge-ai",
-    "offline",
-    "llama.cpp",
 ]
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
@@ -86,11 +82,13 @@ mcp = [
 
 [project.urls]
 Homepage = "https://openjet.dev/"
-Website = "https://openjet.dev/"
 Documentation = "https://github.com/l-forster/open-jet/blob/master/docs/getting-started.md"
 Repository = "https://github.com/l-forster/open-jet"
 Issues = "https://github.com/l-forster/open-jet/issues"
 "OpenJet Engine" = "https://github.com/l-forster/open-jet/tree/master/megakernel"
+"Python SDK" = "https://github.com/l-forster/open-jet/blob/master/docs/sdk/quickstart.md"
+Benchmarks = "https://github.com/l-forster/open-jet/blob/master/docs/benchmarking.md"
+Discord = "https://discord.gg/pspKHtExSa"
 
 [project.scripts]
 open-jet = "src.cli:main"
