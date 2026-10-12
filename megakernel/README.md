@@ -151,7 +151,9 @@ appended to the conversation), `--score ids.txt` (teacher-forced agreement), `--
 divergence, perplexity and agreement against a reference file, see Correctness), `MK_PROFILE=1`
 (per-phase timing, including a "min-composed" estimate that filters out time-slicing by other GPU
 users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
-megakernel instead).
+megakernel instead), `MK_PF_CAP=1024` (prefill chunk in tokens, a multiple of 128, default 2048;
+1024 frees ~0.34 GB of VRAM for longer contexts, prefill ~4% slower), `MK_EMBD_DEVICE=1` (keep
+`token_embd` in VRAM, see Server).
 
 ### The GGUF
 
@@ -205,6 +207,10 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
 - Sampling: temperature, top_p, top_k (<= 32), min_p, seed; presence / repetition penalties are
   ignored (with a warning). One request at a time.
 - KV cache: fp16, or q8_0 when fp16 does not fit the requested context (`--kv auto|f16|q8`).
+- VRAM: `token_embd` (0.72 GB) lives in pinned host memory that the GPU reads directly. A cycle
+  reads only its few tokens' rows, each staged into shared memory with one coalesced read, so
+  decode speed is unchanged. For the longest contexts on a 24 GB card, `MK_PF_CAP=1024` also halves
+  the prefill scratch.
 
 ## How it gets its speed
 
