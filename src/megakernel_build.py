@@ -15,10 +15,16 @@ from typing import Any, Callable
 
 from rich.markup import escape
 
-from .llama_server import _megakernel_dir, _megakernel_gpu_info, _megakernel_model_supported, _megakernel_root
+from .llama_server import (
+    _megakernel_dir,
+    _megakernel_gpu_info,
+    _megakernel_library,
+    _megakernel_model_supported,
+    _megakernel_root,
+    _megakernel_variant,
+)
 from .provisioning import LLAMA_CPP_DIR, _native_tool_path, _run_exec
 
-_LIBRARY = "libqwen38mk.so"
 _BUILD_TAG = ".openjet-build.json"
 _SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "prefill.cuh", "prefill_gemm.cuh", "gguf.h", "capi.cpp")
 
@@ -43,22 +49,28 @@ def _arch_for_cap(cap: str) -> str:
     return "sm_" + cap.replace(".", "")
 
 
-def _build_is_current(root: Path, arch: str) -> bool:
-    if _megakernel_dir() is None:
+def _build_is_current(root: Path, arch: str, model: str = "") -> bool:
+    library = _megakernel_library(model)
+    variant = _megakernel_variant(model)
+    if _megakernel_dir(model) is None:
         return False
     try:
-        tag = json.loads((root / _BUILD_TAG).read_text())
+        tag = json.loads((root / (_BUILD_TAG if variant == "native" else ".openjet-build-mixed.json")).read_text())
     except (OSError, ValueError):
         return False
     if tag.get("arch") != arch:
         return False
-    built = (root / _LIBRARY).stat().st_mtime
-    return all(not (root / name).is_file() or (root / name).stat().st_mtime <= built for name in _SOURCES)
+    built = (root / library).stat().st_mtime
+    sources = _SOURCES if variant == "native" else tuple(
+        {"qwen38_mk.cu": "qwen38_mixed.cu", "prefill_gemm.cuh": "prefill_gemm_mixed.cuh"}.get(name, name)
+        for name in _SOURCES
+    )
+    return all(not (root / name).is_file() or (root / name).stat().st_mtime <= built for name in sources)
 
 
-def megakernel_build_command(root: Path, *, nvcc: str, arch: str, llama_dir: Path) -> list[str]:
+def megakernel_build_command(root: Path, *, nvcc: str, arch: str, llama_dir: Path, model: str = "") -> list[str]:
     # -B: the object file may be from another GPU architecture or an older source.
-    return ["make", "-B", "-C", str(root), f"NVCC={nvcc}", f"ARCH={arch}", f"LLAMA={llama_dir}", _LIBRARY]
+    return ["make", "-B", "-C", str(root), "-j1", f"NVCC={nvcc}", f"ARCH={arch}", f"LLAMA={llama_dir}", _megakernel_library(model)]
 
 
 async def ensure_megakernel(
@@ -75,6 +87,15 @@ async def ensure_megakernel(
         return setup_result
     if not _megakernel_model_supported(str(setup_result.get("llama_model") or "")):
         return setup_result
+    model = str(setup_result.get("llama_model") or "")
+    if not Path(model).is_file():
+        log.write("[yellow]Skipping the megakernel: download the model before building its engine.[/]")
+        return setup_result
+    variant = _megakernel_variant(model)
+    if variant is None:
+        log.write("[yellow]Skipping the megakernel: unsupported or unreadable GGUF tensor types; using llama-server.[/]")
+        return setup_result
+    library = _megakernel_library(model)
     gpu = _megakernel_gpu_info()
     if gpu is None:
         return setup_result
@@ -82,7 +103,7 @@ async def ensure_megakernel(
     if not (root / "Makefile").is_file():
         return setup_result
     arch = _arch_for_cap(gpu[1])
-    if _build_is_current(root, arch):
+    if _build_is_current(root, arch, model):
         return setup_result
 
     skip = "[yellow]Skipping the Qwen3.8-27B megakernel ({}); using llama-server.[/]"
@@ -97,16 +118,16 @@ async def ensure_megakernel(
         log.write(skip.format(f"{escape(str(root))} is not writable"))
         return setup_result
 
-    set_status(f"building the Qwen3.8-27B megakernel for {arch} (a few minutes)")
-    log.write(f"[bold bright_white]Building the Qwen3.8-27B megakernel for {arch} (a few minutes)...[/]")
-    rc, out, err = await _run_exec(*megakernel_build_command(root, nvcc=nvcc, arch=arch, llama_dir=LLAMA_CPP_DIR))
+    set_status(f"building the Qwen3.8-27B {variant} megakernel for {arch} (a few minutes)")
+    log.write(f"[bold bright_white]Building the Qwen3.8-27B {variant} megakernel for {arch} (a few minutes)...[/]")
+    rc, out, err = await _run_exec(*megakernel_build_command(root, nvcc=nvcc, arch=arch, llama_dir=LLAMA_CPP_DIR, model=model))
     clear_status()
-    if rc != 0 or not (root / _LIBRARY).is_file():
+    if rc != 0 or not (root / library).is_file():
         tail = "\n".join((err or out).strip().splitlines()[-15:])
         log.write(skip.format("build failed"))
         if tail:
             log.write(f"[dim]{escape(tail)}[/]")
         return setup_result
-    (root / _BUILD_TAG).write_text(json.dumps({"arch": arch}) + "\n")
+    (root / (_BUILD_TAG if variant == "native" else ".openjet-build-mixed.json")).write_text(json.dumps({"arch": arch}) + "\n")
     log.write("[bold bright_white]Megakernel built: OpenJet will serve Qwen3.8-27B with it.[/]")
     return setup_result

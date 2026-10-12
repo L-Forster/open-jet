@@ -74,11 +74,18 @@ Which model file runs on it — `openjet setup` shows the engine in brackets nex
 |---|---|
 | `(OpenJet megakernel, 1.5x faster)` | unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads |
 | `(OpenJet megakernel, semi compatible)` | a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis |
-| `(llama.cpp)` | everything else, including other Qwen3.8-27B quants (unsloth `UD-*`, bartowski, GSQ-RCO) |
+| `(OpenJet megakernel, mixed quant)` | unsloth Qwen3.8-27B `UD-Q4_K_XL`, using a separate build |
+| `(llama.cpp)` | everything else, including other Qwen3.8-27B quants (other unsloth `UD-*`, bartowski, GSQ-RCO) |
 
 If none of your models is the megakernel's own, setup offers to download it.
 
-Setup builds llama.cpp with CUDA, then compiles the megakernel against it. The compile takes about
+Setup builds llama.cpp with CUDA, then compiles only the megakernel library needed by the selected
+model, based on its GGUF tensor types. Existing Q4_K_M users keep the smaller build. The mixed
+engine takes longer and uses roughly 11 GiB of system RAM during compilation; see the
+[build requirements](megakernel/README.md#build--run). Both engines keep the embedding table in
+system RAM by default, saving about 680 MiB of GPU VRAM.
+
+For Q4_K_M, setup compiles the megakernel against llama.cpp. The compile takes about
 2 minutes and ends with `Megakernel built: OpenJet will serve Qwen3.8-27B with it.` If you set
 OpenJet up before 0.4.32, upgrade and run `openjet setup` again.
 
@@ -239,7 +246,7 @@ running `llama-server` or the megakernel itself.
 **Can it use a cloud model?** Only if you choose one. `/mode` switches between Local, Codex,
 OpenRouter and Slipstream; local llama.cpp is the default.
 
-**Does the megakernel work on other GPUs or models?** It serves Qwen3.8-27B Q4_K_M on RTX 30, 40 and
+**Does the megakernel work on other GPUs or models?** It serves Qwen3.8-27B Q4_K_M and UD-Q4_K_XL on RTX 30, 40 and
 50-series GPUs with 24 GB or more (sm_86, sm_89, sm_120). It's tuned on an RTX 3090; `openjet setup` builds it
 for whichever of these GPUs you have. Everything else uses `llama-server`.
 

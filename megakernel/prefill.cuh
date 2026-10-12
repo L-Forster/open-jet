@@ -4,7 +4,11 @@
 // megakernel expects: K/V caches (trunk + MTP), committed delta-net state, conv ring, h history.
 // Included inside qwen38_mk.cu's anonymous namespace.
 
+#ifdef OPENJET_MIXED_QUANTS
+#include "prefill_gemm_mixed.cuh"
+#else
 #include "prefill_gemm.cuh"
+#endif
 
 struct PBufs {
     int cap;      // token capacity of a chunk (multiple of 128)

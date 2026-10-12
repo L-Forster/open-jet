@@ -99,11 +99,16 @@ def best(runs, key):
 
 
 def main():
+    global MODEL, MK
     ap = argparse.ArgumentParser()
     ap.add_argument("--ctx-sizes", default="0,2000,4000,8000,16000,30000")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("-n", type=int, default=256)
+    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--mk-bin", default=MK, help="megakernel executable (qwen38_mixed for extended quants)")
     args = ap.parse_args()
+    MODEL = args.model
+    MK = args.mk_bin
     os.makedirs(TMP, exist_ok=True)
     sizes = [int(x) for x in args.ctx_sizes.split(",")]
     prompts = [l.strip() for l in open(os.path.join(HERE, "prompts.txt")) if l.strip()]

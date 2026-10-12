@@ -688,6 +688,17 @@ __device__ __forceinline__ float dequant_q4k(const uint8_t * row, int e) {
     return d * (float) s * (float) qv - dmin * (float) m;
 }
 
+constexpr int EMBD_RB = D / 256 * 144; // bytes of one Q4_K token_embd row
+
+// token_embd row -> shared memory in one coalesced read: the table is in mapped host memory, where
+// every dependent access pays a PCIe round trip
+__device__ __forceinline__ const uint8_t * stage_embd_row(int tok, uint8_t * dst) {
+    if (threadIdx.x < EMBD_RB / 16)
+        reinterpret_cast<uint4 *>(dst)[threadIdx.x] = reinterpret_cast<const uint4 *>(cW.embd + (size_t) tok * EMBD_RB)[threadIdx.x];
+    __syncthreads();
+    return dst;
+}
+
 // token embedding rows -> x, plus quantised attn_norm input for layer 0
 template <int T>
 __device__ __noinline__ void embed_prologue() {
@@ -695,7 +706,7 @@ __device__ __noinline__ void embed_prologue() {
     if (t >= T) return;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int tok = ((volatile Ctl *) cB.ctl)->tok[t];
-    const uint8_t * row = cW.embd + (size_t) tok * (D / 256 * 144);
+    const uint8_t * row = stage_embd_row(tok, smem);
     const float * w0 = cW.L[0].attn_norm;
     for (int j = warp; j < U_D; j += NW) {
         const int e = 32 * j + lane;
@@ -1860,7 +1871,7 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
         float * se = reinterpret_cast<float *>(sm);
         float * sh = se + D;
         float * red = sh + D;
-        const uint8_t * erow = cW.embd + (size_t) tok * (D / 256 * 144);
+        const uint8_t * erow = stage_embd_row(tok, reinterpret_cast<uint8_t *>(red + 32));
         float ae = 0.f, ah = 0.f;
         for (int e = tid; e < D; e += NT) {
             const float v = dequant_q4k(erow, e);
@@ -2012,6 +2023,7 @@ struct MKEngine::Impl {
     ModelW hw{};
     Bufs hb{};
     std::vector<void *> allocs;
+    void * embd_host = nullptr;
     int ctx;
     int nsm = 0;
     float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f; // sampling (temp 0: greedy)
@@ -2404,9 +2416,22 @@ struct MKEngine::Impl {
         {
             const auto & t = file.get("token_embd.weight");
             if (t.type != gguf::Q4_K) throw std::runtime_error("token_embd must be Q4_K");
-            uint8_t * d = dalloc<uint8_t>(t.nbytes, false);
-            CK(cudaMemcpy(d, t.data, t.nbytes, cudaMemcpyHostToDevice));
-            hw.embd = d;
+            // mapped pinned host memory: a cycle reads only a few 2.8 KB rows over PCIe, saves 0.7 GB of VRAM
+            const char * ed = getenv("MK_EMBD_DEVICE");
+            if (!(ed && ed[0] == '1') &&
+                cudaHostAlloc(&embd_host, t.nbytes, cudaHostAllocMapped | cudaHostAllocWriteCombined) == cudaSuccess) {
+                memcpy(embd_host, t.data, t.nbytes);
+                void * d = nullptr;
+                CK(cudaHostGetDevicePointer(&d, embd_host, 0));
+                hw.embd = (const uint8_t *) d;
+                fprintf(stderr, "[mk] token_embd in mapped host memory (%.2f GB)\n", t.nbytes / 1e9);
+            } else {
+                cudaGetLastError();
+                embd_host = nullptr;
+                uint8_t * d = dalloc<uint8_t>(t.nbytes, false);
+                CK(cudaMemcpy(d, t.data, t.nbytes, cudaMemcpyHostToDevice));
+                hw.embd = d;
+            }
         }
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
         if (n_conv)
@@ -2477,6 +2502,7 @@ struct MKEngine::Impl {
     ~Impl() {
         print_profile();
         for (void * p : allocs) cudaFree(p);
+        if (embd_host) cudaFreeHost(embd_host);
     }
 
     void launch(int mode, int T, int last, int score = 0) {
@@ -2612,7 +2638,9 @@ struct MKEngine::Impl {
 
     void pf_init() {
         if (pf_ready) return;
-        const int cap = 2048;
+        // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch is ~0.33 MB per token
+        int cap = 2048;
+        if (const char * e = getenv("MK_PF_CAP")) cap = std::max(128, std::min(2048, atoi(e) / 128 * 128));
         hp.cap = cap;
         hp.x = dalloc<float>((size_t) cap * D);
         hp.xm = dalloc<float>((size_t) cap * D);
@@ -2781,8 +2809,9 @@ struct MKEngine::Impl {
             if (pred || sink) {
                 pk_norm_quant<<<T, 256>>>(hp.x, hw.onorm);
                 std::vector<float> rows;
-                for (int s = 0; s < T; s += 128) {
-                    const int nt = std::min(128, T - s);
+                const int tile = std::min(128, cap * FF / VOCAB); // logits rows that fit in y0
+                for (int s = 0; s < T; s += tile) {
+                    const int nt = std::min(tile, T - s);
                     const int lo = std::max(s, first - n); // rows from lo on are at positions >= first
                     if (!pred && lo >= s + nt) continue;
                     gemm(hw.head, nt, hp.y0, VOCAB, pf::OUT_STORE, s);

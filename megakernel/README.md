@@ -17,7 +17,8 @@ Which model file runs on it (details in [The GGUF](#the-gguf)):
 |---|---|
 | unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads | megakernel |
 | a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis | megakernel, semi compatible |
-| any other quant (unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
+| unsloth Qwen3.8-27B `UD-Q4_K_XL` | separate mixed-quant megakernel |
+| any other quant (other unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
 
 ## How it works
 
@@ -132,8 +133,24 @@ between `-d` settings.
 ## Build / run
 
 Requires CUDA 12+ (12.8+ for RTX 50 series; built with 13.2), an sm_86, sm_89 or sm_120 GPU with 24 GB, and the repo's llama.cpp build (only
-`libllama`, for tokenization, loaded vocab-only). `openjet setup` builds `libqwen38mk.so` automatically
-(this source ships in the open-jet wheel); building by hand:
+`libllama`, for tokenization, loaded vocab-only). `openjet setup` reads the selected model's GGUF
+header and builds only the library it needs (the source ships in the open-jet wheel):
+
+- `libqwen38mk.so` / `qwen38_mk.cu`: the original Q4_K_M engine, including its existing
+  conversions for plain llama-quantize Q4_K_M. Its original quant-specialized kernels are retained.
+- `libqwen38mk_mixed.so` / `qwen38_mixed.cu`: additional quant kernels for UD-Q4_K_XL and
+  supported mixed tensor recipes. This is compiled only when the selected model needs it.
+
+Selection checks tensor roles and types, rather than assuming the quant recipe from the filename.
+Both libraries and their architecture/build records are retained independently when switching models.
+The default `make` target builds only the original engine.
+
+The mixed engine has a heavier compilation: in an RTX 3090 / CUDA 13.2 test, compilation consumed
+roughly 11 GiB of available system RAM and succeeded with 16 GiB assigned to WSL. This is observed
+usage, not a proven minimum; 32 GB system RAM is recommended for headroom when building the mixed
+engine. GPU VRAM is separate. Existing Q4_K_M users do not compile the mixed engine.
+
+Building the original engine by hand:
 
 ```sh
 cd megakernel
@@ -141,6 +158,19 @@ make        # qwen38_mk (CLI), libqwen38mk.so (server library), tools/vocab_freq
 ./qwen38_mk -m ../models/Qwen3.8-27B-Q4_K_M.gguf -p "Write quicksort in C" -n 512 \
             -d 4 --draft-vocab draft_vocab_32k.bin --think --temp 1.0 --top-p 0.95 --top-k 20
 ```
+
+To build and serve the mixed engine manually:
+
+```sh
+make -j1 qwen38_mixed libqwen38mk_mixed.so
+python server/mk_server.py -m /path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf --lib ./libqwen38mk_mixed.so
+```
+
+The original CLI remains Q4_K_M-only; use `./qwen38_mixed` or the server with `--lib` for the mixed engine.
+Benchmark scripts accept `--model /path/to/model.gguf --mk-bin ./qwen38_mixed` for this executable.
+`openjet` passes the correct library automatically. The mixed loader accepts Q4_K, Q5_K, Q6_K,
+Q8_0 and IQ4_XS projections, and converts Q3_K / IQ3_S to Q6_K and IQ4_NL to Q8_0.
+Both engines still require Q4_K token embeddings and a Q6_K output head.
 
 CLI flags: `-d` drafts per cycle (0-4; with 4 the depth drops to 3 for a cycle after a rejected
 draft), `-c` KV capacity, `--kv f16|q8|auto` (KV cache format), `--think [xhigh|medium|low]`
@@ -151,7 +181,9 @@ appended to the conversation), `--score ids.txt` (teacher-forced agreement), `--
 divergence, perplexity and agreement against a reference file, see Correctness), `MK_PROFILE=1`
 (per-phase timing, including a "min-composed" estimate that filters out time-slicing by other GPU
 users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
-megakernel instead).
+megakernel instead), `MK_PF_CAP=1024` (prefill chunks of 1024 tokens; default 2048,
+rounded down to a multiple of 128 and clamped to 128–2048), `MK_EMBD_DEVICE=1` (keep
+`token_embd` in GPU memory).
 
 ### The GGUF
 
@@ -169,8 +201,8 @@ every tensor against it:
 
 A plain `llama-quantize ... Q4_K_M` stores `ssm_out`, `ssm_alpha`, `ssm_beta` and `nextn.eh_proj` as
 Q4_K; the loader re-encodes those to the table's types (145 tensors) and the file then runs the same
-kernels. A file with any other mix is refused, naming the first tensor that does not match, and
-open-jet starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
+kernels. The original engine refuses any other mix, naming the first tensor that does not match.
+OpenJet selects the mixed engine for supported extended recipes and otherwise starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
 
 To build a file with unsloth's mix from the BF16 GGUF (unsloth's imatrix optional):
 
@@ -205,6 +237,11 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
 - Sampling: temperature, top_p, top_k (<= 32), min_p, seed; presence / repetition penalties are
   ignored (with a warning). One request at a time.
 - KV cache: fp16, or q8_0 when fp16 does not fit the requested context (`--kv auto|f16|q8`).
+- Both engines keep the ~0.72 GB token embedding table in mapped pinned system RAM by default,
+  freeing about 680 MiB of GPU VRAM. `MK_EMBD_DEVICE=1` restores GPU residency.
+- `MK_PF_CAP=1024` halves prefill scratch, freeing about another 325 MiB of VRAM.
+  The default remains 2048; throughput depends on prompt length. Smaller caps also limit
+  scoring/logit tiles to the scratch allocation. These options apply to both quant engines.
 
 ## How it gets its speed
 

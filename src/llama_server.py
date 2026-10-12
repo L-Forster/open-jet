@@ -40,7 +40,7 @@ _MTP_SPEC_ARGS: tuple[str, ...] = (
 
 
 # The Qwen3.8-27B megakernel (<openjet>/megakernel): a specialised CUDA engine for this one model and
-# quantisation on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120) with an OpenAI-compatible
+# supported quantisations on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120) with an OpenAI-compatible
 # server in front of it.
 _MEGAKERNEL_SERVER = Path("server") / "mk_server.py"
 _MEGAKERNEL_FILES = ("libqwen38mk.so", "draft_vocab_32k.bin", str(_MEGAKERNEL_SERVER))
@@ -55,15 +55,21 @@ def _megakernel_root() -> Path:
     return Path(override).expanduser() if override else openjet_install_root() / "megakernel"
 
 
-def _megakernel_dir() -> Path | None:
+def _megakernel_library(model: str = "") -> str:
+    return "libqwen38mk_mixed.so" if _megakernel_variant(model) == "mixed" else "libqwen38mk.so"
+
+
+def _megakernel_dir(model: str = "") -> Path | None:
     root = _megakernel_root()
-    return root if all((root / name).is_file() for name in _MEGAKERNEL_FILES) else None
+    files = (_megakernel_library(model), *_MEGAKERNEL_FILES[1:])
+    return root if all((root / name).is_file() for name in files) else None
 
 
 def _megakernel_model_supported(model: str) -> bool:
-    # the plain Q4_K_M only: UD-Q4_K_M, AP-Q4_K_M and the like are other quant mixes and run on llama-server
+    # Q4_K_M and unsloth's UD-Q4_K_XL: UD-Q4_K_M, AP-Q4_K_M and the like are untested quant mixes and run
+    # on llama-server
     name = Path(model).name.lower()
-    return name.endswith(".gguf") and re.search(r"qwen3\.8-27b[-.]q4_k_m", name) is not None
+    return name.endswith(".gguf") and re.search(r"qwen3\.8-27b[-.](q4_k_m|ud-q4_k_xl)", name) is not None
 
 
 # decode speed in the agent's reasoning mode on an RTX 3090, megakernel/README.md
@@ -71,11 +77,12 @@ MEGAKERNEL_RUNTIME_LABEL = "OpenJet megakernel, 1.5x faster"
 
 
 MEGAKERNEL_SEMI_LABEL = "OpenJet megakernel, semi compatible"
+MEGAKERNEL_MIXED_LABEL = "OpenJet megakernel, mixed quant"
 _GGUF_SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
 
-def _gguf_tensor_types(path: Path, names: tuple[str, ...]) -> dict[str, int]:
-    """ggml type ids of the named tensors, read from a GGUF header."""
+def _gguf_tensor_types(path: Path, names: tuple[str, ...] | None = None) -> dict[str, int]:
+    """ggml type ids of the named tensors (all of them when names is None), read from a GGUF header."""
     found: dict[str, int] = {}
     with open(path, "rb") as f:
         if f.read(4) != b"GGUF":
@@ -105,27 +112,63 @@ def _gguf_tensor_types(path: Path, names: tuple[str, ...]) -> dict[str, int]:
             name = f.read(struct.unpack("<Q", f.read(8))[0]).decode("utf-8", "replace")
             f.seek(8 * struct.unpack("<I", f.read(4))[0], 1)
             kind, _offset = struct.unpack("<IQ", f.read(12))
-            if name in names:
+            if names is None or name in names:
                 found[name] = kind
-                if len(found) == len(names):
+                if names is not None and len(found) == len(names):
                     break
     return found
 
 
-def _megakernel_quant_mix(model: str) -> str | None:
-    """"native" for the quant mix the megakernel's kernels are built for, "semi" for a plain
-    llama-quantize Q4_K_M (four tensor roles are re-encoded at load), None for anything else."""
-    names = ("blk.0.ssm_out.weight", "blk.0.ssm_alpha.weight", "blk.64.nextn.eh_proj.weight")
+# ggml types the megakernel loader accepts: F32, Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS, plus Q3_K, IQ3_S
+# (re-encoded as Q6_K) and IQ4_NL (as Q8_0), exactly
+_MEGAKERNEL_TYPES = frozenset({0, 8, 11, 12, 13, 14, 20, 21, 23})
+
+
+def _megakernel_variant(model: str) -> str | None:
+    """Select by tensor roles/types, without reading tensor data or loading the model.
+
+    The native loader also accepts plain Q4_K_M, re-encoding four roles at load.
+    A missing file is a not-yet-downloaded catalog entry; setup selects again after download.
+    """
+    if not model or not Path(model).is_file():
+        return "native"
     try:
-        types = _gguf_tensor_types(Path(model), names)
+        types = _gguf_tensor_types(Path(model))
     except (OSError, struct.error, KeyError):
         return None
+    if not types or not set(types.values()) <= _MEGAKERNEL_TYPES:
+        return None
+    if types.get("token_embd.weight") != 12 or types.get("output.weight") != 14:
+        return None
+    native_roles = {
+        "ssm_out": {12, 13}, "ssm_alpha": {0, 12}, "ssm_beta": {0, 12},
+        "nextn.eh_proj": {8, 12}, "ffn_down": {12, 14},
+        "attn_v": {12, 14}, "attn_qkv": {12, 14},
+        "ffn_gate": {12}, "ffn_up": {12}, "attn_q": {12}, "attn_k": {12},
+        "attn_output": {12}, "attn_gate": {12},
+        "token_embd": {12}, "output": {14},
+    }
+    for name, kind in types.items():
+        role = re.sub(r"^blk\.\d+\.", "", name).removesuffix(".weight")
+        if kind not in native_roles.get(role, {0}):
+            return "mixed"
+    return "native"
+
+
+def _megakernel_quant_mix(model: str) -> str | None:
+    """"native" for the quant mixes the megakernel is benchmarked on (unsloth's Q4_K_M and UD-Q4_K_XL),
+    "semi" for any other mix of types it reads (e.g. a plain llama-quantize Q4_K_M), None otherwise."""
+    names = ("blk.0.ssm_out.weight", "blk.0.ssm_alpha.weight", "blk.64.nextn.eh_proj.weight")
+    try:
+        types = _gguf_tensor_types(Path(model))
+    except (OSError, struct.error, KeyError):
+        return None
+    if not types or not set(types.values()) <= _MEGAKERNEL_TYPES:
+        return None
     mix = tuple(types.get(name) for name in names)
-    if mix == (13, 0, 8):  # Q5_K, F32, Q8_0
+    if mix in ((13, 0, 8), (8, 8, 14)):  # unsloth Q4_K_M: Q5_K, F32, Q8_0; unsloth UD-Q4_K_XL: Q8_0, Q8_0, Q6_K
         return "native"
-    if mix == (12, 12, 12):  # all Q4_K
-        return "semi"
-    return None
+    return "semi"
 
 
 def model_runtime_label(model: str) -> str:
@@ -133,11 +176,13 @@ def model_runtime_label(model: str) -> str:
     if not _megakernel_model_supported(model) or _megakernel_gpu() is None:
         return "llama.cpp"
     if not Path(model).is_file():  # a catalog model that is not downloaded yet
-        return MEGAKERNEL_RUNTIME_LABEL
+        return MEGAKERNEL_MIXED_LABEL if "ud-q4_k_xl" in Path(model).name.lower() else MEGAKERNEL_RUNTIME_LABEL
     mix = _megakernel_quant_mix(model)
     if mix == "semi":
         return MEGAKERNEL_SEMI_LABEL
-    return MEGAKERNEL_RUNTIME_LABEL if mix == "native" else "llama.cpp"
+    if mix == "native":
+        return MEGAKERNEL_MIXED_LABEL if _megakernel_variant(model) == "mixed" else MEGAKERNEL_RUNTIME_LABEL
+    return "llama.cpp"
 
 
 def _megakernel_gpu() -> str | None:
@@ -179,8 +224,10 @@ def _megakernel_gpu_info() -> tuple[str, str] | None:
 def megakernel_unavailable_reason(model: str) -> str | None:
     """None when the megakernel can serve *model* on this machine, else why not."""
     if not _megakernel_model_supported(model):
-        return "the megakernel only supports Qwen3.8-27B Q4_K_M"
-    if _megakernel_dir() is None:
+        return "the megakernel only supports Qwen3.8-27B Q4_K_M and UD-Q4_K_XL"
+    if _megakernel_variant(model) is None:
+        return "the GGUF tensor types are unsupported or its header is unreadable"
+    if _megakernel_dir(model) is None:
         return "the megakernel is not built (rerun `openjet setup` with the CUDA toolkit installed)"
     if importlib.util.find_spec("jinja2") is None:
         return "the megakernel server needs jinja2"
@@ -687,11 +734,13 @@ class LlamaServerClient:
         raise TimeoutError("llama-server did not become ready")
 
     async def _start_megakernel(self, *, env: dict[str, str], ctx: int) -> None:
-        root = _megakernel_dir()
+        root = _megakernel_dir(self.model)
         assert root is not None
         cmd = [
             sys.executable,
             str(root / _MEGAKERNEL_SERVER),
+            "--lib",
+            str(root / _megakernel_library(self.model)),
             "-m",
             self.model,
             "--host",

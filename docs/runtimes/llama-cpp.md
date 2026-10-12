@@ -37,8 +37,14 @@ it, setup says so and OpenJet uses `llama-server`. In a source checkout you can 
 cd megakernel && make
 ```
 
+Unsloth's Qwen3.8-27B UD-Q4_K_XL uses a separate mixed-quant library. Setup selects and builds
+only the required library by inspecting the downloaded GGUF's tensor roles and types. Existing
+Q4_K_M users keep the original engine and its smaller compilation. Both builds are cached
+independently. The mixed engine's compilation needs substantially more system RAM; see
+[build requirements](../../megakernel/README.md#build--run). The performance figures above are for Q4_K_M.
+
 With `llama_backend: auto` (the default) OpenJet then starts `megakernel/server/mk_server.py`
-whenever the configured model is Qwen3.8-27B Q4_K_M, the megakernel is built, the GPU is sm_86, sm_89 or
+whenever the configured model is Qwen3.8-27B Q4_K_M or UD-Q4_K_XL, its selected megakernel library is built, the GPU is sm_86, sm_89 or
 sm_120 with at least 23 GB and `jinja2` is installed; in every other case, or if the megakernel fails to start,
 it starts `llama-server` as usual. `llama_backend: llama` turns it off, `llama_backend: megakernel`
 makes it required. `OPENJET_MEGAKERNEL_DIR` points at a megakernel build elsewhere.
