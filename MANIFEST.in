@@ -5,4 +5,6 @@ prune ui/dist
 recursive-include src/tui_bin *
 include megakernel/Makefile megakernel/README.md megakernel/draft_vocab_32k.bin
 recursive-include megakernel *.cu *.cuh *.h *.cpp
-include megakernel/server/mk_server.py
+include megakernel/pyproject.toml megakernel/LICENSE
+include megakernel/__init__.py megakernel/__main__.py
+include megakernel/server/__init__.py megakernel/server/mk_server.py

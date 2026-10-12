@@ -2,7 +2,8 @@
 
 `openjet` uses `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) as its local/offline inference backend.
 
-In this simplified build, `llama.cpp` is the only supported local runtime.
+OpenJet can also use its specialised [OpenJet Engine](../../megakernel/README.md)
+for supported Qwen3.8-27B models. Its README covers standalone installation and the HTTP API.
 
 Pre-built binaries are available for x86, while Jetson/ARM64 commonly requires source build with device-appropriate flags.
 
@@ -14,7 +15,7 @@ Use the deployment-specific build guides:
 
 The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/bin/`.
 
-## Qwen3.8-27B megakernel backend (RTX 3090)
+## OpenJet Engine backend (RTX 30/40/50 series)
 
 For one specific setup, Qwen3.8-27B Q4_K_M on an RTX 30, 40 or 50-series GPU with 24 GB+ (sm_86, sm_89,
 sm_120), OpenJet ships a

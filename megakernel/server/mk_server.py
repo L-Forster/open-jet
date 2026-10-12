@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible chat server for the Qwen3.8-27B megakernel (a drop-in for the parts of
+"""OpenJet Engine: OpenAI-compatible chat server for the Qwen3.8-27B megakernel (a drop-in for the parts of
 llama-server's API that open-jet uses).
 
   python3 server/mk_server.py -m model.gguf --port 18080 [--ctx 32768] [--draft 4]
@@ -535,7 +535,9 @@ def make_handler(srv):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="OpenJet Engine: CUDA inference for Qwen3.8-27B with an OpenAI-compatible HTTP API."
+    )
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=18080)

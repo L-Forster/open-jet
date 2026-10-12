@@ -12,6 +12,10 @@ already have a local AI stack, `openjet setup` downloads, configures, and serves
 
 On NVIDIA RTX 30, 40 and 50-series GPUs with 24 GB+, OpenJet serves Qwen3.8-27B through its own CUDA engine at **1.5x the speed of llama.cpp** (measured on an RTX 3090). Open source.
 
+**Inference engine:** [OpenJet Engine](https://github.com/l-forster/open-jet/tree/master/megakernel) has its own standalone installation,
+`openjet-engine` server command, HTTP API quick start, benchmarks, and systems documentation.
+Use it directly from your own application without running the coding agent.
+
 [Discord](https://discord.gg/pspKHtExSa)
 
 **In your terminal**, OpenJet is a self-hosted coding agent:
@@ -34,7 +38,7 @@ Open source.
 
 If you are new to local LLMs, OpenJet is the fastest way to get started without spending hours figuring out models, runtimes, and config. If you have already tried local LLMs and got frustrated piecing together a model backend, a frontend, and an actual agent workflow, OpenJet removes that setup tax.
 
-This is the PyPI package for OpenJet. Install it with:
+This is the PyPI package for OpenJet. [Use your coding agent to install it](#quick-start), or install manually with:
 
 ```bash
 pip install open-jet
@@ -48,17 +52,27 @@ The package installs:
 
 ## Quick Start
 
+Use your coding agent to install OpenJet. Paste this into Codex, Claude Code, or another agent with terminal access:
+
+> Install OpenJet on this machine by following https://github.com/l-forster/open-jet/blob/master/docs/agent-install.md. Inspect my hardware, choose a suitable local coding model, configure it without the setup wizard, verify inference works, and tell me how to use OpenJet.
+
+Your agent checks GPU and memory, downloads a model that fits, and verifies the local runtime. [Agent installation instructions](https://github.com/l-forster/open-jet/blob/master/docs/agent-install.md).
+
+For manual installation:
+
 ```bash
 pip install open-jet
 openjet setup
 openjet
 ```
 
+To accept the hardware recommendation without the wizard, run `openjet setup --yes`.
+
 `openjet setup` detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
 
 Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14GB+ VRAM.
 
-## Qwen3.8-27B megakernel (NVIDIA RTX, 24GB+)
+## OpenJet Engine (NVIDIA RTX, 24GB+)
 
 For Qwen3.8-27B Q4_K_M on Linux with an RTX 30, 40 or 50-series GPU that has 24GB or more, OpenJet serves the model through its own CUDA engine instead of `llama-server`. On an RTX 3090 it decodes at 1.5x llama.cpp's speed in the agent's reasoning mode (78 vs 51 tok/s) and up to 1.9x when writing code (140 vs 73 tok/s).
 

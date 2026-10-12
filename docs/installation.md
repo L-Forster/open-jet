@@ -1,5 +1,16 @@
 # Installation
 
+## Install with your agent
+
+Ask Codex or Claude Code to [follow the agent installation instructions](agent-install.md). It can inspect your hardware, choose a model, configure OpenJet without the wizard, verify inference, and give you usage commands.
+
+Once installed, the noninteractive path is:
+
+```bash
+openjet setup --non-interactive --dry-run --json
+openjet setup --non-interactive --yes --json
+```
+
 ## Clone and install
 
 ```bash
@@ -20,7 +31,7 @@ On Windows, run:
 curl -L https://www.openjet.dev/install.bat -o install.bat && install.bat
 ```
 
-This creates a local virtualenv, installs the repo, creates `openjet` / `openjet` command launchers, and starts setup.
+This creates a local virtualenv, installs the repo, creates `open-jet` / `openjet` command launchers, and exits. Run `openjet setup --yes` to accept the hardware recommendation or `openjet setup` for the wizard.
 It is an editable Python install, not a compiled release build.
 
 If stale in-place compiled extension artifacts exist under `src/`, the installer removes them so imports continue to use the source tree.

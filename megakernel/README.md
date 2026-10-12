@@ -1,15 +1,100 @@
-# Qwen3.8-27B megakernel (RTX 30/40/50 series)
+# OpenJet Engine
 
-A specialised CUDA inference engine for `Qwen3.8-27B-Q4_K_M.gguf` (llama.cpp arch `qwen35`:
-48 Gated-DeltaNet + 16 gated-attention layers, one MTP block) on RTX 30, 40 and 50-series GPUs
-with 24 GB+ (sm_86, sm_89, sm_120; tuned and benchmarked on an RTX 3090), with an OpenAI-compatible server that open-jet uses in place of `llama-server`
-(`llama_backend: auto`, see [docs/runtimes/llama-cpp.md](../docs/runtimes/llama-cpp.md)).
+OpenJet Engine is a specialised CUDA inference engine for Qwen3.8-27B on NVIDIA RTX
+30, 40 and 50-series GPUs with 24 GB+ (sm_86, sm_89, sm_120). It combines persistent
+megakernel decoding, on-device MTP speculative verification, and batched tensor-core
+prefill, exposed through an OpenAI-compatible HTTP API.
+
+It is the inference engine developed for [OpenJet](../README.md), the local coding
+agent. You can serve it directly for your own application without installing or running
+the agent. The source remains in `megakernel/`; existing binaries, C API symbols and
+OpenJet's `llama_backend: megakernel` setting keep their names.
+
+On an RTX 3090 with Qwen3.8-27B Q4_K_M, measured reasoning decode is **78 vs 51 tok/s**
+for llama.cpp with MTP, and greedy code generation reaches **140 vs 73 tok/s**.
+These are single-conversation results on that GPU; see [Results](#results) for settings,
+reproduction scripts, and correctness comparisons.
+
+## Standalone installation
+
+Requires Linux, a supported NVIDIA GPU with 24 GB+ VRAM, Python 3.10+, a C++ compiler,
+CMake, Make, and the CUDA toolkit (`nvcc`: CUDA 12+, or 12.8+ for RTX 50).
+Supply a supported Qwen3.8-27B GGUF yourself; see the [model table](#quick-guide).
+
+From a source checkout, build llama.cpp for the tokenizer, install the engine's Python
+server, and compile the original Q4_K_M engine:
+
+```sh
+git clone https://github.com/l-forster/open-jet.git
+cd open-jet
+git clone --depth 1 --branch b10246 https://github.com/ggml-org/llama.cpp.git llama.cpp
+cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
+cmake --build llama.cpp/build --config Release -j 2
+python3 -m venv .venv-engine
+. .venv-engine/bin/activate
+python -m pip install -e ./megakernel
+make -C megakernel NVCC="$(command -v nvcc)" libqwen38mk.so
+openjet-engine --model /absolute/path/to/Qwen3.8-27B-Q4_K_M.gguf --port 18080
+```
+
+This installs the local `openjet-engine` distribution with only Jinja2 as a Python runtime
+dependency. The editable install keeps the server beside the compiled library and bundled
+draft vocabulary. Keep the checkout and llama.cpp build in place. This is a source-install
+entry point; it does not require a separately published PyPI package or the OpenJet CLI.
+`openjet-engine --help` lists the context, sampling-draft, library and KV-cache options.
+You can also launch it with `python -m megakernel`.
+
+For UD-Q4_K_XL, replace the `make` and server commands with:
+
+```sh
+make -C megakernel NVCC="$(command -v nvcc)" -j1 libqwen38mk_mixed.so
+openjet-engine --model /absolute/path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf \
+  --lib "$PWD/megakernel/libqwen38mk_mixed.so" --port 18080
+```
+
+The mixed build used roughly 11 GiB of system RAM in testing; 32 GB is recommended
+for build headroom. See [Build / run](#build--run) for manual CLI builds and quant details.
+
+## HTTP API
+
+The server listens on `127.0.0.1:18080` by default. Use this base URL in any client
+that supports OpenAI chat completions: `http://127.0.0.1:18080/v1`.
+
+```sh
+curl http://127.0.0.1:18080/health
+curl http://127.0.0.1:18080/v1/models
+curl http://127.0.0.1:18080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.8-27B-Q4_K_M.gguf","messages":[{"role":"user","content":"Write quicksort in Python."}],"max_tokens":512,"temperature":0.6,"top_k":20,"stream":false}'
+```
+
+Use the model ID returned by `/v1/models` in your client configuration.
+
+| Endpoint | Behavior |
+|---|---|
+| `GET /health` | Readiness after the model has loaded |
+| `GET /v1/models` | Loaded model ID |
+| `POST /v1/chat/completions` | Chat completions; `stream: true` returns SSE ending in `[DONE]` |
+
+Responses include `choices`, `usage`, and engine `timings`. Thinking output uses
+`reasoning_content`; tool calls use structured `tool_calls`. Requests accept `tools`,
+`chat_template_kwargs`, `temperature`, `top_p`, `top_k` (at most 32), `min_p`, and `seed`.
+One request runs at a time. Text only; presence and repetition penalties are ignored with
+a warning. See [Server](#server) and [Limitations](#limitations) for conversation reuse
+and other API constraints.
+
+## Use with OpenJet
+
+The full `open-jet` package also installs `openjet-engine`. Run `openjet setup` to download
+a model and build the appropriate library automatically, then run `openjet` for the coding
+agent. OpenJet selects this engine when supported and falls back to llama.cpp otherwise;
+see [runtime configuration](../docs/runtimes/llama-cpp.md).
+
+To serve a library built by setup directly, pass `openjet-engine --lib /path/to/libqwen38mk.so`
+(or the mixed library) together with `--model`. Standalone serving loads the requested engine
+and reports errors directly; automatic runtime selection belongs to OpenJet setup.
 
 ## Quick guide
-
-1. Run `openjet setup` and choose "Qwen3.8 27B Q4_K_M MTP". It downloads the model and builds the
-   megakernel (by hand: [Build / run](#build--run)).
-2. Run `openjet`. It serves the model through the megakernel.
 
 Which model file runs on it (details in [The GGUF](#the-gguf)):
 
@@ -300,8 +385,8 @@ processing the whole conversation as one fresh prompt.
 
 ## Limitations
 
-- Specialised to this model's shapes and quant mix (27B, Q4_K_M as published by unsloth, see
-  [The GGUF](#the-gguf)), plus a plain `llama-quantize` Q4_K_M; the loader rejects any other model or mix. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
+- Specialised to Qwen3.8-27B shapes and the supported original or mixed quant recipes
+  described in [The GGUF](#the-gguf); the loader rejects unsupported models or tensor mixes. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
   GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
   repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).

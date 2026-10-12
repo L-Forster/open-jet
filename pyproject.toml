@@ -90,10 +90,12 @@ Website = "https://openjet.dev/"
 Documentation = "https://github.com/l-forster/open-jet/blob/master/docs/getting-started.md"
 Repository = "https://github.com/l-forster/open-jet"
 Issues = "https://github.com/l-forster/open-jet/issues"
+"OpenJet Engine" = "https://github.com/l-forster/open-jet/tree/master/megakernel"
 
 [project.scripts]
 open-jet = "src.cli:main"
 openjet = "src.cli:main"
+openjet-engine = "megakernel.server.mk_server:main"
 
 [build-system]
 requires = ["setuptools>=77,<81", "wheel"]

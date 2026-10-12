@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
+import json
 import os
 import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from .airgap import airgapped_from_cfg
@@ -387,10 +389,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--update", action="store_true", help="pull the latest repo commit from the tracked remote branch")
     parser.add_argument("--version", action="store_true", help="show version information and exit")
     parser.add_argument("--context", type=int, metavar="TOKENS", help="set the configured context window token count")
+    parser.add_argument("--json", dest="json_output", action="store_true", help="output machine-readable status")
     subparsers = parser.add_subparsers(dest="command")
     chat_parser = subparsers.add_parser("chat", help="start the interactive chat UI or run a one-shot prompt")
     chat_parser.add_argument("prompt", nargs=argparse.REMAINDER, help="optional one-shot prompt text")
-    subparsers.add_parser("setup", help="run setup wizard before launching the chat UI")
+    setup_parser = subparsers.add_parser("setup", help="configure OpenJet interactively or without the wizard")
+    setup_parser.add_argument("--non-interactive", action="store_true", help="configure and exit without prompts or the TUI")
+    setup_parser.add_argument("--yes", action="store_true", help="accept recommended download/build and skip the wizard")
+    setup_parser.add_argument("--dry-run", action="store_true", help="inspect hardware and the setup plan without changing anything")
+    setup_parser.add_argument("--json", dest="json_output", action="store_true", default=argparse.SUPPRESS, help="return a JSON setup result")
+    setup_parser.add_argument("--model", help="catalog GGUF filename/label or existing local GGUF path")
+    setup_parser.add_argument("--context-tokens", type=int, help="context window, within the recommended memory limit")
     project_parser = subparsers.add_parser(
         "project",
         help="provision this project's embedded model (build-time; the SDK never downloads at runtime)",
@@ -540,7 +549,13 @@ def main(argv: list[str] | None = None) -> None:
         print(_format_model_profiles_summary(load_config()))
         return
     if getattr(args, "status", False):
-        print(_format_cli_status(load_config()))
+        cfg = load_config()
+        if getattr(args, "json_output", False):
+            print(json.dumps({"schema_version": 1, "runtime": active_runtime(cfg), "model": active_model_ref(cfg),
+                              "setup_complete": bool(cfg.get("setup_complete")), "context_window_tokens": cfg.get("context_window_tokens"),
+                              "configuration": [str(path) for path in active_config_sources()]}))
+        else:
+            print(_format_cli_status(cfg))
         return
     if getattr(args, "context", None) is not None:
         try:
@@ -713,5 +728,30 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "project":
         _start_project(args)
         return
+    if args.command == "setup" and (args.non_interactive or args.yes or args.dry_run):
+        from .agent_setup import SetupError, run_setup
+        from rich.console import Console
+
+        class SetupLog:
+            def write(self, text):
+                Console(stderr=True, highlight=False).print(text)
+
+        try:
+            with redirect_stdout(sys.stderr):
+                result = asyncio.run(run_setup(model=args.model, context=args.context_tokens,
+                                               dry_run=args.dry_run, yes=args.yes, log=SetupLog()))
+        except (SetupError, RuntimeError, ValueError, OSError) as exc:
+            failure = {"schema_version": 1, "status": "error", "stage": getattr(exc, "stage", "setup"), "error": str(exc)}
+            print(json.dumps(failure) if args.json_output else f"Setup failed ({failure['stage']}): {exc}")
+            raise SystemExit(1)
+        if args.json_output:
+            print(json.dumps(result))
+        else:
+            print(f"OpenJet setup {result['status']}: {result['model']} ({result['device']}, {result['context_window_tokens']} tokens)")
+            if result["status"] == "ready":
+                print("Local inference passed. Start in your project with: openjet\nOne prompt: openjet chat \"Explain this repository\"")
+        return
+    if args.command == "setup" and (args.model or args.context_tokens is not None or args.json_output):
+        raise SystemExit("Use --non-interactive, --yes, or --dry-run with setup options.")
     force_setup = bool(args.command == "setup")
     launch_tui(force_setup=force_setup)

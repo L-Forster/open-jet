@@ -1513,7 +1513,8 @@ async def ensure_direct_model(
         raise RuntimeError(f"Hugging Face CLI completed but did not create {target_path}.")
 
     downloaded = target_path.stat().st_size
-    _clear_old_model_files(target_path.parent, target_path, log=log)
+    if not setup_result.get("preserve_model_files"):
+        _clear_old_model_files(target_path.parent, target_path, log=log)
     log.write(f"[bold bright_white]Download complete: {_fmt_size(downloaded)}[/]")
     clear_status()
     merged = dict(setup_result)

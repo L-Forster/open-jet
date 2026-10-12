@@ -114,4 +114,5 @@ def create_runtime_client(
         airgapped=airgapped_from_cfg(cfg),
         diagnostics_hook=diagnostics_hook,
         backend=str(cfg.get("llama_backend") or "auto"),
+        allow_system_tuning=not bool(cfg.get("setup_verification")),
     )

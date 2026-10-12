@@ -16,15 +16,29 @@ On NVIDIA **RTX 30, 40 and 50-series GPUs with 24 GB+**, OpenJet serves Qwen3.8-
 CUDA engine at **1.5x the speed of llama.cpp**. On an RTX 3090: 78 tok/s in reasoning mode, up to
 140 tok/s writing code.
 
+**Inference engine:** [OpenJet Engine](megakernel/README.md) has its own standalone installation,
+`openjet-engine` server command, HTTP API quick start, benchmarks, and systems documentation.
+Use it directly from your own application without running the coding agent.
+
 [Discord](https://discord.com/invite/pspKHtExSa)
 
 ## Install
+
+Use your coding agent to install OpenJet. Paste this into Codex, Claude Code, or another agent with terminal access:
+
+> Install OpenJet on this machine by following https://github.com/l-forster/open-jet/blob/master/docs/agent-install.md. Inspect my hardware, choose a suitable local coding model, configure it without the setup wizard, verify inference works, and tell me how to use OpenJet.
+
+Your agent checks GPU and memory, downloads a model that fits, and verifies the local runtime. See the [agent installation instructions](docs/agent-install.md).
+
+For manual installation:
 
 ```bash
 pipx install open-jet
 openjet setup
 openjet
 ```
+
+To accept the hardware recommendation without the wizard, run `openjet setup --yes`.
 
 `openjet setup` detects your GPU and memory, picks a model and quantisation that fit, downloads the
 GGUF, builds or reuses `llama-server`, and sets the context window and GPU offload. Already have a
@@ -33,7 +47,7 @@ GGUF, builds or reuses `llama-server`, and sets the context window and GPU offlo
 Recommended: a GPU with 14 GB+ VRAM, or Apple silicon with 24 GB+ unified memory. CPU-only works
 too ([Deployment: CPU-only](docs/deployment/cpu-only.md)).
 
-## RTX 30/40/50-series GPUs: the megakernel
+## OpenJet Engine on RTX 30/40/50-series GPUs
 
 For Qwen3.8-27B Q4_K_M on an RTX 30, 40 or 50-series GPU with 24 GB or more (sm_86, sm_89, sm_120,
 including the matching RTX workstation cards), OpenJet replaces `llama-server` with

@@ -295,6 +295,7 @@ class LlamaServerClient:
         airgapped: bool = False,
         diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
         backend: str = "auto",
+        allow_system_tuning: bool = True,
     ) -> None:
         self.model = model
         self.binary = str(binary or "").strip() or None
@@ -319,6 +320,7 @@ class LlamaServerClient:
         if self.backend not in {"auto", "megakernel", "llama"}:
             raise ValueError("llama_backend must be one of: auto, megakernel, llama")
         self.active_backend = "llama.cpp"
+        self.allow_system_tuning = allow_system_tuning
         self._stderr_task: asyncio.Task[None] | None = None
 
     def set_reasoning_mode(self, mode: str) -> None:
@@ -534,8 +536,9 @@ class LlamaServerClient:
             resolved_device = self._resolve_device(binary=binary)
             is_jetson = resolved_device == "cuda" and self._is_jetson_platform()
             if is_jetson:
-                self._ensure_jetson_clocks_sudoers()
-                self._maximize_gpu_clocks()
+                if self.allow_system_tuning:
+                    self._ensure_jetson_clocks_sudoers()
+                    self._maximize_gpu_clocks()
                 # Use cudaMallocManaged on Jetson unified memory so CUDA doesn't
                 # need physically contiguous pages for large allocations.
                 env["GGML_CUDA_ENABLE_UNIFIED_MEMORY"] = "1"

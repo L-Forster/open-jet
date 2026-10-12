@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77,<81", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openjet-engine"
+version = "0.1.0"
+description = "OpenJet Engine: specialised CUDA inference for Qwen3.8-27B with an OpenAI-compatible HTTP API."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+dependencies = ["jinja2>=3.1"]
+keywords = ["cuda", "llm-inference", "gguf", "speculative-decoding", "openjet"]
+
+[project.urls]
+Repository = "https://github.com/l-forster/open-jet"
+Documentation = "https://github.com/l-forster/open-jet/tree/master/megakernel"
+Issues = "https://github.com/l-forster/open-jet/issues"
+
+[project.scripts]
+openjet-engine = "megakernel.server.mk_server:main"
+
+[tool.setuptools]
+packages = ["megakernel", "megakernel.server"]
+package-dir = { megakernel = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+megakernel = ["Makefile", "README.md", "*.cu", "*.cuh", "*.h", "*.cpp", "draft_vocab_32k.bin", "tools/*.cpp"]

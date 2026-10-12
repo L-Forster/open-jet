@@ -24,6 +24,17 @@ Optional setup flow:
 openjet setup
 ```
 
+For installation by Codex, Claude Code, or a script, bypass the wizard:
+
+```bash
+openjet setup --non-interactive --dry-run --json
+openjet setup --non-interactive --yes --json
+openjet setup --yes --model "<catalog filename or local GGUF path>"
+openjet status --json
+```
+
+Dry-run inspects hardware and returns the model recommendation and catalog filenames without writing configuration or downloading anything. `--yes` provisions the selected model/runtime, verifies local inference, saves the working profile, and exits. `--context-tokens` can lower the recommended context. JSON results go to stdout and progress goes to stderr; failures exit nonzero with a stage and error. See [agent installation instructions](../agent-install.md).
+
 Setup supports:
 
 - `Local model: llama.cpp (GGUF)`
