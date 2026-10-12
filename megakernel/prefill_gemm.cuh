@@ -4,7 +4,8 @@
 //
 // X is fp16 [tok][K] with the elements of every 16-group permuted (hperm) so that the 4-byte weight
 // words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (224-byte
-// repack, see qwen38_mk.cu) or Q8_0 (unit repack) and is dequantised to fp16 in registers.
+// repack, see qwen38_mk.cu), Q8_0 (unit repack) or IQ4_XS (Q4_K-shaped 144-byte repack) and is
+// dequantised to fp16 in registers.
 // Tile: 128 weight rows x 128 tokens per CTA, 8 warps of 16 rows x 128 tokens.  K is staged 64 at a
 // time (one 64-group of a super-block: two 32-element sub-blocks) through a cp.async pipeline with
 // one block barrier per stage; per-row sub-block scales are decoded one stage ahead.  Products
@@ -18,7 +19,9 @@
 namespace pf {
 
 constexpr int BM = 128, BN = 128, BK = 64;
-constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8;
+constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8, TIQ4 = 23;
+// kvalues_iq4nl + 128 as bytes (the Q8_0 path's offset)
+constexpr unsigned IQ4U_T0 = 0x3F2D1801u, IQ4U_T1 = 0x766A5D4Fu, IQ4U_T2 = 0xA6998D81u, IQ4U_T3 = 0xF1D9C5B5u;
 
 struct WMat { // device view of one weight matrix (mirrors Mat in qwen38_mk.cu)
     const uint8_t * w;
@@ -31,14 +34,16 @@ struct WMat { // device view of one weight matrix (mirrors Mat in qwen38_mk.cu)
 //   Q5_K: [hdr 16 | qh 32 | qs 32]            src: blk + {0, 16, 32, 48 + 32p, 64 + 32p}
 //   Q6_K: [qlo 32 | qhi 16 | meta 8]          src: blk + {32p, 16 + 32p, 128 + 16p}, 8 B at 192 + 8p
 //   Q8_0: [units 64 | d 4]                    src: blk + {64p + 16c}, 4 B of d at 2 * (2 * st)
+//   IQ4_XS: as Q4_K
 template <int TYPE> struct WT;
 template <> struct WT<TQ4K> { static constexpr int BLK = 144, NCH = 3; };
+template <> struct WT<TIQ4> { static constexpr int BLK = 144, NCH = 3; };
 template <> struct WT<TQ5K> { static constexpr int BLK = 176, NCH = 5; };
 template <> struct WT<TQ6K> { static constexpr int BLK = 224, NCH = 3; };
 template <> struct WT<TQ80> { static constexpr int BLK = 256, NCH = 4; };
 
 template <int TYPE> __device__ __forceinline__ void chunk_src(int c, int & off, int & inc) {
-    if constexpr (TYPE == TQ4K) { off = c == 0 ? 0 : 16 * c; inc = c == 0 ? 0 : 32; }
+    if constexpr (TYPE == TQ4K || TYPE == TIQ4) { off = c == 0 ? 0 : 16 * c; inc = c == 0 ? 0 : 32; }
     else if constexpr (TYPE == TQ5K) { off = c < 3 ? 16 * c : 48 + 16 * (c - 3); inc = c < 3 ? 0 : 32; }
     else if constexpr (TYPE == TQ6K) { off = c < 2 ? 16 * c : 128; inc = c < 2 ? 32 : 16; }
     else { off = 16 * c; inc = 64; }
@@ -84,6 +89,7 @@ template <int TYPE> struct HT;
 // SR: smem bytes per weight row; SEP: fp16 scales in a separate double buffer (else in the row:
 // Q6_K rows are 64 B, chunks XOR-swizzled by (row / 2) % 4, scales in the meta chunk's spare 8 B)
 template <> struct HT<TQ4K> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
+template <> struct HT<TIQ4> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
 template <> struct HT<TQ5K> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
 template <> struct HT<TQ6K> { static constexpr int SR = 64, NS = 4; static constexpr bool SEP = false; };
 template <> struct HT<TQ80> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
@@ -108,10 +114,11 @@ __device__ __forceinline__ __half2 u2h(unsigned u) { return *reinterpret_cast<__
 __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<unsigned *>(&h); }
 
 // GLU: W2 holds the up matrix (same type and shape as W = gate); the CTA computes 64 gate rows
-// (warps 0-3) and the same 64 up rows (warps 4-7) and writes silu(gate) * up as fp16.
+// (warps 0-3) and the same 64 up rows (warps 4-7) and writes silu(gate) * up as fp16. Only for
+// types whose rows carry their own scales (Q6_K / Q8_0 read them through W alone).
 template <int TYPE, bool GLU = false>
 __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok, Out O, const uint8_t * W2 = nullptr) {
-    static_assert(!GLU || TYPE == TQ4K, "fused gate / up is only built for Q4_K");
+    static_assert(!GLU || TYPE == TQ4K || TYPE == TQ5K || TYPE == TIQ4, "fused gate / up needs in-row scales");
     extern __shared__ __align__(16) uint8_t sm[];
     constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR, NSH = HT<TYPE>::NS;
     constexpr int STG = hm_stage<TYPE>();
@@ -186,6 +193,11 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             }
             a = __float2half2_rn(dm.x * (float) sc);
             b = __float2half2_rn(-dm.y * (float) m);
+        } else if constexpr (TYPE == TIQ4) { // header: fp16 d | 2 pad | int8 ls - 32 of the 8 sub-blocks
+            const int4 hd = *reinterpret_cast<const int4 *>(row);
+            const float d = __half2float(__ushort_as_half((unsigned short) (hd.x & 0xffff)));
+            const int sw = (p < 2 ? hd.y : hd.z) >> ((p & 1) * 16 + 8 * j);
+            a = b = __float2half2_rn(d * (float) (int8_t) sw);
         } else if constexpr (TYPE == TQ6K) {
             uint8_t * mrow = const_cast<uint8_t *>(row) + 16 * (3 ^ (((tid >> 1) >> 1) & 3));
             const int2 meta = *reinterpret_cast<const int2 *>(mrow);
@@ -229,7 +241,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     auto rawq = [&](int st) {
         const uint8_t * sw = sm + (st % NSH) * STG;
         const int p = st & 3;
-        constexpr float OFF = TYPE == TQ6K ? -1056.f : TYPE == TQ80 ? -1152.f : -1024.f;
+        constexpr float OFF = TYPE == TQ6K ? -1056.f : (TYPE == TQ80 || TYPE == TIQ4) ? -1152.f : -1024.f;
         const __half2 off2 = __float2half2_rn(OFF);
 #pragma unroll
         for (int mi = 0; mi < HMI; mi++) {
@@ -257,6 +269,16 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
                 wd[1][0][0] |= (h0 & 0x02020202u) << 3; wd[1][0][1] |= (h2 & 0x02020202u) << 3;
                 wd[1][1][0] |= (h1 & 0x02020202u) << 3; wd[1][1][1] |= (h3 & 0x02020202u) << 3;
             }
+        } else if constexpr (TYPE == TIQ4) { // indices -> kvalues + 128 (low nibbles: sub-block 0, high: 1)
+            const unsigned w0 = *reinterpret_cast<const unsigned *>(ra + 16 + 4 * t4);
+            const unsigned w1 = *reinterpret_cast<const unsigned *>(ra + 32 + 4 * t4);
+            const unsigned w2 = *reinterpret_cast<const unsigned *>(rb + 16 + 4 * t4);
+            const unsigned w3 = *reinterpret_cast<const unsigned *>(rb + 32 + 4 * t4);
+            int lo, hi;
+            iq4_lut(w0, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][0][0] = lo; wd[1][0][0] = hi;
+            iq4_lut(w2, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][0][1] = lo; wd[1][0][1] = hi;
+            iq4_lut(w1, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][1][0] = lo; wd[1][1][0] = hi;
+            iq4_lut(w3, IQ4U_T0, IQ4U_T1, IQ4U_T2, IQ4U_T3, lo, hi); wd[0][1][1] = lo; wd[1][1][1] = hi;
         } else if constexpr (TYPE == TQ6K) {
             const int z = (g >> 1) & 3; // rows g and g + 8 share the swizzle
             const unsigned w0 = *reinterpret_cast<const unsigned *>(ra + 16 * z + 4 * t4);

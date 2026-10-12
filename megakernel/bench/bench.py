@@ -40,7 +40,7 @@ def post(url, payload):
 
 
 def run_llama(args):
-    cmd = [LLAMA_SERVER, "-m", MODEL, "--host", "127.0.0.1", "--port", str(args.port), "--parallel", "1",
+    cmd = [LLAMA_SERVER, "-m", args.model, "--host", "127.0.0.1", "--port", str(args.port), "--parallel", "1",
            "--flash-attn", "on", "-ctk", "q8_0", "-ctv", "q8_0", "-ngl", "99", "-c", str(args.ctx)]
     if args.spec > 0:
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", str(args.spec)]
@@ -79,7 +79,7 @@ def run_mk(args):
     results = []
     for i, p in enumerate(prompts()):
         for rep in range(args.reps):
-            cmd = [MK, "-m", MODEL, "-p", p, "-n", str(args.n), "-d", str(args.draft), "-c", str(args.ctx), "--ids", "--quiet"]
+            cmd = [MK, "-m", args.model, "-p", p, "-n", str(args.n), "-d", str(args.draft), "-c", str(args.ctx), "--ids", "--quiet"]
             if args.draft_vocab:
                 cmd += ["--draft-vocab", args.draft_vocab]
             out = subprocess.run(cmd, capture_output=True, text=True)
@@ -109,6 +109,7 @@ def main():
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--dump", default="")
     ap.add_argument("--draft-vocab", default="")
+    ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
     if args.dump:
         os.makedirs(args.dump, exist_ok=True)

@@ -17,6 +17,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -77,7 +78,7 @@ constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (A
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN ? SM_MISC + 2048 : SM_ATTN);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 
-enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14 };
+enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4X = 23 };
 enum { MODE_PREFILL = 0, MODE_DECODE = 1, MODE_BENCH = 2 };
 
 struct Mat {
@@ -578,11 +579,94 @@ __device__ __forceinline__ void rows_q80(const uint8_t * const (&rp)[R], const _
     }
 }
 
+// kvalues_iq4nl as int8, four per word
+constexpr unsigned IQ4_T0 = 0xBFAD9881u, IQ4_T1 = 0xF6EADDCFu, IQ4_T2 = 0x26190D01u, IQ4_T3 = 0x71594535u;
+// The 8 4-bit indices of word q -> table bytes of its low nibbles (lo) and high nibbles (hi), four
+// per int (llama.cpp's get_int_from_table_16). __byte_perm reads only bits 0-2 of each selector nibble.
+__device__ __forceinline__ void iq4_lut(unsigned q, unsigned t0, unsigned t1, unsigned t2, unsigned t3, int & lo, int & hi) {
+    const unsigned sel = 0x32103210u | ((q & 0x88888888u) >> 1);
+    const unsigned a = __byte_perm(__byte_perm(t0, t1, q), __byte_perm(t2, t3, q), sel);
+    const unsigned b = __byte_perm(__byte_perm(t0, t1, q >> 16), __byte_perm(t2, t3, q >> 16), sel >> 16);
+    lo = (int) __byte_perm(a, b, 0x6420);
+    hi = (int) __byte_perm(a, b, 0x7531);
+}
+
+// accR for signed weights (no min term)
+template <int T, int R, int UU>
+__device__ __forceinline__ void accR0(const SX & s, int u, const int (&A)[R][4], const int (&B)[R][4], const float (&fA)[R],
+                                      const float (&fB)[R], float (&acc)[R][T]) {
+#pragma unroll
+    for (int t = 0; t < T; t++) {
+        const int ix = t * UU + u;
+        const int4 va = s.xa[ix], vb = s.xb[ix];
+        const uint2 mm = s.xm[ix];
+        const float2 dx = __half22float2(*reinterpret_cast<const __half2 *>(&mm.x));
+#pragma unroll
+        for (int k = 0; k < R; k++) {
+            int sa = __dp4a(A[k][0], va.x, 0);
+            sa = __dp4a(A[k][1], va.y, sa);
+            sa = __dp4a(A[k][2], va.z, sa);
+            sa = __dp4a(A[k][3], va.w, sa);
+            int sb = __dp4a(B[k][0], vb.x, 0);
+            sb = __dp4a(B[k][1], vb.y, sb);
+            sb = __dp4a(B[k][2], vb.z, sb);
+            sb = __dp4a(B[k][3], vb.w, sb);
+            acc[k][t] += fA[k] * (dx.x * (float) sa) + fB[k] * (dx.y * (float) sb);
+        }
+    }
+}
+
+// IQ4_XS re-laid-out at load into Q4_K-shaped 144-byte blocks (repack_iq4xs): 16-byte header
+// (fp16 d | 2 pad | int8 ls - 32 of the eight 32-weight sub-blocks | 4 pad), then the 128 index
+// bytes in Q4_K order.  A weight is d * (ls - 32) * kvalues_iq4nl[index].
+template <int T, int IT, int R>
+__device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
+    const int lane = threadIdx.x & 31;
+#pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
+    for (int i = 0; i < IT; i++) {
+        const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
+        int4 h[R], q[R];
+#pragma unroll
+        for (int k = 0; k < R; k++) {
+            const uint8_t * blk = rp[k] + b * 144;
+            h[k] = ldw4(blk);
+            q[k] = ldw4(blk + 16 + 32 * p + 16 * hh);
+        }
+        int A[R][4], B[R][4];
+        float fA[R], fB[R];
+#pragma unroll
+        for (int k = 0; k < R; k++) {
+            const float d = __half2float(__ushort_as_half((unsigned short) (h[k].x & 0xffff)));
+            const int sw = (p < 2 ? h[k].y : h[k].z) >> ((p & 1) * 16);
+            fA[k] = d * (float) (int8_t) sw;
+            fB[k] = d * (float) (int8_t) (sw >> 8);
+            iq4_lut(q[k].x, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][0], B[k][0]);
+            iq4_lut(q[k].y, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][1], B[k][1]);
+            iq4_lut(q[k].z, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][2], B[k][2]);
+            iq4_lut(q[k].w, IQ4_T0, IQ4_T1, IQ4_T2, IQ4_T3, A[k][3], B[k][3]);
+        }
+        accR0<T, R, 32 * IT>(s, u, A, B, fA, fB, acc);
+    }
+}
+
 // rows row0 .. row0+R-1 of m, weight type fixed at compile time
 // u0: first unit of a K-slice (multiple of 32) when the activations in s hold only that slice
 template <int TYPE>
 __device__ __forceinline__ int unit_bytes(int u0) {
-    return TYPE == T_Q4K ? (u0 >> 3) * 144 : TYPE == T_Q5K ? (u0 >> 3) * 176 : TYPE == T_Q6K ? (u0 >> 3) * Q6_BLK : 32 * u0;
+    return TYPE == T_Q4K || TYPE == T_IQ4X ? (u0 >> 3) * 144
+         : TYPE == T_Q5K                  ? (u0 >> 3) * 176
+         : TYPE == T_Q6K                  ? (u0 >> 3) * Q6_BLK
+                                          : 32 * u0;
+}
+// R rows of one weight type given their row pointers (and, for Q8_0, their scale rows)
+template <int T, int IT, int R, int TYPE>
+__device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
+                                       float (&acc)[R][T]) {
+    if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_IQ4X) rows_iq4x<T, IT, R>(rp, s, acc);
+    else rows_q80<T, IT, R>(rp, dp, s, acc);
 }
 template <int T, int IT, int R, int TYPE>
 __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, float (&acc)[R][T], int u0 = 0) {
@@ -593,10 +677,7 @@ __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, flo
         rp[k] = m.w + (size_t) (row0 + k) * m.rb + unit_bytes<TYPE>(u0);
         dp[k] = m.d + (size_t) (row0 + k) * m.nd + u0;
     }
-    if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, s, acc);
-    else rows_q80<T, IT, R>(rp, dp, s, acc);
+    rows_t<T, IT, R, TYPE>(rp, dp, s, acc);
 }
 
 // Row pairs [lo, hi) of a single-matrix item range, distributed over all warps of the grid.
@@ -616,11 +697,17 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
     }
 }
 
-// Q4_K or Q6_K matrix (the two types that occur for qkv / v projections)
+// Runtime dispatch on a matrix's type (uniform across the grid). Plain switches: a capturing
+// lambda would take the address of the caller's locals and push them to local memory.
 template <int T, int IT, class Out>
-__device__ __forceinline__ void gemv_pairs_46(const Mat & m, int lo, int hi, Out out) {
-    if (m.type == T_Q6K) gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out);
-    else gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out);
+__device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
+    switch (m.type) {
+        case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;
+        case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;
+        case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
+        case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;
+        default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
+    }
 }
 
 
@@ -791,10 +878,21 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
     }
 }
 
+template <int T, int IT>
+__device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float * x, bool add, const float * wnext, uint8_t * sm) {
+    switch (W.type) {
+        case T_Q4K: resid32<T, IT, T_Q4K>(W, in, x, add, wnext, sm); break;
+        case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;
+        case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
+        case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;
+        default: resid32<T, IT, T_IQ4X>(W, in, x, add, wnext, sm); break;
+    }
+}
+
 // FFN gate/up: warp item = 16 consecutive rows of both matrices (4 rows in flight sharing the
 // activations) -> silu(g)*u quantised per 16-chunk for the down projection.
 template <int T>
-__device__ __noinline__ void ffn_gu(const LayerW & W, uint8_t * /*sm*/) {
+__device__ __noinline__ void ffn_gu_q4k(const LayerW & W, uint8_t * /*sm*/) {
     uint8_t * const sm = smem;
     const int lane = threadIdx.x & 31;
     const SX sx = make_sx(sm, U_D);
@@ -839,6 +937,79 @@ __device__ __noinline__ void ffn_gu(const LayerW & W, uint8_t * /*sm*/) {
             q16_store(cB.qa, lane < 16 ? t : t + 1, j, v, lane < 16 || t + 1 < T);
         }
     }
+}
+
+template <int T> struct LaneT { float v[T]; };
+
+// Rows 16 j .. 16 j + 15 of m against the normed activations in shared memory: lane r gets row
+// 16 j + r (lanes 16-31: 0). As many rows per step as ffn_gu_q4k shares activations across.
+template <int T, int TYPE>
+__device__ __noinline__ LaneT<T> rows16(const Mat m, int j) {
+    const int lane = threadIdx.x & 31;
+    const SX sx = make_sx(nullptr, U_D);
+    const float * s_rs = misc(nullptr);
+    constexpr int R = T >= 3 ? 2 : 4;
+    LaneT<T> res;
+#pragma unroll
+    for (int t = 0; t < T; t++) res.v[t] = 0.f;
+#pragma unroll 1
+    for (int r = 0; r < 16; r += R) {
+        float a[R][T];
+        zero_acc<T, R>(a);
+        mrows<T, 5, R, TYPE>(m, 16 * j + r, sx, a);
+        wsum_acc<T, R>(a);
+#pragma unroll
+        for (int k = 0; k < R; k++)
+            if (lane == r + k) {
+#pragma unroll
+                for (int t = 0; t < T; t++) res.v[t] = a[k][t] * s_rs[t];
+            }
+    }
+    return res;
+}
+
+template <int T>
+__device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
+    switch (m.type) {
+        case T_Q4K: return rows16<T, T_Q4K>(m, j);
+        case T_Q5K: return rows16<T, T_Q5K>(m, j);
+        case T_Q6K: return rows16<T, T_Q6K>(m, j);
+        case T_Q8_0: return rows16<T, T_Q8_0>(m, j);
+        default: return rows16<T, T_IQ4X>(m, j);
+    }
+}
+
+// ffn_gu_q4k for any other gate / up types (each may be any type): gate and up rows of a warp item
+// are computed by one call per matrix, so each weight type gets its own register allocation.
+template <int T>
+__device__ __noinline__ void ffn_gu_any(const LayerW & W, uint8_t * /*sm*/) {
+    uint8_t * const sm = smem;
+    const int lane = threadIdx.x & 31;
+    const SX sx = make_sx(sm, U_D);
+    if (gwarp() < FF / 16) {
+        pf_rows(W.fg, 16 * gwarp(), 2, 576);
+        pf_rows(W.fu, 16 * gwarp(), 2, 576);
+    }
+    fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
+    for (int j = gwarp(); j < FF / 16; j += nwarps()) {
+        const LaneT<T> g = rows16_any<T>(W.fg, j);
+        const LaneT<T> u = rows16_any<T>(W.fu, j);
+        float act[T];
+#pragma unroll
+        for (int t = 0; t < T; t++) act[t] = lane < 16 ? silu(g.v[t]) * u.v[t] : 0.f;
+#pragma unroll
+        for (int t = 0; t < T; t += 2) {
+            const float other = __shfl_sync(0xffffffffu, act[t + 1 < T ? t + 1 : t], lane & 15);
+            const float v = lane < 16 ? act[t] : other;
+            q16_store(cB.qa, lane < 16 ? t : t + 1, j, v, lane < 16 || t + 1 < T);
+        }
+    }
+}
+
+template <int T>
+__device__ __forceinline__ void ffn_gu(const LayerW & W, uint8_t * sm) {
+    if (W.fg.type == T_Q4K && W.fu.type == T_Q4K) ffn_gu_q4k<T>(W, sm);
+    else ffn_gu_any<T>(W, sm);
 }
 
 template <int T>
@@ -894,15 +1065,15 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
         store_lane_t<T>(cB.ab + ch * MAXT * 2 * NVH, 2 * NVH, row, acc);
     }
-    gemv_pairs_46<T, 5>(W.qkv, n_ab, n_ab + n_qkv, [=](int r, const float (&a)[2][T]) {
+    gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, [=](int r, const float (&a)[2][T]) {
         const int lane = threadIdx.x & 31;
 #pragma unroll
         for (int t = 0; t < T; t++)
             if ((lane >> 1) == t)
                 conv[((n + t) % CONV_RING) * QKV + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * misc(nullptr)[t];
     });
-    gemv_pairs<T, 5, T_Q4K>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z,
-                            [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.z, VD, r, a); });
+    gemv_pairs_any<T, 5>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z,
+                         [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.z, VD, r, a); });
     // Warm L2 with what dn_core will read, while the other blocks are still projecting:
     // the head's recurrent state (64 KB), its conv weights, older conv rows and replay entries.
     if (blockIdx.x < NVH) {
@@ -1160,9 +1331,9 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     if (gwarp() < QG / 2) pf_rows(W.q, 2 * gwarp(), 2, 576);
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     const int nq = QG / 2, nk = KVD / 2;
-    gemv_pairs<T, 5, T_Q4K>(W.q, 0, nq, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.qbuf, QG, r, a); });
-    gemv_pairs<T, 5, T_Q4K>(W.k, nq, nq + nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.kbuf, KVD, r, a); });
-    gemv_pairs_46<T, 5>(W.v, nq + nk, nq + 2 * nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.vbuf, KVD, r, a); });
+    gemv_pairs_any<T, 5>(W.q, 0, nq, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.qbuf, QG, r, a); });
+    gemv_pairs_any<T, 5>(W.k, nq, nq + nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.kbuf, KVD, r, a); });
+    gemv_pairs_any<T, 5>(W.v, nq + nk, nq + 2 * nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.vbuf, KVD, r, a); });
     // Warm L2 with what attn_core reads first: q/k norm weights, RoPE rows of the new positions,
     // and the first K / V tile of this block's attention item (positions < n).
     pf_block(W.qn, HD * 4);
@@ -1796,21 +1967,20 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_ATTN_CORE);
             attn_combine<T>(n);
             gsync(epoch, PH_ATTN_COMB);
-            resid32<T, 6, T_Q4K>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
+            resid_any<T, 6>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_O);
         } else {
             dn_proj<T>(W, dl, n, dn_c, sm);
             gsync(epoch, PH_DN_PROJ);
             dn_core<T>(W, dl, n, dn_c, n_commit, sm);
             gsync(epoch, PH_DN_CORE);
-            resid32<T, 6, T_Q5K>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
+            resid_any<T, 6>(W.sout, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_SOUT);
             dl++;
         }
         ffn_gu<T>(W, sm);
         gsync(epoch, PH_FFN_GU);
-        if (W.fd.type == T_Q6K) resid32<T, 17, T_Q6K>(W.fd, cB.qa, cB.x, true, wnext, sm);
-        else resid32<T, 17, T_Q4K>(W.fd, cB.qa, cB.x, true, wnext, sm);
+        resid_any<T, 17>(W.fd, cB.qa, cB.x, true, wnext, sm);
         gsync(epoch, PH_FFN_DOWN);
     }
     write_h_rows<T>(cB.x, cB.qn, cW.onorm, cB.h_hist, n, true, sm);
@@ -1881,7 +2051,7 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
     }
     gsync(epoch, PH_MTP_M0);
     const LayerW & W = cW.L[NL];
-    resid32<R, 10, T_Q8_0>(cW.eh, cB.qe, cB.xm, false, W.attn_norm, sm);
+    resid_any<R, 10>(cW.eh, cB.qe, cB.xm, false, W.attn_norm, sm);
     gsync(epoch, PH_MTP_EH);
     attn_proj<R>(W, 16, pos0, sm);
     gsync(epoch, PH_MTP_ATTN_PROJ);
@@ -1889,12 +2059,11 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
     gsync(epoch, PH_MTP_ATTN_CORE);
     attn_combine<R>(pos0);
     gsync(epoch, PH_MTP_ATTN_COMB);
-    resid32<R, 6, T_Q4K>(W.o, cB.qo, cB.xm, true, W.post_norm, sm);
+    resid_any<R, 6>(W.o, cB.qo, cB.xm, true, W.post_norm, sm);
     gsync(epoch, PH_MTP_RESID_O);
     ffn_gu<R>(W, sm);
     gsync(epoch, PH_MTP_FFN_GU);
-    if (W.fd.type == T_Q6K) resid32<R, 17, T_Q6K>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
-    else resid32<R, 17, T_Q4K>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
+    resid_any<R, 17>(W.fd, cB.qa, cB.xm, true, cW.shnorm, sm);
     gsync(epoch, PH_MTP_FFN_DOWN);
     if (logits) {
         write_h_rows<R>(cB.xm, cB.qn, cW.shnorm, cB.hm, 0, false, sm);
@@ -1921,8 +2090,7 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
         const LayerW & W = cW.L[L];
         if (which == 0) ffn_gu<T>(W, sm);
         else if (which == 1) {
-            if (W.fd.type == T_Q6K) resid32<T, 17, T_Q6K>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
-            else resid32<T, 17, T_Q4K>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
+            resid_any<T, 17>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
         } else if (which == 2) {
             if (!W.attn) dn_proj<T>(W, 0, 0, 0, sm);
         }
@@ -1984,6 +2152,25 @@ __global__ void gather_rows(const uint8_t * src, uint8_t * dst, const __half * d
 
 #include "prefill.cuh"
 
+// silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
+// hperm order): the gate / up pairs it cannot fuse (different types, or Q6_K / Q8_0).
+__global__ void pk_glu(const float * g, const float * u, __half * out, int ld) {
+    const size_t t = blockIdx.x;
+    for (int q = threadIdx.x; q < ld / 16; q += blockDim.x) {
+        const float * gp = g + t * ld + 16 * q;
+        const float * up = u + t * ld + 16 * q;
+        __align__(16) __half hv[16];
+#pragma unroll
+        for (int e = 0; e < 16; e++) {
+            const float gv = gp[e], v = gv / (1.0f + expf(-gv)) * up[e];
+            hv[pf::hperm(e)] = __float2half_rn(fminf(fmaxf(v, -65504.f), 65504.f));
+        }
+        uint4 * dst = reinterpret_cast<uint4 *>(out + t * ld + 16 * q);
+        dst[0] = reinterpret_cast<const uint4 *>(hv)[0];
+        dst[1] = reinterpret_cast<const uint4 *>(hv)[1];
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // host side: loading / repacking
 // ------------------------------------------------------------------------------------------
@@ -2003,6 +2190,91 @@ void parallel_rows(int64_t n, F f) {
         });
     }
     for (auto & t : th) t.join();
+}
+
+// GGUF Q6_K block (210 B: ql[128] | qh[64] | int8 scales[16] | fp16 d) from 256 integers q in [-32, 31],
+// one scale per 16 of them and the bits of d.
+void put_q6k(uint8_t * blk, const int * q, const int8_t * sc, uint16_t dbits) {
+    uint8_t *ql = blk, *qh = blk + 128;
+    for (int n = 0; n < 2; n++)
+        for (int l = 0; l < 32; l++) {
+            const int v0 = q[128 * n + l] + 32, v1 = q[128 * n + l + 32] + 32;
+            const int v2 = q[128 * n + l + 64] + 32, v3 = q[128 * n + l + 96] + 32;
+            ql[64 * n + l] = (uint8_t) ((v0 & 0xF) | ((v2 & 0xF) << 4));
+            ql[64 * n + l + 32] = (uint8_t) ((v1 & 0xF) | ((v3 & 0xF) << 4));
+            qh[32 * n + l] = (uint8_t) (((v0 >> 4) & 3) | (((v1 >> 4) & 3) << 2) | (((v2 >> 4) & 3) << 4) | (((v3 >> 4) & 3) << 6));
+        }
+    memcpy(blk + 192, sc, 16);
+    memcpy(blk + 208, &dbits, 2);
+}
+
+// Q3_K or IQ3_S row -> Q6_K with the same values. Both store a small integer times d times an integer
+// sub-block scale (Q3_K: d (sc - 32) q, q in [-4, 3], per 16; IQ3_S: d (1 + 2 s) q, |q| <= 15, per 32),
+// so q = value / (d * scale) is exact and Q6_K holds it with the same d and scale. f: the row dequantized.
+void reencode_q6k(uint32_t type, const uint8_t * src, const float * f, uint8_t * out, int64_t K) {
+    for (int64_t b = 0; b < K / 256; b++) {
+        const uint8_t * blk = src + b * 110;
+        const float * y = f + b * 256;
+        uint16_t dbits;
+        int8_t sc[16];
+        if (type == gguf::Q3_K) { // hmask[32] | qs[64] | scales[12] (6 bits each) | fp16 d
+            memcpy(&dbits, blk + 108, 2);
+            uint32_t aux[4];
+            memcpy(aux, blk + 96, 12);
+            const uint32_t m1 = 0x03030303u, m2 = 0x0f0f0f0fu, tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & m2) | (((tmp >> 4) & m1) << 4);
+            aux[3] = ((aux[1] >> 4) & m2) | (((tmp >> 6) & m1) << 4);
+            aux[0] = (aux[0] & m2) | (((tmp >> 0) & m1) << 4);
+            aux[1] = (aux[1] & m2) | (((tmp >> 2) & m1) << 4);
+            for (int i = 0; i < 16; i++) sc[i] = (int8_t) ((int) reinterpret_cast<const uint8_t *>(aux)[i] - 32);
+        } else { // IQ3_S: fp16 d | qs[64] | qh[8] | signs[32] | scales[4] (4 bits per 32)
+            memcpy(&dbits, blk, 2);
+            for (int i = 0; i < 16; i++) sc[i] = (int8_t) (1 + 2 * ((blk[106 + i / 4] >> (4 * ((i / 2) & 1))) & 0xf));
+        }
+        const float d = ggml_fp16_to_fp32(dbits);
+        int q[256];
+        for (int e = 0; e < 256; e++) {
+            const float s = d * (float) sc[e / 16];
+            q[e] = s == 0.0f ? 0 : (int) lrintf(y[e] / s);
+        }
+        put_q6k(out + b * 210, q, sc, dbits);
+    }
+}
+
+// IQ4_NL row (18 B blocks: fp16 d | 16 bytes of 4-bit indices) -> Q8_0 (fp16 d | 32 int8) with the same
+// d and q = kvalues_iq4nl[index]: the same values.
+void reencode_iq4nl_q80(const uint8_t * src, uint8_t * out, int64_t K) {
+    static const int8_t kv[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    for (int64_t b = 0; b < K / 32; b++) {
+        const uint8_t * s = src + b * 18;
+        uint8_t * o = out + b * 34;
+        memcpy(o, s, 2);
+        for (int j = 0; j < 16; j++) {
+            o[2 + j] = (uint8_t) kv[s[2 + j] & 0xf];
+            o[2 + j + 16] = (uint8_t) kv[s[2 + j] >> 4];
+        }
+    }
+}
+
+// GGUF IQ4_XS blocks (136 B: fp16 d, u16 scales_h, u8 scales_l[4], u8 qs[128]) -> the 144-byte layout
+// rows_iq4x and the prefill GEMM read (see rows_iq4x).
+void repack_iq4xs(const uint8_t * src, uint8_t * dst, size_t nblocks) {
+    for (size_t i = 0; i < nblocks; i++) {
+        const uint8_t *s = src + i * 136, *qs = s + 8;
+        uint8_t * o = dst + i * 144;
+        uint16_t sh;
+        memcpy(&sh, s + 2, 2);
+        memset(o, 0, 16);
+        memcpy(o, s, 2);
+        for (int ib = 0; ib < 8; ib++)
+            o[4 + ib] = (uint8_t) ((((s[4 + ib / 2] >> (4 * (ib % 2))) & 0xf) | (((sh >> (2 * ib)) & 3) << 4)) - 32);
+        auto idx = [&](int v) {
+            const int ib = v >> 5, j = v & 31;
+            return j < 16 ? qs[16 * ib + j] & 0xf : qs[16 * ib + j - 16] >> 4;
+        };
+        for (int p = 0; p < 4; p++)
+            for (int l = 0; l < 32; l++) o[16 + 32 * p + l] = (uint8_t) (idx(64 * p + l) | (idx(64 * p + 32 + l) << 4));
+    }
 }
 
 } // namespace
@@ -2104,10 +2376,10 @@ struct MKEngine::Impl {
         return (T *) p;
     }
 
-    // A tensor of the file in the quant type `to` its kernel is built for. A plain
-    // `llama-quantize ... Q4_K_M` stores four roles as Q4_K that the kernels read as something
-    // else (ssm_out Q5_K, ssm_alpha / ssm_beta F32, nextn.eh_proj Q8_0): those are re-encoded here,
-    // dequantized and quantized again by ggml. 145 small tensors, a few seconds at load.
+    // A tensor of the file in a type the kernels read. Q3_K and IQ3_S are re-encoded as Q6_K and
+    // IQ4_NL as Q8_0, exactly: every weight is a small integer times an fp16 scale in both (checked
+    // bit for bit against ggml's dequantization of the source row). `to == T_F32` dequantizes
+    // (ssm_alpha / ssm_beta, which are folded into fp32 rows).
     struct Src {
         uint32_t type = 0;
         std::vector<uint64_t> ne;
@@ -2118,30 +2390,46 @@ struct MKEngine::Impl {
     int n_conv = 0;
     double conv_s = 0;
 
-    Src want(const std::string & name, int to) {
+    Src want(const std::string & name, int to = -1) {
         const auto & t = file.get(name);
         Src s;
         s.type = t.type;
         s.ne = t.ne;
         s.data = t.data;
         s.nbytes = t.nbytes;
-        if ((int) t.type == to || t.type != gguf::Q4_K) return s; // any other mix is refused by need() below
+        const bool to_f32 = to == T_F32 && t.type != gguf::F32;
+        const bool to_q6 = !to_f32 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
+        const bool to_q8 = !to_f32 && t.type == gguf::IQ4_NL;
+        if (!to_f32 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
+        const ggml_type from = (ggml_type) t.type;
+        const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
         const int64_t K = (int64_t) t.ne[0];
         int64_t rows = 1;
         for (size_t d = 1; d < t.ne.size(); d++) rows *= (int64_t) t.ne[d];
-        const size_t rs_from = ggml_row_size(GGML_TYPE_Q4_K, K), rs_to = ggml_row_size((ggml_type) to, K);
+        const size_t rs_from = ggml_row_size(from, K), rs_to = ggml_row_size(dst, K);
         const auto t0 = std::chrono::steady_clock::now();
         s.own.resize(rs_to * (size_t) rows);
-        if (to != T_F32) ggml_quantize_init((ggml_type) to);
-        const auto * tr = ggml_get_type_traits(GGML_TYPE_Q4_K);
+        const auto * tr = ggml_get_type_traits(from);
+        const auto * tr_dst = ggml_get_type_traits(dst);
+        std::atomic<bool> exact{true};
         parallel_rows(rows, [&](int64_t r) {
-            thread_local std::vector<float> f;
+            thread_local std::vector<float> f, g;
             f.resize((size_t) K);
-            tr->to_float(t.data + (size_t) r * rs_from, f.data(), K);
-            if (to == T_F32) memcpy(s.own.data() + (size_t) r * rs_to, f.data(), (size_t) K * 4);
-            else ggml_quantize_chunk((ggml_type) to, f.data(), s.own.data() + (size_t) r * rs_to, 0, 1, K, nullptr);
+            const uint8_t * src = t.data + (size_t) r * rs_from;
+            uint8_t * out = s.own.data() + (size_t) r * rs_to;
+            tr->to_float(src, f.data(), K);
+            if (to_f32) {
+                memcpy(out, f.data(), (size_t) K * 4);
+                return;
+            }
+            if (to_q6) reencode_q6k(t.type, src, f.data(), out, K);
+            else reencode_iq4nl_q80(src, out, K);
+            g.resize((size_t) K);
+            tr_dst->to_float(out, g.data(), K);
+            if (memcmp(f.data(), g.data(), (size_t) K * 4) != 0) exact = false;
         });
-        s.type = (uint32_t) to;
+        if (!exact) throw std::runtime_error(name + ": re-encoding is not exact");
+        s.type = (uint32_t) dst;
         s.data = s.own.data();
         s.nbytes = s.own.size();
         n_conv++;
@@ -2223,6 +2511,15 @@ struct MKEngine::Impl {
             m.w = dq;
             m.d = nullptr;
             wbytes += q.size();
+        } else if (t.type == gguf::IQ4_XS) {
+            m.type = T_IQ4X;
+            m.rb = nb * 144;
+            std::vector<uint8_t> q((size_t) N * m.rb);
+            parallel_rows(N, [&](int64_t r) { repack_iq4xs(t.data + (size_t) r * nb * 136, q.data() + (size_t) r * m.rb, nb); });
+            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
+            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
+            m.w = dq;
+            wbytes += q.size();
         } else if (t.type == gguf::Q8_0) {
             const int nb32 = K / 32;
             m.rb = K;
@@ -2279,18 +2576,21 @@ struct MKEngine::Impl {
         nsm = prop.multiProcessorCount;
 
         auto blk = [](int i, const char * s) { return "blk." + std::to_string(i) + "." + s; };
-        // The decode kernels are compiled for one quant type per tensor role (resid32 / gemv_pairs
-        // take it as a template argument), so a GGUF quantized with a different per-tensor recipe
-        // loads without complaint and then reads past its weights on the first token. Check every
-        // role against the type its kernel was built for.
+        // The kernels take the weight type as a template argument and dispatch on each matrix's
+        // type at run time (gemv_pairs_any, resid_any, ffn_gu), for Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS (plus what want()
+        // re-encodes into those). Check every role so that an unsupported type is refused at load.
         auto tname = [](int t) -> std::string {
             switch (t) {
                 case gguf::F32: return "F32";
                 case gguf::F16: return "F16";
                 case gguf::Q8_0: return "Q8_0";
+                case gguf::Q3_K: return "Q3_K";
                 case gguf::Q4_K: return "Q4_K";
                 case gguf::Q5_K: return "Q5_K";
                 case gguf::Q6_K: return "Q6_K";
+                case gguf::IQ4_NL: return "IQ4_NL";
+                case gguf::IQ3_S: return "IQ3_S";
+                case gguf::IQ4_XS: return "IQ4_XS";
                 default: return "type " + std::to_string(t);
             }
         };
@@ -2302,6 +2602,7 @@ struct MKEngine::Impl {
             throw std::runtime_error(name + " is " + tname(got) + ", the kernel needs " + want +
                                      " (see README: the GGUF)");
         };
+        auto needq = [&](const std::string & name, int got) { need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X}); };
         for (int i = 0; i < NLA; i++) {
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
@@ -2313,19 +2614,19 @@ struct MKEngine::Impl {
                 L.k = up_mat(blk(i, "attn_k.weight"), D, KVD);
                 L.v = up_mat(blk(i, "attn_v.weight"), D, KVD);
                 L.o = up_mat(blk(i, "attn_output.weight"), VD, D);
-                need(blk(i, "attn_q.weight"), L.q.type, {T_Q4K});
-                need(blk(i, "attn_k.weight"), L.k.type, {T_Q4K});
-                need(blk(i, "attn_v.weight"), L.v.type, {T_Q4K, T_Q6K});
-                need(blk(i, "attn_output.weight"), L.o.type, {T_Q4K});
+                needq(blk(i, "attn_q.weight"), L.q.type);
+                needq(blk(i, "attn_k.weight"), L.k.type);
+                needq(blk(i, "attn_v.weight"), L.v.type);
+                needq(blk(i, "attn_output.weight"), L.o.type);
                 L.qn = up_f32(blk(i, "attn_q_norm.weight"), HD);
                 L.kn = up_f32(blk(i, "attn_k_norm.weight"), HD);
             } else {
                 L.qkv = up_mat(blk(i, "attn_qkv.weight"), D, QKV);
                 L.gate = up_mat(blk(i, "attn_gate.weight"), D, VD);
-                L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D, T_Q5K);
-                need(blk(i, "attn_qkv.weight"), L.qkv.type, {T_Q4K, T_Q6K});
-                need(blk(i, "attn_gate.weight"), L.gate.type, {T_Q4K});
-                need(blk(i, "ssm_out.weight"), L.sout.type, {T_Q5K});
+                L.sout = up_mat(blk(i, "ssm_out.weight"), VD, D);
+                needq(blk(i, "attn_qkv.weight"), L.qkv.type);
+                needq(blk(i, "attn_gate.weight"), L.gate.type);
+                needq(blk(i, "ssm_out.weight"), L.sout.type);
                 L.conv = up_f32(blk(i, "ssm_conv1d.weight"), 4 * QKV);
                 L.dt = up_f32(blk(i, "ssm_dt.bias"), NVH);
                 L.A = up_f32(blk(i, "ssm_a"), NVH);
@@ -2356,11 +2657,12 @@ struct MKEngine::Impl {
             L.fg = up_mat(blk(i, "ffn_gate.weight"), D, FF);
             L.fu = up_mat(blk(i, "ffn_up.weight"), D, FF);
             L.fd = up_mat(blk(i, "ffn_down.weight"), FF, D);
-            if (L.fg.type != T_Q4K || L.fu.type != T_Q4K) throw std::runtime_error("ffn gate/up must be Q4_K");
-            need(blk(i, "ffn_down.weight"), L.fd.type, {T_Q4K, T_Q6K});
+            needq(blk(i, "ffn_gate.weight"), L.fg.type);
+            needq(blk(i, "ffn_up.weight"), L.fu.type);
+            needq(blk(i, "ffn_down.weight"), L.fd.type);
         }
-        hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D, T_Q8_0);
-        need(blk(NL, "nextn.eh_proj.weight"), hw.eh.type, {T_Q8_0});
+        hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+        needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
         hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
         hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
@@ -2410,8 +2712,8 @@ struct MKEngine::Impl {
         }
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
         if (n_conv)
-            fprintf(stderr, "[mk] %d tensors re-encoded in %.0f s: a plain Q4_K_M quant mix, not the one the kernels are built for "
-                            "(README: the GGUF)\n", n_conv, conv_s);
+            fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: Q3_K / IQ3_S -> Q6_K, IQ4_NL -> Q8_0; ssm_alpha / beta -> F32)\n",
+                    n_conv, conv_s);
 
         hb.x = dalloc<float>(MAXT * D);
         hb.xm = dalloc<float>(MAXT * D);
@@ -2634,7 +2936,10 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ6K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ6K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ80>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ80>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         pf_ready = true;
@@ -2651,17 +2956,28 @@ struct MKEngine::Impl {
             case T_Q5K: pf::mmh<pf::TQ5K><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, X, ntok, O); break;
             case T_Q6K: pf::mmh<pf::TQ6K><<<grid, 256, pf::hm_smem<pf::TQ6K>()>>>(W, X, ntok, O); break;
             case T_Q8_0: pf::mmh<pf::TQ80><<<grid, 256, pf::hm_smem<pf::TQ80>()>>>(W, X, ntok, O); break;
+            case T_IQ4X: pf::mmh<pf::TIQ4><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, X, ntok, O); break;
             default: throw std::runtime_error("gemm: unsupported weight type");
         }
     }
 
-    // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh (both Q4_K)
+    // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh: one fused GEMM when gate and
+    // up share a type with in-row scales, else two GEMMs into y0 / y1 and pk_glu
     void gemm_glu(const Mat & g, const Mat & u, int ntok) {
-        if (g.type != T_Q4K || u.type != T_Q4K || u.rb != g.rb) throw std::runtime_error("gemm_glu: expected Q4_K gate / up");
         const pf::WMat W{g.w, g.d, g.type, g.K, g.N, g.rb, g.nd};
         const pf::Out O{nullptr, g.N, pf::OUT_STORE, hp.xh2};
         const dim3 grid(g.N / (pf::BM / 2), (ntok + pf::BN - 1) / pf::BN);
-        pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w);
+        if (g.type == u.type && g.rb == u.rb) {
+            switch (g.type) {
+                case T_Q4K: pf::mmh<pf::TQ4K, true><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, hp.xh, ntok, O, u.w); return;
+                case T_Q5K: pf::mmh<pf::TQ5K, true><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, hp.xh, ntok, O, u.w); return;
+                case T_IQ4X: pf::mmh<pf::TIQ4, true><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, hp.xh, ntok, O, u.w); return;
+                default: break;
+            }
+        }
+        gemm(g, ntok, hp.y0, g.N, pf::OUT_STORE);
+        gemm(u, ntok, hp.y1, u.N, pf::OUT_STORE);
+        pk_glu<<<ntok, 256>>>(hp.y0, hp.y1, hp.xh2, g.N);
     }
 
     // MK_PF_PROFILE=1: per-category GPU time of the batched prefill (events around each launch)

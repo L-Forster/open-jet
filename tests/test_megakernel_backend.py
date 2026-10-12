@@ -1,8 +1,10 @@
 import asyncio
 import importlib.util
 import json
+import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -30,9 +32,16 @@ class MegakernelSelectionTests(unittest.TestCase):
                       "/m/Qwen3.8-27B-UD-Q4_K_M.gguf", "/m/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf"):
             self.assertIn("only supports", megakernel_unavailable_reason(model))
 
+    def test_ud_q4_k_xl_is_served_by_the_megakernel(self) -> None:
+        with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
+                mock.patch.object(llama_server, "_megakernel_gpu", return_value="0"):
+            self.assertIsNone(megakernel_unavailable_reason("/m/Qwen3.8-27B-UD-Q4_K_XL.gguf"))
+
     def test_setup_selector_names_the_runtime(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_gpu", return_value="0"):
             self.assertEqual(llama_server.model_runtime_label(MODEL), "OpenJet megakernel, 1.5x faster")
+            self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.8-27B-UD-Q4_K_XL.gguf"),
+                             "OpenJet megakernel, 1.5x faster")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.8-27B-UD-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.5-9B-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/mmproj-Qwen3.8-27B-BF16.gguf"), "llama.cpp")
@@ -62,6 +71,39 @@ class MegakernelSelectionTests(unittest.TestCase):
         client = create_runtime_client(cfg)
         self.assertEqual(client.backend, "llama")
         self.assertEqual(create_runtime_client({"runtime": "llama_cpp", "llama_model": MODEL}).backend, "auto")
+
+
+def _write_gguf(path: Path, types: dict[str, int]) -> None:
+    """A GGUF header (no metadata, no data) declaring 1-D tensors of the given ggml types."""
+    with open(path, "wb") as f:
+        f.write(b"GGUF" + struct.pack("<IQQ", 3, len(types), 0))
+        for name, kind in types.items():
+            raw = name.encode()
+            f.write(struct.pack("<Q", len(raw)) + raw + struct.pack("<IQ", 1, 256) + struct.pack("<IQ", kind, 0))
+
+
+class MegakernelQuantMixTests(unittest.TestCase):
+    PROBES = ("blk.0.ssm_out.weight", "blk.0.ssm_alpha.weight", "blk.64.nextn.eh_proj.weight")
+
+    def _mix(self, probe_types: tuple[int, int, int], other: int = 12) -> str | None:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "Qwen3.8-27B-Q4_K_M.gguf"
+            types = dict(zip(self.PROBES, probe_types))
+            types["blk.0.ffn_down.weight"] = other
+            _write_gguf(path, types)
+            return llama_server._megakernel_quant_mix(str(path))
+
+    def test_benchmarked_mixes_are_native(self) -> None:
+        self.assertEqual(self._mix((13, 0, 8)), "native")  # unsloth Q4_K_M
+        self.assertEqual(self._mix((8, 8, 14), other=23), "native")  # unsloth UD-Q4_K_XL
+
+    def test_other_readable_mixes_are_semi(self) -> None:
+        self.assertEqual(self._mix((12, 12, 12)), "semi")  # plain llama-quantize Q4_K_M
+        self.assertEqual(self._mix((14, 0, 8), other=11), "semi")
+
+    def test_types_the_megakernel_cannot_read_fall_back_to_llama(self) -> None:
+        self.assertIsNone(self._mix((13, 0, 8), other=2))  # Q4_0
+        self.assertIsNone(self._mix((13, 0, 8), other=16))  # IQ2_XXS
 
 
 def _nvidia_smi(*lines: str):

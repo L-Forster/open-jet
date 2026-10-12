@@ -99,11 +99,14 @@ def best(runs, key):
 
 
 def main():
+    global MODEL
     ap = argparse.ArgumentParser()
     ap.add_argument("--ctx-sizes", default="0,2000,4000,8000,16000,30000")
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("-n", type=int, default=256)
+    ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
+    MODEL = args.model
     os.makedirs(TMP, exist_ok=True)
     sizes = [int(x) for x in args.ctx_sizes.split(",")]
     prompts = [l.strip() for l in open(os.path.join(HERE, "prompts.txt")) if l.strip()]

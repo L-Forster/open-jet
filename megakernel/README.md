@@ -1,6 +1,6 @@
 # Qwen3.8-27B megakernel (RTX 30/40/50 series)
 
-A specialised CUDA inference engine for `Qwen3.8-27B-Q4_K_M.gguf` (llama.cpp arch `qwen35`:
+A specialised CUDA inference engine for Qwen3.8-27B `Q4_K_M` and unsloth's `UD-Q4_K_XL` (llama.cpp arch `qwen35`:
 48 Gated-DeltaNet + 16 gated-attention layers, one MTP block) on RTX 30, 40 and 50-series GPUs
 with 24 GB+ (sm_86, sm_89, sm_120; tuned and benchmarked on an RTX 3090), with an OpenAI-compatible server that open-jet uses in place of `llama-server`
 (`llama_backend: auto`, see [docs/runtimes/llama-cpp.md](../docs/runtimes/llama-cpp.md)).
@@ -16,8 +16,9 @@ Which model file runs on it (details in [The GGUF](#the-gguf)):
 | Model file | Runs on |
 |---|---|
 | unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads | megakernel |
+| unsloth's Qwen3.8-27B `UD-Q4_K_XL` | megakernel |
 | a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis | megakernel, semi compatible |
-| any other quant (unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
+| any other quant (other unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
 
 ## How it works
 
@@ -129,6 +130,31 @@ sampling the token distribution is the same as without drafts (2000-sample test 
 Verifying 1 vs 4 tokens per pass rounds slightly differently, so on near-ties the output can differ
 between `-d` settings.
 
+**unsloth UD-Q4_K_XL** (`Qwen3.8-27B-UD-Q4_K_XL.gguf`, 17.6 GB: Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS per
+tensor plus a few Q3_K, IQ3_S and IQ4_NL; 17.7 GB on the GPU vs 16.7 GB for the Q4_K_M). The same
+check against llama.cpp b10246 generating token by token with its q8_0 KV cache (13 sequences of
+this repo's code and docs, 13,299 positions after a 1024-token prompt each):
+
+| against llama.cpp generating token by token | top token agrees | KL divergence (mean, nats) | perplexity (reference 2.8099) |
+|---|---|---|---|
+| llama.cpp, batched instead | 98.49% | 0.0017 | 2.8116 |
+| megakernel (prefill kernels, then the decode kernel), q8_0 KV | 98.78% | 0.0012 | 2.8083 |
+| megakernel, prefill kernels only, q8_0 KV | 98.68% | 0.0012 | 2.8077 |
+
+On the same text the Q4_K_M gives 98.73% / 0.0013 with and without the UD support (identical to the
+last digit; llama.cpp batched 98.49% / 0.0018). Decode, `bench/bench.py` (greedy, 4 chat prompts x
+512 tokens, mean of 2 runs; RTX 3090 at 480 W, driver 610.62, CUDA 13.2, WSL2):
+
+| | llama.cpp (MTP 2) | megakernel `-d 4` |
+|---|---|---|
+| Q4_K_M | 72.3 tok/s | 117.0 tok/s (1.62x) |
+| UD-Q4_K_XL | 73.2 tok/s | 103.8 tok/s (1.42x) |
+
+UD-Q4_K_XL puts its extra bits where the megakernel spends its time (FFN gate / up average 5.1 bits
+per weight against Q4_K's 4.5, and the MTP block is Q6_K throughout), so a cycle reads 6% more weight
+bytes; its MTP drafts are also accepted a little less often. Per phase (`MK_PROFILE=1`) its GEMVs
+stream within ~2% of the Q4_K_M's bandwidth, except the Q6_K MTP gate / up at T = 1.
+
 ## Build / run
 
 Requires CUDA 12+ (12.8+ for RTX 50 series; built with 13.2), an sm_86, sm_89 or sm_120 GPU with 24 GB, and the repo's llama.cpp build (only
@@ -155,22 +181,32 @@ megakernel instead).
 
 ### The GGUF
 
-The kernels are compiled for unsloth's `Qwen3.8-27B-Q4_K_M.gguf` quant mix, and the loader checks
-every tensor against it:
+The kernels take the weight type as a template argument and dispatch on each matrix's type at run
+time (`gemv_pairs_any`, `resid_any`, `ffn_gu`, prefill `gemm`), so every projection of the trunk and
+the MTP block can be any of:
 
-| tensors | type |
+| type | how the kernels read it |
 |---|---|
-| `ffn_gate`, `ffn_up`, `attn_q`, `attn_k`, `attn_output`, `attn_gate`, `token_embd` | Q4_K |
-| `ffn_down`, `attn_v`, `attn_qkv` | Q4_K or Q6_K |
-| `ssm_out` | Q5_K |
-| `ssm_alpha`, `ssm_beta` | F32 |
-| `nextn.eh_proj` | Q8_0 |
-| `output` | Q6_K |
+| Q4_K, Q5_K | as stored |
+| Q6_K, Q8_0 | re-laid-out at load (values unchanged) |
+| IQ4_XS | re-laid-out at load into Q4_K-shaped 144-byte blocks, 4-bit indices mapped to int8 weights with `__byte_perm` |
+| Q3_K, IQ3_S | re-encoded at load as Q6_K, exactly |
+| IQ4_NL | re-encoded at load as Q8_0, exactly |
 
-A plain `llama-quantize ... Q4_K_M` stores `ssm_out`, `ssm_alpha`, `ssm_beta` and `nextn.eh_proj` as
-Q4_K; the loader re-encodes those to the table's types (145 tensors) and the file then runs the same
-kernels. A file with any other mix is refused, naming the first tensor that does not match, and
-open-jet starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
+`token_embd` must be Q4_K and `output` Q6_K; `ssm_alpha` / `ssm_beta` are dequantized to F32 at load
+(they are folded into fp32 rows with the norm weight). The exact re-encodes keep every weight's
+value (both formats store a small integer times the same fp16 `d` and an integer sub-block scale),
+and the loader checks each re-encoded row bit for bit against ggml's dequantization of the original.
+A file with any other type is refused, naming the first tensor that does not match, and open-jet
+starts `llama-server`. Which files that covers is in the [quick guide](#quick-guide).
+
+Gate and up projections of different types (25 of the 65 layers of UD-Q4_K_XL) are read in two
+passes over the shared activations in decode (`rows16`: one `__noinline__` function per weight type,
+so each type gets its own register allocation) and as two GEMMs plus a `silu(gate) * up` kernel in
+prefill; same-type Q4_K, Q5_K and IQ4_XS pairs keep the fused GEMM. unsloth's Q4_K_M runs the code it
+ran before (identical output and speed). A plain `llama-quantize ... Q4_K_M` stores `ssm_out`,
+`ssm_alpha`, `ssm_beta` and `nextn.eh_proj` as Q4_K: alpha / beta are dequantized and the other two
+now run in their stored Q4_K (they used to be re-quantized to Q5_K / Q8_0).
 
 To build a file with unsloth's mix from the BF16 GGUF (unsloth's imatrix optional):
 
@@ -182,8 +218,8 @@ llama-quantize --imatrix imatrix_unsloth.gguf \
 ```
 
 Benchmarks: `bench/think_bench.py` (reasoning mode, both engines), `bench/code_bench.py` (greedy
-decode, context sweep, second turn), `bench/bench.py` (decode on the 4 chat prompts);
-`bench/*_bench.cu` are GEMV / GEMM microbenchmarks.
+decode, context sweep, second turn), `bench/bench.py` (decode on the 4 chat prompts; `--model` for
+another GGUF); `bench/*_bench.cu` are GEMV / GEMM microbenchmarks.
 
 ## Server
 
@@ -208,9 +244,11 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
 
 ## How it gets its speed
 
-- **Weights stay in their GGUF k-quant encoding** (Q4_K / Q5_K / Q6_K / Q8_0), read once per
-  cycle regardless of T. Q6_K and Q8_0 are re-laid-out at load time (values unchanged) so every
-  lane does aligned 16/8-byte loads; Q6_K blocks carry their scales and `d` in one 8-byte word.
+- **Weights stay in their GGUF k-quant encoding** (Q4_K / Q5_K / Q6_K / Q8_0 / IQ4_XS), read once per
+  cycle regardless of T. Q6_K, Q8_0 and IQ4_XS are re-laid-out at load time (values unchanged) so every
+  lane does aligned 16/8-byte loads; Q6_K blocks carry their scales and `d` in one 8-byte word; IQ4_XS
+  indices become int8 weights through two `__byte_perm` table lookups per 4 bytes (llama.cpp's
+  `get_int_from_table_16`).
 - **dp4a GEMV with shared activations**: activations are int8 (per-16/32 scales, as llama.cpp's
   q8_1), each warp streams 2-4 weight rows at once and reuses every shared-memory activation
   load across them, so T = 4 costs almost the same memory time as T = 1. Weight loads bypass L1
@@ -263,8 +301,8 @@ processing the whole conversation as one fresh prompt.
 
 ## Limitations
 
-- Specialised to this model's shapes and quant mix (27B, Q4_K_M as published by unsloth, see
-  [The GGUF](#the-gguf)), plus a plain `llama-quantize` Q4_K_M; the loader rejects any other model or mix. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
+- Specialised to this model's shapes (27B) and the weight types under [The GGUF](#the-gguf)
+  (benchmarked: unsloth's Q4_K_M and UD-Q4_K_XL); the loader rejects any other model or type. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
   GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
   repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).
