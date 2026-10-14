@@ -269,7 +269,10 @@ divergence, perplexity and agreement against a reference file, see Correctness),
 users), `MK_PF_PROFILE=1` (per-kernel prefill timing), `MK_PREFILL=mk` (prefill through the decode
 megakernel instead), `MK_PF_CAP=1024` (prefill chunks of 1024 tokens; default 2048,
 rounded down to a multiple of 128 and clamped to 128–2048), `MK_EMBD_DEVICE=1` (keep
-`token_embd` in GPU memory).
+`token_embd` in GPU memory), `MK_DRAFT_SAMPLING=probabilistic` (sample each MTP draft from its
+distribution and verify by rejection sampling, `min(1, p/q)` with residual `max(0, p-q)`, instead of
+argmax-and-match; accepts more drafts at temperature > 0, output distribution unchanged; default
+greedy).
 
 ### The GGUF
 

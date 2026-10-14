@@ -148,6 +148,7 @@ struct Bufs {
     const float2 * rope; // [ctx][32] (cos, sin) of pos * base^(-2i/64)
     float2 * blk_best; // per block: best (logit, id) per row, or the TOPK_MAX best when sampling
     float2 * cand;     // [MAXT][TOPK_MAX] best (logit, id) of the main lm_head rows, descending (sampling)
+    float2 * dcand;    // [MAXT][TOPK_MAX] the MTP draft's distribution per draft step (probabilistic drafting)
     float * logits;    // [MAXT][VOCAB] main lm_head logits of a scoring launch (Launch::score == 2)
     unsigned * bar;
     unsigned * cnt;
@@ -166,6 +167,7 @@ struct Launch {
     float temp, top_p, min_p;
     int top_k; // <= TOPK_MAX
     unsigned long long seed;
+    int draft_prob; // MK_DRAFT_SAMPLING=probabilistic: sample the MTP draft, verify by rejection
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
 
@@ -1596,7 +1598,7 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
 // TOPK_MAX best logits of each row in cB.cand (for sampling).  FULL: additionally stores every
 // logit of each row in cB.logits (scoring).
 template <int TL, bool TOPK = false, bool FULL = false>
-__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok) {
+__device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int * s_tok, float2 * out = nullptr) {
     uint8_t * const sm = smem;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
@@ -1691,8 +1693,10 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
                     const float2 e = __ldcg(&cB.blk_best[((size_t) k * MAXT + warp) * TOPK_MAX + j]);
                     if (!topk_insert(v, id, e.x, __float_as_int(e.y))) break;
                 }
-            cB.cand[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(id));
-            const int best = __shfl_sync(0xffffffffu, id, 0);
+            const int tok = (draft && cW.draft_ids && id >= 0) ? cW.draft_ids[id] : id;
+            (out ? out : cB.cand)[warp * TOPK_MAX + lane] = make_float2(v, __int_as_float(tok));
+            __syncwarp();
+            const int best = __shfl_sync(0xffffffffu, tok, 0);
             if (lane == 0) s_tok[warp] = best;
         }
     } else if (tid < TL) {
@@ -1722,7 +1726,7 @@ __device__ __forceinline__ float urand(unsigned long long seed, unsigned long lo
 
 // sampling distribution over one row's candidates (descending), llama.cpp order: top_k, top_p, min_p,
 // temperature; returns the number kept, p[0..K) normalised
-__device__ int cand_probs(const float2 * c, const Launch & P, float (&p)[TOPK_MAX]) {
+__device__ int cand_probs(const float2 * c, const Launch & P, float * p) {
     int K = P.top_k > 0 ? min(P.top_k, TOPK_MAX) : TOPK_MAX;
     while (K > 1 && !(c[K - 1].x > -INFINITY)) K--;
     const float mx = c[0].x;
@@ -1747,7 +1751,7 @@ __device__ int cand_probs(const float2 * c, const Launch & P, float (&p)[TOPK_MA
 }
 
 // draw from p (optionally without token excl, renormalised)
-__device__ int cand_draw(const float2 * c, const float (&p)[TOPK_MAX], int K, int excl, float u) {
+__device__ int cand_draw(const float2 * c, const float * p, int K, int excl, float u) {
     float s = 0.f;
     for (int j = 0; j < K; j++)
         if (__float_as_int(c[j].y) != excl) s += p[j];
@@ -1763,10 +1767,43 @@ __device__ int cand_draw(const float2 * c, const float (&p)[TOPK_MAX], int K, in
     return last;
 }
 
-// Sampled targets for the verified rows (speculative sampling with point-mass drafts): draft token d
-// at row i is accepted with probability p_i(d); on rejection the row's token is drawn from p_i
-// without d (the residual distribution), and the rows after it are dropped.  Rows with no draft to
-// verify (the bonus row, the last prompt row) are drawn from p_i.  tg then drives the greedy
+// draw from norm(max(0, p - q)): the residual of rejection sampling with a probabilistic draft.
+// q is stored as normalised probabilities in qd (descending, unused rows zeroed). Only p's
+// candidates matter: tokens outside p's support have p = 0 and cannot be drawn.
+__device__ __noinline__ int residual_draw(const float2 * c, const float * p, int K, const float2 * qd, float u) {
+    float s = 0.f;
+    for (int j = 0; j < K; j++) {
+        const int id = __float_as_int(c[j].y);
+        float qj = 0.f;
+#pragma unroll 1
+        for (int k = 0; k < TOPK_MAX && qd[k].x > 0.f; k++)
+            if (__float_as_int(qd[k].y) == id) { qj = qd[k].x; break; }
+        const float d = p[j] - qj;
+        if (d > 0.f) s += d;
+    }
+    if (s <= 0.f) return cand_draw(c, p, K, -1, u); // q dominates p here: the target's own draw
+    float x = u * s;
+    int last = __float_as_int(c[0].y);
+    for (int j = 0; j < K; j++) {
+        const int id = __float_as_int(c[j].y);
+        float qj = 0.f;
+#pragma unroll 1
+        for (int k = 0; k < TOPK_MAX && qd[k].x > 0.f; k++)
+            if (__float_as_int(qd[k].y) == id) { qj = qd[k].x; break; }
+        const float d = p[j] - qj;
+        if (d <= 0.f) continue;
+        last = id;
+        x -= d;
+        if (x < 0.f) return last;
+    }
+    return last;
+}
+
+// Sampled targets for the verified rows: draft token d at row i is accepted with probability
+// p_i(d) for a point-mass draft, or with min(1, p_i(d)/q_i(d)) when the draft sampled from q
+// (P.draft_prob); on rejection the row's token is drawn from the residual distribution (p_i
+// without d, or norm(max(0, p_i - q_i))), and the rows after it are dropped.  Rows with no draft
+// to verify (the bonus row, the last prompt row) are drawn from p_i.  tg then drives the greedy
 // acceptance logic of main_control unchanged.
 __device__ void sample_targets(const Launch & P, int T, int tl, int * tg) {
     const Ctl * c = cB.ctl;
@@ -1780,6 +1817,20 @@ __device__ void sample_targets(const Launch & P, int T, int tl, int * tg) {
             float pd = 0.f;
             for (int j = 0; j < K; j++)
                 if (__float_as_int(cd[j].y) == d) pd += p[j];
+            if (P.draft_prob) {
+                // probabilistic draft: q is the normalised distribution the draft was sampled
+                // from (cB.dcand); accept with min(1, p(d)/q(d)), otherwise draw from max(0, p-q)
+                const float2 * qd = cB.dcand + (size_t) i * TOPK_MAX;
+                float qx = 0.f;
+                for (int j = 0; j < TOPK_MAX && qd[j].x > 0.f; j++)
+                    if (__float_as_int(qd[j].y) == d) { qx = qd[j].x; break; }
+                if (qx > 0.f && (pd >= qx || urand(P.seed, 2 * (n + i)) < pd / qx)) {
+                    tg[i] = d;
+                    continue;
+                }
+                tg[i] = residual_draw(cd, p, K, qd, urand(P.seed, 2 * (n + i) + 1));
+                return;
+            }
             if (urand(P.seed, 2 * (n + i)) < pd) {
                 tg[i] = d;
                 continue;
@@ -1903,7 +1954,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
 
 // one MTP pass over R consecutive positions; rows read from ctl (catch-up) or a draft row.
 template <int R>
-__device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, bool logits, uint8_t * /*sm*/, unsigned & epoch) {
+__device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row, int draft_idx, bool logits, uint8_t * /*sm*/, unsigned & epoch) {
     uint8_t * const sm = smem;
     volatile Ctl * vc = cB.ctl;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -1959,8 +2010,24 @@ __device__ __noinline__ void mtp_pass(int row0, bool draft_row, int draft_idx, b
     if (logits) {
         write_h_rows<R>(cB.xm, cB.qn, cW.shnorm, cB.hm, 0, false, sm);
         int * s_tok = reinterpret_cast<int *>(misc(sm) + 400);
-        if (lm_head<1>(R - 1, true, sm, s_tok) && threadIdx.x == 0) {
-            cB.ctl->tok[1 + (draft_row ? draft_idx : 0)] = s_tok[0];
+        const int di = draft_row ? draft_idx : 0;
+        const bool prob = P.draft_prob && P.temp > 0.0f;
+        float2 * out = prob ? cB.dcand + (size_t) di * TOPK_MAX : nullptr;
+        const bool last = prob ? lm_head<1, true>(R - 1, true, sm, s_tok, out)
+                               : lm_head<1>(R - 1, true, sm, s_tok);
+        if (last && threadIdx.x == 0) {
+            int tok = s_tok[0];
+            if (prob) {
+                // sample the draft from q (top_k / top_p / min_p / temperature, as the target) and
+                // keep q's normalised probabilities in dcand for the rejection test next cycle
+                float * qs = reinterpret_cast<float *>(misc(sm)) + 448;
+                const int K = cand_probs(out, P, qs);
+                const unsigned long long ctr = (unsigned long long) (vc->mtp_P + di + 1);
+                tok = cand_draw(out, qs, K, -1, urand(P.seed ^ 0x85ebca6bULL, 3 * ctr));
+                for (int j = 0; j < K; j++) out[j].x = qs[j];
+                for (int j = K; j < TOPK_MAX; j++) out[j].x = 0.f;
+            }
+            cB.ctl->tok[1 + di] = tok;
             __threadfence();
         }
         gsync(epoch, PH_MTP_LMHEAD);
@@ -2021,16 +2088,16 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
         const bool last_pass = done + R == Rtot;
         const bool want = lg && last_pass && P.ndraft > 0;
         switch (R) {
-            case 1: mtp_pass<1>(done, false, 0, want, sm, epoch); break;
-            case 2: mtp_pass<2>(done, false, 0, want, sm, epoch); break;
-            case 3: mtp_pass<3>(done, false, 0, want, sm, epoch); break;
-            case 4: mtp_pass<4>(done, false, 0, want, sm, epoch); break;
-            case 5: mtp_pass<5>(done, false, 0, want, sm, epoch); break;
+            case 1: mtp_pass<1>(P, done, false, 0, want, sm, epoch); break;
+            case 2: mtp_pass<2>(P, done, false, 0, want, sm, epoch); break;
+            case 3: mtp_pass<3>(P, done, false, 0, want, sm, epoch); break;
+            case 4: mtp_pass<4>(P, done, false, 0, want, sm, epoch); break;
+            case 5: mtp_pass<5>(P, done, false, 0, want, sm, epoch); break;
         }
         done += R;
     }
     if (lg) {
-        for (int i = 1; i < P.ndraft; i++) mtp_pass<1>(0, true, i, true, sm, epoch);
+        for (int i = 1; i < P.ndraft; i++) mtp_pass<1>(P, 0, true, i, true, sm, epoch);
     }
 }
 
@@ -2078,6 +2145,7 @@ struct MKEngine::Impl {
     float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f; // sampling (temp 0: greedy)
     int smp_top_k = TOPK_MAX;
     unsigned long long smp_seed = 0;
+    int draft_prob = 0;  // MK_DRAFT_SAMPLING=probabilistic
     int ndraft;          // MTP drafts the next launch produces
     int nd_avail;        // drafts produced by the previous launch (verified by the next decode cycle)
     bool all_acc = true; // the last decode cycle accepted all of its drafts
@@ -2531,13 +2599,19 @@ struct MKEngine::Impl {
         }
         hb.hm = dalloc<float>(D);
         hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
-        hb.cand = dalloc<float2>((size_t) MAXT * TOPK_MAX);
+        hb.cand = dalloc<float2>((size_t) 2 * MAXT * TOPK_MAX); // [MAXT] main rows + [MAXT] draft rows
+        hb.dcand = hb.cand + (size_t) MAXT * TOPK_MAX;
         hb.logits = dalloc<float>((size_t) MAXT * VOCAB);
         hb.bar = dalloc<unsigned>(4);
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
         hb.ctx = ctx;
         profiling = getenv("MK_PROFILE") != nullptr;
+        {
+            const char * ds = getenv("MK_DRAFT_SAMPLING");
+            draft_prob = ds && !strcmp(ds, "probabilistic") ? 1 : 0;
+            fprintf(stderr, "[mk] draft sampling: %s\n", draft_prob ? "probabilistic" : "greedy");
+        }
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
         CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
 
@@ -2555,7 +2629,7 @@ struct MKEngine::Impl {
     }
 
     void launch(int mode, int T, int last, int score = 0) {
-        Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed};
+        Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed, draft_prob};
         void * args[] = {&L};
         CK(cudaMemsetAsync(hb.bar, 0, 16));
         if (profiling) CK(cudaMemsetAsync(hb.prof, 0, (4096 + 1024 * 128) * 8));
