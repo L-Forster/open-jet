@@ -1352,7 +1352,9 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
             },
         ]
         # the list is the recommended model plus what is already on disk: Large is, Huge is not
-        models_dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        models_dir = Path(tmp.name)
         (models_dir / "large.gguf").touch()
         prompts: list[tuple[str, list[str]]] = []
         choices = iter(["manual", "auto", "__direct__", catalog[1], 2048, 0])
