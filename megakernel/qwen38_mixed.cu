@@ -169,7 +169,7 @@ struct Launch {
     float temp, top_p, min_p;
     int top_k; // <= TOPK_MAX
     unsigned long long seed;
-    int draft_prob; // MK_DRAFT_SAMPLING=probabilistic: sample the MTP draft, verify by rejection
+    int draft_prob; // sample the MTP draft, verify by rejection (default; MK_DRAFT_SAMPLING=greedy: argmax draft)
 };
 constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampling
 
@@ -2143,6 +2143,16 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
             if (prob) {
                 // sample the draft from q (top_k / top_p / min_p / temperature, as the target) and
                 // keep q's normalised probabilities in dcand for the rejection test next cycle
+                // the draft head can hold a token in two rows (dv_add pads the added rows to an even
+                // count with a copy); keep its first entry, or q(d) would count only half its mass
+                int n = 0;
+                for (int j = 0; j < TOPK_MAX; j++) {
+                    const int id = __float_as_int(out[j].y);
+                    bool dup = false;
+                    for (int k = 0; k < n; k++) dup |= __float_as_int(out[k].y) == id;
+                    if (!dup) out[n++] = out[j];
+                }
+                for (int j = n; j < TOPK_MAX; j++) out[j] = make_float2(-INFINITY, __int_as_float(-1));
                 float * qs = reinterpret_cast<float *>(misc(sm)) + 448;
                 const int K = cand_probs(out, P, qs);
                 const unsigned long long ctr = (unsigned long long) (vc->mtp_P + di + 1);
@@ -2371,7 +2381,7 @@ struct MKEngine::Impl {
     float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f; // sampling (temp 0: greedy)
     int smp_top_k = TOPK_MAX;
     unsigned long long smp_seed = 0;
-    int draft_prob = 0;  // MK_DRAFT_SAMPLING=probabilistic
+    int draft_prob = 1;  // MK_DRAFT_SAMPLING=greedy clears it
     int ndraft;          // MTP drafts the next launch produces
     int nd_avail;        // drafts produced by the previous launch (verified by the next decode cycle)
     bool all_acc = true; // the last decode cycle accepted all of its drafts
@@ -2868,7 +2878,7 @@ struct MKEngine::Impl {
         profiling = getenv("MK_PROFILE") != nullptr;
         {
             const char * ds = getenv("MK_DRAFT_SAMPLING");
-            draft_prob = ds && !strcmp(ds, "probabilistic") ? 1 : 0;
+            draft_prob = ds && !strcmp(ds, "greedy") ? 0 : 1;
             fprintf(stderr, "[mk] draft sampling: %s\n", draft_prob ? "probabilistic" : "greedy");
         }
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
