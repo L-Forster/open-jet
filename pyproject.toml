@@ -1,6 +1,6 @@
 [project]
 name = "open-jet"
-version = "0.5.0"
+version = "0.5.1"
 description = "Local AI coding agent and LLM inference engine with a Python SDK, CUDA acceleration, and support for llama.cpp, Ollama and LM Studio."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
