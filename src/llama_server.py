@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import importlib.util
+import logging
 import os
 import re
 import shutil
@@ -40,13 +42,16 @@ _MTP_SPEC_ARGS: tuple[str, ...] = (
 
 
 # The Qwen3.8-27B megakernel (<openjet>/megakernel): a specialised CUDA engine for this one model and
-# supported quantisations on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120) with an OpenAI-compatible
+# supported quantisations on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120), plus experimental Turing
+# (sm_75, native Q4_K_M engine only), with an OpenAI-compatible
 # server in front of it.
 _MEGAKERNEL_SERVER = Path("server") / "mk_server.py"
 _MEGAKERNEL_FILES = ("libqwen38mk.so", "draft_vocab_32k.bin", str(_MEGAKERNEL_SERVER))
 _MEGAKERNEL_MIN_VRAM_MIB = 23000
-# Ampere (RTX 30 / A-series), Ada (RTX 40 / Ada workstation), Blackwell (RTX 50 / Pro).
-_MEGAKERNEL_COMPUTE_CAPS = frozenset({"8.6", "8.9", "12.0"})
+# Turing (RTX 6000/8000), Ampere, Ada and Blackwell.
+_MEGAKERNEL_COMPUTE_CAPS = frozenset({"7.5", "8.6", "8.9", "12.0"})
+# Turing runs only the native Q4_K_M engine; qwen38_mixed.cu needs sm_80+ (cp.async, 99 KB shared memory)
+_MEGAKERNEL_TURING_CAP = "7.5"
 
 
 def _megakernel_root() -> Path:
@@ -74,6 +79,7 @@ def _megakernel_model_supported(model: str) -> bool:
 
 # decode speed in the agent's reasoning mode on an RTX 3090, megakernel/README.md
 MEGAKERNEL_RUNTIME_LABEL = "OpenJet megakernel, 1.5x faster"
+MEGAKERNEL_TURING_LABEL = "OpenJet megakernel, experimental Turing"
 
 
 MEGAKERNEL_SEMI_LABEL = "OpenJet megakernel, semi compatible"
@@ -173,38 +179,100 @@ def _megakernel_quant_mix(model: str) -> str | None:
 
 def model_runtime_label(model: str) -> str:
     """The runtime OpenJet serves *model* with on this machine, as shown in the setup selectors."""
-    if not _megakernel_model_supported(model) or _megakernel_gpu() is None:
+    if not _megakernel_model_supported(model):
         return "llama.cpp"
-    if not Path(model).is_file():  # a catalog model that is not downloaded yet
-        return MEGAKERNEL_MIXED_LABEL if "ud-q4_k_xl" in Path(model).name.lower() else MEGAKERNEL_RUNTIME_LABEL
+    gpu = _megakernel_gpu_info()
+    if gpu is None:
+        return "llama.cpp"
+    downloaded = Path(model).is_file()
+    # a catalog model that is not downloaded yet is selected by name; setup selects again after download
+    mixed = _megakernel_variant(model) == "mixed" if downloaded else "ud-q4_k_xl" in Path(model).name.lower()
+    if mixed and gpu[1] == _MEGAKERNEL_TURING_CAP:
+        return "llama.cpp"
+    if mixed:
+        label = MEGAKERNEL_MIXED_LABEL
+    else:
+        label = MEGAKERNEL_TURING_LABEL if gpu[1] == _MEGAKERNEL_TURING_CAP else MEGAKERNEL_RUNTIME_LABEL
+    if not downloaded:
+        return label
     mix = _megakernel_quant_mix(model)
     if mix == "semi":
         return MEGAKERNEL_SEMI_LABEL
-    if mix == "native":
-        return MEGAKERNEL_MIXED_LABEL if _megakernel_variant(model) == "mixed" else MEGAKERNEL_RUNTIME_LABEL
-    return "llama.cpp"
+    return label if mix == "native" else "llama.cpp"
 
 
 def _megakernel_gpu() -> str | None:
-    """nvidia-smi index of a GPU the megakernel can run on, or None."""
+    """Index or UUID of a GPU the megakernel can run on, or None."""
     gpu = _megakernel_gpu_info()
     return gpu[0] if gpu else None
 
 
+def _cuda_megakernel_gpu_info() -> tuple[str, str] | None:
+    """Discover through CUDA when NVML is unavailable; CUDA honours device visibility."""
+    try:
+        driver = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return None
+    uuid_type = ctypes.c_ubyte * 16
+    signatures = {
+        "cuInit": [ctypes.c_uint],
+        "cuDeviceGetCount": [ctypes.POINTER(ctypes.c_int)],
+        "cuDeviceGet": [ctypes.POINTER(ctypes.c_int), ctypes.c_int],
+        "cuDeviceComputeCapability": [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int],
+        "cuDeviceTotalMem_v2": [ctypes.POINTER(ctypes.c_size_t), ctypes.c_int],
+        "cuDeviceGetUuid": [ctypes.POINTER(uuid_type), ctypes.c_int],
+    }
+    for name, args in signatures.items():
+        function = getattr(driver, name)
+        function.argtypes = args
+        function.restype = ctypes.c_int
+
+    def checked(name: str, *args: Any) -> bool:
+        rc = getattr(driver, name)(*args)
+        if rc != 0 and not (name == "cuInit" and rc == 100):  # CUDA_ERROR_NO_DEVICE
+            logging.getLogger(__name__).warning("CUDA GPU detection: %s failed with error %s", name, rc)
+        return rc == 0
+
+    count = ctypes.c_int()
+    if not checked("cuInit", 0) or not checked("cuDeviceGetCount", ctypes.byref(count)):
+        return None
+    pinned = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    for ordinal in range(min(count.value, 1) if pinned else count.value):
+        device, major, minor = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+        memory, uuid = ctypes.c_size_t(), uuid_type()
+        if not checked("cuDeviceGet", ctypes.byref(device), ordinal):
+            return None
+        if not checked("cuDeviceComputeCapability", ctypes.byref(major), ctypes.byref(minor), device.value):
+            return None
+        if not checked("cuDeviceTotalMem_v2", ctypes.byref(memory), device.value):
+            return None
+        cap = f"{major.value}.{minor.value}"
+        if cap not in _MEGAKERNEL_COMPUTE_CAPS or memory.value < _MEGAKERNEL_MIN_VRAM_MIB * 1024 * 1024:
+            continue
+        if not checked("cuDeviceGetUuid", ctypes.byref(uuid), device.value):
+            return None
+        raw = bytes(uuid).hex()
+        return f"GPU-{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}", cap
+    return None
+
+
 def _megakernel_gpu_info() -> tuple[str, str] | None:
-    """(nvidia-smi index, compute capability) of a GPU the megakernel can run on, or None.
+    """(GPU selector, compute capability) of a GPU the megakernel can run on, or None.
 
     The megakernel runs on CUDA device 0, so a CUDA_VISIBLE_DEVICES already in the
     environment limits the choice to its first entry; otherwise any GPU qualifies
     and _start_megakernel pins the one found here.
     """
     try:
-        out = subprocess.run(
+        result = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,uuid,compute_cap,memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10,
-        ).stdout.strip().splitlines()
+        )
     except (OSError, subprocess.SubprocessError):
-        return None
+        return _cuda_megakernel_gpu_info()
+    if result.returncode != 0:
+        return _cuda_megakernel_gpu_info()
+    out = result.stdout.strip().splitlines()
     pinned = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
     for line in out:
         fields = [field.strip() for field in line.split(",")]
@@ -231,9 +299,12 @@ def megakernel_unavailable_reason(model: str) -> str | None:
         return "the megakernel is not built (rerun `openjet setup` with the CUDA toolkit installed)"
     if importlib.util.find_spec("jinja2") is None:
         return "the megakernel server needs jinja2"
-    if _megakernel_gpu() is None:
-        return (f"the megakernel needs an RTX 30/40/50-series GPU (sm_86, sm_89 or sm_120) "
+    gpu = _megakernel_gpu_info()
+    if gpu is None:
+        return (f"the megakernel needs a Turing or RTX 30/40/50-series GPU (sm_75, sm_86, sm_89 or sm_120) "
                 f"with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB")
+    if gpu[1] == _MEGAKERNEL_TURING_CAP and _megakernel_variant(model) == "mixed":
+        return "the mixed-quant megakernel (UD-Q4_K_XL) does not support Turing GPUs; use Q4_K_M"
     return None
 
 

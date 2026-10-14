@@ -148,6 +148,32 @@ def test_setup_does_not_guess_a_build_before_model_download(tmp_path):
 
 
 def test_mixed_runtime_label_does_not_promise_q4_performance(model):
-    with mock.patch.object(ls, "_megakernel_gpu", return_value="0"):
+    with mock.patch.object(ls, "_megakernel_gpu_info", return_value=("0", "8.6")):
         assert ls.model_runtime_label(model(**{'blk.0.ffn_gate.weight': 23})) == ls.MEGAKERNEL_MIXED_LABEL
         assert ls.model_runtime_label('/missing/Qwen3.8-27B-UD-Q4_K_XL.gguf') == ls.MEGAKERNEL_MIXED_LABEL
+
+
+def test_turing_serves_only_the_native_engine(model, tmp_path):
+    native = model()
+    (tmp_path / 'mixed').mkdir()
+    mixed = gguf(tmp_path / 'mixed' / 'Qwen3.8-27B-UD-Q4_K_XL.gguf',
+                 {'token_embd.weight': 12, 'output.weight': 14, 'blk.0.ssm_out.weight': 8,
+                  'blk.0.ssm_alpha.weight': 8, 'blk.64.nextn.eh_proj.weight': 14,
+                  'blk.0.ffn_gate.weight': 23})
+    with mock.patch.object(ls, "_megakernel_gpu_info", return_value=("0", "7.5")), \
+            mock.patch.object(ls, "_megakernel_dir", return_value=Path("/mk")), \
+            mock.patch.object(ls.importlib.util, "find_spec", return_value=object()):
+        assert ls._megakernel_variant(mixed) == 'mixed'
+        assert ls.model_runtime_label(native) == ls.MEGAKERNEL_TURING_LABEL
+        assert ls.model_runtime_label(mixed) == "llama.cpp"
+        assert ls.model_runtime_label('/missing/Qwen3.8-27B-UD-Q4_K_XL.gguf') == "llama.cpp"
+        assert ls.megakernel_unavailable_reason(native) is None
+        assert "Turing" in ls.megakernel_unavailable_reason(mixed)
+    log = mock.Mock()
+    with mock.patch.object(mb.sys, "platform", "linux"), \
+            mock.patch.object(mb, "_megakernel_gpu_info", return_value=("0", "7.5")), \
+            mock.patch.object(mb, "_run_exec", new_callable=mock.AsyncMock) as run:
+        asyncio.run(mb.ensure_megakernel({"llama_model": mixed}, log=log, set_status=mock.Mock(),
+                                         clear_status=mock.Mock()))
+    run.assert_not_called()
+    assert "Turing" in log.write.call_args.args[0]

@@ -498,10 +498,11 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 }
 
 // Causal flash attention over the cache for the chunk's queries.  CTA = (16 query positions, kv
-// head); warp = one of the 6 query heads of the group (16 rows).  K / V tiles of 32 positions in
+// head); warp = one of the 6 query heads of the group (16 rows). K/V tiles of 32 (Turing: 16) positions in
 // shared memory, S = Q K^T and O += P V on tensor cores (fp16 operands, fp32 accumulation).
-constexpr int AT_Q = 16, AT_K = 32, AT_LD = HD + 8;
+constexpr int AT_Q = 16, AT_K = QWEN_MK_SM75 ? 16 : 32, AT_LD = QWEN_MK_SM75 ? HD : HD + 8;
 constexpr int AT_SMEM = (6 * AT_Q + 2 * AT_K) * AT_LD * 2; // Q, K/V tile
+static_assert(!QWEN_MK_SM75 || AT_SMEM <= 65536, "Turing prefill attention shared memory");
 template <bool Q8>
 __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
     extern __shared__ __align__(16) uint8_t asm_[];
@@ -570,9 +571,9 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
             pf::cpa_wait<0>();
         }
         __syncthreads();
-        float s[4][4];
+        float s[AT_K / 8][4];
 #pragma unroll
-        for (int ni = 0; ni < 4; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
+        for (int ni = 0; ni < AT_K / 8; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
 #pragma unroll
         for (int ks = 0; ks < HD / 16; ks++) {
             const unsigned a0 = *reinterpret_cast<const unsigned *>(qa + 16 * ks);
@@ -580,7 +581,7 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
             const unsigned a2 = *reinterpret_cast<const unsigned *>(qa + 16 * ks + 8);
             const unsigned a3 = *reinterpret_cast<const unsigned *>(qa + 8 * AT_LD + 16 * ks + 8);
 #pragma unroll
-            for (int ni = 0; ni < 4; ni++) {
+            for (int ni = 0; ni < AT_K / 8; ni++) {
                 const __half * kp = sK + (8 * ni + g8) * AT_LD + 2 * t4 + 16 * ks;
                 mma16816(s[ni], a0, a1, a2, a3, *reinterpret_cast<const unsigned *>(kp),
                          *reinterpret_cast<const unsigned *>(kp + 8));
@@ -589,7 +590,7 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
         // causal mask + online softmax (rows g8 and g8 + 8; a row's 4 lanes share it)
         float mx0 = -INFINITY, mx1 = -INFINITY;
 #pragma unroll
-        for (int ni = 0; ni < 4; ni++) {
+        for (int ni = 0; ni < AT_K / 8; ni++) {
             const int p = kb + 8 * ni + 2 * t4;
             if (p > qr0) s[ni][0] = -INFINITY;
             if (p + 1 > qr0) s[ni][1] = -INFINITY;
@@ -605,9 +606,9 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
         const float mn0 = fmaxf(m0, mx0), mn1 = fmaxf(m1, mx1);
         const float al0 = mn0 == -INFINITY ? 1.f : expf(m0 - mn0), al1 = mn1 == -INFINITY ? 1.f : expf(m1 - mn1);
         float ps0 = 0.f, ps1 = 0.f;
-        unsigned pa[4][2]; // P as fp16 pairs: [n8 tile][row g8 / g8 + 8]
+        unsigned pa[AT_K / 8][2]; // P as fp16 pairs: [n8 tile][row g8 / g8 + 8]
 #pragma unroll
-        for (int ni = 0; ni < 4; ni++) {
+        for (int ni = 0; ni < AT_K / 8; ni++) {
             const float p0 = mn0 == -INFINITY ? 0.f : expf(s[ni][0] - mn0);
             const float p1 = mn0 == -INFINITY ? 0.f : expf(s[ni][1] - mn0);
             const float p2 = mn1 == -INFINITY ? 0.f : expf(s[ni][2] - mn1);

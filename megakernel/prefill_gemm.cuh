@@ -5,7 +5,7 @@
 // X is fp16 [tok][K] with the elements of every 16-group permuted (hperm) so that the 4-byte weight
 // words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (224-byte
 // repack, see qwen38_mk.cu) or Q8_0 (unit repack) and is dequantised to fp16 in registers.
-// Tile: 128 weight rows x 128 tokens per CTA, 8 warps of 16 rows x 128 tokens.  K is staged 64 at a
+// Tile: 128 weight rows x 128 tokens (64 on Turing) per CTA, 8 warps of 16 rows. K is staged 64 at a
 // time (one 64-group of a super-block: two 32-element sub-blocks) through a cp.async pipeline with
 // one block barrier per stage; per-row sub-block scales are decoded one stage ahead.  Products
 // accumulate in fp16 over two stages (k = 128) and are then added to fp32 accumulators.
@@ -14,10 +14,11 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include <type_traits>
+#include "cuda_compat.cuh"
 
 namespace pf {
 
-constexpr int BM = 128, BN = 128, BK = 64;
+constexpr int BM = 128, BN = QWEN_MK_SM75 ? 64 : 128, BK = 64;
 constexpr int TQ4K = 12, TQ5K = 13, TQ6K = 14, TQ80 = 8;
 
 struct WMat { // device view of one weight matrix (mirrors Mat in qwen38_mk.cu)
@@ -45,16 +46,16 @@ template <int TYPE> __device__ __forceinline__ void chunk_src(int c, int & off, 
 }
 
 __device__ __forceinline__ void cpa16(unsigned s, const void * g) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(s), "l"(g) : "memory");
+    mk_cuda::copy<16>(s, g);
 }
 __device__ __forceinline__ void cpa8(unsigned s, const void * g) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(s), "l"(g) : "memory");
+    mk_cuda::copy<8>(s, g);
 }
 __device__ __forceinline__ void cpa4(unsigned s, const void * g) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(s), "l"(g) : "memory");
+    mk_cuda::copy<4>(s, g);
 }
-__device__ __forceinline__ void cpa_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
-template <int N> __device__ __forceinline__ void cpa_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory"); }
+__device__ __forceinline__ void cpa_commit() { mk_cuda::commit(); }
+template <int N> __device__ __forceinline__ void cpa_wait() { mk_cuda::wait<N>(); }
 
 __device__ __forceinline__ void ldsm_x4(unsigned (&r)[4], unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
@@ -83,26 +84,31 @@ __host__ __device__ constexpr int hperm(int e) {
 template <int TYPE> struct HT;
 // SR: smem bytes per weight row; SEP: fp16 scales in a separate double buffer (else in the row:
 // Q6_K rows are 64 B, chunks XOR-swizzled by (row / 2) % 4, scales in the meta chunk's spare 8 B)
-template <> struct HT<TQ4K> { static constexpr int SR = 48, NS = 4; static constexpr bool SEP = true; };
+template <> struct HT<TQ4K> { static constexpr int SR = 48, NS = QWEN_MK_SM75 ? 3 : 4; static constexpr bool SEP = true; };
 template <> struct HT<TQ5K> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
-template <> struct HT<TQ6K> { static constexpr int SR = 64, NS = 4; static constexpr bool SEP = false; };
+template <> struct HT<TQ6K> { static constexpr int SR = 64, NS = QWEN_MK_SM75 ? 3 : 4; static constexpr bool SEP = false; };
 template <> struct HT<TQ80> { static constexpr int SR = 80, NS = 3; static constexpr bool SEP = true; };
 constexpr int HCH = 2; // stages accumulated in fp16 before adding to the fp32 accumulators
 constexpr int HMI = 1, HWR = 16 * HMI, HNWM = BM / HWR, HWT = BN / (8 / HNWM), HNI = HWT / 8; // warp tiles
-constexpr int HM_X = BN * 128; // activation tile per stage: 128 tokens x 64 halves, 16 B chunks XOR-swizzled
+constexpr int HM_X = BN * 128; // activation tile per stage: BN tokens x 64 halves, 16 B chunks XOR-swizzled
 template <int TYPE> __host__ __device__ constexpr int hm_stage() { return HT<TYPE>::SR * BM + HM_X; }
 template <int TYPE> __host__ __device__ constexpr int hm_smem() { return HT<TYPE>::NS * hm_stage<TYPE>() + (HT<TYPE>::SEP ? 2 * 2 * BM * 8 : 0); }
 static_assert(BN * (BM + 4) * 4 <= hm_smem<TQ5K>() && BN * (BM + 4) * 4 <= hm_smem<TQ4K>(), "epilogue tile");
+static_assert(!QWEN_MK_SM75 || (hm_smem<TQ4K>() <= 65536 && hm_smem<TQ5K>() <= 65536 &&
+                              hm_smem<TQ6K>() <= 65536 && hm_smem<TQ80>() <= 65536), "Turing shared memory");
 
 __device__ __forceinline__ void hmma16(unsigned (&d)[2], const unsigned (&a)[4], unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
-                 : "+r"(d[0]), "+r"(d[1])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    mk_cuda::mma_f16(d, a, b0, b1);
 }
 __device__ __forceinline__ void hmma16z(unsigned (&d)[2], const unsigned (&a)[4], unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};"
                  : "=r"(d[0]), "=r"(d[1])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+#else
+    d[0] = d[1] = 0;
+    mk_cuda::mma_f16(d, a, b0, b1);
+#endif
 }
 __device__ __forceinline__ __half2 u2h(unsigned u) { return *reinterpret_cast<__half2 *>(&u); }
 __device__ __forceinline__ unsigned h2u(__half2 h) { return *reinterpret_cast<unsigned *>(&h); }
@@ -141,10 +147,11 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     const uint8_t * esrc = W.w + (size_t) (row0 + (tid & (BM - 1))) * W.rb + 192;
     const __half * dsrc = W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd;
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
-    const __half * xsrc[4];
-    unsigned xdst[4];
+    constexpr int XIT = BN * 8 / 256;
+    const __half * xsrc[XIT];
+    unsigned xdst[XIT];
 #pragma unroll
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < XIT; k++) {
         const int i = tid + k * 256, t = i >> 3, c = i & 7;
         xsrc[k] = X + (size_t) (tok0 + t) * W.K + 8 * c;
         xdst[k] = SR * BM + t * 128 + ((c ^ (t & 7)) << 4);
@@ -162,7 +169,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
             if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
         }
 #pragma unroll
-        for (int k = 0; k < 4; k++) cpa16(s + xdst[k], xsrc[k] + BK * st);
+        for (int k = 0; k < XIT; k++) cpa16(s + xdst[k], xsrc[k] + BK * st);
     };
 
     // fp16 scales of stage st -> sws[st & 1][j][row] (thread = (row, j)):

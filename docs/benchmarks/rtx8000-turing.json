@@ -1,0 +1,120 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "baseline": {"gpu_index": 2, "model": "Quadro RTX 8000", "compute_capability": "7.5"},
+    "megakernel": {"gpu_index": 3, "model": "Quadro RTX 8000", "compute_capability": "7.5"},
+    "device_selection": "Each process pinned to its GPU's full UUID; UUIDs omitted from this public record."
+  },
+  "model": {
+    "repository": "unsloth/Qwen3.8-27B-GGUF",
+    "revision": "566347e99d832d31f6245a577198d10d5bdd389e",
+    "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+    "bytes": 17106775008,
+    "sha256": "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169"
+  },
+  "settings": {
+    "context_capacity": 16384,
+    "max_generated_tokens": 256,
+    "seeds": [1000, 1001],
+    "thinking": true,
+    "reasoning_effort": "xhigh",
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "kv_precision": "q8_0 (llama.cpp), q8 (megakernel)",
+    "llama_cpp": {"spec_type": "draft-mtp", "draft_max": 2, "flash_attention": "on", "gpu_layers": 99, "parallel": 1},
+    "megakernel_drafts": [3, 4],
+    "megakernel_draft_vocabulary_size": 32768,
+    "timing_scope": "Decode only, excluding load and prefill; megakernel first generated token belongs to prefill.",
+    "aggregation": "Total timed decode tokens divided by total reported decode seconds; no best-of selection."
+  },
+  "prompts": [
+    {"index": 0, "name": "Python interval merge", "rendered_sha256": "8d1a515d17d5192d29e612568ae44987786b34f51f0139f438028b746cca544b"},
+    {"index": 1, "name": "Bash largest files", "rendered_sha256": "dfd063a607648e106910950329ad7880477a517e763b511f9dd56165db7ec5b2"},
+    {"index": 2, "name": "C ring buffer", "rendered_sha256": "aa5091948e5c8b1656d8f481df2335c8b1cf1da441e4f6d716ff65d8c40e6cc1"},
+    {"index": 3, "name": "Mutex and semaphore", "rendered_sha256": "d1300328cd0d3bb43de2946d5bcaf6cce31ce595bff0bd662de8cefda4645bcd"},
+    {"index": 4, "name": "CUDA source analysis", "rendered_sha256": "d6b5ca4701732ba379f9fda6e95762aa80e90994a07dd2029d42842ec629ef67"}
+  ],
+  "sample_columns": ["prompt_index", "seed", "timed_decode_tokens", "decode_seconds", "reported_tokens_per_second", "accepted_drafts", "proposed_drafts"],
+  "samples": {
+    "llama_mtp2": [
+      [0, 1000, 256, 7.151213, 35.79812264017308, 126, 257],
+      [0, 1001, 256, 6.062522, 42.22665088885451, 148, 214],
+      [1, 1000, 256, 6.74428, 37.9580918941681, 140, 230],
+      [1, 1001, 256, 6.181308, 41.41518267654678, 155, 197],
+      [2, 1000, 256, 8.649091, 29.59848612992972, 119, 271],
+      [2, 1001, 256, 8.772931, 29.18066949346803, 121, 265],
+      [3, 1000, 256, 9.972605, 25.670323852193086, 106, 297],
+      [3, 1001, 256, 8.544212, 29.96180338221945, 129, 251],
+      [4, 1000, 256, 7.560063, 33.86215167783654, 148, 212],
+      [4, 1001, 256, 8.219905, 31.143912247161005, 140, 229]
+    ],
+    "megakernel_d3": [
+      [0, 1000, 255, 4.852, 52.55, 139, 348],
+      [0, 1001, 255, 4.538, 56.20, 148, 324],
+      [1, 1000, 255, 4.508, 56.57, 148, 321],
+      [1, 1001, 255, 4.186, 60.92, 156, 297],
+      [2, 1000, 255, 5.142, 49.59, 134, 363],
+      [2, 1001, 255, 4.816, 52.95, 143, 339],
+      [3, 1000, 255, 5.391, 47.30, 129, 378],
+      [3, 1001, 255, 5.316, 47.97, 134, 372],
+      [4, 1000, 255, 3.916, 65.11, 172, 255],
+      [4, 1001, 255, 4.436, 57.49, 160, 288]
+    ],
+    "megakernel_d4": [
+      [0, 1000, 255, 4.318, 59.05, 160, 323],
+      [0, 1001, 255, 5.069, 50.31, 144, 371],
+      [1, 1000, 255, 3.967, 64.28, 167, 300],
+      [1, 1001, 255, 4.922, 51.81, 143, 358],
+      [2, 1000, 255, 4.581, 55.67, 152, 341],
+      [2, 1001, 255, 4.359, 58.50, 157, 324],
+      [3, 1000, 255, 6.088, 41.88, 116, 433],
+      [3, 1001, 255, 5.578, 45.72, 129, 399],
+      [4, 1000, 255, 3.813, 66.88, 177, 273],
+      [4, 1001, 255, 4.799, 53.14, 155, 333]
+    ]
+  },
+  "summary": {
+    "llama_mtp2": {"timed_decode_tokens": 2560, "decode_seconds": 77.85813, "tokens_per_second": 32.88031705873234},
+    "megakernel_d3": {"timed_decode_tokens": 2550, "decode_seconds": 47.101, "tokens_per_second": 54.138977941020364, "speedup": 1.646546711952772},
+    "megakernel_d4": {"timed_decode_tokens": 2550, "decode_seconds": 47.494, "tokens_per_second": 53.69099254642692, "speedup": 1.632921983401851}
+  },
+  "fingerprints": {
+    "llama_version": "0 (unknown); upstream commit not verified",
+    "benchmark_sha256": {
+      "llama-server": "52569f01f01802e03b260e33df0db081cc579faaf6e15656d77bc6a2b47d5b05",
+      "baseline_libllama-server-impl.so": "e6a899825b512295fdaff1893cacce0779725fd509fab3ef240c137adfe425c5",
+      "baseline_libllama.so.0": "d7e22ab5992343e259c85c67c05946b7bef87247fe250c62c436a67678354f5e",
+      "baseline_libggml-cuda.so.0": "12028554909d37a6965b006dadbee9e8fdc68b27d622afdf06f9ee51be90895b",
+      "qwen38_mk": "3b70e99c6fe7e598598d3ec9ffd2cf25d4dc2d8620b1b2a5e6e6b474ab7810d9",
+      "libqwen38mk.so": "94afa722c6b3df13923cccce36817167d16b4b8a83b61c92506e0384dda38be6",
+      "draft_vocab_32k.bin": "cad444c6a5e571479eb1dec71768c760c76f7c65f0ecfe00c860dca231fc9d24",
+      "think_bench.py": "d7cad01ba239672eecc9790338b6bbd2a526ed6f9f778c6c2897dcf1d3eed79d"
+    },
+    "final_rebuild_sha256": {
+      "qwen38_mk": "a5b6e2acd3771f4aa43c09c7aa01a97bf032ba67f303346cb297ca6c0b92ecc0",
+      "libqwen38mk.so": "646215cb24d84bb9b09ad8278374f1e4cd8946e98463210a81a89454f7e4b063"
+    },
+    "final_binary_benchmark_rerun": false
+  },
+  "validation": {
+    "sm75_compilation_and_linking": "passed",
+    "sm86_compilation": "passed; no sm86 runtime validation",
+    "gpu3_kernel_checks": "MMA mapping, sliced Q4/Q6 GEMV for T3-T5, quantized GEMM/GLU, fp16/q8 attention tails",
+    "memcheck_errors": 0,
+    "racecheck": "0 hazards on recorded quantized prefill matrix checks, not a whole-model guarantee",
+    "megakernel_benchmark_zero_exit_runs": 20,
+    "final_rebuild_smoke": "q8/d4 model generation returned 4",
+    "openjet_managed_client_smoke": "megakernel backend, two successful chat turns"
+  },
+  "limitations": [
+    "Short-generation, decode-only measurements on two separate cards; clocks and other load may differ.",
+    "Context capacity is not prompt length; no long-context quality or KLD validation is claimed.",
+    "Benchmark --quiet suppresses generated text; output quality was not assessed for these samples.",
+    "The same GGUF input does not imply identical internal tensor encoding or arithmetic.",
+    "Megakernel times are reported to millisecond precision; per-sample throughput is rounded.",
+    "Final binaries were rebuilt after comments, a compile-time shared-memory assertion and Makefile test targets were finalized; benchmarks used the original validated binaries.",
+    "Raw machine-local logs, full prompts and GPU UUIDs are intentionally omitted from this public record."
+  ]
+}

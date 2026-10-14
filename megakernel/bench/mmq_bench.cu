@@ -1,5 +1,8 @@
 // Correctness + throughput of the prefill fp16 tensor-core GEMM (prefill_gemm.cuh) on random data.
 //   nvcc -O3 -arch=sm_86 -std=c++17 mmq_bench.cu -o mmq_bench && ./mmq_bench [ntok]
+// Model-free Turing correctness (including a partial token tile):
+//   nvcc -O3 -arch=sm_75 -DQWEN_MK_SM75=1 -std=c++17 mmq_bench.cu -o mmq_check
+//   ./mmq_check 65 --check-only
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,13 +73,16 @@ static uint16_t h(float f) {
 
 int main(int argc, char ** argv) {
     const int ntok = argc > 1 ? atoi(argv[1]) : 1024;
+    const bool check_only = argc > 2 && strcmp(argv[2], "--check-only") == 0;
+    if (ntok < 1) return 1;
+    bool failed = false;
     std::mt19937 rng(1);
     struct Case { int type, K, N; const char * name; };
     const Case cases[] = {{TQ4K, 5120, 17408, "q4k ffn_gate"}, {TQ4K, 17408, 5120, "q4k ffn_down"},
                           {TQ6K, 17408, 5120, "q6k ffn_down"}, {TQ5K, 6144, 5120, "q5k ssm_out"},
                           {TQ6K, 5120, 10240, "q6k qkv"}, {TQ80, 10240, 5120, "q8_0 eh_proj"}};
     for (const Case & cs : cases) {
-        const int K = cs.K, N = cs.N, nb = K / 256;
+        const int K = cs.K, N = check_only ? 256 : cs.N, nb = K / 256;
         const int bsz = cs.type == TQ4K ? 144 : cs.type == TQ5K ? 176 : cs.type == TQ6K ? 224 : 256;
         std::vector<uint8_t> w((size_t) N * nb * bsz);
         for (auto & b : w) b = rng() & 0xff;
@@ -99,7 +105,8 @@ int main(int argc, char ** argv) {
             std::uniform_real_distribution<float> u(0.0005f, 0.004f);
             for (auto & d : dsc) d = h(u(rng));
         }
-        std::vector<__half> xh((size_t) ntok * K);
+        const int padded_tokens = (ntok + BN - 1) / BN * BN;
+        std::vector<__half> xh((size_t) padded_tokens * K);
         std::normal_distribution<float> nd(0.f, 1.f);
         for (auto & v : xh) v = __float2half(nd(rng));
         uint8_t * dw; __half *dx, *dd = nullptr; float *dy, *dr;
@@ -127,7 +134,7 @@ int main(int argc, char ** argv) {
         CK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
         kern<<<grid, 256, smem>>>(W, dx, ntok, O, nullptr);
         CK(cudaGetLastError());
-        const int rt = 64; // reference on the first tokens only
+        const int rt = check_only ? ntok : std::min(64, ntok);
         ref_gemm<<<dim3((N + 127) / 128, rt), 128>>>(W, dx, rt, dr);
         CK(cudaDeviceSynchronize());
         std::vector<float> y((size_t) rt * N), r((size_t) rt * N);
@@ -138,6 +145,38 @@ int main(int argc, char ** argv) {
             num += (y[i] - r[i]) * (y[i] - r[i]);
             den += r[i] * r[i];
             mx = std::max(mx, (double) fabs(y[i] - r[i]));
+        }
+        const double rel = sqrt(num / den);
+        failed |= !std::isfinite(rel) || rel > 0.02;
+        if (check_only) {
+            printf("%-14s N=%d K=%d tok=%d smem=%d: rel err %.2e (max abs %.2e)\n",
+                   cs.name, N, K, ntok, smem, rel, mx);
+            if (cs.type == TQ4K) {
+                __half * dh;
+                CK(cudaMalloc(&dh, (size_t) ntok * N * 2));
+                CK(cudaFuncSetAttribute(mmh<TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, hm_smem<TQ4K>()));
+                const Out glu{nullptr, N, OUT_STORE, dh};
+                mmh<TQ4K, true><<<dim3(N / (BM / 2), grid.y), 256, hm_smem<TQ4K>()>>>(W, dx, ntok, glu, dw);
+                CK(cudaGetLastError());
+                std::vector<__half> gh((size_t) ntok * N);
+                CK(cudaMemcpy(gh.data(), dh, gh.size() * 2, cudaMemcpyDeviceToHost));
+                double gn = 0, gd = 0;
+                for (int t = 0; t < ntok; t++)
+                    for (int row = 0; row < N; row++) {
+                        const float v = r[(size_t) t * N + row];
+                        const float expected = fminf(65504.f, v / (1.f + expf(-v)) * v);
+                        const float actual = __half2float(gh[(size_t) t * N + hperm(row)]);
+                        gn += (actual - expected) * (actual - expected);
+                        gd += expected * expected;
+                    }
+                const double gr = sqrt(gn / gd);
+                printf("  fused GLU: rel err %.2e\n", gr);
+                failed |= !std::isfinite(gr) || gr > 0.02;
+                CK(cudaFree(dh));
+            }
+            CK(cudaFree(dw)); CK(cudaFree(dx)); CK(cudaFree(dy)); CK(cudaFree(dr));
+            if (dd) CK(cudaFree(dd));
+            continue;
         }
         cudaEvent_t a, b;
         cudaEventCreate(&a);
@@ -158,5 +197,5 @@ int main(int argc, char ** argv) {
         cudaFree(dw); cudaFree(dx); cudaFree(dy); cudaFree(dr);
         if (dd) cudaFree(dd);
     }
-    return 0;
+    return failed ? 1 : 0;
 }

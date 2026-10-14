@@ -1,6 +1,6 @@
 // Persistent cooperative "megakernel" for Qwen3.8-27B (llama.cpp arch "qwen35", shared with Qwen3.5/3.6;
 // 64 layers: 48 Gated-DeltaNet + 16 gated full-attention, plus one MTP block), tuned for
-// RTX 3090 (sm_86, 82 SMs).
+// RTX 3090 (sm_86, 82 SMs), with a 64-KiB shared-memory compatibility path for Turing (sm_75).
 //
 // One kernel launch executes an entire speculative decoding cycle:
 //   main forward over T = 1 + n_draft tokens  ->  lm_head + greedy verify on device
@@ -15,6 +15,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "cuda_compat.cuh"
 
 #include <algorithm>
 #include <chrono>
@@ -63,12 +64,12 @@ constexpr int U_D = D / 32, U_FF = FF / 32, U_VD = VD / 32, U_EH = 2 * D / 32;
 constexpr int UMAX = U_FF;
 
 constexpr int AR = 6 * MAXT;   // attention query rows per kv head (6 q heads x tokens)
-constexpr int SM_XU = 4 * UMAX; // activation units (x tokens) shared memory holds; T = 5 ffn_down fills in two halves
+constexpr int SM_XU = QWEN_MK_SM75 ? 1536 : 4 * UMAX;
 constexpr int SM_XA = 0;
 constexpr int SM_XB = SM_XA + SM_XU * 16;
 constexpr int SM_XM = SM_XB + SM_XU * 16;
 constexpr int SM_MISC = SM_XM + SM_XU * 8;
-constexpr int ATP = 32; // attention: positions per K/V tile (two tiles in flight)
+constexpr int ATP = QWEN_MK_SM75 ? 16 : 32; // positions per K/V tile (two tiles in flight)
 constexpr int KVQ_ROW = 256 + 16; // staged q8 K or V row: 256 int8 values + 8 fp16 scales
 // K/V tile region: fp16 cache: 2 stages of fp16 K/V tiles; q8 cache: one fp16 K/V tile + 2 stages of q8 tiles
 constexpr int SM_ATTN_KV = (4 * ATP * (256 + 8) * 2 > 2 * ATP * (256 + 8) * 2 + 4 * ATP * KVQ_ROW)
@@ -76,6 +77,7 @@ constexpr int SM_ATTN_KV = (4 * ATP * (256 + 8) * 2 > 2 * ATP * (256 + 8) * 2 + 
 constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (ATP + 8) * 2 + 96 * 4; // Q, K/V, S, P, stats
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN ? SM_MISC + 2048 : SM_ATTN);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
+static_assert(!QWEN_MK_SM75 || SM_TOTAL + 16 <= 64 * 1024, "Turing shared memory including aligned s_bar_k");
 
 enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14 };
 enum { MODE_PREFILL = 0, MODE_DECODE = 1, MODE_BENCH = 2 };
@@ -174,28 +176,51 @@ constexpr int TOPK_MAX = 32; // candidates kept per main lm_head row when sampli
 // Weights are streamed once per cycle: bypass L1 and mark them evict-first in L2 so that data
 // prefetched with evict-last (recurrent state, KV cache) survives the stream.
 __device__ __forceinline__ unsigned long long l2_evict_first() {
+#if __CUDA_ARCH__ >= 800
     unsigned long long pol;
     asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
     return pol;
+#else
+    return 0;
+#endif
 }
 __device__ __forceinline__ int4 ldw4(const void * p) {
     int4 r;
+#if __CUDA_ARCH__ >= 800
     asm("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.s32 {%0,%1,%2,%3}, [%4], %5;"
         : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
         : "l"(p), "l"(l2_evict_first()));
+#else
+    asm("ld.global.nc.v4.s32 {%0,%1,%2,%3}, [%4];"
+        : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+#endif
     return r;
 }
 __device__ __forceinline__ int2 ldw2(const void * p) {
     int2 r;
+#if __CUDA_ARCH__ >= 800
     asm("ld.global.nc.L1::no_allocate.L2::cache_hint.v2.s32 {%0,%1}, [%2], %3;" : "=r"(r.x), "=r"(r.y) : "l"(p), "l"(l2_evict_first()));
+#else
+    asm("ld.global.nc.v2.s32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
+#endif
     return r;
 }
 __device__ __forceinline__ int ldw1(const void * p) {
     int r;
+#if __CUDA_ARCH__ >= 800
     asm("ld.global.nc.L1::no_allocate.L2::cache_hint.s32 %0, [%1], %2;" : "=r"(r) : "l"(p), "l"(l2_evict_first()));
+#else
+    asm("ld.global.nc.s32 %0, [%1];" : "=r"(r) : "l"(p));
+#endif
     return r;
 }
-__device__ __forceinline__ void pf_l2(const void * p) { asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p)); }
+__device__ __forceinline__ void pf_l2(const void * p) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(p));
+#else
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+#endif
+}
 // prefetch `bytes` starting at p (128-byte lines) with the threads of the calling block
 __device__ __forceinline__ void pf_block(const void * p, int bytes) {
     for (int off = threadIdx.x * 128; off < bytes; off += NT * 128) pf_l2(reinterpret_cast<const uint8_t *>(p) + off);
@@ -323,7 +348,7 @@ __device__ __forceinline__ float * misc(uint8_t * /*sm*/) {
 
 __device__ __forceinline__ void cp_async16(void * smem_dst, const void * gsrc) {
     const unsigned d = (unsigned) __cvta_generic_to_shared(smem_dst);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(d), "l"(gsrc) : "memory");
+    mk_cuda::copy<16>(d, gsrc);
 }
 
 // Load T rows (starting at row t0) of a quantised activation buffer into shared memory with
@@ -341,7 +366,7 @@ __device__ void fill_xs(const QBuf & q, int t0, bool norm, const SX & s, float *
         cp_async16(s.xb + i, gb + (size_t) i * 16);
     }
     for (int i = tid; i < T * U / 2; i += NT) cp_async16(s.xm + 2 * i, gm + 2 * i);
-    asm volatile("cp.async.commit_group;" ::: "memory");
+    mk_cuda::commit();
     if (norm) { // normed consumers always read the K = D residual stream (U_D = 160 partial sums)
         if (warp < T) {
             float p[U_D / 32];
@@ -356,7 +381,7 @@ __device__ void fill_xs(const QBuf & q, int t0, bool norm, const SX & s, float *
     } else if (tid < T) {
         s_rs[tid] = 1.0f;
     }
-    asm volatile("cp.async.wait_all;" ::: "memory");
+    mk_cuda::wait_all();
     __syncthreads();
     mark_fill();
 }
@@ -376,7 +401,8 @@ __device__ void fill_xs_part(const QBuf & q, int u0, const SX & s) {
         const int t = 2 * i / US, u = 2 * i - t * US;
         cp_async16(s.xm + 2 * i, q.meta + (size_t) t * U + u0 + u);
     }
-    asm volatile("cp.async.commit_group;\ncp.async.wait_all;" ::: "memory");
+    mk_cuda::commit();
+    mk_cuda::wait_all();
     __syncthreads();
 }
 
@@ -745,7 +771,31 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
         }
         __syncthreads();
     };
-    if constexpr (T * 32 * IT > SM_XU) {
+    if constexpr (QWEN_MK_SM75 && T * 32 * IT > SM_XU) {
+        // Retain each row group's partial sums in registers across as many K slices as fit.
+        // Unlike the Ampere two-half path, no shared-memory parking buffer is needed.
+        constexpr int IS = SM_XU / (T * 32), US = 32 * IS, REM = IT % IS;
+        static_assert(IS > 0 && T * US * 40 <= SM_MISC, "Turing activation slice");
+        SX sx;
+        sx.xa = reinterpret_cast<int4 *>(sm);
+        sx.xb = reinterpret_cast<int4 *>(sm + T * US * 16);
+        sx.xm = reinterpret_cast<uint2 *>(sm + T * US * 32);
+        sx.U = US;
+        for (int j = blockIdx.x; j < D / 32; j += gridDim.x) {
+            float a[2][T];
+            zero_acc<T, 2>(a);
+            for (int i = 0; i < IT / IS; i++) {
+                fill_xs_part<T, US>(in, i * US, sx);
+                if (j == blockIdx.x && i == 0) mark_fill();
+                mrows<T, IS, 2, TYPE>(W, 32 * j + 2 * warp, sx, a, i * US);
+            }
+            if constexpr (REM != 0) {
+                fill_xs_part<T, 32 * REM>(in, (IT / IS) * US, sx);
+                mrows<T, REM, 2, TYPE>(W, 32 * j + 2 * warp, sx, a, (IT / IS) * US);
+            }
+            epilogue(j, a);
+        }
+    } else if constexpr (T * 32 * IT > SM_XU) {
         // The activations do not fit (T = 5 ffn_down): fill one K-half at a time.  A block's two row
         // groups are processed one after the other; the first group's per-lane partial sums of the
         // first half are parked in shared memory while the second group is computed.
@@ -1221,9 +1271,7 @@ __device__ __forceinline__ void load8(const float * p, float (&v)[8]) {
 // split-K flash decoding over (kv head, chunk) items; also writes this cycle's K/V.
 __device__ __forceinline__ void mma16816(float (&c)[4], unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                          unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+    mk_cuda::mma_f32(c, a0, a1, a2, a3, b0, b1);
 }
 
 // Split-K flash decoding over (kv head, chunk) items.  The 6*T query rows of a kv head form the
@@ -1259,7 +1307,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
     auto issue_tile = [&](int g, int tb, int np_, int st) {
         if constexpr (Q8) {
             kv_stage(sKVq + st * 2 * TP * KVQ_ROW, slot0 + (size_t) g * ctx + tb, TP, np_);
-            asm volatile("cp.async.commit_group;" ::: "memory");
+            mk_cuda::commit();
             return;
         }
         __half * sK = sKV + st * 2 * TP * LDH, * sV = sK + TP * LDH;
@@ -1275,7 +1323,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
                 *reinterpret_cast<int4 *>(sV + p * LDH + cc) = make_int4(0, 0, 0, 0);
             }
         }
-        asm volatile("cp.async.commit_group;" ::: "memory");
+        mk_cuda::commit();
     };
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c = item % nch;
@@ -1367,9 +1415,9 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             // the next tile streams into the other stage while this one is processed
             if (tb + TP < c1) {
                 issue_tile(g, tb + TP, min(TP, c1 - tb - TP), st ^ 1);
-                asm volatile("cp.async.wait_group 1;" ::: "memory");
+                mk_cuda::wait<1>();
             } else {
-                asm volatile("cp.async.wait_group 0;" ::: "memory");
+                mk_cuda::wait<0>();
             }
             __syncthreads();
             if constexpr (Q8) { // q8 stage -> the fp16 tile
@@ -1401,7 +1449,8 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
             // online softmax per query row (causal mask: row token t sees positions <= n + t)
             for (int r = warp; r < R; r += NW) {
                 const int lim = n + (r % T);
-                float s0 = sS[r * TP + lane], s1 = TP > 32 ? sS[r * TP + (lane + 32) % TP] : -INFINITY;
+                float s0 = lane < TP ? sS[r * TP + lane] : -INFINITY;
+                float s1 = TP > 32 ? sS[r * TP + (lane + 32) % TP] : -INFINITY;
                 if (lane >= np_ || tb + lane > lim) s0 = -INFINITY;
                 if (lane + 32 >= np_ || tb + lane + 32 > lim) s1 = -INFINITY;
                 const float mt_ = wmax(fmaxf(s0, s1));
@@ -1414,7 +1463,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
                     al = expf(mold - mnew);
                 }
                 const float ps = wsum(p0 + p1);
-                sP[r * LDP + lane] = __float2half_rn(p0);
+                if (lane < TP) sP[r * LDP + lane] = __float2half_rn(p0);
                 if (TP > 32) sP[r * LDP + (lane + 32) % TP] = __float2half_rn(p1);
                 if (lane == 0) {
                     sL[r] = sL[r] * al + ps;

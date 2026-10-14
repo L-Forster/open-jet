@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "measurement": "Warmed, fresh-context prompt processing through the first generated token",
+  "hardware": {
+    "llama": {"gpu_index": 2, "model": "Quadro RTX 8000", "compute_capability": "7.5"},
+    "megakernel": {"gpu_index": 3, "model": "Quadro RTX 8000", "compute_capability": "7.5"},
+    "selection": "Separate processes pinned by full GPU UUID; private host identifiers omitted."
+  },
+  "model": {
+    "repository": "unsloth/Qwen3.8-27B-GGUF",
+    "revision": "566347e99d832d31f6245a577198d10d5bdd389e",
+    "filename": "Qwen3.8-27B-Q4_K_M.gguf",
+    "bytes": 17106775008,
+    "sha256": "7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169"
+  },
+  "workload": {
+    "description": "Original CC0 synthetic garden ledger and Python arithmetic code, generated from 1024 numbered records",
+    "source_text_sha256": "61e45c928c1685d57968ec857c94e3e733538691d9d5c918acaebd0837434e69",
+    "preparation": "Vocab-only libllama CPU tokenization, add_special=false, parse_special=true; prefix slices of one tokenization",
+    "reproduction": "prefill_bench.py --backend prepare; GPU tokenizer reproduction matched all measured token IDs exactly",
+    "token_hash_encoding": "SHA256 of UTF-8 JSON integer array with separators=(',', ':')",
+    "inputs": [
+      {"tokens": 2048, "token_sha256": "906112992272bf1fc5f02477bedd9e32365f740121231bdc9722d1db89d6e79b"},
+      {"tokens": 4096, "token_sha256": "a00eae8f881e00f6eb3d6b3f40fd01919286c3934c361a180c76b1ad17024b56"},
+      {"tokens": 8192, "token_sha256": "6543ac6dca4139ea1b881cba289a889302568d533ee1b8fb7e486217f965569f"}
+    ]
+  },
+  "settings": {
+    "context_capacity": 16384,
+    "timed_repetitions_per_length": 3,
+    "excluded_same_process_warmups_per_length": 1,
+    "model_loads_per_backend": 1,
+    "generated_tokens_per_request": 1,
+    "sampling": "greedy",
+    "llama": {
+      "kv": "q8_0",
+      "spec_type": "draft-mtp",
+      "draft_max": 2,
+      "flash_attention": "on",
+      "batch": 2048,
+      "microbatch": 512,
+      "parallel": 1,
+      "gpu_layers": 99,
+      "cache_policy": "Erase owned slot 0 before every request; cache_prompt=false and cache-ram=0"
+    },
+    "megakernel": {
+      "mode": "existing synchronous Engine C API",
+      "kv": "q8",
+      "initial_drafts": 4,
+      "draft_vocabulary": 32768,
+      "prefill_chunk_capacity": 2048,
+      "cache_policy": "Reset engine and verify empty sequence before every request"
+    },
+    "aggregation": "For each input length, total evaluated input tokens divided by total measured seconds; no best-of"
+  },
+  "timing_scopes": {
+    "llama": "Native prompt_ms through synchronized first-token sampling in available server source; exact source/build correspondence unverified because binary version is unknown.",
+    "megakernel": "Python perf_counter around synchronous Engine.prefill: includes ctypes conversion, vector copy, N-1 batched tokens, last persistent-kernel step, lm-head/sample, checkpoint work and initial draft setup.",
+    "excluded": ["Model loading", "Warmups", "Reset or slot erasure", "Post-request count validation", "HTTP transfer"],
+    "comparison": "Not identical timer scopes, pure-kernel performance, or end-to-end HTTP time-to-first-token"
+  },
+  "sample_columns": ["input_tokens", "repetition", "measured_seconds"],
+  "samples": {
+    "llama": [
+      [2048, 1, 3.185807],
+      [2048, 2, 3.226417],
+      [2048, 3, 3.272518],
+      [4096, 1, 6.844967],
+      [4096, 2, 6.893474],
+      [4096, 3, 6.978980],
+      [8192, 1, 15.197275],
+      [8192, 2, 16.097891],
+      [8192, 3, 16.471132]
+    ],
+    "megakernel": [
+      [2048, 1, 2.774909155035857],
+      [2048, 2, 2.8038768469705246],
+      [2048, 3, 2.8284858880215324],
+      [4096, 1, 6.163199655013159],
+      [4096, 2, 6.278785590024199],
+      [4096, 3, 6.399841898994055],
+      [8192, 1, 13.566900279023685],
+      [8192, 2, 13.688182424055412],
+      [8192, 3, 13.903749785968103]
+    ]
+  },
+  "summary": [
+    {"input_tokens": 2048, "llama_mean_seconds": 3.2282473333333335, "llama_tokens_per_second": 634.3999664627102, "megakernel_mean_seconds": 2.802423963342638, "megakernel_tokens_per_second": 730.795920527747, "measured_path_ratio": 1.1519482332297741},
+    {"input_tokens": 4096, "llama_mean_seconds": 6.905807, "llama_tokens_per_second": 593.1240186700844, "megakernel_mean_seconds": 6.280609048010471, "megakernel_tokens_per_second": 652.1660508860209, "measured_path_ratio": 1.0995441600026952},
+    {"input_tokens": 8192, "llama_mean_seconds": 15.922099333333334, "llama_tokens_per_second": 514.5050177428445, "megakernel_mean_seconds": 13.7196108296824, "megakernel_tokens_per_second": 597.1014849981455, "measured_path_ratio": 1.1605357856715472}
+  ],
+  "fingerprints_sha256": {
+    "llama-server": "52569f01f01802e03b260e33df0db081cc579faaf6e15656d77bc6a2b47d5b05",
+    "baseline_libllama.so.0.0.0": "d7e22ab5992343e259c85c67c05946b7bef87247fe250c62c436a67678354f5e",
+    "baseline_libllama-server-impl.so": "e6a899825b512295fdaff1893cacce0779725fd509fab3ef240c137adfe425c5",
+    "baseline_libllama-common.so.0.0.0": "38fa8326465ceadc37f2a93eb5063ac32f6da0daae1b56f6494082d7400d2f4f",
+    "baseline_libggml-cuda.so.0.18.0": "12028554909d37a6965b006dadbee9e8fdc68b27d622afdf06f9ee51be90895b",
+    "baseline_libggml-base.so.0.18.0": "d4da62492182b2418361f3ef71e64ca695ee6924c9e90d98c34721a159d5e7cf",
+    "baseline_libggml-cpu.so.0.18.0": "264dd452b07abbab575a989cd0f03610819886d27a21e05c24edc95429ee863d",
+    "baseline_libggml.so.0.18.0": "aa3c115873d6f3a3d391d15f6f7aa972beb0435b27715dd353249d15547e1aec",
+    "final_libqwen38mk.so": "646215cb24d84bb9b09ad8278374f1e4cd8946e98463210a81a89454f7e4b063",
+    "draft_vocab_32k.bin": "cad444c6a5e571479eb1dec71768c760c76f7c65f0ecfe00c860dca231fc9d24",
+    "harness_at_llama_start": "0c1e8191e3d46aca057befba8140db5275ff34c1b8c7c78c970bc67083ce1326"
+  },
+  "validation": {
+    "same_model_and_exact_token_ids": true,
+    "full_input_count_and_no_truncation": true,
+    "first_token_only_no_subsequent_decode": true,
+    "timed_samples": 18,
+    "total_requests_including_excluded_warmups": 24,
+    "llama_owned_slot_erasure_acknowledged": true,
+    "megakernel_empty_resets_and_exact_committed_counts": true,
+    "final_rebuilt_megakernel_library_measured": true,
+    "gpu_workload_preparation_matches_cpu_workload": true
+  },
+  "limitations": [
+    "Cross-card measurements with different timer overheads; ratios describe these measured paths, not isolated kernels.",
+    "One synthetic workload with three timed repetitions per input length; clocks and other host/GPU load can vary.",
+    "No KLD, generated-output quality, long-context quality, or universal performance claim.",
+    "Baseline version reports 0 (unknown), not a verified upstream commit.",
+    "Harness preparation/startup/reporting code changed during the run; loaded measurement loops were unchanged. Megakernel startup harness hash was not captured.",
+    "Initial llama startup failed before any completion because slot actions required --slot-save-path; fixed retry produced all published samples.",
+    "Machine-local paths, GPU UUIDs, full source text and raw responses are omitted."
+  ]
+}
