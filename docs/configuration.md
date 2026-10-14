@@ -185,15 +185,9 @@ ignores presence and repetition penalties, so the non-thinking Qwen3.8 preset (p
 runs without its penalty. Its KV cache is fp16, or q8_0 when the configured context would not fit
 in fp16 (about 80K tokens on a 24 GB card).
 
-Turing (`sm_75`, including RTX 8000) uses an experimental megakernel path compiled with CUDA 12.x.
-CUDA 13 cannot compile `sm_75`. Turing does not inherit the RTX 3090 speedup or long-context
-accuracy claims. On multi-GPU systems, set `CUDA_VISIBLE_DEVICES` to the selected GPU's full UUID
-for both setup and runtime, and put the CUDA 12.x `bin` directory first on `PATH` during setup.
-Keep `llama_backend: auto` for normal fallback behavior; use `llama_backend: megakernel` for
-validation so a failed launch cannot silently switch engines. If `nvidia-smi`/NVML discovery
-fails but CUDA is usable, OpenJet tries CUDA driver discovery, respecting device visibility.
-See the
-[Turing build notes](../megakernel/README.md#turing-rtx-8000).
+Turing (`sm_75`, e.g. Quadro RTX 8000) is experimental and runs only the original Q4_K_M engine;
+UD-Q4_K_XL uses `llama-server` there. On multi-GPU systems, set `CUDA_VISIBLE_DEVICES` to the GPU's
+UUID for both setup and runtime. See [Turing (RTX 8000)](../megakernel/README.md#turing-rtx-8000).
 
 ## Shell Targets
 

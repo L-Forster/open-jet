@@ -73,6 +73,10 @@ decode step runs as a single persistent kernel launch and verifies 4-5 drafted t
 Each figure is a single conversation, not a batch. llama.cpp runs with OpenJet's flags, including
 MTP speculative decoding.
 
+Turing GPUs (sm_75, e.g. the 48 GB Quadro RTX 8000) are supported experimentally for Q4_K_M: a
+contributor measured 54 vs 33 tok/s reasoning decode against llama.cpp. See
+[Turing (RTX 8000)](megakernel/README.md#turing-rtx-8000).
+
 ### Getting the megakernel
 
 It ships as source in the PyPI package (0.4.32 and later) and `openjet setup` compiles it on your

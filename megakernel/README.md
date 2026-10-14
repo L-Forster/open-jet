@@ -217,7 +217,8 @@ between `-d` settings.
 
 ## Build / run
 
-Requires CUDA 12+ (12.8+ for RTX 50 series; built with 13.2), an sm_86, sm_89 or sm_120 GPU with 24 GB, and the repo's llama.cpp build (only
+Requires CUDA 12+ (12.8+ for RTX 50 series; built with 13.2), an sm_86, sm_89 or sm_120 GPU with 24 GB
+(or, experimentally, sm_75: see [Turing](#turing-rtx-8000)), and the repo's llama.cpp build (only
 `libllama`, for tokenization, loaded vocab-only). `openjet setup` reads the selected model's GGUF
 header and builds only the library it needs (the source ships in the open-jet wheel):
 
@@ -383,11 +384,33 @@ processing the whole conversation as one fresh prompt.
   ~2% of prefill time; 3.5e-4 relative error against a float64 reference of the recurrence.
 - **Attention**: causal flash attention over the KV cache on tensor cores.
 
+## Turing (RTX 8000)
+
+Experimental, contributed and tested on a 48 GB Quadro RTX 8000. Only the original Q4_K_M engine
+has a Turing path; the mixed engine needs sm_80+, so open-jet serves UD-Q4_K_XL with llama.cpp on
+Turing. `make ARCH=sm_75` (or setup, on a Turing GPU) defines `QWEN_MK_SM75`, which swaps in
+[`cuda_compat.cuh`](cuda_compat.cuh): synchronous copies instead of `cp.async`, k16 tensor-core MMAs
+split into two k8 ones, no L2 cache-policy hints, and tiles shrunk to Turing's 64 KiB of shared
+memory. Builds for other GPUs are unchanged. CUDA 12 and 13 both compile sm_75.
+
+| RTX 8000, Qwen3.8-27B Q4_K_M | llama.cpp (MTP 2) | megakernel |
+|---|---|---|
+| decode, reasoning mode | 32.9 tok/s | **54.1 tok/s** (1.65x) |
+| prompt processing, 2-8K tokens | 515-634 tok/s | **597-731 tok/s** (1.10-1.16x) |
+
+The two engines ran on two RTX 8000 cards in one machine. Method and raw samples:
+[benchmarking.md](../docs/benchmarking.md#matched-reasoning-comparison-on-two-gpus),
+[decode](../docs/benchmarks/rtx8000-turing.json),
+[prefill](../docs/benchmarks/rtx8000-turing-prefill.json). There is no Turing KLD or long-context
+validation yet. `bench/turing_check.cu` (`make bench/turing_check`) checks the Turing MMA, GEMM
+and attention paths against references without a model. On multi-GPU machines, pin the GPU with
+`CUDA_VISIBLE_DEVICES=<uuid>` for both `openjet setup` and `openjet`.
+
 ## Limitations
 
 - Specialised to Qwen3.8-27B shapes and the supported original or mixed quant recipes
   described in [The GGUF](#the-gguf); the loader rejects unsupported models or tensor mixes. Tuned on sm_86 (RTX 3090); open-jet enables it on sm_86, sm_89 and sm_120
-  GPUs with 24 GB or more. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
+  GPUs with 24 GB or more, and experimentally on sm_75. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
   repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).
 - Text only; one sequence and one checkpoint: a conversation is reused while it grows (or diverges

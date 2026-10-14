@@ -20,7 +20,9 @@ The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/b
 For one specific setup, Qwen3.8-27B Q4_K_M on an RTX 30, 40 or 50-series GPU with 24 GB+ (sm_86, sm_89,
 sm_120), OpenJet ships a
 specialised CUDA engine in [`megakernel/`](../../megakernel/README.md) and serves the model through it
-instead of `llama-server`. Measured on an RTX 3090 against `llama-server` with OpenJet's flags:
+instead of `llama-server`. Turing (sm_75) is supported experimentally for Q4_K_M only; see
+[Turing (RTX 8000)](../../megakernel/README.md#turing-rtx-8000). Measured on an RTX 3090 against
+`llama-server` with OpenJet's flags:
 
 | | llama.cpp | megakernel |
 |---|---|---|

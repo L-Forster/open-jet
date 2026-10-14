@@ -82,8 +82,7 @@ time) and `bench.py`. See [megakernel/README.md](../megakernel/README.md).
 
 Run from the repository root with a built megakernel and the original unsloth
 `Qwen3.8-27B-Q4_K_M.gguf` (catalog revision `566347e99d832d31f6245a577198d10d5bdd389e`).
-For Turing, build with CUDA 12.x and `ARCH=sm_75`; CUDA 13 no longer compiles this architecture.
-See [Turing build and validation](../megakernel/README.md#turing-rtx-8000).
+For Turing, build with `ARCH=sm_75`; see [Turing (RTX 8000)](../megakernel/README.md#turing-rtx-8000).
 
 Use full UUIDs from `nvidia-smi -L` rather than assuming CUDA ordinals match NVIDIA indexes:
 
