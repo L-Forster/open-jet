@@ -17,6 +17,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "cuda_compat.cuh"
 
 #include <algorithm>
 #include <atomic>
