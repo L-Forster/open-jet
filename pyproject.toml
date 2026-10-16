@@ -108,5 +108,5 @@ include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*", "me
 [tool.setuptools.package-data]
 src = ["data/*.json", "tui_bin/**/*"]
 # megakernel source, compiled on the user's machine by `openjet setup` (src/megakernel_build.py)
-megakernel = ["Makefile", "README.md", "*.cu", "*.cuh", "*.h", "*.cpp", "draft_vocab_32k.bin"]
+megakernel = ["Makefile", "README.md", "*.cu", "*.cuh", "*.h", "*.cpp", "draft_vocab_32k.bin", "vision/*.cpp", "vision/*.h"]
 "megakernel.tools" = ["*.cpp"]

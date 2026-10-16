@@ -23,7 +23,8 @@ static void usage() {
             "                 [--temp t] [--top-p p] [--top-k k] [--min-p p] [--seed s]   (default: greedy)\n"
             "                 [--kv f16|q8|auto]   (KV cache format; auto: q8_0 only when fp16 does not fit)\n"
             "                 [--kld ref [--ref-out f] [--score-path prefill|decode|mixed]]   (KL divergence, perplexity and\n"
-            "                     top-token agreement against a reference file of tools/llama_ref or of --ref-out)\n");
+            "                     top-token agreement against a reference file of tools/llama_ref or of --ref-out)\n"
+            "                 [--kld-images f]   (with --kld: the reference's image rows, tools/vision_ref --images-out)\n");
     exit(1);
 }
 
@@ -40,6 +41,7 @@ int main(int argc, char ** argv) {
     // kernels, the decode megakernel, or (mixed) the unscored prefix through the former, like a prompt,
     // and the scored positions through the latter (the first half and the rest when all are scored)
     std::string kld_file, ref_out, score_path = "prefill";
+    std::string kld_images; // --kld-images: image rows of the reference's sequences (tools/vision_ref)
     float temp = 0.f, top_p = 1.f, min_p = 0.f;
     int top_k = 32;
     unsigned long long seed = 1;
@@ -62,6 +64,7 @@ int main(int argc, char ** argv) {
         else if (a == "--kld") kld_file = next();
         else if (a == "--ref-out") ref_out = next();
         else if (a == "--score-path") score_path = next();
+        else if (a == "--kld-images") kld_images = next();
         else if (a == "--turn2") turn2 = next();
         else if (a == "--prompt-ids") prompt_ids_file = next();
         else if (a == "--think") think = (i + 1 < argc && argv[i + 1][0] != '-') ? next() : "xhigh";
@@ -74,7 +77,7 @@ int main(int argc, char ** argv) {
         else if (a == "--turn2-file") { std::ifstream f(next()); std::stringstream ss; ss << f.rdbuf(); turn2 = ss.str(); }
         else usage();
     }
-    if (model.empty() || (kld_file.empty() && !ref_out.empty())) usage();
+    if (model.empty() || (kld_file.empty() && (!ref_out.empty() || !kld_images.empty()))) usage();
     if (score_path != "prefill" && score_path != "decode" && score_path != "mixed") usage();
 
     llama_backend_init();
@@ -114,12 +117,48 @@ int main(int argc, char ** argv) {
         ls::Session ses(kld_file, ref_out, {}, MKEngine::n_vocab());
         size_t longest = 0;
         for (const ls::Seq & q : ses.seqs()) longest = std::max(longest, q.tok.size());
+        // --kld-images: "MKIMG01\0", n_embd, count (int32), then per image seq, pos, nx, ny (int32) and its rows
+        // ([nx * ny][n_embd] fp32)
+        struct KldImage {
+            int seq, pos, nx, ny;
+            std::vector<float> rows;
+        };
+        std::vector<KldImage> kimg;
+        if (!kld_images.empty()) {
+            FILE * f = fopen(kld_images.c_str(), "rb");
+            char magic[8];
+            int hdr[2];
+            if (!f || fread(magic, 1, 8, f) != 8 || memcmp(magic, "MKIMG01", 8) || fread(hdr, sizeof(hdr), 1, f) != 1 ||
+                hdr[0] != MKEngine::n_embd()) {
+                fprintf(stderr, "%s: not an image rows file of this model\n", kld_images.c_str());
+                return 1;
+            }
+            kimg.resize(hdr[1]);
+            for (KldImage & k : kimg) {
+                int v[4];
+                bool ok = fread(v, sizeof(v), 1, f) == 1;
+                if (ok) {
+                    k.seq = v[0], k.pos = v[1], k.nx = v[2], k.ny = v[3];
+                    k.rows.resize((size_t) k.nx * k.ny * hdr[0]);
+                    ok = fread(k.rows.data(), sizeof(float), k.rows.size(), f) == k.rows.size();
+                }
+                if (!ok) {
+                    fprintf(stderr, "%s: truncated\n", kld_images.c_str());
+                    return 1;
+                }
+            }
+            fclose(f);
+            fprintf(stderr, "%zu images from %s\n", kimg.size(), kld_images.c_str());
+        }
         MKEngine eng(model, std::max(ctx, (int) longest + 64), 0, "", kv_mode);
         for (size_t s = 0; s < ses.seqs().size(); s++) {
             const ls::Seq & q = ses.seqs()[s];
             const int N = (int) q.tok.size();
             const int mk_from = score_path == "decode" ? 0 : score_path == "prefill" ? N : q.first > 0 ? q.first : N / 2;
-            eng.score_logits(q.tok, mk_from, q.first, [&](int i0, int n, const float * l) { ses.rows((int) s, i0, n, l); });
+            std::vector<MKImage> im;
+            for (const KldImage & k : kimg)
+                if (k.seq == (int) s) im.push_back({k.pos, k.nx, k.ny, k.rows.data()});
+            eng.score_logits(q.tok, mk_from, q.first, [&](int i0, int n, const float * l) { ses.rows((int) s, i0, n, l); }, im);
             fprintf(stderr, "\r%zu / %zu sequences", s + 1, ses.seqs().size());
         }
         fprintf(stderr, "\n");

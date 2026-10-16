@@ -2386,6 +2386,65 @@ struct MKEngine::Impl {
     int nd_avail;        // drafts produced by the previous launch (verified by the next decode cycle)
     bool all_acc = true; // the last decode cycle accepted all of its drafts
     std::vector<int> seq; // the sequence so far: prompt(s) and emitted tokens (position = index)
+    // Images (MKEngine::MKImage): spans of positions whose input is an embedding row, with M-RoPE positions. llama.cpp's
+    // layout for Qwen-VL (mtmd, IMROPE): the span's rope base r is the position after the text before it; raster row q
+    // has (t, h, w) = (r, r + q / nx, r + q % nx), RoPE frequency i takes t, h, w for i % 3 = 0, 1, 2 (sections 11 / 11 /
+    // 10 of the 32 pairs); the text after the span continues at r + max(nx, ny), so each span shifts the rope position of
+    // everything after it down by nx * ny - max(nx, ny). Attention stays causal in sequence order (llama.cpp's 2D mask
+    // over (t, h, w) orders a span's rows by raster position, which is their sequence order). Only hb.rope changes: its
+    // row n holds the (cos, sin) of position n's rope angles, so the decode and prefill kernels index it by sequence
+    // position as before. rope_base keeps the plain table (row p = position p): every rewritten row is a gather from it.
+    struct Span {
+        int pos, nx, ny;
+        bool operator==(const Span & o) const { return pos == o.pos && nx == o.nx && ny == o.ny; }
+        int n() const { return nx * ny; }
+    };
+    std::vector<Span> spans;      // the images in seq (ascending, disjoint)
+    std::vector<Span> rope_spans; // the spans hb.rope's rows reflect
+    std::vector<float2> rope_base;
+    float * emb_host = nullptr;   // the prefill's image rows: pinned, mapped (cP.emb = its device alias)
+    size_t emb_cap = 0;           // (floats)
+    // Rewrites hb.rope's rows from the first position where `spans` and `rope_spans` differ (none: no copy). Text rows are
+    // rope_base rows shifted by the images before them, image rows per-frequency gathers; pageable host-to-device copies
+    // on the legacy stream, ordered after every kernel that read the old rows.
+    void rope_sync() {
+        if (spans == rope_spans) return;
+        size_t k = 0;
+        while (k < spans.size() && k < rope_spans.size() && spans[k] == rope_spans[k]) k++;
+        int from = ctx, shift = 0;
+        if (k < spans.size()) from = std::min(from, spans[k].pos);
+        if (k < rope_spans.size()) from = std::min(from, rope_spans[k].pos);
+        for (size_t j = 0; j < k; j++) shift += spans[j].n() - std::max(spans[j].nx, spans[j].ny);
+        float2 * dst = const_cast<float2 *>(hb.rope);
+        std::vector<float2> rows;
+        size_t j = k;
+        for (int p = from; p < ctx;) {
+            const int next = j < spans.size() ? spans[j].pos : ctx;
+            if (p < next) { // text rows p .. next - 1
+                CK(cudaMemcpy(dst + (size_t) p * 32, rope_base.data() + (size_t) (p - shift) * 32, (size_t) (next - p) * 32 * sizeof(float2),
+                              cudaMemcpyHostToDevice));
+                p = next;
+                continue;
+            }
+            const Span & s = spans[j++];
+            const int r = p - shift, n = std::min(s.n(), ctx - p);
+            rows.resize((size_t) n * 32);
+            for (int q = 0; q < n; q++) {
+                const int pos3[3] = {r, r + q / s.nx, r + q % s.nx};
+                for (int i = 0; i < 32; i++) rows[(size_t) q * 32 + i] = rope_base[(size_t) pos3[i % 3] * 32 + i];
+            }
+            CK(cudaMemcpy(dst + (size_t) p * 32, rows.data(), rows.size() * sizeof(float2), cudaMemcpyHostToDevice));
+            shift += s.n() - std::max(s.nx, s.ny);
+            p += s.n();
+        }
+        rope_spans = spans;
+    }
+    // the sequence goes back to `len` positions (reset, rewind, truncate): the images from there on are dropped; one cut
+    // by `len` stays (its rows before len are processed; a prefill continuing inside it must supply it again)
+    void spans_cut(int len) {
+        while (!spans.empty() && spans.back().pos >= len) spans.pop_back();
+        rope_sync();
+    }
     // checkpoint of the state right after the last prefill (recurrent state, conv ring, h ring, ctl):
     // lets a caller rewind to the end of the last prompt (KV rows before it are never rewritten)
     float *ck_dstate = nullptr, *ck_conv = nullptr, *ck_hhist = nullptr;
@@ -2865,6 +2924,7 @@ struct MKEngine::Impl {
             float2 * d = dalloc<float2>(rt.size(), false);
             CK(cudaMemcpy(d, rt.data(), rt.size() * sizeof(float2), cudaMemcpyHostToDevice));
             hb.rope = d;
+            rope_base = std::move(rt); // (images: rope_sync gathers rewritten rows from it)
         }
         hb.hm = dalloc<float>(D);
         hb.blk_best = dalloc<float2>((size_t) nsm * MAXT * TOPK_MAX);
@@ -2892,6 +2952,7 @@ struct MKEngine::Impl {
     }
 
     ~Impl() {
+        if (emb_host) cudaFreeHost(emb_host);
         print_profile();
         for (void * p : allocs) cudaFree(p);
         if (embd_host) cudaFreeHost(embd_host);
@@ -3048,6 +3109,8 @@ struct MKEngine::Impl {
         hp.h = dalloc<float>((size_t) (cap + 1) * D);
         hp.qh = dalloc<__half>((size_t) cap * NH * HD);
         hp.tok = dalloc<int>(cap);
+        hp.erow = dalloc<int>(cap);
+        hp.emb = nullptr; // (emb_reserve)
         hp.amax = dalloc<int>(cap);
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
@@ -3175,8 +3238,26 @@ struct MKEngine::Impl {
     // Runs positions n0 .. n0 + toks.size() - 1 through the trunk (and the MTP block's K/V).
     // score: instead of MTP, greedy argmax of every position -> pred, and / or the logits of the
     // positions >= first -> sink.
+    // emb_host holding at least `floats` (grown: pinned, mapped; cP.emb follows it)
+    void emb_reserve(size_t floats) {
+        if (floats <= emb_cap) return;
+        pf_init();
+        CK(cudaDeviceSynchronize()); // (no kernel still reads the old rows)
+        if (emb_host) CK(cudaFreeHost(emb_host));
+        emb_host = nullptr;
+        emb_cap = 0;
+        CK(cudaHostAlloc(reinterpret_cast<void **>(&emb_host), floats * sizeof(float), cudaHostAllocMapped));
+        emb_cap = floats;
+        float * dev = nullptr;
+        CK(cudaHostGetDevicePointer(reinterpret_cast<void **>(&dev), emb_host, 0));
+        hp.emb = dev;
+        CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
+    }
+
+    // erow (images, aligned with toks): each token's row in emb_host, -1 for a token_embd row; chunks with an image row
+    // run pk_embed_img / pk_mtp_in<true>, the others the text kernels.
     void pf_run(const std::vector<int> & toks, int n0, std::vector<int> * pred, const MKEngine::LogitSink * sink = nullptr,
-                int first = 0) {
+                int first = 0, const int * erow = nullptr) {
         pf_init();
         const int N = (int) toks.size(), cap = hp.cap;
         if (n0 == 0) CK(cudaMemset(hp.h, 0, D * sizeof(float)));
@@ -3184,7 +3265,10 @@ struct MKEngine::Impl {
         for (int c0 = 0; c0 < N; c0 += cap) {
             const int T = std::min(cap, N - c0), n = n0 + c0;
             CK(cudaMemcpy(hp.tok, toks.data() + c0, T * sizeof(int), cudaMemcpyHostToDevice));
-            pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
+            const bool img = erow && std::any_of(erow + c0, erow + c0 + T, [](int r) { return r >= 0; });
+            if (img) CK(cudaMemcpy(hp.erow, erow + c0, T * sizeof(int), cudaMemcpyHostToDevice));
+            if (img) pf_time("embed", [&] { pk_embed_img<<<T, 256>>>(T); });
+            else pf_time("embed", [&] { pk_embed<<<T, 256>>>(T); });
             int dl = 0;
             for (int L = 0; L < NL; L++) {
                 const LayerW & W = hw.L[L];
@@ -3237,7 +3321,8 @@ struct MKEngine::Impl {
             }
             pf_time("mtp", [&] {
                 pk_final_h<<<T, 256>>>(T, n);
-                pk_mtp_in<<<T, 256>>>();
+                if (img) pk_mtp_in<true><<<T, 256>>>();
+                else pk_mtp_in<false><<<T, 256>>>();
                 gemm(hw.eh, T, hp.xm, D, pf::OUT_STORE);
                 const LayerW & M = hw.L[NL];
                 pk_norm_quant<<<T, 256>>>(hp.xm, M.attn_norm);
@@ -3275,6 +3360,7 @@ void MKEngine::bench_phases() { p_->bench(); }
 void MKEngine::reset() {
     p_->reset();
     p_->seq.clear();
+    p_->spans_cut(0);
     p_->ck_pos = -1;
     p_->dv_reset();
     stats = MKStats();
@@ -3282,28 +3368,88 @@ void MKEngine::reset() {
 
 int MKEngine::position() const { return p_->hctl.n; }
 
-int MKEngine::prefill(const std::vector<int> & tokens) {
+int MKEngine::prefill(const std::vector<int> & tokens) { return prefill(tokens, {}); }
+
+int MKEngine::prefill(const std::vector<int> & tokens, const std::vector<MKImage> & images_in) {
     if (tokens.empty()) throw std::runtime_error("empty prompt");
     Ctl & c = p_->hctl;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     std::vector<int> & seq = p_->seq;
     if ((int) (seq.size() + tokens.size()) + 8 > p_->ctx) throw std::runtime_error("prompt exceeds context");
-    seq.insert(seq.end(), tokens.begin(), tokens.end());
-    p_->dv_add(tokens.data(), tokens.size());
     // Everything from the committed delta-net position on is fed: on a continued sequence that is
     // the last emitted token (not yet processed) and any accepted drafts not yet folded into the
     // recurrent state, followed by the new tokens.  Their KV / MTP rows are simply rewritten.
     const int n0 = c.dn_c;
+    const int s0 = (int) seq.size(), end = s0 + (int) tokens.size(); // this prompt's positions: s0 .. end - 1
+    const char * mode = getenv("MK_PREFILL");
+    const bool batched = !(mode && std::string(mode) == "mk");
+    // Images, checked before anything changes. The spans after this prompt: the earlier ones before n0, then these.
+    // An earlier span cut by n0 (a rewind to a checkpoint inside it) must come again (same position and grid): its rows
+    // from n0 on are fed from it.
+    using Span = Impl::Span;
+    std::vector<Span> nsp;
+    const Span * cut = nullptr;
+    for (const Span & s : p_->spans)
+        if (s.pos + s.n() <= n0) nsp.push_back(s);
+        else if (s.pos < n0) cut = &s;
+    std::vector<MKImage> images = images_in;
+    std::sort(images.begin(), images.end(), [](const MKImage & a, const MKImage & b) { return a.pos < b.pos; });
+    std::vector<int> erow; // the batched part's rows in emb_host (positions n0 .. end - 2), -1: token_embd
+    if (!images.empty() || cut) {
+        if (!batched || end - n0 < 2) throw std::runtime_error("images need the batched prefill (not MK_PREFILL=mk)");
+        bool cut_ok = false;
+        int prev = nsp.empty() ? 0 : nsp.back().pos + nsp.back().n();
+        size_t rows = 0;
+        for (const MKImage & m : images) {
+            const int n = m.nx * m.ny;
+            if (m.nx <= 0 || m.ny <= 0 || !m.embd) throw std::runtime_error("image: empty grid or no embedding rows");
+            if (m.pos < prev) throw std::runtime_error("images overlap, or one starts inside an earlier one");
+            if (m.pos + n > end - 1) throw std::runtime_error("an image must end before the prompt's last token");
+            if (m.pos < s0) { // continues the span cut by n0
+                if (!cut || cut->pos != m.pos || cut->nx != m.nx || cut->ny != m.ny)
+                    throw std::runtime_error("image at " + std::to_string(m.pos) + " starts before this prompt (" + std::to_string(s0) +
+                                             ") and is not the image the sequence was rewound into");
+                cut_ok = true;
+            }
+            nsp.push_back({m.pos, m.nx, m.ny});
+            rows += (size_t) (m.pos + n - std::max(m.pos, n0));
+            prev = m.pos + n;
+        }
+        if (cut && !cut_ok)
+            throw std::runtime_error("the sequence was rewound to " + std::to_string(n0) + ", inside the image at " +
+                                     std::to_string(cut->pos) + ": pass that image again");
+        p_->emb_reserve(rows * D);
+        erow.assign((size_t) (end - 1 - n0), -1);
+        size_t r = 0;
+        for (const MKImage & m : images) {
+            const int a = std::max(m.pos, n0), n = m.pos + m.nx * m.ny - a;
+            memcpy(p_->emb_host + r * D, m.embd + (size_t) (a - m.pos) * D, (size_t) n * D * sizeof(float));
+            for (int q = 0; q < n; q++) erow[(size_t) (a - n0 + q)] = (int) (r + q);
+            r += n;
+        }
+    }
+    seq.insert(seq.end(), tokens.begin(), tokens.end());
+    if (images.empty()) {
+        p_->dv_add(tokens.data(), tokens.size());
+    } else { // (the draft vocabulary takes the prompt's text tokens, not the image rows' placeholder ids)
+        std::vector<int> text;
+        size_t k = 0;
+        for (int q = s0; q < end; q++) {
+            while (k < images.size() && images[k].pos + images[k].nx * images[k].ny <= q) k++;
+            if (k == images.size() || q < images[k].pos) text.push_back(seq[q]);
+        }
+        p_->dv_add(text.data(), text.size());
+    }
+    p_->spans = nsp;
+    p_->rope_sync();
     const std::vector<int> feed(seq.begin() + n0, seq.end());
     c.mtp_valid = std::min(c.mtp_valid, n0);
     size_t i = 0;
-    const char * mode = getenv("MK_PREFILL");
-    const bool batched = !(mode && std::string(mode) == "mk");
     if (batched && feed.size() >= 2) {
         // all but the last token in batched kernels; the last one goes through the megakernel,
         // which produces the first output token and the MTP drafts
         const std::vector<int> head(feed.begin(), feed.end() - 1);
-        p_->pf_run(head, n0, nullptr);
+        p_->pf_run(head, n0, nullptr, nullptr, 0, erow.empty() ? nullptr : erow.data());
         i = head.size();
         c.dn_c = n0 + (int) i;
         c.mtp_valid = c.dn_c;
@@ -3343,6 +3489,7 @@ int MKEngine::checkpoint_pos() const { return p_->ck_pos; }
 bool MKEngine::rewind_to_checkpoint() {
     if (p_->ck_pos < 0 || p_->ck_pos > (int) p_->seq.size()) return false;
     p_->ck_restore();
+    p_->spans_cut(p_->ck_pos);
     return true;
 }
 
@@ -3351,6 +3498,7 @@ void MKEngine::truncate(int len) {
     if (len < p_->hctl.dn_c || len > (int) seq.size())
         throw std::runtime_error("truncate: can only drop tokens emitted after the committed position");
     seq.resize(len);
+    p_->spans_cut(len);
 }
 
 std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
@@ -3379,14 +3527,45 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
 }
 
 int MKEngine::n_vocab() { return VOCAB; }
+int MKEngine::n_embd() { return D; }
 
 void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int first, const LogitSink & sink) {
+    score_logits(tokens, mk_from, first, sink, {});
+}
+
+void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int first, const LogitSink & sink,
+                            const std::vector<MKImage> & images) {
     const int N = (int) tokens.size();
     if (N + 8 > p_->ctx) throw std::runtime_error("sequence exceeds context");
     reset();
     mk_from = std::min(std::max(mk_from, 0), N);
+    std::vector<int> erow;
+    if (!images.empty()) { // (the batched part's rows, as prefill stages them)
+        size_t rows = 0;
+        int prev = 0;
+        std::vector<MKImage> im = images;
+        std::sort(im.begin(), im.end(), [](const MKImage & a, const MKImage & b) { return a.pos < b.pos; });
+        for (const MKImage & m : im) {
+            if (m.nx <= 0 || m.ny <= 0 || !m.embd || m.pos < prev || m.pos + m.nx * m.ny > mk_from)
+                throw std::runtime_error("score_logits: images must be disjoint, inside the batched part (mk_from)");
+            prev = m.pos + m.nx * m.ny;
+            rows += (size_t) m.nx * m.ny;
+            p_->spans.push_back({m.pos, m.nx, m.ny});
+        }
+        p_->rope_sync();
+        p_->emb_reserve(rows * D);
+        erow.assign((size_t) mk_from, -1);
+        size_t r = 0;
+        for (const MKImage & m : im) {
+            const int n = m.nx * m.ny;
+            memcpy(p_->emb_host + r * D, m.embd, (size_t) n * D * sizeof(float));
+            for (int q = 0; q < n; q++) erow[(size_t) m.pos + q] = (int) (r + q);
+            r += n;
+        }
+    }
     if (mk_from > 0)
-        p_->pf_run(std::vector<int>(tokens.begin(), tokens.begin() + mk_from), 0, nullptr, first < mk_from ? &sink : nullptr, first);
+        p_->pf_run(std::vector<int>(tokens.begin(), tokens.begin() + mk_from), 0, nullptr, first < mk_from ? &sink : nullptr, first,
+                   erow.empty() ? nullptr : erow.data());
     Ctl & c = p_->hctl;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     c.dn_c = mk_from;

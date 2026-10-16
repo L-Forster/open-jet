@@ -26,6 +26,8 @@ struct PBufs {
     float * h;    // [cap + 1][D] final normed hidden of positions n0 - 1 .. n0 + T - 1
     __half * qh;  // [cap][NH][HD] attention queries (normed, rotated, pre-scaled)
     int * tok;    // [cap]
+    int * erow;   // [cap] input-embedding row of each token in emb (MKImage rows), -1: its token_embd row
+    const float * emb; // [rows][D] the prefill's image rows (mapped pinned host memory; null until the first image)
     int * amax;   // [cap] argmax output (scoring)
 };
 
@@ -72,6 +74,20 @@ __global__ void pk_embed(int T) {
     const int t = blockIdx.x;
     const uint8_t * row = cW.embd + (size_t) cP.tok[t] * (D / 256 * 144);
     for (int e = threadIdx.x; e < D; e += blockDim.x) cP.x[(size_t) t * D + e] = dequant_q4k_ldg(row, e);
+}
+
+// pk_embed for a chunk with image rows (MKImage): a token with erow >= 0 takes that row of cP.emb (the vision encoder's
+// fp32 embedding, which llama.cpp feeds as is) instead of its token_embd row; the other tokens as pk_embed
+__global__ void pk_embed_img(int T) {
+    const int t = blockIdx.x, r = __ldg(cP.erow + t);
+    if (r < 0) {
+        const uint8_t * row = cW.embd + (size_t) cP.tok[t] * (D / 256 * 144);
+        for (int e = threadIdx.x; e < D; e += blockDim.x) cP.x[(size_t) t * D + e] = dequant_q4k_ldg(row, e);
+        return;
+    }
+    const float4 * src = reinterpret_cast<const float4 *>(cP.emb + (size_t) r * D);
+    float4 * dst = reinterpret_cast<float4 *>(cP.x + (size_t) t * D);
+    for (int e = threadIdx.x; e < D / 4; e += blockDim.x) dst[e] = __ldg(src + e);
 }
 
 // RMS-norm (weight w) of rows of src [T][D] -> fp16 xh (K = D); rs per token
@@ -699,15 +715,23 @@ __global__ void __launch_bounds__(256) pk_final_h(int T, int n0) {
 }
 
 // MTP input rows: concat(enorm(embed(tok_p)), hnorm(h_{p-1})) -> fp16 xh (K = 2 D)
+// IMG (a chunk with image rows): embed(tok_p) of an image position is its input-embedding row (as llama.cpp's MTP
+// draft takes the vision embedding there, #30257)
+template <bool IMG>
 __global__ void __launch_bounds__(256) pk_mtp_in() {
     __shared__ float se[D];
     __shared__ float red[8];
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const uint8_t * row = cW.embd + (size_t) cP.tok[t] * (D / 256 * 144);
+    const float * er = nullptr;
+    if (IMG) {
+        const int r = __ldg(cP.erow + t);
+        if (r >= 0) er = cP.emb + (size_t) r * D;
+    }
     const float * hp = cP.h + (size_t) t * D;
     float ae = 0.f, ah = 0.f;
     for (int e = threadIdx.x; e < D; e += 256) {
-        const float v = dequant_q4k_ldg(row, e), hv = __ldg(hp + e);
+        const float v = IMG && er ? __ldg(er + e) : dequant_q4k_ldg(row, e), hv = __ldg(hp + e);
         se[e] = v;
         ae += v * v;
         ah += hv * hv;
