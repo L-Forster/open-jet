@@ -79,9 +79,9 @@ Use the model ID returned by `/v1/models` in your client configuration.
 Responses include `choices`, `usage`, and engine `timings`. Thinking output uses
 `reasoning_content`; tool calls use structured `tool_calls`. Requests accept `tools`,
 `chat_template_kwargs`, `temperature`, `top_p`, `top_k` (at most 32), `min_p`, and `seed`.
-One request runs at a time. Text only; presence and repetition penalties are ignored with
-a warning. See [Server](#server) and [Limitations](#limitations) for conversation reuse
-and other API constraints.
+One request runs at a time. Text, plus images with `--mmproj` (see [Images](#images-vision));
+presence and repetition penalties are ignored with a warning. See [Server](#server) and
+[Limitations](#limitations) for conversation reuse and other API constraints.
 
 ## Use with OpenJet
 
@@ -331,6 +331,79 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
 - `MK_PF_CAP=1024` halves prefill scratch, freeing about another 325 MiB of VRAM.
   The default remains 2048; throughput depends on prompt length. Smaller caps also limit
   scoring/logit tiles to the scratch allocation. These options apply to both quant engines.
+- Images: see [Images](#images-vision).
+
+## Images (vision)
+
+With `--mmproj <mmproj GGUF>` (projector `qwen3vl_merger`, e.g. unsloth's `mmproj-BF16.gguf` for Qwen3.8-27B) the
+server accepts OpenAI `image_url` parts (base64 `data:` URLs) and `/props` reports `modalities.vision`. The vision
+tower runs on the CPU, so it uses no GPU memory; the engine takes its output rows in the batched prefill. Both engine
+libraries support it.
+
+```sh
+make vision        # libqwen38vision.so (+ tools/mkv_cli, tools/vision_ref); `make` builds it when llama.cpp has libmtmd
+python3 server/mk_server.py -m Qwen3.8-27B-Q4_K_M.gguf --mmproj mmproj-BF16.gguf -c 100000
+```
+
+open-jet passes `--mmproj` when `OPENJET_MEGAKERNEL_MMPROJ` names the file (and `libqwen38vision.so` is built).
+
+- **Prompt, as llama-server builds it:** a message with images is flattened llama-server's way (text parts joined by
+  newlines, none next to an image), each image becomes `<|vision_start|>`, its rows, `<|vision_end|>`, and decoding /
+  preprocessing (stb_image; smart resize to multiples of 32 px within 8 .. 4096 tokens, the padded bilinear resize,
+  normalisation) are llama.cpp's bit for bit: same token counts and pixels as `llama-server --mmproj`
+  (`--image-min-tokens` / `--image-max-tokens` set the limits; fewer tokens encode faster).
+- **Engine** (`MKImage`, `MKEngine::prefill(tokens, images)`, `mk_prefill_img`): an image's positions take its fp32
+  rows instead of token embeddings (`pk_embed_img`; the MTP block takes them too, as llama.cpp does) and llama.cpp's
+  Qwen-VL M-RoPE positions (IMROPE: t / row / column per frequency, the text after an image continuing at
+  `+ max(nx, ny)`): rows of the RoPE table are rewritten for the image spans (gathered from the plain table), so no
+  attention kernel changes and a text-only prompt runs exactly what it ran before. Truncation and the rewind
+  checkpoint work across images.
+- **Server reuse:** an image's placeholder tokens are all alike, so the reused prefix also ends at the first image
+  that is not the same file (content hash) at the same place; decoded / encoded images are cached (`--image-cache`).
+- **Encoder** (`vision/mk_vision.h`, `--vision-backend auto|cpu|mtmd`): `cpu` = `vision/vit_cpu.cpp`, the tower in fp32
+  with AVX2 / FMA kernels (packed 6x16 FMA GEMM micro-kernel, attention on the same kernel with an online softmax,
+  exact tanh-GELU, weights widened from the file's type, a pool of pinned workers that take tasks dynamically;
+  x86-64 with AVX2 + FMA: Zen 2-5, Haswell+; results independent of the thread count); `mtmd` = llama.cpp's libmtmd
+  encoder (any CPU); `auto` = `cpu` where it runs.
+
+Accuracy against an fp64 forward of the checkpoint (`vision/vit_ref.py`, 5 images of 196 .. 1024 tokens): relative
+L2 error of the rows, lowest row cosine:
+
+| encoder | rel. error | min row cosine |
+|---|---|---|
+| vit_cpu, BF16 mmproj | 4e-6 .. 4e-5 | 1.000000 |
+| libmtmd, BF16 mmproj (BF16 GEMM inputs, fp16 K / V, table GELU) | 4e-3 .. 2.7e-2 | 0.903 |
+| libmtmd, Q8_0 mmproj | 1.3e-2 .. 8.4e-2 | 0.889 |
+
+The BF16 mmproj is the one to use: vit_cpu widens either file to fp32, so a Q8_0 file is no faster, only less
+accurate. Encode time, Ryzen 9 5900XT (Zen 3, 16 cores / 32 threads), BF16 mmproj, steady state:
+
+| image | tokens | vit_cpu | libmtmd |
+|---|---|---|---|
+| 448 x 448 | 196 | 0.51 s | 0.80 s |
+| 640 x 480 | 300 | 0.78 s | 1.29 s |
+| 1024 x 1024 | 1024 | 3.56 s | 6.07 s |
+
+These are back-to-back encodes. The first encode after the server's load costs more (the weights streamed in again);
+the server absorbs that with a warm-up encode at startup. An image that arrives after the CPU has been idle still takes
+~0.4-0.6 s longer at 300 tokens (1.2-1.5 s in the server under WSL2: the host's cores take about a second of load to
+ramp up from idle); repeated images are cached and cost nothing.
+
+Output check: `tools/vision_ref` runs an image prompt through libllama + libmtmd (llama-server's code path),
+teacher-forced, and writes its next-token distributions and the image rows it fed; `qwen38_mk --kld ref
+--kld-images rows` scores the same tokens with the same rows (`--rows-in` feeds given rows, e.g. vit_cpu's or fp64
+ones, to llama.cpp instead). Six image prompts (a photo, a code screenshot, a 1024-token image, a wide image, two
+images, an image between text; 116-223 scored positions each), mean KL from llama.cpp's distributions:
+
+| engine, model | photo | code | 1024 tok | wide | two | between text | text only |
+|---|---|---|---|---|---|---|---|
+| `qwen38_mk`, Q4_K_M (fp16 KV) | 0.0012 | 0.0004 | 0.0041 | 0.0011 | 0.0016 | 0.0031 | 0.0013 |
+| `qwen38_mixed`, UD-Q4_K_XL (q8 KV) | 0.0009 | 0.0006 | 0.0019 | 0.0017 | 0.0011 | 0.0061 | 0.0011 |
+
+(batched prefill; through the prefill + decode path 0.0006-0.0059. Top-token agreement 97.4-100%. Without the image
+rows, i.e. placeholder embeddings, the photo's KL is 0.5. The between-text case's UD figure is one position where
+llama.cpp's batched decode differs from its own one-token decode (max 0.96 nats); with `vision_ref --text-batch 1`
+llama.cpp matches the megakernel there.)
 
 ## How it gets its speed
 
@@ -416,10 +489,10 @@ and attention paths against references without a model. On multi-GPU machines, p
   GPUs with 24 GB or more, and experimentally on sm_75. `make` builds for the installed GPU (`make ARCH=sm_89` to override).
 - Sampling supports temperature, top-k (<= 32), top-p and min-p (llama.cpp's order); no presence /
   repetition penalties yet (open-jet's non-thinking preset uses a presence penalty of 1.5).
-- Text only; one sequence and one checkpoint: a conversation is reused while it grows (or diverges
-  only after the end of the previous prompt); editing an earlier part, e.g. context compaction,
-  re-prefills it. No slot save / restore (open-jet's low-memory shell swap falls back to
-  re-prompting).
+- Text and images (no video or audio; images as base64 `data:` URLs; Qwen-VL projectors only); one
+  sequence and one checkpoint: a conversation is reused while it grows (or diverges only after the
+  end of the previous prompt); editing an earlier part, e.g. context compaction, re-prefills it. No
+  slot save / restore (open-jet's low-memory shell swap falls back to re-prompting).
 
 ## Files
 
@@ -433,4 +506,9 @@ and attention paths against references without a model. On multi-GPU machines, p
 - `tools/vocab_freq.cpp` - builds a draft vocabulary from a list of text files
 - `tools/llama_ref.cpp` / `logit_stats.h` - llama.cpp's next-token distributions and the comparison
   with them (KL divergence, perplexity, top-token agreement)
+- `vision/mk_vision.{h,cpp}` - the CPU vision encoder's C API (`libqwen38vision.so`): image decoding, backends
+- `vision/vit_cpu.{h,cpp}` - the vision tower in fp32 with AVX2 / FMA kernels (the `cpu` backend)
+- `vision/mkv_cli.cpp` - encodes images from the command line (grid, time, rows)
+- `vision/vit_check.cpp` - test: vit_cpu against libmtmd (pixels, rows, times); `vision/vit_ref.py` - the fp64 reference
+- `tools/vision_ref.cpp` - llama.cpp's distributions for an image prompt + the image rows it fed (`--kld-images`)
 - `bench/` - benchmarks (see Build / run)

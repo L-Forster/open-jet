@@ -27,4 +27,5 @@ package-dir = { megakernel = "." }
 include-package-data = false
 
 [tool.setuptools.package-data]
-megakernel = ["Makefile", "README.md", "*.cu", "*.cuh", "*.h", "*.cpp", "draft_vocab_32k.bin", "tools/*.cpp"]
+megakernel = ["Makefile", "README.md", "*.cu", "*.cuh", "*.h", "*.cpp", "draft_vocab_32k.bin", "tools/*.cpp",
+              "vision/*.cpp", "vision/*.h"]

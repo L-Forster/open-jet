@@ -70,6 +70,19 @@ def _megakernel_dir(model: str = "") -> Path | None:
     return root if all((root / name).is_file() for name in files) else None
 
 
+def _megakernel_vision_args(root: Path) -> list[str]:
+    """Image input for the megakernel server: --mmproj when OPENJET_MEGAKERNEL_MMPROJ names the vision projector GGUF
+    (e.g. mmproj-Qwen3.8-27B-BF16.gguf) and the CPU vision encoder is built (libqwen38vision.so, `make vision`).
+    The encoder runs on the CPU, so this costs no VRAM."""
+    path = os.environ.get("OPENJET_MEGAKERNEL_MMPROJ", "").strip()
+    if not path:
+        return []
+    mmproj = Path(path).expanduser()
+    if not mmproj.is_file() or not (root / "libqwen38vision.so").is_file():
+        return []
+    return ["--mmproj", str(mmproj)]
+
+
 def _megakernel_model_supported(model: str) -> bool:
     # Q4_K_M and unsloth's UD-Q4_K_XL: UD-Q4_K_M, AP-Q4_K_M and the like are untested quant mixes and run
     # on llama-server
@@ -823,6 +836,7 @@ class LlamaServerClient:
             str(self.port),
             "-c",
             str(ctx),
+            *_megakernel_vision_args(root),
         ]
         if not env.get("CUDA_VISIBLE_DEVICES", "").strip():
             gpu = _megakernel_gpu()

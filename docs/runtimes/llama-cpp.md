@@ -63,6 +63,9 @@ the model's own chat template, reasoning as `reasoning_content`, tool calls as s
   tokens on a 24 GB card; ~1-2% slower)
 - no slot save / restore: the low-memory shell swap below falls back to re-prompting
 - editing an earlier part of a conversation (e.g. context compaction) re-processes it (~1500 tok/s)
+- images only with a vision projector: build `libqwen38vision.so` (`make -C megakernel vision`) and set
+  `OPENJET_MEGAKERNEL_MMPROJ` to the mmproj GGUF (e.g. unsloth's `mmproj-BF16.gguf`); the image encoder runs on
+  the CPU, so it costs no VRAM ([details](../../megakernel/README.md#images-vision))
 
 ## What setup automates
 

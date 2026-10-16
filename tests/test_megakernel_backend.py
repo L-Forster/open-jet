@@ -3,6 +3,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -286,6 +287,164 @@ class MegakernelServerParsingTests(unittest.TestCase):
     def test_images_are_rejected(self) -> None:
         with self.assertRaises(self.mk.BadRequest):
             self.mk.normalize_messages([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}])
+
+
+class MegakernelVisionArgsTests(unittest.TestCase):
+    def test_mmproj_is_passed_when_set_and_the_encoder_is_built(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            root, mmproj = Path(d), Path(d) / "mmproj.gguf"
+            mmproj.write_bytes(b"GGUF")
+            with mock.patch.dict(llama_server.os.environ, {"OPENJET_MEGAKERNEL_MMPROJ": str(mmproj)}):
+                self.assertEqual(llama_server._megakernel_vision_args(root), [])  # (no libqwen38vision.so)
+                (root / "libqwen38vision.so").write_bytes(b"")
+                self.assertEqual(llama_server._megakernel_vision_args(root), ["--mmproj", str(mmproj)])
+            with mock.patch.dict(llama_server.os.environ, {"OPENJET_MEGAKERNEL_MMPROJ": ""}):
+                self.assertEqual(llama_server._megakernel_vision_args(root), [])
+            with mock.patch.dict(llama_server.os.environ, {"OPENJET_MEGAKERNEL_MMPROJ": str(root / "missing.gguf")}):
+                self.assertEqual(llama_server._megakernel_vision_args(root), [])
+
+
+class _FakeEngine:
+    """MKEngine's sequence / checkpoint semantics (one checkpoint, at the end of the last prompt) and a character
+    tokenizer, without a GPU"""
+
+    def __init__(self):
+        self.seq, self.dn_c, self.ck, self.calls, self.fail = [], 0, -1, [], False
+
+    def tokenize(self, text):
+        return [ord(c) for c in text]
+
+    def sequence(self):
+        return list(self.seq)
+
+    def committed(self):
+        return self.dn_c
+
+    def checkpoint_pos(self):
+        return self.ck
+
+    def truncate(self, n):
+        self.seq = self.seq[:n]
+
+    def reset(self):
+        self.seq, self.dn_c, self.ck = [], 0, -1
+        self.calls.append(("reset",))
+
+    def rewind_to_checkpoint(self):
+        if self.ck < 0 or self.ck > len(self.seq):
+            return False
+        self.seq, self.dn_c = self.seq[:self.ck], self.ck
+        self.calls.append(("rewind", self.ck))
+        return True
+
+    def prefill(self, toks, images=()):
+        if self.fail:
+            self.fail = False
+            raise RuntimeError("prefill: injected failure")
+        n0 = len(self.seq)
+        self.seq += toks
+        self.dn_c = self.ck = len(self.seq)
+        self.calls.append(("prefill", n0, len(toks), tuple((p, nx, ny) for p, nx, ny, _ in images)))
+        self.seq.append(7)  # the first generated token
+        return 7
+
+
+class _FakeImage:
+    def __init__(self, key, nx, ny):
+        self.key, self.nx, self.ny, self.n = key, nx, ny, nx * ny
+        self.encoded = 0
+        self.encode_s = None
+
+    def rows(self):
+        self.encoded += 1
+        return 0  # (an address)
+
+
+class MegakernelVisionTests(unittest.TestCase):
+    VS, VE, PAD = 1001, 1002, 1003
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mk = _load_mk_server()
+
+    def _media(self, content):
+        media = []
+        msgs = self.mk.normalize_messages([{"role": "user", "content": content}], media)
+        return msgs[0]["content"], media
+
+    def test_image_parts_are_flattened_as_llama_server_does(self) -> None:
+        url = {"url": "data:image/png;base64,iVBORw0KGgo="}
+        img = {"type": "image_url", "image_url": url}
+        m = self.mk.MEDIA_MARKER
+        self.assertEqual(self._media([{"type": "text", "text": "a"}, img, {"type": "text", "text": "b"}])[0], f"a{m}b")
+        self.assertEqual(self._media([img, {"type": "text", "text": "b"}])[0], f"{m}b")
+        self.assertEqual(self._media([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}, img])[0], f"a\nb{m}")
+        text, media = self._media([img, img])
+        self.assertEqual((text, len(media)), (m + m, 2))
+        self.assertEqual(media[0][:4], bytes([0x89, 0x50, 0x4E, 0x47]))  # (the decoded data: URL)
+        # a message without images keeps its parts, as before
+        self.assertIsInstance(self._media([{"type": "text", "text": "a"}])[0], list)
+
+    def test_remote_image_urls_are_rejected(self) -> None:
+        with self.assertRaises(self.mk.BadRequest):
+            self._media([{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}])
+
+    def _server(self, images):
+        srv = object.__new__(self.mk.Server)
+        srv.eng = _FakeEngine()
+        srv.vis_start, srv.vis_end, srv.img_pad = self.VS, self.VE, self.PAD
+        srv.vision = mock.Mock()
+        srv.vision.image.side_effect = lambda data: images[data]
+        return srv
+
+    def test_each_image_becomes_its_rows_between_vision_start_and_end(self) -> None:
+        im = _FakeImage("k", 3, 2)
+        srv = self._server({b"png": im})
+        m = self.mk.MEDIA_MARKER
+        toks, images = srv.tokenize_prompt(f"ab{m}c", [b"png"])
+        self.assertEqual(toks, [ord("a"), ord("b"), self.VS] + [self.PAD] * 6 + [self.VE, ord("c")])
+        self.assertEqual(images, [(3, im)])
+
+    def test_a_different_image_at_the_same_place_is_not_reused(self) -> None:
+        a, b = _FakeImage("a", 2, 2), _FakeImage("b", 2, 2)
+        srv = self._server({b"A": a, b"B": b})
+        m = self.mk.MEDIA_MARKER
+        toks, images = srv.tokenize_prompt(f"x{m}yz", [b"A"])
+        srv.load_prompt(toks, images)
+        self.assertEqual(srv.eng.calls[-1], ("prefill", 0, len(toks), ((2, 2, 2),)))
+        toks2, images2 = srv.tokenize_prompt(f"x{m}yz", [b"B"])
+        self.assertEqual(toks2, toks)  # (the placeholders are alike)
+        _, reused = srv.load_prompt(toks2, images2)
+        self.assertEqual(reused, 0)  # (the checkpoint is after the image: a full prefill)
+        self.assertEqual(srv.eng.calls[-2:], [("reset",), ("prefill", 0, len(toks), ((2, 2, 2),))])
+        self.assertEqual(b.encoded, 1)
+
+    def test_the_same_image_is_reused_and_not_fed_again(self) -> None:
+        a = _FakeImage("a", 4, 4)
+        srv = self._server({b"A": a})
+        m = self.mk.MEDIA_MARKER
+        toks, images = srv.tokenize_prompt(f"x{m}yz", [b"A"])
+        srv.load_prompt(toks, images)
+        srv.eng.seq += [8, 8, 8]  # decoding went on
+        srv.eng.dn_c = len(srv.eng.seq)
+        toks2, images2 = srv.tokenize_prompt(f"x{m}yzw", [b"A"])  # diverges after the end of the previous prompt
+        _, reused = srv.load_prompt(toks2, images2)
+        self.assertEqual(reused, len(toks))
+        self.assertEqual(srv.eng.calls[-2:], [("rewind", len(toks)), ("prefill", len(toks), 1, ())])
+        self.assertEqual(a.encoded, 1)
+
+    def test_after_a_failed_prefill_nothing_is_reused(self) -> None:
+        a = _FakeImage("a", 2, 2)
+        srv = self._server({b"A": a})
+        m = self.mk.MEDIA_MARKER
+        toks, images = srv.tokenize_prompt(f"x{m}yz", [b"A"])
+        srv.load_prompt(toks, images)
+        srv.eng.fail = True
+        with self.assertRaises(RuntimeError):
+            srv.load_prompt(toks + [ord("w")], images)
+        _, reused = srv.load_prompt(toks + [ord("w")], images)
+        self.assertEqual(reused, 0)
+        self.assertEqual(srv.eng.calls[-2][0], "reset")
 
 
 if __name__ == "__main__":

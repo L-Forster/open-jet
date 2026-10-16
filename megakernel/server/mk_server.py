@@ -10,19 +10,25 @@ via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool call
 `tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Successive requests of a
 conversation reuse the processed tokens: the new prompt is matched against the sequence so far and
 only the rest is prefilled (rewinding to the end of the previous prompt if it diverges after that).
+With --mmproj, OpenAI image_url parts (base64 data: URLs) are encoded on the CPU (vision/mk_vision.h).
 GET /health, GET /v1/models.  One request at a time.
 """
 import argparse
+import base64
+import binascii
 import codecs
 import ctypes
+import hashlib
 import json
 import os
 import random
 import re
+import struct
 import sys
 import threading
 import time
 import uuid
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import jinja2
@@ -63,6 +69,12 @@ class Engine:
         for name, (res, args) in sig.items():
             f = getattr(L, name)
             f.restype, f.argtypes = res, args
+        # images (libraries before it: text only)
+        self.images = hasattr(L, "mk_prefill_img")
+        if self.images:
+            L.mk_prefill_img.restype = ctypes.c_int
+            L.mk_prefill_img.argtypes = [vp, ip, ctypes.c_int, ip, ip, ip, ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+            L.mk_n_embd.restype, L.mk_n_embd.argtypes = ctypes.c_int, []
         self.h = L.mk_new(model.encode(), ctx, n_draft, draft_vocab.encode() if draft_vocab else None, kv_mode)
         if not self.h:
             raise RuntimeError(L.mk_last_error().decode())
@@ -104,9 +116,16 @@ class Engine:
         if self.L.mk_set_sampling(self.h, temp, top_p, top_k, min_p, seed) < 0:
             raise self._err("sampling")
 
-    def prefill(self, toks):
+    def prefill(self, toks, images=()):
+        """images: (pos, nx, ny, rows address) of each image the fed positions overlap (absolute positions)"""
         arr = (ctypes.c_int * len(toks))(*toks)
-        r = self.L.mk_prefill(self.h, arr, len(toks))
+        if images:
+            k = len(images)
+            pos, nx, ny = ((ctypes.c_int * k)(*[im[j] for im in images]) for j in range(3))
+            rows = (ctypes.c_void_p * k)(*[im[3] for im in images])
+            r = self.L.mk_prefill_img(self.h, arr, len(toks), pos, nx, ny, rows, k)
+        else:
+            r = self.L.mk_prefill(self.h, arr, len(toks))
         if r < 0:
             raise self._err("prefill")
         return r
@@ -141,6 +160,106 @@ class Engine:
         return self.L.mk_rewind_to_checkpoint(self.h) == 0
 
 
+class Vision:
+    """ctypes binding of vision/mk_vision.h (libqwen38vision.so): the CPU image encoder, plus a cache of decoded /
+    encoded images by content hash, so a conversation re-sending its images encodes each once"""
+
+    class Image:
+        def __init__(self, vision, handle, key):
+            self.v, self.h, self.key = vision, handle, key
+            nx, ny = ctypes.c_int(), ctypes.c_int()
+            self.n = vision.L.mkv_image_grid(handle, ctypes.byref(nx), ctypes.byref(ny))
+            self.nx, self.ny = nx.value, ny.value
+            self.encode_s = None
+
+        def rows(self):
+            """address of the [n][n_embd] fp32 rows, encoding on the first call"""
+            L = self.v.L
+            if self.encode_s is None:
+                if L.mkv_image_encode(self.v.ctx, self.h) != 0:
+                    raise RuntimeError(f"image encode: {L.mkv_last_error().decode()}")
+                self.encode_s = L.mkv_image_encode_ms(self.h) / 1e3
+            return L.mkv_image_rows(self.h)
+
+        def free(self):
+            if self.h:
+                self.v.L.mkv_image_free(self.h)
+                self.h = None
+
+    class Params(ctypes.Structure):
+        _fields_ = [("n_threads", ctypes.c_int), ("min_tokens", ctypes.c_int), ("max_tokens", ctypes.c_int),
+                    ("flash_attn", ctypes.c_int), ("verbose", ctypes.c_int), ("backend", ctypes.c_int)]
+
+    BACKENDS = {"auto": 0, "mtmd": 1, "cpu": 2}
+
+    def __init__(self, lib, mmproj, model, threads=0, min_tokens=0, max_tokens=0, cache=8, backend="auto"):
+        L = self.L = ctypes.CDLL(lib)
+        vp, cp = ctypes.c_void_p, ctypes.c_char_p
+        for name, res, args in (
+                ("mkv_params_default", Vision.Params, []), ("mkv_new", vp, [cp, cp, Vision.Params]),
+                ("mkv_free", None, [vp]), ("mkv_last_error", cp, []), ("mkv_n_embd", ctypes.c_int, [vp]),
+                ("mkv_n_threads", ctypes.c_int, [vp]), ("mkv_backend", ctypes.c_int, [vp]),
+                ("mkv_image_load", vp, [vp, cp, ctypes.c_size_t]),
+                ("mkv_image_grid", ctypes.c_int, [vp, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]),
+                ("mkv_image_encode", ctypes.c_int, [vp, vp]), ("mkv_image_rows", vp, [vp]),
+                ("mkv_image_encode_ms", ctypes.c_double, [vp]), ("mkv_image_free", None, [vp])):
+            f = getattr(L, name)
+            f.restype, f.argtypes = res, args
+        p = L.mkv_params_default()
+        p.n_threads, p.min_tokens, p.max_tokens, p.backend = threads, min_tokens, max_tokens, Vision.BACKENDS[backend]
+        self.ctx = L.mkv_new(mmproj.encode(), model.encode(), p)
+        if not self.ctx:
+            raise RuntimeError(f"vision: {L.mkv_last_error().decode()}")
+        self.n_embd = L.mkv_n_embd(self.ctx)
+        self.n_threads = L.mkv_n_threads(self.ctx)
+        self.backend = {1: "libmtmd", 2: "vit_cpu"}.get(L.mkv_backend(self.ctx), "?")
+        self.cache = {}  # key -> Image, least recently used first
+        self.cache_max = max(1, cache)
+
+    def image(self, data):
+        """the Image of these file bytes (decoded and preprocessed; encoded lazily by rows())"""
+        key = hashlib.sha256(data).hexdigest()
+        im = self.cache.pop(key, None)
+        if im is None:
+            h = self.L.mkv_image_load(self.ctx, data, len(data))
+            if not h:
+                raise BadRequest(f"image: {self.L.mkv_last_error().decode()}")
+            im = Vision.Image(self, h, key)
+        self.cache[key] = im
+        while len(self.cache) > self.cache_max:
+            old = self.cache.pop(next(iter(self.cache)))
+            old.free()
+        return im
+
+    def warm_up(self):
+        """one encode of a 64 x 64 grey PNG (not cached): the first encode after the engine's load pays ~0.5 s once
+        (every weight streamed in again, the workers' scratch), here at startup instead of in the first image request"""
+        w = h = 64
+        raw = b"".join(bytes([0]) + bytes([128, 128, 128]) * w for _ in range(h))
+
+        def chunk(t, d):
+            return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        png = (bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+               + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+        hd = self.L.mkv_image_load(self.ctx, png, len(png))
+        if not hd or self.L.mkv_image_encode(self.ctx, hd) != 0:
+            raise RuntimeError(f"vision warm-up: {self.L.mkv_last_error().decode()}")
+        self.L.mkv_image_free(hd)
+
+
+def image_bytes(url):
+    """the file bytes of an OpenAI image_url (a data: URL, as llama-server takes them by default)"""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        raise BadRequest("image_url: only data: URLs (base64) are supported")
+    head, sep, payload = url.partition(",")
+    if not sep or ";base64" not in head:
+        raise BadRequest("image_url: expected a base64 data: URL")
+    try:
+        return base64.b64decode(payload, validate=False)
+    except (binascii.Error, ValueError) as e:
+        raise BadRequest(f"image_url: bad base64 ({e})")
+
+
 # ---------------------------------------------------------------------------------------------
 # chat template and output parsing
 
@@ -161,15 +280,37 @@ class BadRequest(Exception):
     pass
 
 
-def normalize_messages(messages):
+MEDIA_MARKER = "<__media__>"  # llama-server's (mtmd_default_marker)
+
+
+def normalize_messages(messages, media=None):
+    """media (a list: the server has a vision encoder): image_url parts become MEDIA_MARKER and their file bytes are
+    appended to media in order. A message with images is flattened to one string as llama-server does (text parts
+    joined by newlines, no newline next to an image), so the prompt around each image is llama-server's."""
     out = []
     for m in messages:
         m = dict(m)
         content = m.get("content")
         if isinstance(content, list):
             for part in content:
-                if isinstance(part, dict) and part.get("type") not in (None, "text"):
-                    raise BadRequest(f"unsupported content part type {part.get('type')!r} (text only)")
+                if isinstance(part, dict) and part.get("type") not in (None, "text", "image_url"):
+                    raise BadRequest(f"unsupported content part type {part.get('type')!r} (text and image_url only)")
+            if any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
+                if media is None:
+                    raise BadRequest("image input is not supported: start the server with --mmproj")
+                text, after_media = "", False
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        iu = part.get("image_url")
+                        media.append(image_bytes(iu.get("url") if isinstance(iu, dict) else iu))
+                        text += MEDIA_MARKER
+                        after_media = True
+                    else:
+                        if not after_media and text:
+                            text += "\n"
+                        text += str((part.get("text") if isinstance(part, dict) else part) or "")
+                        after_media = False
+                m["content"] = text
         if content is None:
             m["content"] = ""
         if m.get("role") == "assistant" and m.get("tool_calls"):
@@ -285,17 +426,33 @@ class OutputParser:
 
 
 class Server:
+    vision = None   # Vision (--mmproj), else text only
+    img_spans = ()  # the images of the engine's sequence: (pos, n, key), None: unknown; replaced, never mutated
+
     def __init__(self, args):
         self.args = args
         t0 = time.time()
         self.eng = Engine(args.lib, args.model, args.ctx, args.draft, args.draft_vocab,
                           {"f16": 0, "q8": 1, "auto": -1}[args.kv])
         self.template = make_template(self.eng.chat_template())
+        if getattr(args, "mmproj", None):
+            if not self.eng.images:
+                raise RuntimeError(f"{args.lib} has no image input (mk_prefill_img): rebuild it")
+            self.vision = Vision(args.vision_lib, args.mmproj, args.model, args.vision_threads, args.image_min_tokens,
+                                 args.image_max_tokens, args.image_cache, args.vision_backend)
+            if self.vision.n_embd != self.eng.L.mk_n_embd():
+                raise RuntimeError(f"mmproj rows of {self.vision.n_embd} for a model of {self.eng.L.mk_n_embd()}")
+            ids = [self.eng.tokenize(t) for t in ("<|vision_start|>", "<|vision_end|>", "<|image_pad|>")]
+            if any(len(i) != 1 for i in ids):
+                raise RuntimeError("the vocabulary has no <|vision_start|> / <|vision_end|> / <|image_pad|> tokens")
+            self.vis_start, self.vis_end, self.img_pad = (i[0] for i in ids)
         self.warm_up()
         self.model_id = os.path.basename(args.model)
         self.lock = threading.Lock()
         self.warned = set()
-        log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts")
+        vis = (f", vision on the CPU ({os.path.basename(args.mmproj)}, {self.vision.backend}, {self.vision.n_threads} threads)"
+               if self.vision else "")
+        log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts{vis}")
 
     def warm_up(self):
         """Runs one prefill and one decode cycle before the server listens.
@@ -311,6 +468,8 @@ class Server:
         self.eng.prefill(toks)
         self.eng.step()
         self.eng.reset()
+        if self.vision:
+            self.vision.warm_up()
 
     def warn_once(self, key, msg):
         if key not in self.warned:
@@ -318,8 +477,10 @@ class Server:
             log("warning:", msg)
 
     def render(self, body):
+        """(prompt text, thinking, image file bytes in prompt order: one MEDIA_MARKER in the text each)"""
         kw = dict(body.get("chat_template_kwargs") or {})
-        ctx = dict(messages=normalize_messages(body.get("messages") or []), add_generation_prompt=True)
+        media = [] if self.vision else None
+        ctx = dict(messages=normalize_messages(body.get("messages") or [], media), add_generation_prompt=True)
         if body.get("tools"):
             ctx["tools"] = body["tools"]
         for k in ("enable_thinking", "preserve_thinking", "reasoning_effort"):
@@ -330,10 +491,32 @@ class Server:
         except jinja2.exceptions.TemplateError as e:
             raise BadRequest(f"chat template: {e}")
         thinking = text.endswith("<think>\n")
-        return text, thinking
+        if media and text.count(MEDIA_MARKER) != len(media):
+            raise BadRequest(f"the rendered prompt has {text.count(MEDIA_MARKER)} image markers for {len(media)} images")
+        return text, thinking, media or []
 
-    def load_prompt(self, toks):
-        """brings the engine to `toks` processed, reusing what it has; returns (first token, reused count)"""
+    def tokenize_prompt(self, text, media):
+        """the prompt's token ids and its images [(pos, Vision.Image)]: each MEDIA_MARKER becomes <|vision_start|>, the
+        image's rows (<|image_pad|> placeholders, nx * ny of them), <|vision_end|>; the text between is tokenized piece
+        by piece, as mtmd_tokenize does"""
+        if not media:
+            return self.eng.tokenize(text), []
+        toks, images = [], []
+        segs = text.split(MEDIA_MARKER)
+        for i, seg in enumerate(segs):
+            if seg:
+                toks += self.eng.tokenize(seg)
+            if i < len(media):
+                im = self.vision.image(media[i])
+                toks.append(self.vis_start)
+                images.append((len(toks), im))
+                toks += [self.img_pad] * im.n
+                toks.append(self.vis_end)
+        return toks, images
+
+    def load_prompt(self, toks, images=()):
+        """brings the engine to `toks` processed, reusing what it has; returns (first token, reused count).
+        images: [(pos, Vision.Image)] of the prompt"""
         eng = self.eng
         seq = eng.sequence()
         lcp = 0
@@ -342,14 +525,32 @@ class Server:
                 break
             lcp += 1
         lcp = min(lcp, len(toks) - 1)  # at least one token is fed (it produces the next one)
+        # images: their rows' placeholder ids are alike, so the processed sequence matches only up to the first image
+        # that is not the same image at the same position in both (after a failed prefill: nothing is reused)
+        spans = [(p, im.n, im.key) for p, im in images]
+        if self.img_spans is None:
+            lcp = 0
+        else:
+            for p, _, _ in set(spans) ^ set(self.img_spans):
+                lcp = min(lcp, p)
+
+        def feed(start):  # prefill toks[start:] with the images it overlaps (encoded now, each once: Vision's cache)
+            imgs = [(p, im.nx, im.ny, im.rows()) for p, im in images if p + im.n > start]
+            return eng.prefill(toks[start:], imgs), start
+
+        self.img_spans = None  # (until the prefill succeeds)
         if seq and lcp >= eng.committed():
             eng.truncate(lcp)
-            return eng.prefill(toks[lcp:]), lcp
-        ck = eng.checkpoint_pos()
-        if 0 < ck <= lcp and eng.rewind_to_checkpoint():
-            return eng.prefill(toks[ck:]), ck
-        eng.reset()
-        return eng.prefill(toks), 0
+            r = feed(lcp)
+        else:
+            ck = eng.checkpoint_pos()
+            if 0 < ck <= lcp and eng.rewind_to_checkpoint():
+                r = feed(ck)
+            else:
+                eng.reset()
+                r = feed(0)
+        self.img_spans = spans
+        return r
 
     def sampling(self, body):
         temp = float(body.get("temperature", 0.8) if body.get("temperature") is not None else 0.8)
@@ -374,8 +575,8 @@ class Server:
     def generate(self, body, emit):
         """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas.
         Returns (finish_reason, tool_calls, usage). emit returning False aborts."""
-        text, thinking = self.render(body)
-        toks = self.eng.tokenize(text)
+        text, thinking, media = self.render(body)
+        toks, images = self.tokenize_prompt(text, media)
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
         max_new = int(max_new)
         limit = self.args.ctx - len(toks) - 16
@@ -385,8 +586,13 @@ class Server:
         tools = body.get("tools") or []
         self.sampling(body)
         t0 = time.time()
-        tok, reused = self.load_prompt(toks)
+        enc0 = [im.encode_s for _, im in images]
+        tok, reused = self.load_prompt(toks, images)
         t1 = time.time()
+        enc = [im.encode_s for (_, im), e in zip(images, enc0) if e is None and im.encode_s is not None]
+        if images:
+            log(f"images: {len(images)} ({', '.join(f'{im.nx}x{im.ny}' for _, im in images)} tokens), "
+                f"{len(enc)} encoded on the CPU in {sum(enc):.2f} s")
         parser = OutputParser(thinking, tools)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         n_gen, finish, pending, aborted = 0, "length", [tok], False
@@ -439,7 +645,8 @@ def make_handler(srv):
             elif path in ("/v1/models", "/models"):
                 self._json(200, {"object": "list", "data": [{"id": srv.model_id, "object": "model", "owned_by": "openjet"}]})
             elif path == "/props":
-                self._json(200, {"default_generation_settings": {"n_ctx": srv.args.ctx}, "total_slots": 1})
+                self._json(200, {"default_generation_settings": {"n_ctx": srv.args.ctx}, "total_slots": 1,
+                                 "modalities": {"vision": srv.vision is not None, "audio": False}})
             else:
                 self._json(404, {"error": {"message": "not found", "type": "not_found_error"}})
 
@@ -547,6 +754,16 @@ def main():
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "libqwen38mk.so"))
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
+    ap.add_argument("--mmproj", default=None,
+                    help="vision projector GGUF (e.g. mmproj-*.gguf): image_url inputs, encoded on the CPU (no VRAM)")
+    ap.add_argument("--vision-lib", default=os.path.join(os.path.dirname(HERE), "libqwen38vision.so"))
+    ap.add_argument("--vision-threads", type=int, default=0, help="CPU threads of the image encoder (0: all)")
+    ap.add_argument("--vision-backend", choices=["auto", "cpu", "mtmd"], default="auto",
+                    help="image encoder: cpu (AVX2 / FMA fp32 kernels), mtmd (llama.cpp's), auto (cpu if the CPU has AVX2 + FMA)")
+    ap.add_argument("--image-min-tokens", type=int, default=0, help="minimum tokens per image (0: the mmproj's default)")
+    ap.add_argument("--image-max-tokens", type=int, default=0,
+                    help="maximum tokens per image (0: the mmproj's default, 4096 for Qwen3.x; fewer encode faster)")
+    ap.add_argument("--image-cache", type=int, default=8, help="images kept decoded / encoded for reuse")
     args = ap.parse_args()
     srv = Server(args)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))
