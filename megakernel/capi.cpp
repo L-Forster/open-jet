@@ -22,8 +22,17 @@ thread_local std::string g_err;
 extern "C" {
 
 const char * mk_last_error() { return g_err.c_str(); }
+void * mk_new2(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode, int kv_ctx);
+int mk_slots_open2(void * hp, int n, int ctx, int seg_tokens);
+int mk_slot_begin2(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
+                   int share_len, int pin);
 
 void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode) {
+    return mk_new2(model, ctx, n_draft, draft_vocab, kv_mode, 0);
+}
+
+// as mk_new, with kv_ctx: positions of the engine's own K/V cache (0: ctx; parallel slots have their own)
+void * mk_new2(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode, int kv_ctx) {
     try {
         llama_backend_init();
         llama_model_params mp = llama_model_default_params();
@@ -32,7 +41,7 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
         h->lm = llama_model_load_from_file(model, mp);
         if (!h->lm) throw std::runtime_error("failed to load the vocabulary");
         h->vocab = llama_model_get_vocab(h->lm);
-        h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode);
+        h->eng = new MKEngine(model, ctx, n_draft, draft_vocab ? draft_vocab : "", kv_mode, kv_ctx);
         return h;
     } catch (const std::exception & e) {
         g_err = e.what();
@@ -135,6 +144,106 @@ void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
     *cycles = s.cycles;
     *drafted = s.drafted;
     *accepted = s.accepted;
+}
+
+// slots (parallel decoding): open n persistent sequences drawing on one K/V pool of n x ctx positions (0: the most
+// that fit in device memory); returns the pool's positions, or -1
+int mk_slots_open(void * hp, int n, int ctx) { return mk_slots_open2(hp, n, ctx, 0); }
+
+// as mk_slots_open; seg_tokens > 0: shared segments (prefixes stored once) too
+int mk_slots_open2(void * hp, int n, int ctx, int seg_tokens) {
+    try {
+        return static_cast<Handle *>(hp)->eng->slots_open(n, ctx, seg_tokens);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// slot <- the prompt (prefilled, reusing a matching prefix; first draft ready); temp 0: greedy. Returns the reused count
+int mk_slot_start(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
+    try {
+        return static_cast<Handle *>(hp)->eng->slot_start(slot, std::vector<int>(toks, toks + n), temp, top_p, top_k, min_p, seed);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// positions of the shared segment the slot reads (0: none)
+int mk_slot_segment(void * hp, int slot) { return static_cast<Handle *>(hp)->eng->slot_segment(slot); }
+
+// slot_start in parts: mk_slot_begin returns the reused count (or -1), mk_slot_prefill feeds up to `budget` prompt
+// tokens and returns how many remain (0: ready to step; -1: error)
+int mk_slot_begin(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
+    return mk_slot_begin2(hp, slot, toks, n, temp, top_p, top_k, min_p, seed, 0, 0);
+}
+
+// as mk_slot_begin; share_len: a prefix other prompts may share (a segment), pin: keep that segment while unused
+int mk_slot_begin2(void * hp, int slot, const int * toks, int n, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
+                   int share_len, int pin) {
+    try {
+        return static_cast<Handle *>(hp)->eng->slot_begin(slot, std::vector<int>(toks, toks + n), temp, top_p, top_k, min_p, seed, share_len, pin != 0);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+int mk_slot_prefill(void * hp, int slot, int budget) {
+    try {
+        return static_cast<Handle *>(hp)->eng->slot_prefill(slot, budget);
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// one step of the n slots: out[i * per + j] = the j-th token slot i emitted, counts[i] how many (<= per; 0: the
+// slot's context is full)
+int mk_slots_step(void * hp, const int * slots, int n, int * out, int per, int * counts) {
+    try {
+        auto em = static_cast<Handle *>(hp)->eng->slots_step(std::vector<int>(slots, slots + n));
+        for (int i = 0; i < n; i++) {
+            counts[i] = std::min((int) em[i].size(), per);
+            for (int j = 0; j < counts[i]; j++) out[i * per + j] = em[i][j];
+        }
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// (MK_PF_PROFILE) the phase times collected since the last report, to stderr
+void mk_profile_report(void * hp) { static_cast<Handle *>(hp)->eng->profile_report(); }
+
+// (test) the hidden state of the slot's last processed position -> out[0 .. n), returns its size
+int mk_slot_h(void * hp, int slot, float * out, int n) {
+    try {
+        auto h = static_cast<Handle *>(hp)->eng->slot_h(slot);
+        for (int i = 0; i < std::min(n, (int) h.size()); i++) out[i] = h[i];
+        return (int) h.size();
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
+}
+
+// mk_slots_step with the next chunk of slot pslot's prompt in the same pass (budget rows with the step's); *remain <-
+// the prompt tokens left, as mk_slot_prefill returns
+int mk_slots_step_mixed(void * hp, int pslot, int budget, const int * slots, int n, int * out, int per, int * counts, int * remain) {
+    try {
+        auto em = static_cast<Handle *>(hp)->eng->slots_step_mixed(pslot, budget, std::vector<int>(slots, slots + n), *remain);
+        for (int i = 0; i < n; i++) {
+            counts[i] = std::min((int) em[i].size(), per);
+            for (int j = 0; j < counts[i]; j++) out[i * per + j] = em[i][j];
+        }
+        return 0;
+    } catch (const std::exception & e) {
+        g_err = e.what();
+        return -1;
+    }
 }
 
 } // extern "C"

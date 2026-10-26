@@ -11,7 +11,7 @@ endif
 all: qwen38_mk libqwen38mk.so tools/vocab_freq tools/llama_ref
 
 # ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh cuda_compat.cuh
+qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h prefill.cuh prefill_gemm.cuh cuda_compat.cuh bmm.cuh
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 qwen38_mk: qwen38_mk.o main.cu logit_stats.h

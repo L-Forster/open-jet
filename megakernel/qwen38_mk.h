@@ -16,8 +16,11 @@ class MKEngine {
     // n_draft: MTP draft tokens per cycle (0..4). ctx: KV-cache capacity in tokens.
     // draft_vocab: optional file of int32 token ids; the MTP draft head is restricted to them.
     // kv_mode: KV cache format, 0 fp16, 1 q8_0 (half the memory, ~1-2% slower), -1 auto (q8_0 only
-    // when the fp16 cache for ctx positions does not fit in the free GPU memory).
-    MKEngine(const std::string & gguf_path, int ctx, int n_draft, const std::string & draft_vocab = "", int kv_mode = -1);
+    // when the fp16 cache for ctx positions does not fit in the free GPU memory); -n: auto for n copies
+    // (the engine's and n - 1 parallel slots of ctx positions).
+    // kv_ctx: positions of the engine's own K/V cache (default ctx); parallel slots (slots_open) have their own, so a
+    // server running only slots can keep it small
+    MKEngine(const std::string & gguf_path, int ctx, int n_draft, const std::string & draft_vocab = "", int kv_mode = -1, int kv_ctx = 0);
     ~MKEngine();
 
     // Clears all sequence state (KV, recurrent state, positions).
@@ -58,6 +61,35 @@ class MKEngine {
     void score_logits(const std::vector<int> & tokens, int mk_from, int first, const LogitSink & sink);
     static int n_vocab();
     void bench_phases();
+    // test path: greedy decode of several sequences at once (batched weight GEMMs, per-sequence state); returns the
+    // n_new tokens of each, step_secs = time of the decode steps
+    std::vector<std::vector<int>> ms_generate(const std::vector<std::vector<int>> & prompts, int n_new, int ctx_s, double & step_secs, bool tc = false);
+    // slots (server): persistent sequences decoded together; slots_step runs one speculative step of the given slots
+    // and returns the tokens each emitted (greedy, or sampled with the slot's parameters: exact speculative sampling)
+    // The slots' K/V is one pool of n x ctx positions (ctx 0: all the device memory left) in pages any slot draws on
+    // as its context grows (idle slots' caches are reclaimed); seg_tokens > 0: shared segments (prompt prefixes
+    // stored once, see slot_begin) too. Returns the pool's positions; a slot the pool cannot extend emits nothing.
+    int slots_open(int n, int ctx, int seg_tokens = 0);
+    int slot_segment(int slot) const; // positions of the shared segment slot `slot` reads (0: none)
+    int segments_drop(); // frees the segments no slot reads (pinned ones too); returns how many
+    void profile_report(); // (MK_PF_PROFILE) the phase times collected since the last report
+    int slot_start(int slot, const std::vector<int> & prompt, float temp, float top_p, int top_k, float min_p, unsigned long long seed); // returns reused tokens
+    // slot_start in parts, so other slots can step between prefill chunks: slot_begin returns the reused count,
+    // slot_prefill feeds up to `budget` prompt tokens and returns how many remain (0: ready to step; budget 0 abandons)
+    // share_len: positions < share_len are a prefix other prompts may share; unless a segment holds it already (then
+    // the slot attaches to it: no prefill of it), the prefill makes it one (pin: kept while unused)
+    int slot_begin(int slot, const std::vector<int> & prompt, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
+                   int share_len = 0, bool pin = false);
+    int slot_prefill(int slot, int budget);
+    std::vector<std::vector<int>> slots_step(const std::vector<int> & slots);
+    // slots_step with the next chunk of slot `slot`'s prompt in the same pass (the weights read once for both): the
+    // chunk and the step's rows fill `budget` rows; remain <- the prompt tokens left, as slot_prefill returns
+    std::vector<std::vector<int>> slots_step_mixed(int slot, int budget, const std::vector<int> & slots, int & remain);
+    std::vector<int> slot_sequence(int slot) const; // the slot's tokens (prompt, emitted ones)
+    std::vector<float> slot_h(int slot) const; // (test) hidden state of the slot's last processed position
+    // ... with one MTP draft per sequence and step (oracle 1 / 2: drafts from `ref`, right / wrong, for testing)
+    std::vector<std::vector<int>> ms_generate_spec(const std::vector<std::vector<int>> & prompts, int n_new, int ctx_s, double & step_secs,
+                                                   int oracle = 0, const std::vector<std::vector<int>> * ref = nullptr, double * acc_rate = nullptr);
     int n_draft() const { return n_draft_; }
     MKStats stats;
 

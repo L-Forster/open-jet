@@ -18,6 +18,9 @@
 #include "cuda_compat.cuh"
 
 #include <algorithm>
+#include <random>
+#include <tuple>
+#include <initializer_list>
 #include <chrono>
 #include <map>
 #include <cmath>
@@ -50,6 +53,7 @@ constexpr int NH = 24, NKV = 4, HD = 256;
 constexpr int NKH = 16, NVH = 48, HK = 128;
 constexpr int QKV = 10240, VD = 6144, QG = 12288, KVD = 1024;
 constexpr int MAXT = 5;
+constexpr int MAXT_BUF = 12; // (row-scaling experiment: activation buffers sized for --bench-phases at T <= 12)
 constexpr int NT = 512, NW = NT / 32;
 constexpr float EPS = 1e-6f;
 constexpr float ROPE_BASE = 10000000.0f;
@@ -155,10 +159,33 @@ struct Bufs {
     Ctl * ctl;
     unsigned long long * prof; // optional per-barrier timestamps (block 0)
     int ctx;
+    // a shared K/V segment (same layout, stride segctx) holding positions < segn; the own cache then holds positions
+    // segn .. at rows pos - segn (segn 0: no segment)
+    void *kseg, *vseg;
+    __half *ksseg, *vsseg;
+    int segn, segctx;
+    const int * segptab; // the segment's pages in the pool (nullptr: contiguous, stride segctx)
+    // own cache paged (slots): kc .. are a pool of KV_PG-position pages [page][slot][kv head][KV_PG][..], own
+    // position i (pos - segn) in page ptab[i / KV_PG] (nullptr: contiguous, stride ctx)
+    const int * ptab;
 };
+constexpr int KV_PG = 256;
+// row of own-cache position i (attention slot, kv head g): paged (ptab) or contiguous of stride ctx. (The tables
+// change only between launches: read-only loads, through L1 — plain loads skip it under -dlcm=cg.)
+__device__ __forceinline__ size_t kv_own_row(const int * ptab, int ctx, int slot, int g, int i) {
+    return ptab ? (((size_t) __ldg(ptab + i / KV_PG) * N_ATT_SLOTS + slot) * NKV + g) * KV_PG + i % KV_PG : ((size_t) slot * NKV + g) * ctx + i;
+}
 
 __constant__ ModelW cW;
 __constant__ Bufs cB;
+
+// K/V row of (attention slot, kv head, position) in the segment (pos < segn) or the slot's own cache
+__device__ __forceinline__ size_t kv_row(int slot, int g, int pos, bool & seg) {
+    seg = pos < cB.segn;
+    return seg ? kv_own_row(cB.segptab, cB.segctx, slot, g, pos) : kv_own_row(cB.ptab, cB.ctx, slot, g, pos - cB.segn);
+}
+__device__ __forceinline__ const void * kv_base(bool seg, int which) { return seg ? (which ? cB.vseg : cB.kseg) : (which ? cB.vc : cB.kc); }
+__device__ __forceinline__ const __half * kv_sbase(bool seg, int which) { return seg ? (which ? cB.vsseg : cB.ksseg) : (which ? cB.vsc : cB.ksc); }
 
 struct Launch {
     int mode, T, last, ndraft;
@@ -351,6 +378,11 @@ __device__ __forceinline__ float * misc(uint8_t * /*sm*/) {
 __device__ __forceinline__ void cp_async16(void * smem_dst, const void * gsrc) {
     const unsigned d = (unsigned) __cvta_generic_to_shared(smem_dst);
     mk_cuda::copy<16>(d, gsrc);
+}
+
+__device__ __forceinline__ void cp_async8(void * smem_dst, const void * gsrc) {
+    const unsigned d = (unsigned) __cvta_generic_to_shared(smem_dst);
+    mk_cuda::copy<8>(d, gsrc);
 }
 
 // Load T rows (starting at row t0) of a quantised activation buffer into shared memory with
@@ -773,7 +805,7 @@ __device__ __noinline__ void resid32(const Mat W, const QBuf in, float * x, bool
         }
         __syncthreads();
     };
-    if constexpr (QWEN_MK_SM75 && T * 32 * IT > SM_XU) {
+    if constexpr ((QWEN_MK_SM75 || T > 5) && T * 32 * IT > SM_XU) {
         // Retain each row group's partial sums in registers across as many K slices as fit.
         // Unlike the Ampere two-half path, no shared-memory parking buffer is needed.
         constexpr int IS = SM_XU / (T * 32), US = 32 * IS, REM = IT % IS;
@@ -894,6 +926,168 @@ __device__ __noinline__ void ffn_gu(const LayerW & W, uint8_t * /*sm*/) {
 #pragma unroll
                     for (int t = 0; t < T; t++) act[t] = silu(a[k][t] * s_rs[t]) * (a[RG + k][t] * s_rs[t]);
                 }
+        }
+#pragma unroll
+        for (int t = 0; t < T; t += 2) {
+            const float other = __shfl_sync(0xffffffffu, act[t + 1 < T ? t + 1 : t], lane & 15);
+            const float v = lane < 16 ? act[t] : other;
+            q16_store(cB.qa, lane < 16 ? t : t + 1, j, v, lane < 16 || t + 1 < T);
+        }
+    }
+}
+
+// int8 m8n8k16 (Turing on): (d0, d1) += a (8 rows x 16 k) . b (16 k x 8 columns); the m16n8 shapes' halves
+__device__ __forceinline__ void mma_s8_8816(int & d0, int & d1, unsigned a, unsigned b) {
+    asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%0,%1};"
+                 : "+r"(d0), "+r"(d1) : "r"(a), "r"(b));
+}
+// int8 tensor-core mma (m16n8k16, s32 accumulate): d = a (16 rows x 16 k) . b (16 k x 8 columns)
+__device__ __forceinline__ void mma_s8(int (&d)[4], unsigned a0, unsigned a1, unsigned b0) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
+                 : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(0));
+#else // (rows g / g + 8: the same fragments as two m8n8k16)
+    d[0] = d[1] = d[2] = d[3] = 0;
+    mma_s8_8816(d[0], d[1], a0, b0);
+    mma_s8_8816(d[2], d[3], a1, b0);
+#endif
+}
+
+// ffn_gu for T > 5 rows on the tensor cores (the dp4a path is compute-bound there): a warp item is the same 16 rows
+// of both matrices (the mma's M), the rows' tokens are its N (8 per n-tile). Per 16-value chunk (activation unit
+// half): one mma per matrix and n-tile on the raw nibbles, then the chunk's Q4_K sub-block scale x activation scale
+// and the min correction in fp32, as accR. Lane (g = lane / 4, tg = lane % 4) holds rows g and g + 8 of each
+// matrix for tokens 2 tg, 2 tg + 1 of each n-tile; the result is shuffled back to ffn_gu's lane-per-row layout.
+// fill_xs for the mma kernels: row stride U + 1 units, so the 8 b-fragment rows (tokens) of a load hit 8 different
+// bank groups (stride U = 160 units is a multiple of the 32 banks: 8-way conflicts)
+template <int T>
+__device__ void fill_xs_pad(const QBuf & q, const SX & s, float * s_rs) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, U = q.U;
+    for (int i = tid; i < T * U; i += NT) {
+        const int t = i / U, d = i + t; // t * (U + 1) + u
+        cp_async16(s.xa + d, q.xa + (size_t) i * 16);
+        cp_async16(s.xb + d, q.xb + (size_t) i * 16);
+        cp_async8(s.xm + d, q.meta + i);
+    }
+    mk_cuda::commit();
+    if (warp < T) {
+        float p[U_D / 32];
+#pragma unroll
+        for (int k = 0; k < U_D / 32; k++) p[k] = __ldcg(q.ssq + warp * U_D + lane + 32 * k);
+        float acc = 0.f;
+#pragma unroll
+        for (int k = 0; k < U_D / 32; k++) acc += p[k];
+        acc = wsum(acc);
+        if (lane == 0) s_rs[warp] = rsqrtf(acc / (float) D + EPS);
+    }
+    mk_cuda::wait_all();
+    __syncthreads();
+    mark_fill();
+}
+
+template <int T>
+__device__ __noinline__ void ffn_gu_mma(const LayerW & W, uint8_t * /*sm*/) {
+    constexpr int NTL = (T + 7) / 8;
+    uint8_t * const sm = smem;
+    const int lane = threadIdx.x & 31, g = lane >> 2, tg = lane & 3;
+    const SX sx = make_sx(sm, U_D);
+    const float * s_rs = misc(sm);
+    if (gwarp() < FF / 16) {
+        pf_rows(W.fg, 16 * gwarp(), 2, 576);
+        pf_rows(W.fu, 16 * gwarp(), 2, 576);
+    }
+    fill_xs_pad<T>(cB.qn, sx, misc(sm));
+    constexpr int UP = U_D + 1; // padded row stride (units)
+    const int rb = W.fg.rb;
+    const unsigned * xa = reinterpret_cast<const unsigned *>(sx.xa);
+    const unsigned * xb = reinterpret_cast<const unsigned *>(sx.xb);
+    for (int j = gwarp(); j < FF / 16; j += nwarps()) {
+        // [gate row g, gate row g + 8, up row g, up row g + 8]
+        const uint8_t * w[4] = {W.fg.w + (size_t) (16 * j + g) * rb, W.fg.w + (size_t) (16 * j + g + 8) * rb,
+                                W.fu.w + (size_t) (16 * j + g) * rb, W.fu.w + (size_t) (16 * j + g + 8) * rb};
+        float acc[2][NTL][4];
+#pragma unroll
+        for (int m = 0; m < 2; m++)
+#pragma unroll
+            for (int nt = 0; nt < NTL; nt++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) acc[m][nt][c] = 0.f;
+#pragma unroll 1
+        for (int b = 0; b < D / 256; b++) {
+            // the whole block's words of this lane up front (36 loads in flight): headers + qs bytes 16 + 32 p + 16 hh + 4 tg
+            int4 h[4];
+            unsigned qw[4][8];
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                h[k] = ldw4(w[k] + b * 144);
+#pragma unroll
+                for (int i = 0; i < 8; i++) qw[k][i] = __ldcg(reinterpret_cast<const unsigned *>(w[k] + b * 144 + 16 + 16 * i) + tg);
+            }
+#pragma unroll
+            for (int p = 0; p < 4; p++) {
+                float fA[4], gA[4], fB[4], gB[4];
+#pragma unroll
+                for (int k = 0; k < 4; k++) q4k_scales(h[k], p, fA[k], gA[k], fB[k], gB[k]);
+#pragma unroll
+                for (int hh = 0; hh < 2; hh++) {
+                    const int u = 8 * b + 2 * p + hh;
+                    unsigned q[4];
+#pragma unroll
+                    for (int k = 0; k < 4; k++) q[k] = qw[k][2 * p + hh];
+#pragma unroll
+                    for (int nt = 0; nt < NTL; nt++) {
+                        const int n = 8 * nt + g; // this lane's b column
+                        const unsigned bA = n < T ? xa[(n * UP + u) * 4 + tg] : 0u;
+                        const unsigned bB = n < T ? xb[(n * UP + u) * 4 + tg] : 0u;
+                        float dxA[2], dxB[2], sqA[2], sqB[2];
+#pragma unroll
+                        for (int e = 0; e < 2; e++) {
+                            const int t = 8 * nt + 2 * tg + e;
+                            dxA[e] = dxB[e] = sqA[e] = sqB[e] = 0.f;
+                            if (t < T) {
+                                const uint2 mm = sx.xm[t * UP + u];
+                                const float2 dx = __half22float2(*reinterpret_cast<const __half2 *>(&mm.x));
+                                const int qq = (int) mm.y;
+                                dxA[e] = dx.x;
+                                dxB[e] = dx.y;
+                                sqA[e] = dx.x * (float) (short) (qq & 0xffff);
+                                sqB[e] = dx.y * (float) (short) (qq >> 16);
+                            }
+                        }
+#pragma unroll
+                        for (int m = 0; m < 2; m++) {
+                            int dA[4], dB[4];
+                            mma_s8(dA, q[2 * m] & M4, q[2 * m + 1] & M4, bA);
+                            mma_s8(dB, (q[2 * m] >> 4) & M4, (q[2 * m + 1] >> 4) & M4, bB);
+#pragma unroll
+                            for (int c = 0; c < 4; c++) {
+                                const int r = 2 * m + (c >> 1), e = c & 1;
+                                acc[m][nt][c] += fA[r] * (dxA[e] * (float) dA[c]) + fB[r] * (dxB[e] * (float) dB[c]) - gA[r] * sqA[e] -
+                                                 gB[r] * sqB[e];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // silu(g) * u in the mma layout, then to ffn_gu's layout: lane L holds row L % 16 of every token
+        float fr[NTL][4];
+#pragma unroll
+        for (int nt = 0; nt < NTL; nt++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) {
+                const int t = 8 * nt + 2 * tg + (c & 1);
+                const float rs = t < T ? s_rs[t] : 0.f;
+                fr[nt][c] = silu(acc[0][nt][c] * rs) * (acc[1][nt][c] * rs);
+            }
+        float act[T];
+#pragma unroll
+        for (int t = 0; t < T; t++) {
+            const int nt = t / 8, tl = t % 8, src = (lane & 7) * 4 + tl / 2;
+            const float x0 = __shfl_sync(0xffffffffu, fr[nt][tl & 1], src);
+            const float x1 = __shfl_sync(0xffffffffu, fr[nt][2 + (tl & 1)], src);
+            act[t] = (lane & 8) ? x1 : x0;
         }
 #pragma unroll
         for (int t = 0; t < T; t += 2) {
@@ -1191,16 +1385,17 @@ __device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK,
     }
 }
 
-// async copy of q8 K/V rows r < np (positions row0 + r) into the staging layout (rows >= np: zero scales)
-__device__ __forceinline__ void kv_stage(uint8_t * dst, size_t row0, int rows, int np) {
-    const int8_t * Kq = static_cast<const int8_t *>(cB.kc), * Vq = static_cast<const int8_t *>(cB.vc);
+// async copy of q8 K/V rows r < np (positions tb + r of attention slot `slot`, kv head g) into the staging layout
+// (rows >= np: zero scales)
+__device__ __forceinline__ void kv_stage(uint8_t * dst, int slot, int g, int tb, int rows, int np) {
     for (int i = threadIdx.x; i < 2 * rows * 17; i += blockDim.x) {
         const int which = i / (rows * 17), r = (i / 17) % rows, c = i % 17;
         uint8_t * d = dst + (size_t) (which * rows + r) * KVQ_ROW + 16 * c;
         if (r < np) {
-            const size_t row = row0 + r;
-            if (c < 16) cp_async16(d, (which ? Vq : Kq) + row * HD + 16 * c);
-            else cp_async16(d, (which ? cB.vsc : cB.ksc) + row * (HD / 32));
+            bool seg;
+            const size_t row = kv_row(slot, g, tb + r, seg);
+            if (c < 16) cp_async16(d, static_cast<const int8_t *>(kv_base(seg, which)) + row * HD + 16 * c);
+            else cp_async16(d, kv_sbase(seg, which) + row * (HD / 32));
         } else if (c == 16) {
             *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
         }
@@ -1233,16 +1428,14 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     pf_block(cB.rope + (size_t) n * 32, T * 32 * 8);
     int nch, CS;
     attn_dims(n + T, nch, CS);
-    const size_t ctx = cB.ctx;
     const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
-    const uint8_t * Kc = static_cast<const uint8_t *>(cB.kc) + (size_t) slot * NKV * ctx * rowb;
-    const uint8_t * Vc = static_cast<const uint8_t *>(cB.vc) + (size_t) slot * NKV * ctx * rowb;
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
         for (int i = threadIdx.x; i < (c1 - c0) * lines; i += NT) {
-            const size_t off = ((size_t) g * ctx + c0 + i / lines) * rowb + (i % lines) * 128;
-            pf_l2(Kc + off);
-            pf_l2(Vc + off);
+            bool seg;
+            const size_t off = kv_row(slot, g, c0 + i / lines, seg) * rowb + (i % lines) * 128;
+            pf_l2(static_cast<const uint8_t *>(kv_base(seg, 0)) + off);
+            pf_l2(static_cast<const uint8_t *>(kv_base(seg, 1)) + off);
         }
     }
 }
@@ -1308,18 +1501,18 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 
     auto issue_tile = [&](int g, int tb, int np_, int st) {
         if constexpr (Q8) {
-            kv_stage(sKVq + st * 2 * TP * KVQ_ROW, slot0 + (size_t) g * ctx + tb, TP, np_);
+            kv_stage(sKVq + st * 2 * TP * KVQ_ROW, slot, g, tb, TP, np_);
             mk_cuda::commit();
             return;
         }
         __half * sK = sKV + st * 2 * TP * LDH, * sV = sK + TP * LDH;
-        const __half * gK = Kc + ((size_t) g * ctx + tb) * HD;
-        const __half * gV = Vc + ((size_t) g * ctx + tb) * HD;
         for (int i = tid; i < TP * (HD / 8); i += NT) {
             const int p = i >> 5, cc = (i & 31) * 8;
             if (p < np_) {
-                cp_async16(sK + p * LDH + cc, gK + (size_t) p * HD + cc);
-                cp_async16(sV + p * LDH + cc, gV + (size_t) p * HD + cc);
+                bool seg;
+                const size_t row = kv_row(slot, g, tb + p, seg);
+                cp_async16(sK + p * LDH + cc, static_cast<const __half *>(kv_base(seg, 0)) + row * HD + cc);
+                cp_async16(sV + p * LDH + cc, static_cast<const __half *>(kv_base(seg, 1)) + row * HD + cc);
             } else {
                 *reinterpret_cast<int4 *>(sK + p * LDH + cc) = make_int4(0, 0, 0, 0);
                 *reinterpret_cast<int4 *>(sV + p * LDH + cc) = make_int4(0, 0, 0, 0);
@@ -1389,7 +1582,8 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
             rope8(v, lane, pp);
-            const size_t row = slot0 + (size_t) g * ctx + pp;
+            bool seg_; // (new positions: always in the own cache)
+            const size_t row = kv_row(slot, g, pp, seg_);
             if constexpr (Q8) kv_store_q8(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v);
             else kv_store_f16(static_cast<__half *>(cB.kc) + row * HD, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
@@ -2062,6 +2256,8 @@ __device__ void bench_phase(int which, int layer, uint8_t * /*sm*/, unsigned & e
             else resid32<T, 17, T_Q4K>(W.fd, cB.qa, cB.x, true, W.attn_norm, sm);
         } else if (which == 2) {
             if (!W.attn) dn_proj<T>(W, 0, 0, 0, sm);
+        } else if (which == 3) {
+            if constexpr (T > 5) ffn_gu_mma<T>(W, sm);
         }
         gsync(epoch, PH_FFN_GU);
     }
@@ -2073,7 +2269,12 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     if (P.mode == MODE_BENCH) {
         switch (P.T) {
             case 1: bench_phase<1>(P.last, P.ndraft, sm, epoch); break;
+            case 2: bench_phase<2>(P.last, P.ndraft, sm, epoch); break;
+            case 3: bench_phase<3>(P.last, P.ndraft, sm, epoch); break;
             case 4: bench_phase<4>(P.last, P.ndraft, sm, epoch); break;
+            case 5: bench_phase<5>(P.last, P.ndraft, sm, epoch); break;
+            case 8: bench_phase<8>(P.last, P.ndraft, sm, epoch); break;
+            case 12: bench_phase<12>(P.last, P.ndraft, sm, epoch); break;
         }
         return;
     }
@@ -2120,6 +2321,7 @@ __global__ void gather_rows(const uint8_t * src, uint8_t * dst, const __half * d
 }
 
 #include "prefill.cuh"
+#include "bmm.cuh"
 
 // ------------------------------------------------------------------------------------------
 // host side: loading / repacking
@@ -2144,13 +2346,55 @@ void parallel_rows(int64_t n, F f) {
 
 } // namespace
 
+static inline int fbits(float f) { int i; memcpy(&i, &f, 4); return i; }
+// host versions of cand_probs / cand_draw (llama.cpp's order: top_k, top_p, min_p, temperature) for the batched path
+static int host_cand_probs(const float2 * c, float temp, float top_p, int top_k, float min_p, float * p) {
+    int K = top_k > 0 ? std::min(top_k, 32) : 32;
+    while (K > 1 && !(c[K - 1].x > -INFINITY)) K--;
+    const float mx = c[0].x;
+    float s = 0.f;
+    for (int j = 0; j < K; j++) s += (p[j] = expf(c[j].x - mx));
+    if (top_p < 1.0f) {
+        float cum = 0.f;
+        for (int j = 0; j < K; j++) {
+            cum += p[j] / s;
+            if (cum >= top_p) { K = j + 1; break; }
+        }
+    }
+    if (min_p > 0.0f) {
+        int k = 1;
+        while (k < K && p[k] >= min_p * p[0]) k++;
+        K = k;
+    }
+    s = 0.f;
+    for (int j = 0; j < K; j++) s += (p[j] = expf((c[j].x - mx) / temp));
+    for (int j = 0; j < K; j++) p[j] /= s;
+    return K;
+}
+static int host_cand_draw(const float2 * c, const float * p, int K, int excl, double u) {
+    double s = 0;
+    for (int j = 0; j < K; j++) if (fbits(c[j].y) != excl) s += p[j];
+    double x = u * s;
+    int last = fbits(c[0].y);
+    for (int j = 0; j < K; j++) {
+        const int id = fbits(c[j].y);
+        if (id == excl) continue;
+        last = id;
+        x -= p[j];
+        if (x < 0) return id;
+    }
+    return last;
+}
+
 struct MKEngine::Impl {
     gguf::File file;
     ModelW hw{};
     Bufs hb{};
     std::vector<void *> allocs;
+    std::vector<void *> hallocs; // host memory (slot checkpoints)
     void * embd_host = nullptr;
     int ctx;
+    int kv_ctx; // positions of the engine's own K/V cache (the single-stream API); the slots have their own
     int nsm = 0;
     float smp_temp = 0.f, smp_top_p = 1.f, smp_min_p = 0.f; // sampling (temp 0: greedy)
     int smp_top_k = TOPK_MAX;
@@ -2167,22 +2411,22 @@ struct MKEngine::Impl {
     int ck_pos = -1;
     void ck_save() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
-        if (!ck_dstate) {
-            ck_dstate = dalloc<float>(ns, false);
-            ck_conv = dalloc<float>(nc, false);
-            ck_hhist = dalloc<float>(nh, false);
+        if (!ck_dstate) { // (in host memory when the engine's own K/V is reduced: a parallel server's slots need the room)
+            ck_dstate = kv_ctx < ctx ? halloc<float>(ns) : dalloc<float>(ns, false);
+            ck_conv = kv_ctx < ctx ? halloc<float>(nc) : dalloc<float>(nc, false);
+            ck_hhist = kv_ctx < ctx ? halloc<float>(nh) : dalloc<float>(nh, false);
         }
-        CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDeviceToDevice));
+        CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(ck_hhist, hb.h_hist, nh * 4, cudaMemcpyDefault));
         CK(cudaMemcpy(&ck_ctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
         ck_pos = ck_ctl.dn_c;
     }
     void ck_restore() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
-        CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDeviceToDevice));
+        CK(cudaMemcpy(hb.dstate, ck_dstate, ns * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(hb.conv, ck_conv, nc * 4, cudaMemcpyDefault));
+        CK(cudaMemcpy(hb.h_hist, ck_hhist, nh * 4, cudaMemcpyDefault));
         hctl = ck_ctl;
         hctl.mtp_valid = std::min(hctl.mtp_valid, ck_pos);
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -2235,6 +2479,19 @@ struct MKEngine::Impl {
                         arr_last = std::vector<double>(PH_COUNT, 0.0);
     std::vector<long> arr_n = std::vector<long>(PH_COUNT, 0);
 
+    void dfree(std::initializer_list<void *> ps) {
+        for (void * p : ps) {
+            if (!p) continue;
+            allocs.erase(std::find(allocs.begin(), allocs.end(), p));
+            CK(cudaFree(p));
+        }
+    }
+    template <class T> T * halloc(size_t n) { // (pageable: pinned memory is scarce under WSL and the memory caps)
+        void * p = std::malloc(n * sizeof(T));
+        if (!p) throw std::runtime_error("host allocation failed");
+        hallocs.push_back(p);
+        return (T *) p;
+    }
     template <class T> T * dalloc(size_t n, bool zero = true) {
         void * p;
         CK(cudaMalloc(&p, n * sizeof(T) + 16));
@@ -2399,17 +2656,17 @@ struct MKEngine::Impl {
     QBuf qbuf(int U) {
         QBuf q;
         q.U = U;
-        q.xa = dalloc<int8_t>((size_t) MAXT * U * 16);
-        q.xb = dalloc<int8_t>((size_t) MAXT * U * 16);
-        q.meta = dalloc<uint2>((size_t) MAXT * U);
-        q.ssq = dalloc<float>((size_t) MAXT * U);
+        q.xa = dalloc<int8_t>((size_t) MAXT_BUF * U * 16);
+        q.xb = dalloc<int8_t>((size_t) MAXT_BUF * U * 16);
+        q.meta = dalloc<uint2>((size_t) MAXT_BUF * U);
+        q.ssq = dalloc<float>((size_t) MAXT_BUF * U);
         return q;
     }
 
     int n_draft_max;
     int kv_mode; // KV cache format: 0 fp16, 1 q8_0, -1 auto (q8_0 when fp16 does not fit)
-    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_)
-        : file(path), ctx(ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), kv_mode(kv_mode_) {
+    Impl(const std::string & path, int ctx_, int ndraft_, const std::string & draft_vocab, int kv_mode_, int kv_ctx_)
+        : file(path), ctx(ctx_), kv_ctx(kv_ctx_ > 0 ? std::min(kv_ctx_, ctx_) : ctx_), ndraft(ndraft_), nd_avail(ndraft_), n_draft_max(ndraft_), kv_mode(kv_mode_) {
         if (file.strs["general.architecture"] != "qwen35") throw std::runtime_error("expected qwen35 architecture");
         if (file.ints["qwen35.block_count"] != NLA || file.ints["qwen35.embedding_length"] != D)
             throw std::runtime_error("unexpected model dimensions (this kernel is specialised for the 27B)");
@@ -2565,33 +2822,37 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] %d tensors re-encoded in %.0f s: a plain Q4_K_M quant mix, not the one the kernels are built for "
                             "(README: the GGUF)\n", n_conv, conv_s);
 
-        hb.x = dalloc<float>(MAXT * D);
-        hb.xm = dalloc<float>(MAXT * D);
+        hb.x = dalloc<float>(MAXT_BUF * D);
+        hb.xm = dalloc<float>(MAXT_BUF * D);
         hb.qn = qbuf(U_D);
         hb.qo = qbuf(U_VD);
         hb.qa = qbuf(U_FF);
         hb.qe = qbuf(U_EH);
-        hb.z = dalloc<float>(MAXT * VD);
-        hb.ab = dalloc<float>(AB_SPLIT * MAXT * 2 * NVH);
-        hb.qbuf = dalloc<float>(MAXT * QG);
-        hb.kbuf = dalloc<float>(MAXT * KVD);
-        hb.vbuf = dalloc<float>(MAXT * KVD);
+        hb.z = dalloc<float>(MAXT_BUF * VD);
+        hb.ab = dalloc<float>(AB_SPLIT * MAXT_BUF * 2 * NVH);
+        hb.qbuf = dalloc<float>(MAXT_BUF * QG);
+        hb.kbuf = dalloc<float>(MAXT_BUF * KVD);
+        hb.vbuf = dalloc<float>(MAXT_BUF * KVD);
         hb.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV);
         hb.kvgb = dalloc<float>((size_t) 48 * KV_RING * KVGB);
         hb.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
         {
-            const size_t rows = (size_t) N_ATT_SLOTS * NKV * ctx;
+            const size_t rows = (size_t) N_ATT_SLOTS * NKV * kv_ctx, slot_rows = (size_t) N_ATT_SLOTS * NKV * ctx;
             size_t free_b = 0, total_b = 0;
             CK(cudaMemGetInfo(&free_b, &total_b));
-            // fp16 needs 2 x rows x HD x 2 bytes; leave ~1.5 GB for the prefill buffers, checkpoint and runtime
-            const bool q8 = kv_mode == 1 || (kv_mode < 0 && rows * HD * 4 + (size_t) 1536 * 1024 * 1024 > free_b);
+            // fp16 needs 2 x rows x HD x 2 bytes per copy; leave ~1.5 GB for the prefill buffers and runtime. Auto
+            // (kv_mode -n): the engine's copy (kv_ctx positions) and n - 1 parallel slots of ctx positions (each with
+            // its delta-net state), all in this format
+            const size_t copies = kv_mode < 0 ? (size_t) -kv_mode : 1, slot_state = (size_t) 48 * NVH * 128 * 128 * 4;
+            const bool q8 = kv_mode == 1 ||
+                            (kv_mode < 0 && rows * HD * 4 + (copies - 1) * (slot_rows * HD * 4 + slot_state) + (size_t) 1536 * 1024 * 1024 > free_b);
             hb.kvq8 = q8;
             hb.kc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
             hb.vc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
             hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
             hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
             fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? "q8_0" : "fp16",
-                    rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, ctx);
+                    rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, kv_ctx);
         }
         hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
         hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
@@ -2615,7 +2876,7 @@ struct MKEngine::Impl {
         hb.bar = dalloc<unsigned>(4);
         hb.cnt = dalloc<unsigned>(4);
         hb.ctl = dalloc<Ctl>(1);
-        hb.ctx = ctx;
+        hb.ctx = kv_ctx;
         profiling = getenv("MK_PROFILE") != nullptr;
         {
             const char * ds = getenv("MK_DRAFT_SAMPLING");
@@ -2635,6 +2896,7 @@ struct MKEngine::Impl {
     ~Impl() {
         print_profile();
         for (void * p : allocs) cudaFree(p);
+        for (void * p : hallocs) std::free(p);
         if (embd_host) cudaFreeHost(embd_host);
     }
 
@@ -2723,7 +2985,7 @@ struct MKEngine::Impl {
     }
 
     void bench() {
-        const char * names[3] = {"ffn_gu", "ffn_down", "dn_proj"};
+        const char * names[7] = {"ffn_gu", "ffn_down", "dn_proj", "gu_mma", "gu_tc", "down_tc", "dn_tc"};
         if (profiling) {
             // i-cache test: 4 back-to-back iterations of one phase inside one launch
             for (int which = 0; which < 3; which++) {
@@ -2743,15 +3005,121 @@ struct MKEngine::Impl {
             }
             return;
         }
+        // gu_mma against ffn_gu (dp4a) on random activations: the quantised outputs (cB.qa) of the same layers
+        {
+            std::mt19937 rng(1);
+            const int U = U_D;
+            std::vector<int8_t> xa((size_t) MAXT_BUF * U * 16), xb(xa.size());
+            std::vector<uint2> meta((size_t) MAXT_BUF * U);
+            std::vector<float> ssq((size_t) MAXT_BUF * U, 1.0f);
+            for (auto & v : xa) v = (int8_t) ((int) (rng() % 255) - 127);
+            for (auto & v : xb) v = (int8_t) ((int) (rng() % 255) - 127);
+            for (size_t i = 0; i < meta.size(); i++) {
+                int sa = 0, sb = 0;
+                for (int k = 0; k < 16; k++) sa += xa[i * 16 + k], sb += xb[i * 16 + k];
+                const __half2 dx = __floats2half2_rn(0.004f + 0.002f * (rng() % 5), 0.004f + 0.002f * (rng() % 5));
+                meta[i].x = *reinterpret_cast<const unsigned *>(&dx);
+                meta[i].y = (unsigned) (unsigned short) (short) sa | ((unsigned) (unsigned short) (short) sb << 16);
+            }
+            CK(cudaMemcpy(hb.qn.xa, xa.data(), xa.size(), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(hb.qn.xb, xb.data(), xb.size(), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(hb.qn.meta, meta.data(), meta.size() * sizeof(uint2), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(hb.qn.ssq, ssq.data(), ssq.size() * sizeof(float), cudaMemcpyHostToDevice));
+            for (int T : {8, 12}) {
+                std::vector<int8_t> out[2];
+                std::vector<uint2> om[2];
+                for (int k = 0; k < 2; k++) {
+                    Launch L{MODE_BENCH, T, k ? 3 : 0, 1, 0};
+                    void * args[] = {&L};
+                    CK(cudaMemsetAsync(hb.bar, 0, 16));
+                    CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
+                    CK(cudaDeviceSynchronize());
+                    out[k].resize((size_t) 2 * T * U_FF * 16);
+                    om[k].resize((size_t) T * U_FF);
+                    CK(cudaMemcpy(out[k].data(), hb.qa.xa, (size_t) T * U_FF * 16, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(out[k].data() + (size_t) T * U_FF * 16, hb.qa.xb, (size_t) T * U_FF * 16, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(om[k].data(), hb.qa.meta, om[k].size() * sizeof(uint2), cudaMemcpyDeviceToHost));
+                }
+                size_t diff = 0, nz = 0;
+                int maxd = 0;
+                for (size_t i = 0; i < out[0].size(); i++) {
+                    const int d = std::abs((int) out[0][i] - (int) out[1][i]);
+                    diff += d != 0;
+                    nz += out[0][i] != 0;
+                    maxd = std::max(maxd, d);
+                }
+                double maxrel = 0;
+                for (size_t i = 0; i < om[0].size(); i++)
+                    for (int part = 0; part < 2; part++) {
+                        const float a = __half2float(reinterpret_cast<const __half *>(&om[0][i].x)[part]);
+                        const float b = __half2float(reinterpret_cast<const __half *>(&om[1][i].x)[part]);
+                        if (a > 0) maxrel = std::max(maxrel, (double) std::fabs(a - b) / a);
+                    }
+                fprintf(stderr, "[mk-bench] gu_mma vs ffn_gu T=%d: %zu / %zu int8 outputs differ (max %d), %zu nonzero, chunk scales max rel diff %.2e\n",
+                        T, diff, out[0].size(), maxd, nz, maxrel);
+            }
+        }
+        {
+            unsigned * bx; float2 * bd; float * bo;
+            CK(cudaMalloc(&bx, (size_t) bmm::TM * FF));
+            CK(cudaMalloc(&bd, (size_t) FF / 32 * bmm::TM * sizeof(float2)));
+            CK(cudaMalloc(&bo, (size_t) bmm::TM * 2 * FF * sizeof(float)));
+            std::vector<unsigned> hx((size_t) bmm::TM * FF / 4);
+            for (size_t i = 0; i < hx.size(); i++) hx[i] = (unsigned) (i * 2654435761u);
+            std::vector<float2> hd((size_t) FF / 32 * bmm::TM, make_float2(0.004f, 0.1f));
+            CK(cudaMemcpy(bx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(bd, hd.data(), hd.size() * sizeof(float2), cudaMemcpyHostToDevice));
+            CK(cudaMemcpyToSymbol(bmm::g_bx, &bx, sizeof(bx)));
+            CK(cudaMemcpyToSymbol(bmm::g_bd, &bd, sizeof(bd)));
+            CK(cudaMemcpyToSymbol(bmm::g_bout, &bo, sizeof(bo)));
+        }
+        // tensor-core batched phases as separate launches, 4 layers each (as the phases above)
+        for (int T : {8, 12}) {
+            ModelW hw;
+            CK(cudaMemcpyFromSymbol(&hw, cW, sizeof(ModelW)));
+            const int sm_bytes = SM_TOTAL;
+            auto set = [&](auto k) { CK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, sm_bytes)); };
+            set(T == 8 ? bmm::k_gu<8> : bmm::k_gu<12>);
+            set(T == 8 ? bmm::k_down<8, T_Q4K> : bmm::k_down<12, T_Q4K>);
+            set(T == 8 ? bmm::k_down<8, T_Q6K> : bmm::k_down<12, T_Q6K>);
+            set(T == 8 ? bmm::k_dn<8> : bmm::k_dn<12>);
+            for (int ph = 0; ph < 3; ph++) {
+                float best = 1e30f;
+                cudaEvent_t a, b;
+                cudaEventCreate(&a);
+                cudaEventCreate(&b);
+                for (int rep = 0; rep < 100; rep++) {
+                    const int layer = ph == 2 ? 0 : rep % 16;
+                    cudaEventRecord(a);
+                    for (int it = 0; it < 4; it++) {
+                        const LayerW & W = hw.L[layer + 4 * it];
+                        if (ph == 0) (T == 8 ? bmm::k_gu<8> : bmm::k_gu<12>)<<<nsm, NT, sm_bytes>>>(W.fg, W.fu);
+                        else if (ph == 1) {
+                            if (W.fd.type == T_Q6K) (T == 8 ? bmm::k_down<8, T_Q6K> : bmm::k_down<12, T_Q6K>)<<<nsm, NT, sm_bytes>>>(W.fd);
+                            else (T == 8 ? bmm::k_down<8, T_Q4K> : bmm::k_down<12, T_Q4K>)<<<nsm, NT, sm_bytes>>>(W.fd);
+                        } else (T == 8 ? bmm::k_dn<8> : bmm::k_dn<12>)<<<nsm, NT, sm_bytes>>>(W.qkv, W.gate);
+                    }
+                    cudaEventRecord(b);
+                    CK(cudaEventSynchronize(b));
+                    CK(cudaGetLastError());
+                    float ms;
+                    cudaEventElapsedTime(&ms, a, b);
+                    best = std::min(best, ms);
+                }
+                fprintf(stderr, "[mk-bench] %-8s T=%d: %.1f us / 4 layers (separate launches)\n", ph == 0 ? "gu_tc" : ph == 1 ? "down_tc" : "dn_tc", T, best * 1000);
+            }
+        }
         for (int which = 0; which < 3; which++)
-            for (int T : {1, 4}) {
+            for (int T : {1, 2, 3, 4, 5, 8, 12}) {
+                if (which == 3) continue;
+                if (which >= 4 && T <= 5) continue;
                 float best = 1e30f;
                 cudaEvent_t a, b;
                 cudaEventCreate(&a);
                 cudaEventCreate(&b);
                 for (int rep = 0; rep < 400; rep++) {
                     cudaEventRecord(a);
-                    Launch L{MODE_BENCH, T, which, which == 2 ? 0 : (rep % 16), 0};
+                    Launch L{MODE_BENCH, T, which, (which == 2 || which == 6) ? 0 : (rep % 16), 0};
                     void * args[] = {&L};
                     CK(cudaMemsetAsync(hb.bar, 0, 16));
                     CK(cudaLaunchCooperativeKernel((void *) mk_cycle, dim3(nsm), dim3(NT), args, SM_TOTAL, 0));
@@ -2768,6 +3136,26 @@ struct MKEngine::Impl {
     // ---------------- batched prefill (prefill.cuh) ----------------
     PBufs hp{};
     bool pf_ready = false;
+    float * ksplit = nullptr; // partial sums of K-split GEMMs (gemm)
+    // pf_attn: few queries over a long context split the positions (nz x T <= ATT_SPLIT_ROWS rows of partials)
+    static constexpr int ATT_SPLIT_ROWS = 1024;
+    float * att_spo = nullptr;
+    float2 * att_sml = nullptr;
+    void pf_attn(int T, int n0, int slot) {
+        const int base = (T + AT_Q - 1) / AT_Q * NKV, keys = n0 + T;
+        int nz = std::min({16, (4 * nsm + base - 1) / base, keys / 1024, ATT_SPLIT_ROWS / T});
+        if (nz < 2) {
+            if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n0, slot);
+            else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n0, slot);
+            return;
+        }
+        const int chunk = ((keys + nz - 1) / nz + AT_K - 1) / AT_K * AT_K;
+        nz = (keys + chunk - 1) / chunk;
+        const dim3 grid((T + AT_Q - 1) / AT_Q, NKV, nz);
+        if (hb.kvq8) pk_attn<true><<<grid, 192, AT_SMEM>>>(T, n0, slot, chunk, att_spo, att_sml);
+        else pk_attn<false><<<grid, 192, AT_SMEM>>>(T, n0, slot, chunk, att_spo, att_sml);
+        pk_attn_comb<<<dim3(T, NH), HD>>>(T, nz, att_spo, att_sml);
+    }
 
     void pf_init() {
         if (pf_ready) return;
@@ -2790,6 +3178,9 @@ struct MKEngine::Impl {
         hp.qh = dalloc<__half>((size_t) cap * NH * HD);
         hp.tok = dalloc<int>(cap);
         hp.amax = dalloc<int>(cap);
+        ksplit = dalloc<float>((size_t) 2 * (nsm / 2) * pf::BM * pf::BN);
+        att_spo = dalloc<float>((size_t) ATT_SPLIT_ROWS * NH * HD);
+        att_sml = dalloc<float2>((size_t) ATT_SPLIT_ROWS * NH);
         CK(cudaMemcpyToSymbol(cP, &hp, sizeof(PBufs)));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
@@ -2805,8 +3196,15 @@ struct MKEngine::Impl {
     void gemm(const Mat & m, int ntok, float * y, int ldy, int mode, int t0 = 0, const __half * xin = nullptr) {
         const pf::WMat W{m.w, m.d, m.type, m.K, m.N, m.rb, m.nd};
         const __half * X = (xin ? xin : hp.xh) + (size_t) t0 * m.K;
-        const pf::Out O{y, ldy, mode, nullptr};
-        const dim3 grid(m.N / pf::BM, (ntok + pf::BN - 1) / pf::BN);
+        pf::Out O{y, ldy, mode, nullptr};
+        dim3 grid(m.N / pf::BM, (ntok + pf::BN - 1) / pf::BN);
+        // few tokens on a narrow matrix (5120 rows: 40 CTAs a 128-token tile) leave SMs idle: K split in two, the halves
+        // summed after (fp32 partials, a fixed order)
+        const bool split = (int) (grid.x * grid.y) <= nsm / 2 && m.K % 512 == 0 && m.type != T_Q8_0;
+        if (split) {
+            grid.z = 2;
+            O = pf::Out{ksplit, m.N, pf::OUT_STORE, nullptr};
+        }
         switch (m.type) {
             case T_Q4K: pf::mmh<pf::TQ4K><<<grid, 256, pf::hm_smem<pf::TQ4K>()>>>(W, X, ntok, O); break;
             case T_Q5K: pf::mmh<pf::TQ5K><<<grid, 256, pf::hm_smem<pf::TQ5K>()>>>(W, X, ntok, O); break;
@@ -2814,6 +3212,7 @@ struct MKEngine::Impl {
             case T_Q8_0: pf::mmh<pf::TQ80><<<grid, 256, pf::hm_smem<pf::TQ80>()>>>(W, X, ntok, O); break;
             default: throw std::runtime_error("gemm: unsupported weight type");
         }
+        if (split) pf::ksum2<<<(ntok * m.N + 255) / 256, 256>>>(ksplit, ntok, m.N, y, ldy, mode);
     }
 
     // xh2[t] = silu(Wg x_t) * (Wu x_t) for the first ntok rows of xh (both Q4_K)
@@ -2921,8 +3320,7 @@ struct MKEngine::Impl {
                     pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
                     pf_time("attn_prep", [&] { pk_attn_prep<<<T, 256>>>(n, L / 4, W.qn, W.kn, 1); });
                     pf_time("attn", [&] {
-                        if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, L / 4);
-                        else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, L / 4);
+                        pf_attn(T, n, L / 4);
                     });
                     pf_time("attn_out", [&] { pk_attn_out<<<T, 256>>>(); });
                     pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
@@ -2979,6 +3377,1552 @@ struct MKEngine::Impl {
         pf_report();
     }
 
+    // ---------------- multi-sequence greedy decode (test path) ----------------
+    // Each sequence has its own delta-net state, conv ring and K/V cache; a step runs the stateless kernels and the
+    // weight GEMMs once for all S rows, the stateful ones (attention prep / attention, delta-net prep / conv ring /
+    // scan) per sequence with that sequence's state (cB) and its row of the work buffers (cP) swapped in.
+    struct MSeq {
+        float *conv, *dstate;
+        int * dptab;            // its own cache's pages (device; capacity: the pool)
+        std::vector<int> pages; // ... (host)
+        int pos;
+    };
+    std::vector<MSeq> ms;
+    // the slots' own caches: one pool of KV_PG-position pages that any slot draws on as its context grows
+    void *pk = nullptr, *pv = nullptr;
+    __half *pks = nullptr, *pvs = nullptr;
+    int npages = 0, ms_ctx = 0; // ms_ctx: positions of the pool (the most one slot can hold)
+    std::vector<int> pfree;
+    std::vector<long> ms_used; // per slot: when it last stepped or prefilled (idle caches go first)
+    long ms_clock = 0;
+    std::vector<int> stepping; // the slots of the last step
+    size_t page_bytes() const { return (size_t) KV_PG * kv_pos_bytes(); }
+    size_t slot_state_bytes() const { return (size_t) 48 * (NVH * 128 * 128 + CONV_RING * QKV) * 4; }
+    void ms_alloc(int S, int pages) {
+        if ((int) ms.size() >= S && pages <= npages) return;
+        // (test path: more than the slots hold reallocates them; the server opens its slots once)
+        for (auto & q : ms) dfree({q.conv, q.dstate, q.dptab});
+        dfree({pk, pv, pks, pvs});
+        ms.clear();
+        for (auto & m : msp) { m.seq.clear(); m.ck_pos = -1; m.rep_n = 0; m.seg = m.ck_seg = m.seg_build = nullptr; m.share_at = -1; }
+        while (!segs.empty()) seg_free(segs.back()); // (their pages are in the pool)
+        pages = std::max(pages, npages);
+        {   // it must fit: past the device memory the driver may page it to host memory (WSL), which runs but slowly
+            size_t free_b = 0, total_b = 0;
+            CK(cudaMemGetInfo(&free_b, &total_b));
+            const size_t need = (size_t) S * slot_state_bytes() + (size_t) pages * page_bytes();
+            if (need + (size_t) 512 * 1024 * 1024 > free_b)
+                throw std::runtime_error("slots: " + std::to_string(S) + " sequences and " + std::to_string(pages * KV_PG) + " positions need " +
+                                         std::to_string(need / 1000000) + " MB, " + std::to_string(free_b / 1000000) +
+                                         " MB free (q8 KV, a smaller context or fewer slots)");
+        }
+        npages = pages;
+        ms_ctx = npages * KV_PG;
+        const size_t rows = (size_t) npages * N_ATT_SLOTS * NKV * KV_PG;
+        pk = hb.kvq8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+        pv = hb.kvq8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+        pks = hb.kvq8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+        pvs = hb.kvq8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+        pfree.clear();
+        for (int i = npages - 1; i >= 0; i--) pfree.push_back(i);
+        while ((int) ms.size() < S) {
+            MSeq q{};
+            q.conv = dalloc<float>((size_t) 48 * CONV_RING * QKV);
+            q.dstate = dalloc<float>((size_t) 48 * NVH * 128 * 128);
+            q.dptab = dalloc<int>(npages);
+            ms.push_back(q);
+        }
+        ms_used.assign(S, 0);
+        stepping.clear();
+    }
+    // slot q's own cache covers own positions < n: pages from the pool, then from idle slots (their caches dropped,
+    // least recently used first); false: no room
+    bool own_reserve(int q, int n) {
+        auto & pg = ms[q].pages;
+        const int need = (n + KV_PG - 1) / KV_PG, have = (int) pg.size();
+        ms_used[q] = ++ms_clock;
+        if (need <= have) return true;
+        if (!pool_take(need - have, q)) return false;
+        while ((int) pg.size() < need) { pg.push_back(pfree.back()); pfree.pop_back(); }
+        CK(cudaMemcpy(ms[q].dptab + have, pg.data() + have, (need - have) * sizeof(int), cudaMemcpyHostToDevice));
+        return true;
+    }
+    // slot q keeps own positions < n
+    void own_trim(int q, int n) {
+        auto & pg = ms[q].pages;
+        while ((int) pg.size() > (n + KV_PG - 1) / KV_PG) { pfree.push_back(pg.back()); pg.pop_back(); }
+    }
+    bool slot_busy(int q) const {
+        return q == solo || msp[q].pf_at >= 0 || std::find(stepping.begin(), stepping.end(), q) != stepping.end();
+    }
+    // drop the cache of the least recently used idle slot other than `keep` (its next prompt starts from scratch)
+    bool own_evict(int keep) {
+        int v = -1;
+        for (int q = 0; q < (int) ms.size(); q++)
+            if (q != keep && !ms[q].pages.empty() && !slot_busy(q) && (v < 0 || ms_used[q] < ms_used[v])) v = q;
+        if (v < 0) return false;
+        own_trim(v, 0);
+        auto & m = msp[v];
+        m.seq.clear();
+        m.ck_pos = -1;
+        m.rep_n = 0;
+        if (m.seg) { m.seg->refs--; m.seg = nullptr; }
+        return true;
+    }
+    Bufs ms_bufs(int s) const {
+        Bufs b = hb;
+        b.conv = ms[s].conv;
+        b.dstate = ms[s].dstate;
+        b.kc = pk;
+        b.vc = pv;
+        b.ksc = pks;
+        b.vsc = pvs;
+        b.ptab = ms[s].dptab;
+        b.ctx = ms_ctx;
+        if (s < (int) msp.size() && msp[s].seg) {
+            const Segment * g = msp[s].seg;
+            b.kseg = pk; b.vseg = pv; b.ksseg = pks; b.vsseg = pvs; b.segptab = g->dptab;
+            b.segn = b.segctx = (int) g->toks.size();
+        } else if (s < (int) msp.size() && msp[s].seg_build) { // (the prefix prefills straight into the new segment)
+            const Segment * g = msp[s].seg_build;
+            b.ptab = g->dptab;
+            b.ctx = (int) g->toks.size();
+        }
+        return b;
+    }
+    // the work buffers seen from row s (attention: q|gate rows of QG, k|v of 2 KVD; delta net: qkv rows of QKV)
+    PBufs ms_rows(int s, bool attn) const {
+        PBufs p = hp;
+        p.y0 = hp.y0 + (size_t) s * (attn ? QG : QKV);
+        p.y1 = hp.y1 + (size_t) s * (attn ? 2 * KVD : VD);
+        p.y2 = hp.y2 + (size_t) s * VD;
+        p.qh = hp.qh + (size_t) s * NH * HD;
+        p.dq = hp.dq + (size_t) s * QKV;
+        p.gb = hp.gb + (size_t) s * 96;
+        p.ab = hp.ab + (size_t) s * 96;
+        return p;
+    }
+    void ms_set(const Bufs & b, const PBufs & p) {
+        CK(cudaMemcpyToSymbolAsync(cB, &b, sizeof(Bufs)));
+        CK(cudaMemcpyToSymbolAsync(cP, &p, sizeof(PBufs)));
+    }
+    // sequence s: state from scratch, prefill all but the last token (the step feeds that one)
+    void ms_prefill(int s, const std::vector<int> & toks) {
+        pf_init();
+        CK(cudaMemset(ms[s].dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
+        CK(cudaMemset(ms[s].conv, 0, sizeof(float) * (size_t) 48 * CONV_RING * QKV));
+        const Bufs b = ms_bufs(s);
+        CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
+        if (toks.size() > 1) pf_run(std::vector<int>(toks.begin(), toks.end() - 1), 0, nullptr);
+        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        ms[s].pos = (int) toks.size() - 1;
+        if ((int) msp.size() > s) CK(cudaMemcpy(msp[s].hlast, hp.h, D * sizeof(float), cudaMemcpyDeviceToDevice)); // (pf_run leaves h of its last row in h[0])
+    }
+    // tensor-core path buffers: per-32 int8 activations for K = D and K = FF
+    unsigned *a5x = nullptr, *aFx = nullptr, *a6x = nullptr;
+    float2 *a5d = nullptr, *aFd = nullptr, *a6d = nullptr;
+    float * abf = nullptr;
+    float * dpart = nullptr; // [NCH][TM][D] ffn_down partial sums per k-range
+    void ms_tc_init() {
+        if (a5x) return;
+        a5x = dalloc<unsigned>((size_t) bmm::TM * D / 4);
+        a5d = dalloc<float2>((size_t) D / 32 * bmm::TM);
+        aFx = dalloc<unsigned>((size_t) bmm::TM * FF / 4);
+        aFd = dalloc<float2>((size_t) FF / 32 * bmm::TM);
+        a6x = dalloc<unsigned>((size_t) bmm::TM * VD / 4);
+        a6d = dalloc<float2>((size_t) VD / 32 * bmm::TM);
+        abf = dalloc<float>((size_t) bmm::TM * 96);
+        dpart = dalloc<float>((size_t) bmm::NCH * bmm::TM * D);
+        auto set = [&](auto k) { CK(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::SMEM)); };
+        set(bmm::k_qkx<1, T_Q4K>); set(bmm::k_qkx<1, T_Q5K>); set(bmm::k_qkx<2, T_Q4K>); set(bmm::k_qkx<2, T_Q5K>); set(bmm::k_qkx_kh<T_Q4K>); set(bmm::k_qkx_kh<T_Q5K>);
+        set(bmm::k_q4mx<1>); set(bmm::k_q4mx<2>); set(bmm::k_q4mx<3>); set(bmm::k_q4mx<3, true>);
+        set(bmm::k_down2<1, T_Q4K>); set(bmm::k_down2<1, T_Q6K>); set(bmm::k_down2<2, T_Q4K>); set(bmm::k_down2<2, T_Q6K>);
+        set(bmm::k_q4x<1>); set(bmm::k_q4x<2>); set(bmm::k_q4x<3>); set(bmm::k_q6x<1>); set(bmm::k_q6x<2>); set(bmm::k_q6x<3>);
+        set(bmm::k_downx<1, T_Q4K>); set(bmm::k_downx<2, T_Q4K>); set(bmm::k_downx<1, T_Q6K>); set(bmm::k_downx<2, T_Q6K>);
+    }
+    // W x for the S rows quantised in a5x / a5d (K = D): Q4_K or Q6_K
+    // blocks for a GEMV of `items` 16-row items (4 groups per block): the fewest that keep the most items per group,
+    // so every group does the same count (1024 items: 64 blocks x 4 groups x 4, not 82 x 4 with a quarter idle in
+    // the last round); a few SMs idle cost less than the ragged last round while the rest saturate memory
+    int gsz(int items) const {
+        if (getenv("MS_FULLGRID")) return nsm;
+        const int per = (items + 4 * nsm - 1) / (4 * nsm);
+        return std::min(nsm, (items + 4 * per - 1) / (4 * per));
+    }
+    void tc_mv(const Mat & m, int S, float * out, int ld, int add, int grid = 0, cudaStream_t st = 0) {
+        if (m.K != D) throw std::runtime_error("tc_mv: K must be D");
+        const int G = grid ? grid : gsz(m.N / 16);
+        if (m.type == T_Q6K) {
+            if (S <= 8) bmm::k_q6x<1><<<G, NT, bmm::SMEM, st>>>(m, a5x, a5d, out, ld, add, S);
+            else if (S <= bmm::TS) bmm::k_q6x<2><<<G, NT, bmm::SMEM, st>>>(m, a5x, a5d, out, ld, add, S);
+            else bmm::k_q6x<3><<<G, NT, bmm::SMEM, st>>>(m, a5x, a5d, out, ld, add, S);
+        } else if (m.type == T_Q4K) {
+            if (S <= 8) bmm::k_q4x<1><<<G, NT, bmm::SMEM, st>>>(m, a5x, a5d, out, ld, add, S);
+            else if (S <= bmm::TS) bmm::k_q4x<2><<<G, NT, bmm::SMEM, st>>>(m, a5x, a5d, out, ld, add, S);
+            else bmm::k_q4x<3><<<G, NT, bmm::SMEM, st>>>(m, a5x, a5d, out, ld, add, S);
+        } else throw std::runtime_error("tc_mv: Q4_K / Q6_K only");
+    }
+    // W x for the S rows quantised in a6x / a6d (K = VD): Q4_K (attn_o) or Q5_K (ssm_out)
+    void tc_mv6(const Mat & m, int S, float * out, int ld, int add) {
+        if (m.K != VD || S > bmm::TM) throw std::runtime_error("tc_mv6: K must be VD, at most TM rows");
+        if (m.type != T_Q5K && m.type != T_Q4K) throw std::runtime_error("tc_mv6: Q4_K / Q5_K only");
+        const int G = gsz(m.N / 16);
+        if (S <= bmm::TS) {
+            if (m.type == T_Q5K) { if (S <= 8) bmm::k_qkx<1, T_Q5K><<<G, NT, bmm::SMEM>>>(m, a6x, a6d, out, ld, add, S); else bmm::k_qkx<2, T_Q5K><<<G, NT, bmm::SMEM>>>(m, a6x, a6d, out, ld, add, S); }
+            else { if (S <= 8) bmm::k_qkx<1, T_Q4K><<<G, NT, bmm::SMEM>>>(m, a6x, a6d, out, ld, add, S); else bmm::k_qkx<2, T_Q4K><<<G, NT, bmm::SMEM>>>(m, a6x, a6d, out, ld, add, S); }
+            return;
+        }
+        // more rows than K = VD stages (6 KB a row): both K halves in one launch, all rows staged, then the ordered sum
+        // (rows TS .. from global memory: 75 vs 52 us at 16 rows; at 9-12 rows the halves gain nothing)
+        if (ld != D || !add || m.N != D) throw std::runtime_error("tc_mv6: past TS rows only x += W a");
+        const dim3 g2((G + 1) / 2, 2);
+        if (m.type == T_Q5K) bmm::k_qkx_kh<T_Q5K><<<g2, NT, bmm::SMEM>>>(m, a6x, a6d, dpart, S);
+        else bmm::k_qkx_kh<T_Q4K><<<g2, NT, bmm::SMEM>>>(m, a6x, a6d, dpart, S);
+        bmm::k_kh_reduce<<<(S * D + 255) / 256, 256>>>(dpart, out, S);
+    }
+    // x += W_down a for the R rows in aFx / aFd: k-range split (no chunk barriers), then the ordered reduce
+    // (folding the reduce into k_down2's last k-range block saved nothing: its serial tail cost what the launch did)
+    void tc_down(const Mat & m, int R, float * x) {
+        const dim3 grid(D / 16 / 16, bmm::NCH);
+        const bool q6 = m.type == T_Q6K;
+        if (R <= 8) { if (q6) bmm::k_down2<1, T_Q6K><<<grid, NT, bmm::SMEM>>>(m, aFx, aFd, dpart, R); else bmm::k_down2<1, T_Q4K><<<grid, NT, bmm::SMEM>>>(m, aFx, aFd, dpart, R); }
+        else { if (q6) bmm::k_down2<2, T_Q6K><<<grid, NT, bmm::SMEM>>>(m, aFx, aFd, dpart, R); else bmm::k_down2<2, T_Q4K><<<grid, NT, bmm::SMEM>>>(m, aFx, aFd, dpart, R); }
+        bmm::k_down_reduce<<<(R * D + 255) / 256, 256>>>(dpart, x, R);
+    }
+    cudaStream_t side = nullptr; // (non-blocking) GEMVs run beside the main stream's
+    cudaEvent_t ev_in = nullptr, ev_out = nullptr;
+    // several matrices (K = D, same input a5x / a5d): all Q4_K in one launch, mixed types as concurrent launches
+    void tc_mv_multi(std::initializer_list<std::tuple<const Mat *, float *, int>> ms_, int S) {
+        bmm::MV mv{};
+        bool q4 = true;
+        for (auto & t : ms_) q4 = q4 && std::get<0>(t)->type == T_Q4K && std::get<0>(t)->K == D && std::get<0>(t)->rb == std::get<0>(*ms_.begin())->rb;
+        if (getenv("MS_NOFUSE")) {
+            for (auto & t : ms_) tc_mv(*std::get<0>(t), S, std::get<1>(t), std::get<2>(t), 0);
+            return;
+        }
+        if (!q4) { // mixed types (a Q6_K qkv or v): the Q4_K ones fused, the others concurrently on the side stream,
+                   // the grids split so every group gets the same item count
+            if (!side) {
+                CK(cudaStreamCreateWithFlags(&side, cudaStreamNonBlocking));
+                CK(cudaEventCreateWithFlags(&ev_in, cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&ev_out, cudaEventDisableTiming));
+            }
+            int tot = 0;
+            for (auto & t : ms_) tot += std::get<0>(t)->N / 16;
+            const int per = (tot + 4 * nsm - 1) / (4 * nsm);
+            auto blocks = [&](int items) { return (items + 4 * per - 1) / (4 * per); };
+            bmm::MV mv{};
+            int it = 0;
+            CK(cudaEventRecord(ev_in, 0));
+            CK(cudaStreamWaitEvent(side, ev_in, 0));
+            for (auto & t : ms_) {
+                const Mat & m = *std::get<0>(t);
+                if (m.type == T_Q4K && m.K == D) {
+                    mv.w[mv.nm] = m.w; mv.out[mv.nm] = std::get<1>(t); mv.ld[mv.nm] = std::get<2>(t);
+                    it += m.N / 16;
+                    mv.iend[mv.nm] = it;
+                    mv.rb = m.rb;
+                    mv.nm++;
+                } else tc_mv(m, S, std::get<1>(t), std::get<2>(t), 0, blocks(m.N / 16), side);
+            }
+            if (mv.nm) {
+                for (int i = mv.nm; i < 3; i++) mv.iend[i] = it;
+                if (S <= 8) bmm::k_q4mx<1><<<blocks(it), NT, bmm::SMEM>>>(mv, a5x, a5d, S);
+                else if (S <= bmm::TS) bmm::k_q4mx<2><<<blocks(it), NT, bmm::SMEM>>>(mv, a5x, a5d, S);
+                else bmm::k_q4mx<3><<<blocks(it), NT, bmm::SMEM>>>(mv, a5x, a5d, S);
+            }
+            CK(cudaEventRecord(ev_out, side));
+            CK(cudaStreamWaitEvent(0, ev_out, 0));
+            return;
+        }
+        int it = 0;
+        for (auto & t : ms_) {
+            const Mat & m = *std::get<0>(t);
+            mv.w[mv.nm] = m.w;
+            mv.out[mv.nm] = std::get<1>(t);
+            mv.ld[mv.nm] = std::get<2>(t);
+            it += m.N / 16;
+            mv.iend[mv.nm] = it;
+            mv.nm++;
+        }
+        for (int i = mv.nm; i < 3; i++) mv.iend[i] = it;
+        mv.rb = std::get<0>(*ms_.begin())->rb;
+        mv.add = 0;
+        if (S <= 8) bmm::k_q4mx<1><<<gsz(it), NT, bmm::SMEM>>>(mv, a5x, a5d, S);
+        else if (S <= bmm::TS) bmm::k_q4mx<2><<<gsz(it), NT, bmm::SMEM>>>(mv, a5x, a5d, S);
+        else if (it >= 2 * FF / 16) bmm::k_q4mx<3, true><<<gsz(it), NT, bmm::SMEM>>>(mv, a5x, a5d, S); // (ffn gate + up)
+        else bmm::k_q4mx<3><<<gsz(it), NT, bmm::SMEM>>>(mv, a5x, a5d, S);
+    }
+    // RMS norm + per-32 quantisation (K = D) of R rows of x into a5x / a5d; hp.rs = the rows' 1 / rms
+    void tc_normq(const float * x, const float * w, int R) { bmm::k_norm_quant32<<<dim3(D / 256, R), 256>>>(x, w, hp.rs, a5x, a5d); }
+    float2 * hpart = nullptr; // [TM][HB][32] per-chunk argmax / top-32 candidates
+    void head_argmax(const float * y, int ld, int N, const int * ids, int R) {
+        if (!hpart) hpart = dalloc<float2>((size_t) bmm::TM * bmm::HB * 32);
+        bmm::k_argmax_p1<<<dim3(bmm::HB, R), 256>>>(y, ld, N, hpart);
+        bmm::k_argmax_p2<<<R, 32>>>(hpart, ids, dtok);
+    }
+    void head_topk(const float * y, int ld, int N, int R) {
+        if (!hpart) hpart = dalloc<float2>((size_t) bmm::TM * bmm::HB * 32);
+        bmm::k_topk_p1<<<dim3(bmm::HB, R), 256>>>(y, ld, N, hpart);
+        bmm::k_topk_p2<<<R, 256>>>(hpart, nullptr, dcand);
+    }
+    void tc_quant(const float * src, const float * src2, int ld, const float * w, const float * rs, int K, int S, unsigned * gx, float2 * gd) {
+        bmm::k_quant32<<<dim3(K / 256, S), 256>>>(src, src2, ld, w, rs, K, gx, gd);
+    }
+    // ms_step with the int8 tensor-core GEMVs for every K = D projection, ffn_down and the lm_head (the K = 6144
+    // projections, attn_o and ssm_out (Q5_K), stay on the fp16 GEMM)
+    void ms_step_tc(std::vector<int> & tok) {
+        const int S = (int) tok.size();
+        if (S > bmm::TM) throw std::runtime_error("ms_step_tc: too many sequences");
+        ms_tc_init();
+        CK(cudaMemcpy(hp.tok, tok.data(), S * sizeof(int), cudaMemcpyHostToDevice));
+        pf_time("ms_misc", [&] { pk_embed<<<S, 256>>>(S); });
+        int dl = 0;
+        for (int L = 0; L < NL; L++) {
+            const LayerW & W = hw.L[L];
+            pf_time("ms_misc", [&] {
+                pk_norm_quant<<<S, 256>>>(hp.x, W.attn_norm);
+                tc_quant(hp.x, nullptr, D, W.attn_norm, hp.rs, D, S, a5x, a5d);
+            });
+            if (W.attn) {
+                pf_time("ms_gemm_attn_in", [&] {
+                    tc_mv(W.q, S, hp.y0, QG, 0);
+                    tc_mv(W.k, S, hp.y1, 2 * KVD, 0);
+                    tc_mv(W.v, S, hp.y1 + KVD, 2 * KVD, 0);
+                });
+                pf_time("ms_attn_seq", [&] {
+                    for (int s = 0; s < S; s++) {
+                        ms_set(ms_bufs(s), ms_rows(s, true));
+                        pk_attn_prep<<<1, 256>>>(ms[s].pos, L / 4, W.qn, W.kn, 1);
+                        if (hb.kvq8) pk_attn<true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                        else pk_attn<false><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                    }
+                    ms_set(hb, hp);
+                });
+                pf_time("ms_gemm_attn_o", [&] {
+                    bmm::k_gate_attn<<<S, 256>>>(hp.y0, hp.y2, hp.y1);
+                    tc_quant(hp.y1, nullptr, VD, nullptr, nullptr, VD, S, a6x, a6d);
+                    tc_mv6(W.o, S, hp.x, D, 1);
+                });
+            } else {
+                pf_time("ms_gemm_dn_in", [&] {
+                    tc_mv(W.qkv, S, hp.y0, QKV, 0);
+                    tc_mv(W.gate, S, hp.y1, VD, 0);
+                });
+                pf_time("ms_dn_ab", [&] { bmm::k_ab_ms<<<2 * NVH, 256>>>(W.ab, hp.x, hp.rs, S, abf); });
+                pf_time("ms_dn_seq", [&] {
+                    bmm::MsDn P{};
+                    for (int s = 0; s < S; s++) { P.conv[s] = ms[s].conv; P.dstate[s] = ms[s].dstate; P.pos[s] = ms[s].pos; }
+                    bmm::k_dn_ms<<<dim3(NVH, S), 512>>>(P, dl, W.conv, W.dt, W.A, hp.y0, hp.ab, hp.cap, hp.y2, abf);
+                });
+                pf_time("ms_gemm_dn_out", [&] {
+                    bmm::k_gate_dn<<<S, 256>>>(hp.y2, hp.y1, W.snorm, hp.y0);
+                    tc_quant(hp.y0, nullptr, VD, nullptr, nullptr, VD, S, a6x, a6d);
+                    tc_mv6(W.sout, S, hp.x, D, 1);
+                });
+                dl++;
+            }
+            pf_time("ms_misc", [&] {
+                pk_norm_quant<<<S, 256>>>(hp.x, W.post_norm);
+                tc_quant(hp.x, nullptr, D, W.post_norm, hp.rs, D, S, a5x, a5d);
+            });
+            pf_time("ms_ffn_gu", [&] {
+                tc_mv(W.fg, S, hp.y0, FF, 0);
+                tc_mv(W.fu, S, hp.y1, FF, 0);
+                tc_quant(hp.y0, hp.y1, FF, nullptr, nullptr, FF, S, aFx, aFd);
+            });
+            pf_time("ms_ffn_down", [&] {
+                if (W.fd.type == T_Q6K) {
+                    if (S <= 8) bmm::k_downx<1, T_Q6K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, hp.x, D, 1, S);
+                    else bmm::k_downx<2, T_Q6K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, hp.x, D, 1, S);
+                } else {
+                    if (S <= 8) bmm::k_downx<1, T_Q4K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, hp.x, D, 1, S);
+                    else bmm::k_downx<2, T_Q4K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, hp.x, D, 1, S);
+                }
+            });
+        }
+        pf_time("ms_head", [&] {
+            pk_norm_quant<<<S, 256>>>(hp.x, hw.onorm);
+            tc_quant(hp.x, nullptr, D, hw.onorm, hp.rs, D, S, a5x, a5d);
+            tc_mv(hw.head, S, hp.y0, VOCAB, 0);
+            pk_argmax<<<S, 256>>>(0);
+        });
+        CK(cudaGetLastError());
+        CK(cudaMemcpy(tok.data(), hp.amax, S * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int s = 0; s < S; s++) ms[s].pos++;
+    }
+
+    // ---------------- multi-sequence speculative decode (1 MTP draft per sequence) ----------------
+    // A shared K/V segment: the K/V of a prompt prefix (positions < n, all attention slots incl. the MTP layer's) and
+    // the recurrent state after it, stored once; slots whose prompts start with its tokens attach to it (their own
+    // cache then holds positions n ..), copying the state instead of prefilling the prefix.
+    struct Segment {
+        std::vector<int> toks;      // its tokens (n of them)
+        std::vector<int> pages;     // its K/V: pages of the slots' pool
+        int * dptab = nullptr;      // ... (device)
+        float *dstate = nullptr, *conv = nullptr, *h = nullptr; // state after toks; h: final hidden of position n - 1
+        int refs = 0;               // slots attached
+        bool pinned = false;        // kept while unused (the shared-context mode)
+        bool ready = false;         // its prefix has been prefilled (a slot is still writing it otherwise)
+        long last_use = 0;
+        size_t bytes = 0;
+    };
+    std::vector<Segment *> segs;
+    size_t seg_reserve = 0, seg_used = 0; // device memory set aside for segments' states (their K/V: pool pages)
+    long seg_clock = 0;
+    size_t kv_pos_bytes() const { return (size_t) 2 * N_ATT_SLOTS * NKV * (hb.kvq8 ? HD + HD / 32 * 2 : HD * 2); } // K + V, one position
+    static size_t seg_state_bytes() { return ((size_t) 48 * (NVH * 128 * 128 + CONV_RING * QKV) + D) * 4; }
+    void seg_free(Segment * s) {
+        for (void * p : {(void *) s->dptab, (void *) s->dstate, (void *) s->conv, (void *) s->h})
+            if (p) CK(cudaFree(p));
+        pfree.insert(pfree.end(), s->pages.begin(), s->pages.end());
+        seg_used -= s->bytes;
+        segs.erase(std::find(segs.begin(), segs.end(), s));
+        delete s;
+    }
+    // drop the least recently used segment no slot reads (pinned ones stay)
+    bool seg_evict() {
+        Segment * v = nullptr;
+        for (Segment * s : segs) if (s->ready && !s->refs && !s->pinned && (!v || s->last_use < v->last_use)) v = s;
+        if (v) seg_free(v);
+        return v != nullptr;
+    }
+    // room for `bytes` of segment state, evicting unused unpinned segments
+    bool seg_room(size_t bytes) {
+        while (seg_used + bytes > seg_reserve)
+            if (!seg_evict()) return false;
+        return true;
+    }
+    // k free pages in the pool: unused segments go first, then idle slots' caches (except slot keep)
+    bool pool_take(int k, int keep) {
+        while ((int) pfree.size() < k)
+            if (!seg_evict() && !own_evict(keep)) return false;
+        return true;
+    }
+    // the longest segment whose tokens prefix `prompt`, leaving at least one token to feed
+    Segment * seg_match(const std::vector<int> & prompt) const {
+        Segment * best = nullptr;
+        for (Segment * s : segs)
+            if (s->ready && s->toks.size() < prompt.size() && (!best || s->toks.size() > best->toks.size()) &&
+                std::equal(s->toks.begin(), s->toks.end(), prompt.begin()))
+                best = s;
+        return best;
+    }
+    struct MSpec {
+        float * rep[2] = {nullptr, nullptr}; // [48][bmm::RPL] the last draft's delta-net update inputs (read / write alternate)
+        int par = 0;
+        float * hlast = nullptr; // [D] final normed hidden of position pos - 1
+        int last = 0, pos = 0, draft = -1, rep_n = 0;
+        int dr[bmm::DMAX] = {};                      // drafts for the next step: nd of them
+        int nd = 1;
+        int src[bmm::DMAX] = {};                     // 0: MTP, 1: prompt lookup
+        float chain_acc = 0.5f;                      // running acceptance of its chained MTP drafts (gates deeper ones)
+        float temp = 0.f, top_p = 1.f, min_p = 0.f;  // sampling (temp 0: greedy)
+        int top_k = 32;
+        std::mt19937_64 rng;
+        std::vector<int> seq;                        // tokens of the sequence: processed ones, then `last` at pos
+        float *ck_dstate = nullptr, *ck_conv = nullptr, *ck_h = nullptr; // state at the end of the last prompt
+        int ck_pos = -1;                             // ... processed through ck_pos - 1
+        int pf_at = -1;                              // prompt being prefilled (slot_prefill): processed through pf_at - 1
+        Segment * seg = nullptr;                     // shared segment attached (positions < seg->toks.size())
+        Segment * ck_seg = nullptr;                  // ... when the checkpoint was taken
+        int share_at = -1;                           // prefill to stop here: positions < share_at form a segment ...
+        Segment * seg_build = nullptr;               // ... written directly into this one while they prefill
+        std::vector<int> cand1;                      // (MS_DRAFT_STATS) the first draft's top 8 candidates
+    };
+    long rank_hist[6] = {}; // (MS_DRAFT_STATS) target's rank among the first draft's candidates: 1, 2, 3-4, 5-8, other
+    std::vector<MSpec> msp;
+    std::vector<int> sl; // this step's slots: batch index -> slot
+    unsigned * aHx = nullptr; // the MTP input's hidden half, per-32 int8
+    float2 * aHd = nullptr;
+    float * att_po = nullptr; // [TM][NH][ATT_SPL][HD] attention partial outputs per context split
+    float2 * att_ml = nullptr; // [TM][NH][ATT_SPL] their (max, sum)
+    float * mh = nullptr; // [TM][D] MTP h inputs
+    float * mhm = nullptr; // [TM][D] the MTP layer's normed output (h of a chained draft)
+    float * mhc = nullptr; // [TM][D] the chained draft's h rows (copied out of mhm before the pass rewrites it)
+    int * dtok = nullptr; // [TM] argmax outputs
+    float2 * dcand = nullptr; // [TM][32] top candidates (sampling)
+    bool need_cand = false;
+    std::vector<float2> hcand;
+    void spec_init(int S) {
+        ms_tc_init();
+        while ((int) msp.size() < S) {
+            MSpec q;
+            q.rep[0] = dalloc<float>((size_t) 48 * bmm::DMAX * bmm::RPL);
+            q.rep[1] = dalloc<float>((size_t) 48 * bmm::DMAX * bmm::RPL);
+            q.hlast = dalloc<float>(D);
+            // the checkpoint (copied at prompt ends, read when a request restarts from the last prompt) in pinned host
+            // memory: 0.15 GB a slot of device memory goes to K/V instead
+            q.ck_dstate = halloc<float>((size_t) 48 * NVH * 128 * 128);
+            q.ck_conv = halloc<float>((size_t) 48 * CONV_RING * QKV);
+            q.ck_h = halloc<float>(D);
+            msp.push_back(q);
+        }
+        if (!att_po) {
+            att_po = dalloc<float>((size_t) bmm::TM * NH * bmm::ATT_SPL * HD);
+            att_ml = dalloc<float2>((size_t) bmm::TM * NH * bmm::ATT_SPL);
+            CK(cudaFuncSetAttribute(bmm::k_attn_ms<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::ATT_SMEM));
+            CK(cudaFuncSetAttribute(bmm::k_attn_ms<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::ATT_SMEM));
+            CK(cudaFuncSetAttribute(bmm::k_attn_ms2<true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem2<1, true>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_ms2<false, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem2<1>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_ms2<true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem2<2, true>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_ms2<false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem2<2>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_jobs<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<1>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_jobs<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<2>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_jobs<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<3>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_jobs<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<4>()));
+            CK(cudaFuncSetAttribute(bmm::k_attn_jobs<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<6>()));
+        }
+        if (!mh) { mh = dalloc<float>((size_t) bmm::TM * D); mhm = dalloc<float>((size_t) bmm::TM * D); mhc = dalloc<float>((size_t) bmm::TM * D); dtok = dalloc<int>(bmm::TM); dcand = dalloc<float2>((size_t) bmm::TM * 32); }
+    }
+    // work buffers seen from row r0 (as ms_rows, by row instead of sequence)
+    PBufs rows_at(int r0, bool attn) const {
+        PBufs p = hp;
+        p.y0 = hp.y0 + (size_t) r0 * (attn ? QG : QKV);
+        p.y1 = hp.y1 + (size_t) r0 * (attn ? 2 * KVD : VD);
+        p.y2 = hp.y2 + (size_t) r0 * VD;
+        p.qh = hp.qh + (size_t) r0 * NH * HD;
+        return p;
+    }
+    // attention of the R rows at row `off` of the work buffers (sequence s: rows off + r0[s] .. + nt[s] at positions
+    // pos[s] ..; q / k / v in y0 / y1 there) -> y2 there
+    void sp_attn_core(const LayerW & W, int slot, int S, int R, const int * r0, const int * nt, const int * pos, int off) {
+        const PBufs v = rows_at(off, true);
+        static const bool noattn = getenv("MS_XATTN") != nullptr; // (timing experiment: skip)
+        static const bool attn_old = getenv("MS_ATTN_OLD") != nullptr;
+        if (!noattn && !attn_old) pf_time("sp_attn_seq", [&] {
+            bmm::AttnMs A{};
+            int maxp = 0;
+            for (int s = 0; s < S; s++) {
+                const MSeq & q = ms[sl[s]];
+                A.kc[s] = pk; A.vc[s] = pv; A.ksc[s] = pks; A.vsc[s] = pvs; A.ptab[s] = q.dptab;
+                if (const Segment * g = msp[sl[s]].seg) {
+                    A.kseg[s] = pk; A.vseg[s] = pv; A.ksseg[s] = pks; A.vsseg[s] = pvs; A.segptab[s] = g->dptab;
+                    A.segn[s] = A.segctx[s] = (int) g->toks.size();
+                }
+                A.pos[s] = pos[s]; A.nt[s] = nt[s]; A.r0[s] = r0[s];
+                for (int i = 0; i < nt[s]; i++) A.rseq[r0[s] + i] = s;
+                if (nt[s]) maxp = std::max(maxp, pos[s] + nt[s]);
+            }
+            // context splits: at least 256 positions each, at most ATT_SPL per sequence
+            for (int s = 0; s < S; s++) if (nt[s] > 8) throw std::runtime_error("sp attention: at most 8 rows per sequence");
+            int ntmax = 0;
+            for (int s = 0; s < S; s++) ntmax = std::max(ntmax, nt[s]);
+            static const bool ms2 = getenv("MS_ATTN_MS2") != nullptr; // (k_attn_ms2 / k_attn_ms for all of it)
+            int chunk = 0, nspl = 0;
+            if (hb.kvq8 && !ms2) {
+                auto launch = [&](const bmm::AttnJobs & J, int nj, int rows, int ch, int nsp) {
+                    const dim3 jg(nj, NKV, nsp);
+                    const int mt = (rows + 15) / 16;
+                    if (mt <= 1) bmm::k_attn_jobs<1><<<jg, 256, bmm::att_smem_jobs<1>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                    else if (mt == 2) bmm::k_attn_jobs<2><<<jg, 256, bmm::att_smem_jobs<2>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                    else if (mt == 3) bmm::k_attn_jobs<3><<<jg, 256, bmm::att_smem_jobs<3>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                    else if (mt == 4) bmm::k_attn_jobs<4><<<jg, 256, bmm::att_smem_jobs<4>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                    else bmm::k_attn_jobs<6><<<jg, 256, bmm::att_smem_jobs<6>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                };
+                // jobs: each shared segment once for the sequences on it (<= 96 packed rows a job), each own cache
+                bmm::AttnJobs G{}, J{};
+                int ng = 0, nj = 0, grows[bmm::TM] = {}, own_of[bmm::TM] = {}, segmax = 0, ownmax = 0, ownsum = 0, orows = 0;
+                for (int s = 0; s < S; s++) {
+                    if (!nt[s]) continue;
+                    if (A.segn[s]) {
+                        int gi = 0;
+                        while (gi < ng && !(G.ptab[gi] == A.segptab[s] && grows[gi] + 6 * nt[s] <= 96)) gi++;
+                        if (gi == ng) {
+                            G.k[gi] = A.kseg[s]; G.v[gi] = A.vseg[s]; G.ks[gi] = A.ksseg[s]; G.vs[gi] = A.vsseg[s]; G.ptab[gi] = A.segptab[s];
+                            G.stride[gi] = A.segctx[s]; G.hi[gi] = A.segn[s];
+                            ng++;
+                        }
+                        G.seq[gi][G.n[gi]++] = s;
+                        grows[gi] += 6 * nt[s];
+                        segmax = std::max(segmax, A.segn[s]);
+                    }
+                    J.k[nj] = A.kc[s]; J.v[nj] = A.vc[s]; J.ks[nj] = A.ksc[s]; J.vs[nj] = A.vsc[s];
+                    J.stride[nj] = ms_ctx; J.ptab[nj] = A.ptab[s]; J.lo[nj] = J.off[nj] = A.segn[s]; J.hi[nj] = pos[s] + nt[s];
+                    J.seq[nj][0] = s; J.n[nj] = 1;
+                    own_of[s] = nj++;
+                    ownmax = std::max(ownmax, pos[s] + nt[s] - A.segn[s]);
+                    ownsum += pos[s] + nt[s] - A.segn[s];
+                    orows = std::max(orows, 6 * nt[s]);
+                }
+                // segments: one wave of blocks; own caches: about one wave over all of them, splits of >= 256
+                // positions, at most ATT_SPL per row in all
+                int segchunk = 0, segspl = 0, grmax = 0;
+                if (ng) {
+                    const int nss = std::max(1, std::min(bmm::ATT_SEG_SPL, nsm / (ng * NKV)));
+                    segchunk = (std::max(256, (segmax + nss - 1) / nss) + 31) / 32 * 32;
+                    segspl = (segmax + segchunk - 1) / segchunk;
+                    for (int gi = 0; gi < ng; gi++) {
+                        grmax = std::max(grmax, grows[gi]);
+                        for (int j = 0; j < G.n[gi]; j++) J.soff[own_of[G.seq[gi][j]]] = (G.hi[gi] + segchunk - 1) / segchunk;
+                    }
+                }
+                chunk = std::max({256, (int) (((long) ownsum * NKV + nsm - 1) / nsm), (ownmax + bmm::ATT_SPL - segspl - 1) / (bmm::ATT_SPL - segspl)});
+                chunk = (chunk + 31) / 32 * 32;
+                auto blocks = [&](int ch) {
+                    int b = 0;
+                    for (int j = 0; j < nj; j++) b += (J.hi[j] - J.lo[j] + ch - 1) / ch;
+                    return b * NKV;
+                };
+                while (chunk < ownmax && blocks(chunk) > nsm) chunk += std::max(32, chunk / 64 / 32 * 32);
+                nspl = (ownmax + chunk - 1) / chunk;
+                for (int j = 0; j < nj; j++) A.ns[J.seq[j][0]] = J.soff[j] + (J.hi[j] - J.lo[j] + chunk - 1) / chunk;
+                bmm::k_attn_prep_ms<<<R, 256>>>(A, slot, ms_ctx, W.qn, W.kn, v.y0, v.y1, v.qh);
+                if (ng) launch(G, ng, grmax, segchunk, segspl);
+                launch(J, nj, orows, chunk, nspl);
+            } else {
+            // context splits: at least 256 positions each, at most 16 per sequence
+            chunk = std::max(256, (maxp + 15) / 16 + 31) / 32 * 32;
+            nspl = (maxp + chunk - 1) / chunk;
+            for (int s = 0; s < S; s++) A.ns[s] = (pos[s] + nt[s] + chunk - 1) / chunk;
+            bmm::k_attn_prep_ms<<<R, 256>>>(A, slot, ms_ctx, W.qn, W.kn, v.y0, v.y1, v.qh);
+            const dim3 ag(S, NKV, nspl);
+            if (ntmax <= 2 && !getenv("MS_ATTN1")) { // the GQA group packed into the MMA rows (6 nq <= 16, or 32)
+                if (hb.kvq8) bmm::k_attn_ms2<true, 1><<<ag, 256, bmm::att_smem2<1, true>()>>>(A, slot, ms_ctx, chunk, v.qh, att_po, att_ml);
+                else bmm::k_attn_ms2<false, 1><<<ag, 256, bmm::att_smem2<1>()>>>(A, slot, ms_ctx, chunk, v.qh, att_po, att_ml);
+            } else if (ntmax <= 5 && !getenv("MS_ATTN1")) {
+                if (hb.kvq8) bmm::k_attn_ms2<true, 2><<<ag, 256, bmm::att_smem2<2, true>()>>>(A, slot, ms_ctx, chunk, v.qh, att_po, att_ml);
+                else bmm::k_attn_ms2<false, 2><<<ag, 256, bmm::att_smem2<2>()>>>(A, slot, ms_ctx, chunk, v.qh, att_po, att_ml);
+            } else if (hb.kvq8) bmm::k_attn_ms<true><<<dim3(nspl, NKV, S), 192, bmm::ATT_SMEM>>>(A, slot, ms_ctx, chunk, v.qh, att_po, att_ml);
+            else bmm::k_attn_ms<false><<<dim3(nspl, NKV, S), 192, bmm::ATT_SMEM>>>(A, slot, ms_ctx, chunk, v.qh, att_po, att_ml);
+            }
+            bmm::k_attn_comb<<<dim3(R, NH), HD>>>(A, att_po, att_ml, v.y2);
+            if (getenv("MS_ATTN_CHECK")) { // (test) against the per-sequence prefill kernels
+                std::vector<float> a((size_t) R * VD), b(a.size());
+                CK(cudaMemcpy(a.data(), v.y2, a.size() * 4, cudaMemcpyDeviceToHost));
+                for (int s = 0; s < S; s++) {
+                    if (!nt[s]) continue;
+                    ms_set(ms_bufs(sl[s]), rows_at(off + r0[s], true));
+                    if (hb.kvq8) pk_attn<true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+                    else pk_attn<false><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+                }
+                ms_set(hb, hp);
+                CK(cudaMemcpy(b.data(), v.y2, b.size() * 4, cudaMemcpyDeviceToHost));
+                double d = 0, n = 0;
+                for (size_t i = 0; i < a.size(); i++) { d += (a[i] - b[i]) * (a[i] - b[i]); n += b[i] * b[i]; }
+                static int shown = 0;
+                if (shown++ < 4) fprintf(stderr, "[attn-check] max pos %d, %d splits of %d: rel diff %.2e\n", maxp, nspl, chunk, std::sqrt(d / n));
+            }
+        });
+        if (!noattn && attn_old) pf_time("sp_attn_seq", [&] {
+        for (int s = 0; s < S; s++) {
+            if (!nt[s]) continue;
+            ms_set(ms_bufs(sl[s]), rows_at(off + r0[s], true));
+            pk_attn_prep<<<nt[s], 256>>>(pos[s], slot, W.qn, W.kn, 1);
+            if (hb.kvq8) pk_attn<true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+            else pk_attn<false><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+        }
+        ms_set(hb, hp);
+        });
+    }
+    // one attention-type layer W (KV slot `slot`) on the R rows of residual `x`, sequence s owning rows r0[s] .. + nt[s]
+    // at positions pos[s] ..; the ffn after it
+    void sp_attn_layer(const LayerW & W, int slot, float * x, int S, int R, const int * r0, const int * nt, const int * pos, const float * post_w) {
+        pf_time("sp_norm", [&] {
+        tc_normq(x, W.attn_norm, R);
+        });
+        pf_time("sp_attn_in", [&] {
+        tc_mv_multi({{&W.q, hp.y0, QG}, {&W.k, hp.y1, 2 * KVD}, {&W.v, hp.y1 + KVD, 2 * KVD}}, R);
+        });
+        sp_attn_core(W, slot, S, R, r0, nt, pos, 0);
+        pf_time("sp_attn_o", [&] {
+        bmm::k_gate_attn_q<<<dim3(VD / 256, R), 256>>>(hp.y0, hp.y2, a6x, a6d);
+        tc_mv6(W.o, R, x, D, 1);
+        });
+        sp_ffn(W, x, R, post_w);
+    }
+    void sp_ffn(const LayerW & W, float * x, int R, const float * post_w) {
+        pf_time("sp_norm", [&] {
+        tc_normq(x, post_w, R);
+        });
+        pf_time("sp_ffn_gu", [&] {
+        tc_mv_multi({{&W.fg, hp.y0, FF}, {&W.fu, hp.y1, FF}}, R);
+        tc_quant(hp.y0, hp.y1, FF, nullptr, nullptr, FF, R, aFx, aFd);
+        });
+        const bool q6 = W.fd.type == T_Q6K;
+        pf_time("sp_ffn_down", [&] {
+        if (getenv("MS_DOWN1")) {
+            if (R <= 8) { if (q6) bmm::k_downx<1, T_Q6K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, x, D, 1, R); else bmm::k_downx<1, T_Q4K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, x, D, 1, R); }
+            else { if (q6) bmm::k_downx<2, T_Q6K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, x, D, 1, R); else bmm::k_downx<2, T_Q4K><<<nsm, NT, bmm::SMEM>>>(W.fd, aFx, aFd, x, D, 1, R); }
+        } else tc_down(W.fd, R, x);
+        });
+    }
+    // per-phase GEMV timing of the speculative path at R rows over all layers (real weights, arbitrary activations)
+    void bench_sp(int R) {
+        auto bytes = [](const Mat & m) { return (double) m.rb * m.N + (m.d ? (double) m.nd * m.N * 2 : 0.0); };
+        auto time = [&](const char * name, auto f, double by, int nl) {
+            double best = 1e30;
+            for (int rep = 0; rep < 7; rep++) {
+                cudaEvent_t a, b;
+                CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
+                CK(cudaEventRecord(a));
+                f();
+                CK(cudaEventRecord(b));
+                CK(cudaEventSynchronize(b));
+                float ms = 0;
+                CK(cudaEventElapsedTime(&ms, a, b));
+                best = std::min(best, (double) ms);
+                CK(cudaEventDestroy(a)); CK(cudaEventDestroy(b));
+            }
+            fprintf(stderr, "[bench-sp] R=%d %-8s %7.1f us/layer  %6.2f ms total  %5.0f GB/s\n", R, name, best * 1e3 / nl, best, by / (best * 1e-3) / 1e9);
+        };
+        double b_gu = 0, b_dn = 0, b_dni = 0, b_dno = 0, b_ai = 0, b_ao = 0;
+        int nd = 0, na = 0;
+        for (int L = 0; L < NL; L++) {
+            const LayerW & W = hw.L[L];
+            b_gu += bytes(W.fg) + bytes(W.fu); b_dn += bytes(W.fd);
+            if (W.attn) { na++; b_ai += bytes(W.q) + bytes(W.k) + bytes(W.v); b_ao += bytes(W.o); }
+            else { nd++; b_dni += bytes(W.qkv) + bytes(W.gate); b_dno += bytes(W.sout); }
+        }
+        time("ffn_gu", [&] { for (int L = 0; L < NL; L++) tc_mv_multi({{&hw.L[L].fg, hp.y0, FF}, {&hw.L[L].fu, hp.y1, FF}}, R); }, b_gu, NL);
+        time("ffn_down", [&] { for (int L = 0; L < NL; L++) tc_down(hw.L[L].fd, R, hp.x); }, b_dn, NL);
+        {
+            double b4 = 0, b6 = 0; int n4 = 0, n6 = 0;
+            for (int L = 0; L < NL; L++) { if (hw.L[L].fd.type == T_Q6K) { b6 += bytes(hw.L[L].fd); n6++; } else { b4 += bytes(hw.L[L].fd); n4++; } }
+            time("down_q4", [&] { for (int L = 0; L < NL; L++) if (hw.L[L].fd.type != T_Q6K) tc_down(hw.L[L].fd, R, hp.x); }, b4, n4);
+            time("down_q6", [&] { for (int L = 0; L < NL; L++) if (hw.L[L].fd.type == T_Q6K) tc_down(hw.L[L].fd, R, hp.x); }, b6, n6);
+            time("down_red", [&] { for (int L = 0; L < NL; L++) bmm::k_down_reduce<<<(R * D + 255) / 256, 256>>>(dpart, hp.x, R); }, 0, NL);
+        }
+        time("dn_in", [&] { for (int L = 0; L < NL; L++) if (!hw.L[L].attn) tc_mv_multi({{&hw.L[L].qkv, hp.y0, QKV}, {&hw.L[L].gate, hp.y1, VD}}, R); }, b_dni, nd);
+        time("dn_out", [&] { for (int L = 0; L < NL; L++) if (!hw.L[L].attn) tc_mv6(hw.L[L].sout, R, hp.x, D, 1); }, b_dno, nd);
+        time("attn_in", [&] { for (int L = 0; L < NL; L++) if (hw.L[L].attn) tc_mv_multi({{&hw.L[L].q, hp.y0, QG}, {&hw.L[L].k, hp.y1, 2 * KVD}, {&hw.L[L].v, hp.y1 + KVD, 2 * KVD}}, R); }, b_ai, na);
+        time("attn_o", [&] { for (int L = 0; L < NL; L++) if (hw.L[L].attn) tc_mv6(hw.L[L].o, R, hp.x, D, 1); }, b_ao, na);
+        time("head", [&] { tc_mv(hw.head, R, hp.y0, VOCAB, 0); }, bytes(hw.head), 1);
+        time("argmax", [&] { head_argmax(hp.y0, VOCAB, VOCAB, nullptr, R); }, (double) R * VOCAB * 4, 1);
+        time("topk32", [&] { head_topk(hp.y0, VOCAB, VOCAB, R); }, (double) R * VOCAB * 4, 1);
+        { // the split top 32 against the one-block kernel on the same logits (the last head output)
+            std::vector<float> lg((size_t) R * VOCAB);
+            std::mt19937 rng(7);
+            std::normal_distribution<float> nd(0.f, 3.f);
+            for (auto & v : lg) v = nd(rng);
+            CK(cudaMemcpy(hp.y0, lg.data(), lg.size() * 4, cudaMemcpyHostToDevice));
+            std::vector<float2> a((size_t) R * 32), b(a.size());
+            bmm::k_topk32<<<R, 256>>>(hp.y0, VOCAB, VOCAB, nullptr, dcand);
+            CK(cudaMemcpy(a.data(), dcand, a.size() * sizeof(float2), cudaMemcpyDeviceToHost));
+            head_topk(hp.y0, VOCAB, VOCAB, R);
+            CK(cudaMemcpy(b.data(), dcand, b.size() * sizeof(float2), cudaMemcpyDeviceToHost));
+            int same = 0;
+            for (size_t i = 0; i < a.size(); i++) same += a[i].x == b[i].x && fbits(a[i].y) == fbits(b[i].y);
+            fprintf(stderr, "[bench-sp] topk split == one-block: %d / %zu candidates\n", same, a.size());
+        }
+        { // host round trip: launch, copy 4 bytes back (sync), as the step's draft / acceptance hand-offs
+            int hv = 0;
+            CK(cudaDeviceSynchronize());
+            const auto a = std::chrono::steady_clock::now();
+            for (int i = 0; i < 200; i++) { bmm::k_argmax_p2<<<1, 32>>>(hpart, nullptr, dtok); CK(cudaMemcpy(&hv, dtok, 4, cudaMemcpyDeviceToHost)); }
+            fprintf(stderr, "[bench-sp] host round trip %.1f us\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / 200 * 1e6);
+        }
+        time("mtp_eh", [&] { gemm(hw.eh, R, hp.xm, D, pf::OUT_STORE); }, bytes(hw.eh), 1);
+        if (aHx) time("mtp_eh8", [&] {
+            const int8_t * eh8 = reinterpret_cast<const int8_t *>(hw.eh.w);
+            bmm::k_q8dp<<<nsm, NT, bmm::SMEM>>>(eh8, hw.eh.d, 0, a5x, a5d, hp.xm, D, 0, D, R);
+            bmm::k_q8dp<<<nsm, NT, bmm::SMEM>>>(eh8, hw.eh.d, D, aHx, aHd, hp.xm, D, 1, D, R);
+        }, (double) D * 2 * D * (1 + 2.0 / 32), 1);
+        { Mat hd = hw.head_d; hd.N = (hd.N + 15) / 16 * 16; time("head_d", [&] { tc_mv(hd, R, hp.y0, hd.N, 0); }, bytes(hd), 1); }
+        time("quant_ff", [&] { for (int L = 0; L < NL; L++) tc_quant(hp.y0, hp.y1, FF, nullptr, nullptr, FF, R, aFx, aFd); }, 0, NL);
+        time("norm_d", [&] { for (int L = 0; L < NL; L++) tc_normq(hp.x, hw.L[L].attn_norm, R); }, 0, NL);
+        time("dn_seq", [&] {
+            bmm::MsDn2 P{};
+            const int SB = std::min((int) ms.size(), (R + 2) / 3), NTB = R / SB; // (the open slots, up to 3 rows each)
+            for (int s = 0; s < SB; s++) { P.conv[s] = ms[s].conv; P.dstate[s] = ms[s].dstate; P.rep[s] = msp[s].rep[0]; P.repw[s] = msp[s].rep[1]; P.pos[s] = 64; P.r0[s] = NTB * s; P.nt[s] = NTB; P.rep_n[s] = 0; }
+            int dl = 0;
+            for (int L = 0; L < NL; L++) if (!hw.L[L].attn) { const LayerW & W = hw.L[L]; bmm::k_dn_ms4<<<dim3(2 * NVH, SB), 256>>>(P, dl++, W.conv, W.dt, W.A, hp.y0, W.ab, hp.x, hp.rs, hp.y2); }
+        }, 0, nd);
+    }
+    // main model on the rows; out[r] = argmax of row r; the rows' final normed hidden go to hp.h[r + 1]
+    void sp_main(const std::vector<int> & tok, int S, const int * r0, const int * nt, const int * pos, std::vector<int> & out) {
+        const int R = (int) tok.size();
+        CK(cudaMemcpy(hp.tok, tok.data(), R * sizeof(int), cudaMemcpyHostToDevice));
+        pk_embed<<<R, 256>>>(R);
+        int dl = 0;
+        for (int L = 0; L < NL; L++) {
+            const LayerW & W = hw.L[L];
+            if (W.attn) {
+                sp_attn_layer(W, L / 4, hp.x, S, R, r0, nt, pos, W.post_norm);
+                continue;
+            }
+            pf_time("sp_norm", [&] {
+            tc_normq(hp.x, W.attn_norm, R);
+            });
+            pf_time("sp_dn_in", [&] {
+            tc_mv_multi({{&W.qkv, hp.y0, QKV}, {&W.gate, hp.y1, VD}}, R);
+            });
+            // (k_dn_ms4 computes alpha / beta itself; the others read them from abf)
+            static const bool sep_ab = getenv("MS_DN2") || getenv("MS_DN3") || getenv("MS_DN_CHECK");
+            if (sep_ab) pf_time("sp_dn_ab", [&] { bmm::k_ab_ms<<<2 * NVH, 256>>>(W.ab, hp.x, hp.rs, R, abf); });
+            bmm::MsDn2 P{};
+            for (int s = 0; s < S; s++) {
+                const int q = sl[s];
+                P.conv[s] = ms[q].conv; P.dstate[s] = ms[q].dstate;
+                P.rep[s] = msp[q].rep[msp[q].par]; P.repw[s] = msp[q].rep[msp[q].par ^ 1];
+                P.pos[s] = pos[s]; P.r0[s] = r0[s]; P.nt[s] = nt[s]; P.rep_n[s] = msp[q].rep_n;
+            }
+            static const bool nodn = getenv("MS_XDN") != nullptr; // (timing experiment: skip)
+            if (!nodn) pf_time("sp_dn_seq", [&] {
+                if (getenv("MS_DN2")) bmm::k_dn_ms2<<<dim3(NVH, S), 512>>>(P, dl, W.conv, W.dt, W.A, hp.y0, abf, hp.y2);
+                else if (getenv("MS_DN3")) bmm::k_dn_ms3<<<dim3(2 * NVH, S), 256>>>(P, dl, W.conv, W.dt, W.A, hp.y0, abf, hp.y2);
+                else if (getenv("MS_DN_CHECK")) { // (test) k_dn_ms4 against k_dn_ms3 from the same state
+                    const size_t ns = (size_t) NVH * 128 * 128, nc = (size_t) CONV_RING * QKV;
+                    static float * snap = nullptr;
+                    if (!snap) CK(cudaMalloc(&snap, (size_t) bmm::TM * (ns + nc + bmm::DMAX * bmm::RPL) * 4));
+                    auto save = [&](bool back) {
+                        for (int s = 0; s < S; s++) {
+                            float * d = snap + (size_t) s * (ns + nc + bmm::DMAX * bmm::RPL);
+                            float * st = P.dstate[s] + (size_t) dl * ns, * cv = P.conv[s] + (size_t) dl * nc, * rw = P.repw[s] + (size_t) dl * bmm::DMAX * bmm::RPL;
+                            CK(cudaMemcpy(back ? st : d, back ? d : st, ns * 4, cudaMemcpyDeviceToDevice));
+                            CK(cudaMemcpy(back ? cv : d + ns, back ? d + ns : cv, nc * 4, cudaMemcpyDeviceToDevice));
+                            CK(cudaMemcpy(back ? rw : d + ns + nc, back ? d + ns + nc : rw, bmm::DMAX * bmm::RPL * 4, cudaMemcpyDeviceToDevice));
+                        }
+                    };
+                    save(false);
+                    bmm::k_dn_ms3<<<dim3(2 * NVH, S), 256>>>(P, dl, W.conv, W.dt, W.A, hp.y0, abf, hp.y2);
+                    std::vector<float> a((size_t) R * VD), b(a.size());
+                    CK(cudaMemcpy(a.data(), hp.y2, a.size() * 4, cudaMemcpyDeviceToHost));
+                    save(true);
+                    bmm::k_dn_ms4<<<dim3(2 * NVH, S), 256>>>(P, dl, W.conv, W.dt, W.A, hp.y0, W.ab, hp.x, hp.rs, hp.y2);
+                    CK(cudaMemcpy(b.data(), hp.y2, b.size() * 4, cudaMemcpyDeviceToHost));
+                    double d = 0, n = 0, mx = 0;
+                    for (size_t i = 0; i < a.size(); i++) { d += (a[i] - b[i]) * (a[i] - b[i]); n += a[i] * a[i]; mx = std::max(mx, (double) std::fabs(a[i] - b[i])); }
+                    static int shown = 0;
+                    int rmax = 0;
+                    for (int s = 0; s < S; s++) rmax = std::max(rmax, P.rep_n[s]);
+                    if (rmax >= 3 && shown++ < 4) fprintf(stderr, "[dn-check] layer %d max rep_n %d: rel diff %.2e, max %.2e\n", dl, rmax, std::sqrt(d / std::max(n, 1e-30)), mx);
+                }
+                else bmm::k_dn_ms4<<<dim3(2 * NVH, S), 256>>>(P, dl, W.conv, W.dt, W.A, hp.y0, W.ab, hp.x, hp.rs, hp.y2);
+            });
+            pf_time("sp_dn_out", [&] {
+            bmm::k_gate_dn_q<<<dim3(NVH / 8, R), 256>>>(hp.y2, hp.y1, W.snorm, a6x, a6d);
+            tc_mv6(W.sout, R, hp.x, D, 1);
+            });
+            sp_ffn(W, hp.x, R, W.post_norm);
+            dl++;
+        }
+        sp_head(R, out);
+    }
+    // the final norm and LM head of rows 0 .. R - 1 (residual in hp.x): out[r] = argmax (and the top 32 when sampling);
+    // the rows' final normed hidden go to hp.h[r + 1]
+    void sp_head(int R, std::vector<int> & out) {
+        pf_time("sp_head", [&] {
+        pk_final_h<<<R, 256>>>(R, 0);
+        tc_normq(hp.x, hw.onorm, R);
+        tc_mv(hw.head, R, hp.y0, VOCAB, 0);
+        head_argmax(hp.y0, VOCAB, VOCAB, nullptr, R);
+        if (need_cand) head_topk(hp.y0, VOCAB, VOCAB, R);
+        });
+        out.resize(R);
+        CK(cudaMemcpy(out.data(), dtok, R * sizeof(int), cudaMemcpyDeviceToHost));
+        if (need_cand) {
+            hcand.resize((size_t) R * 32);
+            CK(cudaMemcpy(hcand.data(), dcand, hcand.size() * sizeof(float2), cudaMemcpyDeviceToHost));
+        }
+    }
+    // sp_main with slot q's prompt tokens ptoks (positions n0 ..; its state through n0 - 1, h of n0 - 1 in hsrc) in the
+    // same pass, as rows 0 .. T - 1 before the step's: the per-row kernels and the weight GEMMs run once over all rows
+    // (the prefill's fp16 GEMMs), the stateful ones per part with their own kernels (the prompt's: pf_run's, on slot
+    // q's state; the step's: sp_main's). The prompt rows also fill slot q's MTP K/V; its h of position n0 + T - 1
+    // goes to msp[q].hlast.
+    void mix_main(int q, const std::vector<int> & ptoks, int n0, const float * hsrc, const std::vector<int> & tok, int S, const int * r0,
+                  const int * nt, const int * pos, std::vector<int> & out) {
+        pf_init();
+        const int T = (int) ptoks.size(), R = (int) tok.size(), N = T + R;
+        if (T < 1 || N > hp.cap) throw std::runtime_error("mix_main: bad chunk");
+        const Bufs bq = ms_bufs(q);
+        ms_set(bq, hp);
+        if (n0 == 0) CK(cudaMemsetAsync(hp.h, 0, D * sizeof(float)));
+        else CK(cudaMemcpyAsync(hp.h, hsrc, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        std::vector<int> all(ptoks);
+        all.insert(all.end(), tok.begin(), tok.end());
+        CK(cudaMemcpy(hp.tok, all.data(), N * sizeof(int), cudaMemcpyHostToDevice));
+        pf_time("mix_misc", [&] { pk_embed<<<N, 256>>>(N); });
+        int dl = 0;
+        for (int L = 0; L < NL; L++) {
+            const LayerW & W = hw.L[L];
+            pf_time("mix_misc", [&] { pk_norm_quant<<<N, 256>>>(hp.x, W.attn_norm); });
+            if (W.attn) {
+                pf_time("gemm_attn_qkv", [&] {
+                    gemm(W.q, N, hp.y0, QG, pf::OUT_STORE);
+                    gemm(W.k, N, hp.y1, 2 * KVD, pf::OUT_STORE);
+                    gemm(W.v, N, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE);
+                });
+                pf_time("attn", [&] {
+                    pk_attn_prep<<<T, 256>>>(n0, L / 4, W.qn, W.kn, 1);
+                    pf_attn(T, n0, L / 4);
+                });
+                sp_attn_core(W, L / 4, S, R, r0, nt, pos, T);
+                ms_set(bq, hp); // (its test paths swap the buffers)
+                pf_time("mix_misc", [&] { pk_attn_out<<<N, 256>>>(); });
+                pf_time("gemm_attn_o", [&] { gemm(W.o, N, hp.x, D, pf::OUT_ADD); });
+            } else {
+                pf_time("gemm_dn_in", [&] { gemm(W.qkv, N, hp.y0, QKV, pf::OUT_STORE); gemm(W.gate, N, hp.y1, VD, pf::OUT_STORE); });
+                pf_time("dn", [&] {
+                    pk_ab<<<dim3((T + 63) / 64, AB_SPLITS), 256>>>(W.ab, T);
+                    pk_dn_prep<<<T, 256>>>(T, n0, dl, W.conv, W.dt, W.A);
+                    pk_conv_ring<<<std::min(T, CONV_RING), 256>>>(T, n0, dl);
+                    pk_dn_scan<<<dim3(NVH, 2), 256>>>(T, dl);
+                });
+                pf_time("sp_dn_seq", [&] {
+                    bmm::MsDn2 P{};
+                    for (int s = 0; s < S; s++) {
+                        const int k = sl[s];
+                        P.conv[s] = ms[k].conv; P.dstate[s] = ms[k].dstate;
+                        P.rep[s] = msp[k].rep[msp[k].par]; P.repw[s] = msp[k].rep[msp[k].par ^ 1];
+                        P.pos[s] = pos[s]; P.r0[s] = r0[s]; P.nt[s] = nt[s]; P.rep_n[s] = msp[k].rep_n;
+                    }
+                    bmm::k_dn_ms4<<<dim3(2 * NVH, S), 256>>>(P, dl, W.conv, W.dt, W.A, hp.y0 + (size_t) T * QKV, W.ab, hp.x + (size_t) T * D,
+                                                             hp.rs + T, hp.y2 + (size_t) T * VD);
+                });
+                pf_time("mix_misc", [&] { pk_dn_out<<<N, 256>>>(W.snorm); });
+                pf_time("gemm_dn_out", [&] { gemm(W.sout, N, hp.x, D, pf::OUT_ADD); });
+                dl++;
+            }
+            pf_time("mix_misc", [&] { pk_norm_quant<<<N, 256>>>(hp.x, W.post_norm); });
+            pf_time("gemm_ffn_gu", [&] { gemm_glu(W.fg, W.fu, N); });
+            pf_time("gemm_ffn_down", [&] { gemm(W.fd, N, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
+        }
+        pf_time("mtp", [&] { // the prompt rows' MTP K/V (as pf_run)
+            pk_final_h<<<T, 256>>>(T, n0);
+            pk_mtp_in<<<T, 256>>>();
+            gemm(hw.eh, T, hp.xm, D, pf::OUT_STORE);
+            const LayerW & M = hw.L[NL];
+            pk_norm_quant<<<T, 256>>>(hp.xm, M.attn_norm);
+            gemm(M.k, T, hp.y1, 2 * KVD, pf::OUT_STORE);
+            gemm(M.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE);
+            pk_attn_prep<<<T, 256>>>(n0, 16, M.qn, M.kn, 0);
+        });
+        CK(cudaMemcpyAsync(msp[q].hlast, hp.h + (size_t) T * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        // the step's rows: moved to rows 0 .., then sp_main's head
+        ms_set(hb, hp);
+        if (T >= R) CK(cudaMemcpyAsync(hp.x, hp.x + (size_t) T * D, (size_t) R * D * sizeof(float), cudaMemcpyDeviceToDevice));
+        else {
+            CK(cudaMemcpyAsync(hp.xm, hp.x + (size_t) T * D, (size_t) R * D * sizeof(float), cudaMemcpyDeviceToDevice));
+            CK(cudaMemcpyAsync(hp.x, hp.xm, (size_t) R * D * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+        sp_head(R, out);
+    }
+    // MTP rows (token tok[r] at position pos[s] + i, previous hidden hsrc[r]): fills the MTP K/V (slot 16); returns the
+    // draft (argmax of the last row of each sequence with rows) in draft[s]
+    void sp_mtp(const std::vector<int> & tok, const std::vector<const float *> & hsrc, int S, const int * r0, const int * nt, const int * pos,
+                std::vector<int> & draft, bool chained = false) {
+        const int R = (int) tok.size();
+        CK(cudaMemcpy(hp.tok, tok.data(), R * sizeof(int), cudaMemcpyHostToDevice));
+        for (int r = 0; r < R; r++) CK(cudaMemcpyAsync(mh + (size_t) r * D, hsrc[r], D * sizeof(float), cudaMemcpyDeviceToDevice));
+        PBufs p = hp;
+        p.h = mh;
+        ms_set(hb, p);
+        static const bool eh_old = getenv("MS_EH_OLD") != nullptr;
+        if (eh_old) {
+            pk_mtp_in<<<R, 256>>>();
+            ms_set(hb, hp);
+            gemm(hw.eh, R, hp.xm, D, pf::OUT_STORE);
+        } else { // int8 activations and the repacked weights (eh = [E | H]: two K = D GEMVs)
+            ms_set(hb, hp);
+            if (!aHx) {
+                aHx = dalloc<unsigned>((size_t) bmm::TM * D / 4);
+                aHd = dalloc<float2>((size_t) D / 32 * bmm::TM);
+                CK(cudaFuncSetAttribute(bmm::k_q8dp, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::SMEM));
+            }
+            const int8_t * eh8 = reinterpret_cast<const int8_t *>(hw.eh.w); // (Q8_0 is loaded as int8 rows + scales)
+            const __half * ehs = hw.eh.d;
+            bmm::k_mtp_in_q<<<R, 256>>>(hp.tok, mh, hw.enorm, hw.hnorm, a5x, a5d, aHx, aHd);
+            bmm::k_q8dp<<<nsm, NT, bmm::SMEM>>>(eh8, ehs, 0, a5x, a5d, hp.xm, D, 0, D, R);
+            bmm::k_q8dp<<<nsm, NT, bmm::SMEM>>>(eh8, ehs, D, aHx, aHd, hp.xm, D, 1, D, R);
+            if (getenv("MS_EH_CHECK")) { // (test) against the fp16 GEMM path
+                std::vector<float> a((size_t) R * D), b(a.size());
+                CK(cudaMemcpy(a.data(), hp.xm, a.size() * 4, cudaMemcpyDeviceToHost));
+                ms_set(hb, p);
+                pk_mtp_in<<<R, 256>>>();
+                ms_set(hb, hp);
+                gemm(hw.eh, R, hp.xm, D, pf::OUT_STORE);
+                CK(cudaMemcpy(b.data(), hp.xm, b.size() * 4, cudaMemcpyDeviceToHost));
+                double d = 0, n = 0;
+                for (size_t i = 0; i < a.size(); i++) { d += (a[i] - b[i]) * (a[i] - b[i]); n += b[i] * b[i]; }
+                static int shown = 0;
+                if (shown++ < 3) fprintf(stderr, "[eh-check] R %d: rel diff %.2e\n", R, std::sqrt(d / n));
+            }
+        }
+        const LayerW & M = hw.L[NL];
+        sp_attn_layer(M, 16, hp.xm, S, R, r0, nt, pos, M.post_norm);
+        bmm::k_rmsnorm<<<R, 256>>>(hp.xm, hw.shnorm, mhm);
+        tc_normq(hp.xm, hw.shnorm, R);
+        // the draft head (base draft vocabulary + the sequences' tokens; the whole lm_head without a draft vocabulary),
+        // its rows rounded up to the GEMV's 16 (the buffer holds DV_EXTRA spare rows)
+        // The whole lm_head for a first draft: the draft vocabulary's lower acceptance (0.63 vs 0.73 at 4 x 2 rows)
+        // loses more than its ~1.3 ms per step saves
+        // MS_DRAFT_VOCAB 0: whole lm_head, 1: draft vocabulary, 2 (default): the draft vocabulary for the chained second
+        // draft only (its pass saves ~1.2 ms per step for a small acceptance loss: 50.2 vs 49.5 tok/s at 4 x 2 drafts)
+        static const int dv_mode = getenv("MS_DRAFT_VOCAB") ? atoi(getenv("MS_DRAFT_VOCAB")) : 2;
+        const bool use_dv = dv_mode == 1 || (dv_mode == 2 && chained);
+        Mat hd = use_dv ? hw.head_d : hw.head;
+        const int nd = hd.N;
+        hd.N = (nd + 15) / 16 * 16;
+        tc_mv(hd, R, hp.y0, hd.N, 0);
+        head_argmax(hp.y0, hd.N, nd, use_dv ? hw.draft_ids : nullptr, R);
+        std::vector<int> am(R);
+        CK(cudaMemcpy(am.data(), dtok, R * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int s = 0; s < S; s++) if (nt[s]) draft[s] = am[r0[s] + nt[s] - 1];
+        static const bool dstats = getenv("MS_DRAFT_STATS") != nullptr;
+        if (dstats && !chained && !use_dv) { // (test) the first draft's top candidates, for rank statistics
+            head_topk(hp.y0, hd.N, nd, R);
+            std::vector<float2> c((size_t) R * 32);
+            CK(cudaMemcpy(c.data(), dcand, c.size() * sizeof(float2), cudaMemcpyDeviceToHost));
+            for (int s = 0; s < S; s++)
+                if (nt[s]) {
+                    auto & v = msp[sl[s]].cand1;
+                    v.assign(8, -1);
+                    for (int k = 0; k < 8; k++) v[k] = fbits(c[(size_t) (r0[s] + nt[s] - 1) * 32 + k].y);
+                }
+        }
+    }
+
+    // ---------------- slot API (server): persistent sequences, speculative steps over any subset ----------------
+    int slot_nd = 1;
+    // ctx_s 0: the most positions per slot that fit in the device memory left (after each slot's fixed state and a
+    // reserve for the work buffers), at most the engine's ctx; returns the positions per slot
+    int slots_open(int n, int ctx_s, int seg_tokens = 0) {
+        // MTP drafts per slot: 2 while the slots' rows fit (4 x 3 = 12): measured 4 x 2 drafts 49 tok/s each against
+        // 46 with 1 at short context, 41 against 35 at 8k (the GEMVs cost about the same at 8 or 12 rows)
+        slot_nd = getenv("MS_ND") ? std::max(1, std::min(2, atoi(getenv("MS_ND")))) : n * 3 <= bmm::TM ? 2 : 1;
+        if (n * (1 + slot_nd) > bmm::TM) throw std::runtime_error("slots_open: at most " + std::to_string(bmm::TM / (1 + slot_nd)) + " slots");
+        // segments: seg_tokens positions of shared prefixes and two segments' states, kept out of the slots' share
+        seg_reserve = seg_tokens > 0 ? 2 * seg_state_bytes() + (1 << 20) : 0; // (their K/V comes from the pool)
+        // the pool: n x ctx_s positions, or (ctx_s 0) all the device memory left
+        int pages = (int) (((size_t) n * std::max(ctx_s, 0) + KV_PG - 1) / KV_PG);
+        if (ctx_s <= 0) {
+            size_t free_b = 0, total_b = 0;
+            CK(cudaMemGetInfo(&free_b, &total_b));
+            if (!ms.empty()) free_b += (size_t) npages * page_bytes() + ms.size() * slot_state_bytes();
+            free_b = free_b > seg_reserve ? free_b - seg_reserve : 0;
+            const size_t fixed = slot_state_bytes() + (size_t) 2 * 48 * bmm::DMAX * bmm::RPL * 4 + D * 4, reserve = (size_t) 400 << 20;
+            if (free_b < reserve + n * fixed + 4 * page_bytes()) throw std::runtime_error("slots_open: no room for the slots");
+            pages = (int) std::min<size_t>((size_t) n * ctx / KV_PG, (free_b - reserve - n * fixed) / page_bytes());
+        }
+        ms_alloc(n, pages);
+        spec_init(n);
+        dv_reset();
+        size_t free_b = 0, total_b = 0;
+        CK(cudaMemGetInfo(&free_b, &total_b));
+        fprintf(stderr, "[mk] %d slots and shared segments draw on a pool of %d positions (%s K/V, pages of %d); %.2f GB of device memory left\n",
+                n, ms_ctx, hb.kvq8 ? "q8_0" : "fp16", KV_PG, free_b / 1e9);
+        return ms_ctx;
+    }
+    // Prompt lookup: the tokens after d1 where the sequence's last LK tokens, followed by d1, occurred before (the most
+    // recent such place), at most `len`. Agents repeat their context (code, file contents, tool output): there it is a
+    // far better source of further drafts than the chained MTP pass (~29% accepted), and agreeing with d1 keeps it
+    // from guessing.
+    static std::vector<int> lookup_cont(const std::vector<int> & q, int d1, int len) {
+        constexpr int LK = 3, SPAN = 32768;
+        const int n = (int) q.size();
+        if (n < LK + 2) return {};
+        for (int e = n - 3; e >= std::max(LK - 1, n - SPAN); e--) { // e: last token of an earlier occurrence
+            if (q[e] != q[n - 1] || q[e + 1] != d1) continue;
+            bool ok = true;
+            for (int k = 1; k < LK && ok; k++) ok = q[e - k] == q[n - 1 - k];
+            if (ok) return std::vector<int>(q.begin() + e + 2, q.begin() + std::min(n, e + 2 + len));
+        }
+        return {};
+    }
+    long st_lookup = 0, st_chain = 0; // further drafts from prompt lookup / from chained MTP passes
+    const float chain_gate = getenv("MS_CHAIN_GATE") ? (float) atof(getenv("MS_CHAIN_GATE")) : 0.6f; // (deeper chained drafts)
+    long st_src[2][bmm::DMAX][2] = {}; // [source][draft index][drafted, accepted]
+    // drafts of slots `ss` whose MTP rows were just computed (d1: first draft). The rows past each slot's `last` and
+    // first draft (TM - 2 S of them) go first to lookup continuations (up to DMAX drafts a slot), then to second
+    // drafts from the chained MTP pass for the other slots.
+    void slots_chain(const std::vector<int> & ss, const std::vector<int> & d1, const std::vector<int> & last_row) {
+        const int S = (int) ss.size();
+        for (int i = 0; i < S; i++) { msp[ss[i]].dr[0] = d1[i]; msp[ss[i]].nd = 1; msp[ss[i]].src[0] = 0; }
+        if (slot_nd < 2) return;
+        static const bool lookup = !getenv("MS_LOOKUP") || atoi(getenv("MS_LOOKUP")) != 0;
+        static const int rows = getenv("MS_ROWS") ? std::min(bmm::TM, atoi(getenv("MS_ROWS"))) : bmm::TM; // (rows a step may use)
+        int budget = rows - 2 * S;
+        std::vector<std::vector<int>> cont(S);
+        for (int i = 0; i < S; i++) if (lookup) cont[i] = lookup_cont(msp[ss[i]].seq, d1[i], bmm::DMAX - 1);
+        for (int round = 0; round < bmm::DMAX - 1 && budget > 0; round++) // lookup drafts, a row per slot per round
+            for (int i = 0; i < S && budget > 0; i++) {
+                auto & m = msp[ss[i]];
+                if ((int) cont[i].size() > round) { m.src[m.nd] = 1; m.dr[m.nd++] = cont[i][round]; budget--; st_lookup++; }
+            }
+        // slots without lookup drafts: chained MTP drafts while rows last, the second for all of them, deeper ones for
+        // slots whose chained drafts have been holding up (code: ~0.88 accepted; prose: ~0.3)
+        std::vector<int> cur, row; // slots (index i) in this chained pass, and their h rows in mhm
+        for (int i = 0; i < S && budget > 0; i++) if (msp[ss[i]].nd == 1) { cur.push_back(i); row.push_back(last_row[i]); budget--; }
+        for (int depth = 1; !cur.empty(); depth++) {
+            const int SR = (int) cur.size();
+            std::vector<int> tok(SR), cr0(SR), cnt(SR, 1), cpos(SR), dd(SR), sub(SR);
+            std::vector<const float *> hs(SR);
+            for (int j = 0; j < SR; j++) {
+                const auto & m = msp[ss[cur[j]]];
+                sub[j] = ss[cur[j]];
+                tok[j] = m.dr[m.nd - 1]; cr0[j] = j; cpos[j] = m.pos + depth;
+                CK(cudaMemcpyAsync(mhc + (size_t) j * D, mhm + (size_t) row[j] * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
+                hs[j] = mhc + (size_t) j * D;
+            }
+            sl = sub;
+            sp_mtp(tok, hs, SR, cr0.data(), cnt.data(), cpos.data(), dd, true);
+            for (int j = 0; j < SR; j++) { auto & m = msp[sub[j]]; m.src[m.nd] = 0; m.dr[m.nd++] = dd[j]; }
+            st_chain += SR;
+            std::vector<int> nc, nr;
+            for (int j = 0; j < SR && budget > 0; j++) {
+                const auto & m = msp[sub[j]];
+                if (m.nd < bmm::DMAX && m.chain_acc > chain_gate) { nc.push_back(cur[j]); nr.push_back(j); budget--; }
+            }
+            cur.swap(nc);
+            row.swap(nr);
+        }
+    }
+    // continue slot q's state from position n0 (processed through n0 - 1, h of n0 - 1 in hsrc) with toks[n0 .. P - 2]
+    void slot_prefill_from(int q, const std::vector<int> & toks, int n0, const float * hsrc) {
+        pf_init();
+        const Bufs b = ms_bufs(q);
+        CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
+        if (n0 > 0) CK(cudaMemcpy(hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, hsrc, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        if ((int) toks.size() - 1 > n0) pf_run(std::vector<int>(toks.begin() + n0, toks.end() - 1), n0, nullptr);
+        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        if ((int) toks.size() - 1 > n0) CK(cudaMemcpy(msp[q].hlast, hp.h, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        else if (n0 > 0 && hsrc != msp[q].hlast) CK(cudaMemcpy(msp[q].hlast, hsrc, D * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+    // apply slot q's pending accepted-draft replays to its committed state (no rows)
+    void slot_flush(int q) {
+        auto & m = msp[q];
+        if (!m.rep_n) return;
+        bmm::MsDn2 P{};
+        P.conv[0] = ms[q].conv; P.dstate[0] = ms[q].dstate;
+        P.rep[0] = m.rep[m.par]; P.repw[0] = m.rep[m.par ^ 1];
+        P.pos[0] = m.pos; P.r0[0] = 0; P.nt[0] = 0; P.rep_n[0] = m.rep_n;
+        int dl = 0;
+        for (int L = 0; L < NL; L++) {
+            const LayerW & W = hw.L[L];
+            if (W.attn) continue;
+            bmm::k_dn_ms4<<<dim3(2 * NVH, 1), 256>>>(P, dl, W.conv, W.dt, W.A, hp.y0, W.ab, hp.x, hp.rs, hp.y2);
+            dl++;
+        }
+        m.rep_n = 0;
+    }
+    // slot q <- prompt, reusing what the slot holds: an extension of its sequence continues from its position, a
+    // prompt that shares the slot's last prompt (its checkpoint) restarts there, anything else is prefilled from 0.
+    // slot_begin picks that and returns the reused token count; slot_prefill feeds up to `budget` of the remaining
+    // prompt tokens per call (other slots step in between) and returns how many remain; the last call saves the
+    // checkpoint and makes the first draft.
+    // share_len > 0: positions < share_len are a prefix other prompts may share (a system prompt): unless a segment
+    // already holds it, the prefill stops there to make it one (pin: keep it while unused)
+    int slot_begin(int q, const std::vector<int> & prompt, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
+                   int share_len = 0, bool pin = false) {
+        if (prompt.empty()) throw std::runtime_error("slot_start: empty prompt");
+        if (temp > 0.f && (top_k <= 0 || top_k > 32)) throw std::runtime_error("slot_start: sampling needs 1 <= top_k <= 32");
+        solo_exit();
+        auto & m = msp[q];
+        const int P = (int) prompt.size();
+        size_t lcp = 0;
+        while (lcp < m.seq.size() && lcp < prompt.size() && m.seq[lcp] == prompt[lcp]) lcp++;
+        int n0 = 0;
+        // the most reused of: extending the slot's processed tokens (through pos - 1; `last` itself is unprocessed, so
+        // a stop or token budget that dropped the step's final token still extends), the last prompt's checkpoint, a
+        // shared segment
+        Segment * gm = seg_match(prompt);
+        const int gn = gm && gm != m.seg ? (int) gm->toks.size() : 0;
+        if (!m.seq.empty() && m.pf_at < 0 && (int) lcp >= m.pos && P >= m.pos + 1 && m.pos >= gn) {
+            slot_flush(q);
+            n0 = m.pos;
+        } else if (m.ck_pos > 0 && m.ck_pos >= gn && m.ck_seg == m.seg && (int) lcp >= m.ck_pos && P >= m.ck_pos + 1) { // last prompt's checkpoint
+            CK(cudaMemcpy(ms[q].dstate, m.ck_dstate, sizeof(float) * (size_t) 48 * NVH * 128 * 128, cudaMemcpyDefault));
+            CK(cudaMemcpy(ms[q].conv, m.ck_conv, sizeof(float) * (size_t) 48 * CONV_RING * QKV, cudaMemcpyDefault));
+            CK(cudaMemcpy(m.hlast, m.ck_h, D * sizeof(float), cudaMemcpyDefault));
+            n0 = m.ck_pos;
+        } else {
+            if (m.seg) { m.seg->refs--; m.seg = nullptr; }
+            own_trim(q, 0); // (nothing the slot holds is reused)
+            if (Segment * g = seg_match(prompt)) { // a shared prefix: its state, no prefill
+                CK(cudaMemcpy(ms[q].dstate, g->dstate, sizeof(float) * (size_t) 48 * NVH * 128 * 128, cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(ms[q].conv, g->conv, sizeof(float) * (size_t) 48 * CONV_RING * QKV, cudaMemcpyDeviceToDevice));
+                CK(cudaMemcpy(m.hlast, g->h, D * sizeof(float), cudaMemcpyDeviceToDevice));
+                m.seg = g;
+                g->refs++;
+                g->last_use = ++seg_clock;
+                n0 = (int) g->toks.size();
+            } else {
+                CK(cudaMemset(ms[q].dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
+                CK(cudaMemset(ms[q].conv, 0, sizeof(float) * (size_t) 48 * CONV_RING * QKV));
+                CK(cudaMemset(m.hlast, 0, D * sizeof(float)));
+            }
+        }
+        if (m.seg_build) { seg_free(m.seg_build); m.seg_build = nullptr; } // (an abandoned build)
+        m.share_at = -1;
+        if (!m.seg && share_len >= 1024 && share_len < P && seg_room(seg_state_bytes()) &&
+            (m.seg_build = seg_new(std::vector<int>(prompt.begin(), prompt.begin() + share_len), pin, q)))
+            m.share_at = share_len;
+        const int segn = m.seg ? (int) m.seg->toks.size() : m.share_at > 0 ? m.share_at : 0;
+        if (!own_reserve(q, P - segn + std::max(2 * bmm::DMAX, MAXT) + 2)) {
+            if (m.seg_build) { seg_free(m.seg_build); m.seg_build = nullptr; m.share_at = -1; }
+            throw std::runtime_error("slot_start: no room for the prompt in the slots' K/V pool");
+        }
+        m.rep_n = 0;
+        m.seq = prompt;
+        m.pf_at = n0;
+        dv_add(prompt.data() + n0, prompt.size() - n0);
+        m.temp = temp; m.top_p = top_p; m.top_k = top_k; m.min_p = min_p;
+        m.rng.seed(seed);
+        return n0;
+    }
+    int slot_prefill(int q, int budget) {
+        auto & m = msp[q];
+        if (m.pf_at < 0) return 0;
+        if (budget <= 0) { // abandon (the request went away): the slot keeps only its checkpoint
+            m.pf_at = -1;
+            m.seq.clear();
+            m.share_at = -1;
+            if (m.seg_build) { seg_free(m.seg_build); m.seg_build = nullptr; }
+            return 0;
+        }
+        solo_exit();
+        const int P = (int) m.seq.size();
+        int e = std::min(P - 1, m.pf_at + budget);
+        if (m.share_at > m.pf_at) e = std::min(e, m.share_at);
+        if (e > m.pf_at) slot_prefill_from(q, std::vector<int>(m.seq.begin(), m.seq.begin() + e + 1), m.pf_at, m.hlast);
+        return slot_prefilled(q, e);
+    }
+    // slot q has processed its prompt through position e - 1: returns the prompt tokens left (0: the last chunk, which
+    // saves the checkpoint and makes the first draft)
+    int slot_prefilled(int q, int e) {
+        auto & m = msp[q];
+        const int P = (int) m.seq.size();
+        m.pf_at = e;
+        if (e == m.share_at) seg_promote(q);
+        if (e < P - 1) return P - 1 - e;
+        m.pf_at = -1;
+        m.last = m.seq.back(); m.pos = P - 1;
+        // checkpoint: processed through P - 2
+        CK(cudaMemcpy(m.ck_dstate, ms[q].dstate, sizeof(float) * (size_t) 48 * NVH * 128 * 128, cudaMemcpyDefault));
+        CK(cudaMemcpy(m.ck_conv, ms[q].conv, sizeof(float) * (size_t) 48 * CONV_RING * QKV, cudaMemcpyDefault));
+        CK(cudaMemcpy(m.ck_h, m.hlast, D * sizeof(float), cudaMemcpyDefault));
+        m.ck_pos = P - 1;
+        m.ck_seg = m.seg;
+        slot_redraft(q);
+        return 0;
+    }
+    // a segment for tokens `toks` (device memory for their K/V and the state after them), not ready yet
+    // (nullptr: no room in the pool; slot `keep` building it keeps its cache)
+    Segment * seg_new(const std::vector<int> & toks, bool pin, int keep) {
+        const int np = ((int) toks.size() + KV_PG - 1) / KV_PG;
+        if (!pool_take(np, keep)) return nullptr;
+        Segment * g = new Segment;
+        g->toks = toks;
+        g->pinned = pin;
+        auto dev = [&](size_t bytes) { void * p; CK(cudaMalloc(&p, bytes)); g->bytes += bytes; return p; };
+        g->pages.assign(pfree.end() - np, pfree.end());
+        pfree.resize(pfree.size() - np);
+        g->dptab = (int *) dev(np * sizeof(int));
+        CK(cudaMemcpy(g->dptab, g->pages.data(), np * sizeof(int), cudaMemcpyHostToDevice));
+        g->dstate = (float *) dev(sizeof(float) * (size_t) 48 * NVH * 128 * 128);
+        g->conv = (float *) dev(sizeof(float) * (size_t) 48 * CONV_RING * QKV);
+        g->h = (float *) dev(sizeof(float) * D);
+        seg_used += g->bytes;
+        segs.push_back(g);
+        return g;
+    }
+    // slot q has processed exactly positions < share_at, their K/V written into seg_build: the state after them
+    // completes the segment, which the slot attaches to (its own cache then holds positions share_at ..)
+    void seg_promote(int q) {
+        auto & m = msp[q];
+        Segment * g = m.seg_build;
+        m.share_at = -1;
+        m.seg_build = nullptr;
+        if (!g) return;
+        CK(cudaMemcpy(g->dstate, ms[q].dstate, sizeof(float) * (size_t) 48 * NVH * 128 * 128, cudaMemcpyDeviceToDevice));
+        CK(cudaMemcpy(g->conv, ms[q].conv, sizeof(float) * (size_t) 48 * CONV_RING * QKV, cudaMemcpyDeviceToDevice));
+        CK(cudaMemcpy(g->h, m.hlast, sizeof(float) * D, cudaMemcpyDeviceToDevice));
+        g->ready = true;
+        m.seg = g; // (nothing at positions >= share_at is written yet: the own cache starts there)
+        g->refs = 1;
+        g->last_use = ++seg_clock;
+    }
+    int slot_start(int q, const std::vector<int> & prompt, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
+        const int reused = slot_begin(q, prompt, temp, top_p, top_k, min_p, seed);
+        slot_prefill(q, 1 << 30);
+        return reused;
+    }
+    // drafts for slot q's `last` (its MTP row from hlast)
+    void slot_redraft(int q) {
+        auto & m = msp[q];
+        std::vector<int> tok = {m.last}, r0 = {0}, nt = {1}, pos = {m.pos}, d1(1);
+        std::vector<const float *> hs = {m.hlast};
+        sl = {q};
+        sp_mtp(tok, hs, 1, r0.data(), nt.data(), pos.data(), d1);
+        slots_chain({q}, d1, {0});
+    }
+
+    // Solo: a lone active slot decodes through the megakernel (one launch per cycle, n_draft_max drafts) on the
+    // slot's own buffers; any other use of the slots hands it back first. It borrows the single-stream
+    // engine's control state (hctl, sampling, draft depth), restored when it hands back.
+    int solo = -1;
+    struct SoloSaved {
+        Ctl ctl;
+        float temp, top_p, min_p;
+        int top_k, ndraft, nd_avail;
+        unsigned long long seed;
+        bool all_acc;
+    } solo_saved;
+    bool solo_on = !getenv("MS_SOLO") || atoi(getenv("MS_SOLO")) != 0;
+    std::vector<int> solo_enter(int q) {
+        auto & m = msp[q];
+        slot_flush(q);
+        const Bufs b = ms_bufs(q);
+        CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
+        if (m.pos > 0) CK(cudaMemcpy(hb.h_hist + (size_t) ((m.pos - 1) % H_RING) * D, m.hlast, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        CK(cudaMemcpy(&hctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        solo_saved = {hctl, smp_temp, smp_top_p, smp_min_p, smp_top_k, ndraft, nd_avail, smp_seed, all_acc};
+        smp_temp = m.temp; smp_top_p = m.top_p; smp_top_k = m.top_k; smp_min_p = m.min_p; smp_seed = m.rng();
+        hctl.n = hctl.dn_c = m.pos;
+        hctl.mtp_valid = m.pos; // (the slot's MTP K/V covers its positions; the engine's own value is unrelated)
+        hctl.tok[0] = m.last;
+        CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
+        ndraft = n_draft_max;
+        launch(MODE_PREFILL, 1, 1);
+        CK(cudaMemcpy(&hctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        nd_avail = ndraft;
+        all_acc = true;
+        solo = q;
+        m.seq.push_back(hctl.out[0]);
+        dv_add(hctl.out, 1);
+        return {hctl.out[0]};
+    }
+    std::vector<int> solo_step() {
+        auto & m = msp[solo];
+        const int segn = m.seg ? (int) m.seg->toks.size() : 0; // (the own cache holds positions segn ..)
+        if (!own_reserve(solo, hctl.n - segn + MAXT + 2)) return {}; // (context full)
+        const int T = 1 + nd_avail;
+        ndraft = (!all_acc && n_draft_max > 3) ? n_draft_max - 1 : n_draft_max; // (as MKEngine::step)
+        launch(MODE_DECODE, T, 0);
+        nd_avail = ndraft;
+        CK(cudaMemcpy(&hctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
+        std::vector<int> out(hctl.out, hctl.out + hctl.n_out);
+        m.seq.insert(m.seq.end(), out.begin(), out.end());
+        dv_add(hctl.out, hctl.n_out);
+        all_acc = hctl.n_acc == T - 1;
+        st_drafted += T - 1;
+        st_accepted += hctl.n_acc;
+        return out;
+    }
+    // back to the slot format: state through dn_c - 1, then the emitted tokens not yet in it are prefilled
+    void solo_exit() {
+        if (solo < 0) return;
+        const int q = solo;
+        solo = -1;
+        auto & m = msp[q];
+        const int dc = hctl.dn_c;
+        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        CK(cudaMemcpy(m.hlast, hb.h_hist + (size_t) ((dc - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        slot_prefill_from(q, m.seq, dc, m.hlast);
+        const SoloSaved & v = solo_saved;
+        hctl = v.ctl;
+        CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
+        smp_temp = v.temp; smp_top_p = v.top_p; smp_min_p = v.min_p; smp_top_k = v.top_k; smp_seed = v.seed;
+        ndraft = v.ndraft; nd_avail = v.nd_avail; all_acc = v.all_acc;
+        m.pos = (int) m.seq.size() - 1;
+        m.last = m.seq.back();
+        m.rep_n = 0;
+        slot_redraft(q);
+    }
+    // one speculative step of slots `ss`: returns the tokens each emitted (1 .. nd + 1); drafted / accepted counters
+    long st_drafted = 0, st_accepted = 0;
+    // a prompt chunk that joins a step (slots_step_mixed): slot q's prompt from its pf_at on, budget rows in all
+    struct PfJob {
+        int q = -1, budget = 0;
+        int e = -1; // (out) processed through position e - 1
+    };
+    std::vector<std::vector<int>> slots_step(const std::vector<int> & ss, PfJob * pj = nullptr) {
+        // own pages for the positions this step writes (rows, MTP passes): a slot the pool cannot extend sits it out
+        // and emits nothing (its context is full)
+        stepping = ss;
+        std::vector<int> run;
+        for (int q : ss) {
+            const auto & m = msp[q];
+            const int segn = m.seg ? (int) m.seg->toks.size() : 0, p = q == solo ? hctl.n : m.pos;
+            if (own_reserve(q, p + std::max(2 * bmm::DMAX, MAXT) + 2 - segn)) run.push_back(q);
+        }
+        if (run.size() == ss.size()) return slots_run(ss, pj);
+        std::vector<std::vector<int>> out(ss.size());
+        if (!run.empty()) {
+            auto o = slots_run(run, pj);
+            for (size_t i = 0, j = 0; i < ss.size(); i++)
+                if (j < run.size() && ss[i] == run[j]) out[i] = std::move(o[j++]);
+        }
+        return out;
+    }
+    // one step of slots `ss` with the next chunk of slot q's prompt in the same pass (the weights are read once for
+    // both): the chunk fills `budget` rows with the step's; returns the slots' tokens as slots_step, and in remain the
+    // prompt tokens left as slot_prefill
+    std::vector<std::vector<int>> slots_step_mixed(int q, int budget, const std::vector<int> & ss, int & remain) {
+        auto & m = msp[q];
+        if (m.pf_at < 0 || budget <= 0 || ss.empty()) {
+            remain = slot_prefill(q, budget);
+            return ss.empty() ? std::vector<std::vector<int>>() : slots_step(ss);
+        }
+        PfJob pj;
+        pj.q = q;
+        pj.budget = std::min(budget, pf_cap());
+        auto out = slots_step(ss, &pj);
+        remain = pj.e < 0 ? slot_prefill(q, budget) : slot_prefilled(q, pj.e); // (no slot could step: alone)
+        return out;
+    }
+    int pf_cap() {
+        pf_init();
+        return hp.cap;
+    }
+    std::vector<std::vector<int>> slots_run(const std::vector<int> & ss, PfJob * pj = nullptr) {
+        bool pf = false;
+        for (const auto & m : msp) pf |= m.pf_at >= 0;
+        if (ss.size() == 1 && solo_on && !pf) return {solo == ss[0] ? solo_step() : (solo_exit(), solo_enter(ss[0]))};
+        solo_exit();
+        const int S = (int) ss.size();
+        { // drafts were allotted for the slots stepping then: slots joined since may push the rows past TM
+            int rows = 0;
+            for (int q : ss) rows += 1 + msp[q].nd;
+            while (rows > bmm::TM) {
+                int best = -1;
+                for (int q : ss) if (msp[q].nd > 1 && (best < 0 || msp[q].nd > msp[best].nd)) best = q;
+                if (best < 0) throw std::runtime_error("slots_step: too many slots for one step");
+                msp[best].nd--;
+                rows--;
+            }
+        }
+        std::vector<int> tok, r0(S), nt(S), pos(S), am;
+        need_cand = false;
+        for (int i = 0; i < S; i++) {
+            const auto & m = msp[ss[i]];
+            need_cand |= m.temp > 0.f;
+            r0[i] = (int) tok.size();
+            pos[i] = m.pos;
+            tok.push_back(m.last);
+            for (int d = 0; d < m.nd; d++) tok.push_back(m.dr[d]);
+            nt[i] = 1 + m.nd;
+        }
+        sl = ss;
+        if (pj) { // the prompt chunk: through position e - 1 (to the shared prefix's end at most, as slot_prefill)
+            auto & m = msp[pj->q];
+            const int R = (int) tok.size();
+            int e = std::min((int) m.seq.size() - 1, m.pf_at + std::max(1, pj->budget - R));
+            if (m.share_at > m.pf_at) e = std::min(e, m.share_at);
+            pj->e = e;
+            if (e > m.pf_at) mix_main(pj->q, std::vector<int>(m.seq.begin() + m.pf_at, m.seq.begin() + e), m.pf_at, m.hlast, tok, S, r0.data(), nt.data(),
+                     pos.data(), am);
+            else sp_main(tok, S, r0.data(), nt.data(), pos.data(), am);
+        } else sp_main(tok, S, r0.data(), nt.data(), pos.data(), am);
+        for (int i = 0; i < S; i++) msp[ss[i]].par ^= 1; // this step's draft entries become the next step's replay
+        std::vector<std::vector<int>> out(S);
+        std::vector<int> mtok, mr0(S), mnt(S), mpos(S), lr(S), d1(S);
+        std::vector<const float *> mhs;
+        std::uniform_real_distribution<double> U;
+        for (int i = 0; i < S; i++) {
+            auto & m = msp[ss[i]];
+            int k = 0, fin = -1;
+            if (m.temp > 0.f) { // exact speculative sampling with deterministic drafts
+                for (;; k++) {
+                    const float2 * c = hcand.data() + (size_t) (r0[i] + k) * 32;
+                    float pr[32];
+                    const int K = host_cand_probs(c, m.temp, m.top_p, m.top_k, m.min_p, pr);
+                    if (k == m.nd) { fin = host_cand_draw(c, pr, K, -1, U(m.rng)); break; }
+                    float pd = 0.f;
+                    for (int j = 0; j < K; j++) if (fbits(c[j].y) == m.dr[k]) pd = pr[j];
+                    if (U(m.rng) < pd) continue;
+                    fin = host_cand_draw(c, pr, K, m.dr[k], U(m.rng));
+                    break;
+                }
+            } else {
+                if (!m.cand1.empty()) {
+                    int rk = 0;
+                    while (rk < 8 && m.cand1[rk] != am[r0[i]]) rk++;
+                    rank_hist[rk == 0 ? 0 : rk == 1 ? 1 : rk < 4 ? 2 : rk < 8 ? 3 : 4]++;
+                }
+                while (k < m.nd && am[r0[i] + k] == m.dr[k]) k++;
+                fin = am[r0[i] + k];
+            }
+            st_drafted += m.nd;
+            for (int d = 0; d < m.nd && d <= k; d++) { st_src[m.src[d]][d][0]++; st_src[m.src[d]][d][1] += d < k; } // reached drafts
+            for (int d = 1; d < m.nd && d <= k; d++) if (m.src[d] == 0) m.chain_acc = 0.9f * m.chain_acc + 0.1f * (d < k ? 1.f : 0.f);
+            st_accepted += k;
+            mr0[i] = (int) mtok.size();
+            mpos[i] = m.pos + 1;
+            for (int j = 0; j <= k; j++) {
+                const int t = j < k ? m.dr[j] : fin;
+                out[i].push_back(t);
+                mtok.push_back(t);
+                mhs.push_back(hp.h + (size_t) (r0[i] + j + 1) * D); // position pos + 1 + j: h of row j
+            }
+            mnt[i] = k + 1;
+            lr[i] = mr0[i] + k;
+            m.last = out[i].back();
+            m.pos += k + 1;
+            m.rep_n = k;
+            m.seq.insert(m.seq.end(), out[i].begin(), out[i].end());
+            // h of position pos - 1 (row k): the next prompt may continue from here
+            CK(cudaMemcpyAsync(m.hlast, hp.h + (size_t) (r0[i] + k + 1) * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        }
+        dv_add(mtok.data(), mtok.size());
+        sl = ss;
+        sp_mtp(mtok, mhs, S, mr0.data(), mnt.data(), mpos.data(), d1);
+        slots_chain(ss, d1, lr);
+        return out;
+    }
+    int slot_pos(int q) const { return msp[q].pos; }
+
+    // one greedy step of sequences 0 .. S - 1 fed tok[s] at their positions: tok[s] <- argmax next token
+    void ms_step(std::vector<int> & tok) {
+        const int S = (int) tok.size();
+        CK(cudaMemcpy(hp.tok, tok.data(), S * sizeof(int), cudaMemcpyHostToDevice));
+        pf_time("ms_misc", [&] { pk_embed<<<S, 256>>>(S); });
+        int dl = 0;
+        for (int L = 0; L < NL; L++) {
+            const LayerW & W = hw.L[L];
+            pf_time("ms_misc", [&] { pk_norm_quant<<<S, 256>>>(hp.x, W.attn_norm); });
+            if (W.attn) {
+                pf_time("ms_gemm_attn_in", [&] {
+                gemm(W.q, S, hp.y0, QG, pf::OUT_STORE);
+                gemm(W.k, S, hp.y1, 2 * KVD, pf::OUT_STORE);
+                gemm(W.v, S, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE);
+                });
+                pf_time("ms_attn_seq", [&] {
+                for (int s = 0; s < S; s++) {
+                    ms_set(ms_bufs(s), ms_rows(s, true));
+                    pk_attn_prep<<<1, 256>>>(ms[s].pos, L / 4, W.qn, W.kn, 1);
+                    if (hb.kvq8) pk_attn<true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                    else pk_attn<false><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                }
+                ms_set(hb, hp);
+                });
+                pf_time("ms_misc", [&] { pk_attn_out<<<S, 256>>>(); });
+                pf_time("ms_gemm_attn_o", [&] { gemm(W.o, S, hp.x, D, pf::OUT_ADD); });
+            } else {
+                pf_time("ms_gemm_dn_in", [&] {
+                gemm(W.qkv, S, hp.y0, QKV, pf::OUT_STORE);
+                gemm(W.gate, S, hp.y1, VD, pf::OUT_STORE);
+                });
+                pf_time("ms_dn_ab", [&] { pk_ab<<<dim3((S + 63) / 64, AB_SPLITS), 256>>>(W.ab, S); });
+                pf_time("ms_dn_seq", [&] {
+                for (int s = 0; s < S; s++) {
+                    ms_set(ms_bufs(s), ms_rows(s, false));
+                    pk_dn_prep<<<1, 256>>>(1, ms[s].pos, dl, W.conv, W.dt, W.A);
+                    pk_conv_ring<<<1, 256>>>(1, ms[s].pos, dl);
+                    pk_dn_scan<<<dim3(NVH, 2), 256>>>(1, dl);
+                }
+                ms_set(hb, hp);
+                });
+                pf_time("ms_misc", [&] { pk_dn_out<<<S, 256>>>(W.snorm); });
+                pf_time("ms_gemm_dn_out", [&] { gemm(W.sout, S, hp.x, D, pf::OUT_ADD); });
+                dl++;
+            }
+            pf_time("ms_misc", [&] { pk_norm_quant<<<S, 256>>>(hp.x, W.post_norm); });
+            pf_time("ms_ffn_gu", [&] { gemm_glu(W.fg, W.fu, S); });
+            pf_time("ms_ffn_down", [&] { gemm(W.fd, S, hp.x, D, pf::OUT_ADD, 0, hp.xh2); });
+        }
+        pf_time("ms_head", [&] {
+        pk_norm_quant<<<S, 256>>>(hp.x, hw.onorm);
+        gemm(hw.head, S, hp.y0, VOCAB, pf::OUT_STORE);
+        pk_argmax<<<S, 256>>>(0);
+        });
+        CK(cudaGetLastError());
+        CK(cudaMemcpy(tok.data(), hp.amax, S * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int s = 0; s < S; s++) ms[s].pos++;
+    }
+
     void reset() {
         CK(cudaMemset(hb.dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(hb.h_hist, 0, sizeof(float) * (size_t) H_RING * D));
@@ -2988,16 +4932,126 @@ struct MKEngine::Impl {
     }
 };
 
-MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode)
+MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode, int kv_ctx)
     : p_(nullptr), n_draft_(n_draft) {
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
-    p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode);
+    p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode, kv_ctx);
     reset();
 }
 
 MKEngine::~MKEngine() { delete p_; }
 
 void MKEngine::bench_phases() { p_->bench(); }
+
+
+std::vector<std::vector<int>> MKEngine::ms_generate_spec(const std::vector<std::vector<int>> & prompts, int n_new, int ctx_s, double & step_secs,
+                                                         int oracle, const std::vector<std::vector<int>> * ref, double * acc_rate) {
+    auto & I = *p_;
+    const int S = (int) prompts.size();
+    I.slots_open(S, ctx_s);
+    for (int s = 0; s < S; s++) I.slot_start(s, prompts[s], I.smp_temp, I.smp_top_p, I.smp_top_k, I.smp_min_p, I.smp_seed * 1000003ULL + s);
+    I.pf_ev.clear();
+    I.st_drafted = I.st_accepted = 0;
+    std::vector<int> ss(S);
+    for (int s = 0; s < S; s++) ss[s] = s;
+    std::vector<std::vector<int>> out(S);
+    int n_steps = 0;
+    CK(cudaDeviceSynchronize());
+    const auto t0 = std::chrono::steady_clock::now();
+    auto done = [&]() { for (int s = 0; s < S; s++) if ((int) out[s].size() < n_new) return false; return true; };
+    while (!done()) {
+        if (oracle && ref)
+            for (int s = 0; s < S; s++) {
+                const int k = (int) out[s].size();
+                I.msp[s].nd = I.slot_nd;
+                for (int i = 0; i < I.slot_nd; i++) {
+                    int d = k + i < (int) (*ref)[s].size() ? (*ref)[s][k + i] : 0;
+                    if (oracle == 2) d = (d + 1) % VOCAB;
+                    I.msp[s].dr[i] = d;
+                }
+            }
+        auto em = I.slots_step(ss);
+        for (int s = 0; s < S; s++) out[s].insert(out[s].end(), em[s].begin(), em[s].end());
+        n_steps++;
+    }
+    step_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (getenv("MS_BENCH")) { I.bench_sp(16); I.bench_sp(12); I.bench_sp(8); if (getenv("MS_BENCH")[0] == '2') { I.bench_sp(4); I.bench_sp(2); } }
+    if (getenv("MS_DRAFT_STATS")) {
+        const long * h = I.rank_hist;
+        const double n = h[0] + h[1] + h[2] + h[3] + h[4];
+        fprintf(stderr, "[draft-stats] target = first draft's top 1 %.3f, top 2 %.3f, top 4 %.3f, top 8 %.3f (%g steps)\n",
+                h[0] / n, (h[0] + h[1]) / n, (h[0] + h[1] + h[2]) / n, (h[0] + h[1] + h[2] + h[3]) / n, n);
+        for (auto & x : I.rank_hist) x = 0;
+    }
+    if (getenv("MS_TIMES") && I.st_lookup + I.st_chain)
+        fprintf(stderr, "[ms-spec] further drafts: %ld from prompt lookup, %ld from the chained MTP pass\n", I.st_lookup, I.st_chain);
+    if (getenv("MS_TIMES"))
+        for (int sr = 0; sr < 2; sr++)
+            for (int d = 0; d < bmm::DMAX; d++)
+                if (I.st_src[sr][d][0]) fprintf(stderr, "[ms-spec]   %s draft %d: %ld reached, %.2f accepted\n", sr ? "lookup" : "MTP", d + 1,
+                                                I.st_src[sr][d][0], (double) I.st_src[sr][d][1] / I.st_src[sr][d][0]);
+    memset(I.st_src, 0, sizeof(I.st_src));
+    I.st_lookup = I.st_chain = 0;
+    if (getenv("MS_TIMES")) fprintf(stderr, "[ms-spec] ND=%d, %d steps, %.2f ms per step\n", I.slot_nd, n_steps, 1e3 * step_secs / n_steps);
+    if (I.pf_prof) { fprintf(stderr, "[ms-spec] profile over %d steps:\n", n_steps); I.pf_report(); }
+    for (auto & o : out) o.resize(n_new);
+    if (acc_rate) *acc_rate = I.st_drafted ? (double) I.st_accepted / I.st_drafted : 0.0;
+    return out;
+}
+
+// ---- slot API ----
+int MKEngine::slots_open(int n, int ctx, int seg_tokens) { return p_->slots_open(n, ctx, seg_tokens); }
+void MKEngine::profile_report() { p_->pf_report(); }
+int MKEngine::segments_drop() {
+    int n = 0;
+    for (auto * s : std::vector<MKEngine::Impl::Segment *>(p_->segs)) if (!s->refs) { p_->seg_free(s); n++; }
+    return n;
+}
+int MKEngine::slot_segment(int slot) const { const auto * g = p_->msp[slot].seg; return g ? (int) g->toks.size() : 0; }
+int MKEngine::slot_start(int slot, const std::vector<int> & prompt, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
+    return p_->slot_start(slot, prompt, temp, top_p, top_k, min_p, seed);
+}
+int MKEngine::slot_begin(int slot, const std::vector<int> & prompt, float temp, float top_p, int top_k, float min_p, unsigned long long seed,
+                         int share_len, bool pin) {
+    return p_->slot_begin(slot, prompt, temp, top_p, top_k, min_p, seed, share_len, pin);
+}
+int MKEngine::slot_prefill(int slot, int budget) { return p_->slot_prefill(slot, budget); }
+std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> & slots) { return p_->slots_step(slots); }
+std::vector<std::vector<int>> MKEngine::slots_step_mixed(int slot, int budget, const std::vector<int> & slots, int & remain) {
+    return p_->slots_step_mixed(slot, budget, slots, remain);
+}
+std::vector<int> MKEngine::slot_sequence(int slot) const { return p_->msp[slot].seq; }
+std::vector<float> MKEngine::slot_h(int slot) const {
+    std::vector<float> h(D);
+    CK(cudaMemcpy(h.data(), p_->msp[slot].hlast, D * sizeof(float), cudaMemcpyDeviceToHost));
+    return h;
+}
+
+std::vector<std::vector<int>> MKEngine::ms_generate(const std::vector<std::vector<int>> & prompts, int n_new, int ctx_s, double & step_secs, bool tc) {
+    const int S = (int) prompts.size();
+    for (const auto & pr : prompts)
+        if ((int) pr.size() + n_new + 8 > ctx_s) throw std::runtime_error("ms_generate: prompt + n_new exceeds ctx_s");
+    p_->ms_alloc(S, S * ((ctx_s + KV_PG - 1) / KV_PG));
+    for (int s = 0; s < S; s++) {
+        p_->own_trim(s, 0);
+        if (!p_->own_reserve(s, ctx_s)) throw std::runtime_error("ms_generate: no room");
+        p_->ms_prefill(s, prompts[s]);
+    }
+    p_->pf_ev.clear();
+    std::vector<int> tok(S);
+    for (int s = 0; s < S; s++) tok[s] = prompts[s].back();
+    std::vector<std::vector<int>> out(S);
+    CK(cudaDeviceSynchronize());
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < n_new; i++) {
+        if (tc) p_->ms_step_tc(tok);
+        else p_->ms_step(tok);
+        for (int s = 0; s < S; s++) out[s].push_back(tok[s]);
+    }
+    step_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (p_->pf_prof) { fprintf(stderr, "[ms] S=%d profile over %d steps:\n", S, n_new); p_->pf_report(); }
+    return out;
+}
 
 void MKEngine::reset() {
     p_->reset();
@@ -3014,7 +5068,7 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
     Ctl & c = p_->hctl;
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     std::vector<int> & seq = p_->seq;
-    if ((int) (seq.size() + tokens.size()) + 8 > p_->ctx) throw std::runtime_error("prompt exceeds context");
+    if ((int) (seq.size() + tokens.size()) + 8 > p_->kv_ctx) throw std::runtime_error("prompt exceeds context");
     seq.insert(seq.end(), tokens.begin(), tokens.end());
     p_->dv_add(tokens.data(), tokens.size());
     // Everything from the committed delta-net position on is fed: on a continued sequence that is
@@ -3109,7 +5163,7 @@ int MKEngine::n_vocab() { return VOCAB; }
 
 void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int first, const LogitSink & sink) {
     const int N = (int) tokens.size();
-    if (N + 8 > p_->ctx) throw std::runtime_error("sequence exceeds context");
+    if (N + 8 > p_->kv_ctx) throw std::runtime_error("sequence exceeds context");
     reset();
     mk_from = std::min(std::max(mk_from, 0), N);
     if (mk_from > 0)
@@ -3137,7 +5191,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
 
 int MKEngine::step(std::vector<int> & out) {
     Ctl & c = p_->hctl;
-    if (c.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full");
+    if (c.n + MAXT + 2 >= p_->kv_ctx) throw std::runtime_error("context full");
     const int T = 1 + p_->nd_avail;
     // Draft depth: after a cycle that rejected a draft, draft one token less (but at least 3), since a
     // deeper draft is then unlikely to be accepted; the full depth again after a fully accepted cycle.

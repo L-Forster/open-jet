@@ -12,8 +12,10 @@ OpenJet's `llama_backend: megakernel` setting keep their names.
 
 On an RTX 3090 with Qwen3.8-27B Q4_K_M, measured reasoning decode is **78 vs 51 tok/s**
 for llama.cpp with MTP, and greedy code generation reaches **140 vs 73 tok/s**.
-These are single-conversation results on that GPU; see [Results](#results) for settings,
-reproduction scripts, and correctness comparisons.
+These are single-conversation results on that GPU. With four agents sharing it (`--parallel 4`),
+each decodes at **64-72 vs 18-20 tok/s** for `llama-server --parallel 4`, and at 52-55 vs 15-16
+with 23K tokens of context each. See [Results](#results) for settings, reproduction scripts, and
+correctness comparisons.
 
 ## Standalone installation
 
@@ -79,7 +81,8 @@ Use the model ID returned by `/v1/models` in your client configuration.
 Responses include `choices`, `usage`, and engine `timings`. Thinking output uses
 `reasoning_content`; tool calls use structured `tool_calls`. Requests accept `tools`,
 `chat_template_kwargs`, `temperature`, `top_p`, `top_k` (at most 32), `min_p`, and `seed`.
-One request runs at a time. Text only; presence and repetition penalties are ignored with
+One request runs at a time unless the server is started with `--parallel N`
+([Parallel serving](#parallel-serving)). Text only; presence and repetition penalties are ignored with
 a warning. See [Server](#server) and [Limitations](#limitations) for conversation reuse
 and other API constraints.
 
@@ -169,6 +172,22 @@ which add 1-8% to the megakernel's decode here.)
 
 With the q8_0 KV cache (chosen automatically for contexts above ~80K tokens, e.g. open-jet's 100K)
 decode is ~1-2% and prefill 2-7% slower than with fp16.
+
+**Four agents at once** ([Parallel serving](#parallel-serving); `bench/parallel_bench.py`, coding
+tasks, 512 tokens, temperature 0.6, thinking off). llama.cpp as `llama-server -ngl 99 -fa on
+-c 131072 --parallel 4 -ctk q8_0 -ctv q8_0 --jinja`, the megakernel as `mk_server.py -c 0
+--parallel 4`; same GPU, back to back:
+
+| per agent | llama.cpp | megakernel |
+|---|---|---|
+| decode, short prompts | 18-20 tok/s | **64-72 tok/s** |
+| decode, 23K tokens of context each | 15-16 tok/s | **52-55 tok/s** |
+| first token of the next request on those contexts | 13.4 s | **0.2-0.5 s** |
+| a 20K-token prompt arrives: its first token | 20.9 s | 20.4 s |
+| ... an agent decoding meanwhile | 0.6 tok/s | **9.5 tok/s** |
+
+Context capacity is about equal: llama.cpp was given 4 x 32K positions, the megakernel's pool holds
+132K.
 
 **Correctness.** The output is not byte-identical to llama.cpp's: the arithmetic is ordered and
 rounded differently, so where two tokens are close the other one can win, and a generation then
@@ -303,7 +322,8 @@ llama-quantize --imatrix imatrix_unsloth.gguf \
 ```
 
 Benchmarks: `bench/think_bench.py` (reasoning mode, both engines), `bench/code_bench.py` (greedy
-decode, context sweep, second turn), `bench/bench.py` (decode on the 4 chat prompts);
+decode, context sweep, second turn), `bench/bench.py` (decode on the 4 chat prompts),
+`bench/parallel_bench.py` (several agents on any OpenAI-compatible server);
 `bench/*_bench.cu` are GEMV / GEMM microbenchmarks.
 
 ## Server
@@ -324,13 +344,38 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
   end of the previous prompt (e.g. a reformatted tool call) the engine rewinds to a checkpoint
   saved there. Anything else starts over (batched prefill, ~1500 tok/s).
 - Sampling: temperature, top_p, top_k (<= 32), min_p, seed; presence / repetition penalties are
-  ignored (with a warning). One request at a time.
+  ignored (with a warning). One request at a time, or several with `--parallel N` (below).
 - KV cache: fp16, or q8_0 when fp16 does not fit the requested context (`--kv auto|f16|q8`).
 - Both engines keep the ~0.72 GB token embedding table in mapped pinned system RAM by default,
   freeing about 680 MiB of GPU VRAM. `MK_EMBD_DEVICE=1` restores GPU residency.
 - `MK_PF_CAP=1024` halves prefill scratch, freeing about another 325 MiB of VRAM.
-  The default remains 2048; throughput depends on prompt length. Smaller caps also limit
-  scoring/logit tiles to the scratch allocation. These options apply to both quant engines.
+  The default is 2048, and 1024 under `--parallel`, where the memory goes to context (a 9.1K-token
+  prompt measured 1248-1508 tok/s at either cap). Smaller caps also limit scoring/logit tiles to
+  the scratch allocation. These options apply to both quant engines.
+
+### Parallel serving
+
+`--agents N` serves up to 8 conversations at once (two MTP drafts each per step up to 5, one
+above), e.g. several coding agents on one GPU; it is `--parallel N -c 0`:
+
+```sh
+openjet-engine --model /absolute/path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
+```
+
+- Each conversation lives in a slot. A request goes to the slot already holding its conversation,
+  which then processes only what is new; otherwise to the free slot that loses least (an empty one
+  before another conversation's cache).
+- `-c 0` gives the slots all the memory left: their K/V (q8_0) is one pool of pages that any slot
+  draws on as its context grows, 132K positions on a 24 GB RTX 3090 (about 33K per agent with 4).
+- A system message plus tools of 1024 tokens or more is stored once and shared by the
+  conversations that start with it (`--no-shared-prefix` turns this off).
+- The active slots decode together: one pass over the weights for all their rows (each slot's
+  current token and its MTP / prompt-lookup drafts).
+- A new prompt rides along with those steps: each pass holds the step's rows plus the next chunk
+  of the prompt, 256 rows in all (`MK_PF_MIX`; `MK_PF_MIX=0` instead prefills chunks of
+  `MK_PF_CHUNK`, 512, between steps). The other agents keep decoding while it is processed, with
+  no cost to the prompt's own speed, and its state is bit-identical to prefilling it alone.
+- Q4_K_M engine only; the mixed-quant library serves one conversation at a time.
 
 ## How it gets its speed
 
@@ -386,6 +431,11 @@ processing the whole conversation as one fresh prompt.
   in registers with `movmatrix`; gates are carried as log g, so tiny or zero gates are exact.
   ~2% of prefill time; 3.5e-4 relative error against a float64 reference of the recurrence.
 - **Attention**: causal flash attention over the KV cache on tensor cores.
+- **Small chunks** (a prompt riding along with parallel steps, or a prompt's tail): a GEMM whose
+  128-row tiles would leave most SMs idle (5120 output rows: 40 CTAs) splits K in two, the fp32
+  halves summed in a fixed order, and attention of few queries over a long context splits the
+  cached positions over more blocks, merging the partial softmax results in order. Both are
+  1.6-2x faster at 128 tokens; KL against llama.cpp is unchanged.
 
 ## Turing (RTX 8000)
 
@@ -394,7 +444,8 @@ has a Turing path; the mixed engine needs sm_80+, so open-jet serves UD-Q4_K_XL 
 Turing. `make ARCH=sm_75` (or setup, on a Turing GPU) defines `QWEN_MK_SM75`, which swaps in
 [`cuda_compat.cuh`](cuda_compat.cuh): synchronous copies instead of `cp.async`, k16 tensor-core MMAs
 split into two k8 ones, no L2 cache-policy hints, and tiles shrunk to Turing's 64 KiB of shared
-memory. Builds for other GPUs are unchanged. CUDA 12 and 13 both compile sm_75.
+memory. Builds for other GPUs are unchanged. CUDA 12 and 13 both compile sm_75. The int8 MMAs of
+the parallel path are built from m8n8k16 there (compiled, not yet run on Turing hardware).
 
 | RTX 8000, Qwen3.8-27B Q4_K_M | llama.cpp (MTP 2) | megakernel |
 |---|---|---|
@@ -420,6 +471,8 @@ and attention paths against references without a model. On multi-GPU machines, p
   only after the end of the previous prompt); editing an earlier part, e.g. context compaction,
   re-prefills it. No slot save / restore (open-jet's low-memory shell swap falls back to
   re-prompting).
+- `--parallel`: at most 8 conversations (16 rows per step), Q4_K_M engine only. With 4 agents on
+  a 24 GB card, each has about 33K tokens of context.
 
 ## Files
 
