@@ -10,7 +10,8 @@ via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool call
 `tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Successive requests of a
 conversation reuse the processed tokens: the new prompt is matched against the sequence so far and
 only the rest is prefilled (rewinding to the end of the previous prompt if it diverges after that).
-GET /health, GET /v1/models.  One request at a time.
+GET /health, GET /v1/models, GET /slots (--parallel: each slot's state, tok/s, context, task; see tools/mk_top.py).
+One request at a time unless --parallel.
 """
 import argparse
 import codecs
@@ -36,6 +37,27 @@ TOPK_MAX = 32
 
 def log(*a):
     print("[mk-server]", *a, file=sys.stderr, flush=True)
+
+
+def under_wsl():
+    try:
+        with open("/proc/version") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+def drop_file_cache(path):
+    """releases the page cache holding a file (the GGUF once its weights are on the GPU, which the engine unmaps after
+    loading). Only under WSL, where cached pages stay counted against Windows, a whole model's worth of RAM held for
+    nothing: elsewhere the cache is free and makes the next start fast."""
+    if not under_wsl():
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
 
 
 class Engine:
@@ -351,6 +373,23 @@ class OutputParser:
 # ---------------------------------------------------------------------------------------------
 
 
+def task_label(body):
+    """(task, agent) a request shows in GET /slots: metadata.task / metadata.agent (or the OpenAI `user` field) when
+    the client sends them, else the first line of the first user message"""
+    meta = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    task = str(meta.get("task") or "")
+    if not task:
+        for m in body.get("messages") or []:
+            if m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, list):
+                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+                # (skipping headings such as "Delegated task:")
+                task = next((ln.strip() for ln in str(c or "").splitlines() if ln.strip() and not ln.strip().endswith(":")), "")
+                break
+    return task[:200], str(meta.get("agent") or body.get("user") or "")
+
+
 def common_prefix(a, b):
     n = 0
     for x, y in zip(a, b):
@@ -371,13 +410,18 @@ class SlotScheduler:
     MIX_ROWS = int(os.environ.get("MK_PF_MIX", "256"))
 
     class Req:
-        def __init__(self, toks, sp, max_new, share_len=0, pin=False):
+        def __init__(self, toks, sp, max_new, share_len=0, pin=False, task="", agent=""):
             self.toks, self.sp, self.max_new = toks, sp, max_new
             self.share_len, self.pin = share_len, pin
+            self.task, self.agent = task, agent
+            self.tail = ""  # the last of its output text (GET /slots)
+            self.t_end = None
             self.q = queue.Queue()
             self.n = 0
             self.reused = 0  # prompt tokens the slot already held (set when its prefill starts)
             self.cancelled = False
+
+    RATE_WINDOW = 3.0  # seconds of emitted tokens a slot's tok/s is measured over
 
     def __init__(self, eng, n, ctx):
         self.eng, self.n, self.ctx = eng, n, ctx
@@ -387,10 +431,15 @@ class SlotScheduler:
         self.building = {}  # shared prefix -> the slot prefilling it into a segment (requests sharing it wait)
         self.built = set()  # shared prefixes made into segments
         self.seq = [[] for _ in range(n)]  # each slot's tokens (prompt, emitted), as the engine holds them
+        # GET /slots: each slot's latest request, (time, tokens) of its recent steps, prompt tokens left to prefill
+        self.last = [None] * n
+        self.emitted = [[] for _ in range(n)]
+        self.pf_rem = [0] * n
+        self.total_gen = 0
         threading.Thread(target=self.run, daemon=True).start()
 
-    def submit(self, toks, sp, max_new, share_len=0, pin=False):
-        r = SlotScheduler.Req(toks, sp, max_new, share_len, pin)
+    def submit(self, toks, sp, max_new, share_len=0, pin=False, task="", agent=""):
+        r = SlotScheduler.Req(toks, sp, max_new, share_len, pin, task, agent)
         with self.cv:
             self.pending.append(r)
             self.cv.notify()
@@ -404,10 +453,35 @@ class SlotScheduler:
         r = self.active.pop(slot)
         self.free.append(slot)
         r.q.put(None)
+        r.t_end = time.time()
+
+    def snapshot(self):
+        """per-slot state for GET /slots (read from the HTTP threads while the scheduler runs)"""
+        now = time.time()
+        active, filling = dict(self.active), dict(self.filling)
+        slots = []
+        for s in range(self.n):
+            r = self.last[s]
+            ev = [e for e in list(self.emitted[s]) if now - e[0] <= self.RATE_WINDOW]
+            # the tokens of the steps after the window's first over the time since it (the first step's tokens were
+            # made before its timestamp); nothing to measure before a second step
+            rate = sum(e[1] for e in ev[1:]) / (now - ev[0][0]) if len(ev) > 1 else 0.0
+            st = "decode" if s in active else "prefill" if s in filling else "idle"
+            slots.append({
+                "id": s, "state": st,
+                "ctx": len(self.seq[s]) - (self.pf_rem[s] if st == "prefill" else 0),
+                "tok_s": rate if st == "decode" else 0.0,
+                "prompt": len(r.toks) if r else 0, "reused": r.reused if r else 0, "prefill_left": self.pf_rem[s],
+                "generated": r.n if r else 0, "task": r.task if r else "", "agent": r.agent if r else "",
+                "tail": r.tail if r else "", "idle_s": now - r.t_end if r and st == "idle" and r.t_end else 0.0,
+            })
+        return {"slots": slots, "pending": len(self.pending), "ctx": self.ctx, "total_generated": self.total_gen}
 
     def _fail(self, slot, r, e):
         r.q.put(e)
+        r.t_end = time.time()
         self.seq[slot] = []
+        self.pf_rem[slot] = 0
         self.free.append(slot)
 
     def run(self):
@@ -438,6 +512,7 @@ class SlotScheduler:
                     reused = r.reused = eng.slot_begin(slot, r.toks, *r.sp, r.share_len, r.pin)
                     self.filling[slot] = (r, time.time(), reused)
                     self.seq[slot] = list(r.toks)
+                    self.last[slot], self.emitted[slot], self.pf_rem[slot] = r, [], len(r.toks) - reused
                     if r.share_len and reused < r.share_len:  # this slot prefills the shared prefix (or no room)
                         self.building[self.share_key(r)] = slot
                     elif r.share_len:
@@ -456,8 +531,10 @@ class SlotScheduler:
                         del self.filling[slot]
                         self.building = {k: v for k, v in self.building.items() if v != slot}
                         self.seq[slot] = []
+                        self.pf_rem[slot] = 0
                         self.free.append(slot)
                         r.q.put(None)
+                        r.t_end = time.time()
                     else:
                         if self.active and self.MIX_ROWS > 0:
                             slots = sorted(self.active)
@@ -465,6 +542,7 @@ class SlotScheduler:
                             stepped = (slots, em)
                         else:
                             rem = eng.slot_prefill(slot, self.PF_CHUNK if self.active else 1 << 30)
+                        self.pf_rem[slot] = rem
                         if rem == 0:
                             self._prefilled(slot, r, t0, reused)
                 except Exception as e:
@@ -492,6 +570,9 @@ class SlotScheduler:
                     self._finish(s)
                     continue
                 self.seq[s] += toks
+                now = time.time()
+                self.emitted[s] = [e for e in self.emitted[s] if now - e[0] <= self.RATE_WINDOW] + [(now, len(toks))]
+                self.total_gen += len(toks)
                 for t in toks:
                     r.q.put(t)
                     r.n += 1
@@ -516,6 +597,7 @@ class SlotScheduler:
         if r.max_new <= 0:  # (nothing to generate: a shared-context prefill, or no room)
             self.free.append(slot)
             r.q.put(None)
+            r.t_end = time.time()
         else:
             self.active[slot] = r
 
@@ -550,6 +632,7 @@ class Server:
             self.sched = SlotScheduler(self.eng, args.parallel, args.ctx)
             if self.shared_text:
                 log(f"shared context: {shared_toks} tokens, prefilled once (with the first request) and shared by all")
+        drop_file_cache(args.model)
         log(f"ready in {time.time() - t0:.1f} s: {self.model_id}, ctx {args.ctx}, {args.draft} drafts")
 
     def warm_up(self):
@@ -687,7 +770,8 @@ class Server:
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         n_gen, finish, aborted = 0, "length", False
         if self.sched is not None:  # parallel: the scheduler decodes this request with the others
-            req = self.sched.submit(toks, sp, max_new, self.share_len(body, toks), self.shared_text is not None)
+            req = self.sched.submit(toks, sp, max_new, self.share_len(body, toks), self.shared_text is not None,
+                                    *task_label(body))
             t1 = None
             while True:
                 t = req.q.get()
@@ -703,7 +787,9 @@ class Server:
                     continue
                 if aborted:
                     continue
-                for kind, delta in parser.feed(dec.decode(self.eng.piece(t))):
+                text = dec.decode(self.eng.piece(t))
+                req.tail = (req.tail + text)[-400:]
+                for kind, delta in parser.feed(text):
                     if emit(kind, delta) is False:
                         aborted = True
                         req.cancelled = True
@@ -764,6 +850,8 @@ def make_handler(srv):
                 self._json(200, {"object": "list", "data": [{"id": srv.model_id, "object": "model", "owned_by": "openjet"}]})
             elif path == "/props":
                 self._json(200, {"default_generation_settings": {"n_ctx": srv.args.ctx}, "total_slots": max(1, srv.args.parallel)})
+            elif path == "/slots" and srv.sched is not None:
+                self._json(200, {"model": srv.model_id, **srv.sched.snapshot()})
             else:
                 self._json(404, {"error": {"message": "not found", "type": "not_found_error"}})
 

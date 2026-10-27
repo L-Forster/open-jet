@@ -157,10 +157,16 @@ struct Bufs {
     Ctl * ctl;
     unsigned long long * prof; // optional per-barrier timestamps (block 0)
     int ctx;
+    // (prefill.cuh's K/V addressing, shared with qwen38_mk.cu: this engine keeps them zero, one contiguous cache)
+    void *kseg, *vseg;
+    __half *ksseg, *vsseg;
+    int segn, segctx;
+    const int * segptab;
+    const int * ptab;
 };
-
 __constant__ ModelW cW;
 __constant__ Bufs cB;
+#include "kv_paged.cuh"
 
 struct Launch {
     int mode, T, last, ndraft;
@@ -2889,6 +2895,7 @@ struct MKEngine::Impl {
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mk_cycle, NT, SM_TOTAL));
         if (nb < 1) throw std::runtime_error("megakernel does not fit on an SM");
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
+        file.release();
     }
 
     ~Impl() {
@@ -3261,8 +3268,10 @@ struct MKEngine::Impl {
     }
 };
 
-MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode)
+MKEngine::MKEngine(const std::string & path, int ctx, int n_draft, const std::string & draft_vocab, int kv_mode, int kv_ctx)
     : p_(nullptr), n_draft_(n_draft) {
+    // (kv_ctx: a separate engine K/V size, asked for only by parallel slots: refused before minutes of loading)
+    if (kv_ctx > 0) throw std::runtime_error("parallel slots need the Q4_K_M engine (libqwen38mk.so)");
     if (n_draft < 0 || n_draft > MAXT - 1) throw std::runtime_error("n_draft must be in [0, " + std::to_string(MAXT - 1) + "]");
     p_ = new Impl(path, ctx, n_draft, draft_vocab, kv_mode);
     reset();
@@ -3434,3 +3443,20 @@ std::vector<float> MKEngine::last_hidden() {
     CK(cudaMemcpy(h.data(), p_->hb.h_hist + (size_t) (pos % H_RING) * D, D * 4, cudaMemcpyDeviceToHost));
     return h;
 }
+
+// Parallel slots (mk_server --parallel) are built only into the Q4_K_M engine (qwen38_mk.cu)
+[[noreturn]] static void no_slots() { throw std::runtime_error("parallel slots need the Q4_K_M engine (libqwen38mk.so)"); }
+std::vector<std::vector<int>> MKEngine::ms_generate(const std::vector<std::vector<int>> &, int, int, double &, bool) { no_slots(); }
+std::vector<std::vector<int>> MKEngine::ms_generate_spec(const std::vector<std::vector<int>> &, int, int, double &, int,
+                                                          const std::vector<std::vector<int>> *, double *) { no_slots(); }
+int MKEngine::slots_open(int, int, int) { no_slots(); }
+int MKEngine::slot_segment(int) const { no_slots(); }
+int MKEngine::segments_drop() { no_slots(); }
+void MKEngine::profile_report() {}
+int MKEngine::slot_start(int, const std::vector<int> &, float, float, int, float, unsigned long long) { no_slots(); }
+int MKEngine::slot_begin(int, const std::vector<int> &, float, float, int, float, unsigned long long, int, bool) { no_slots(); }
+int MKEngine::slot_prefill(int, int) { no_slots(); }
+std::vector<std::vector<int>> MKEngine::slots_step(const std::vector<int> &) { no_slots(); }
+std::vector<std::vector<int>> MKEngine::slots_step_mixed(int, int, const std::vector<int> &, int &) { no_slots(); }
+std::vector<int> MKEngine::slot_sequence(int) const { no_slots(); }
+std::vector<float> MKEngine::slot_h(int) const { no_slots(); }

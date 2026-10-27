@@ -65,7 +65,15 @@ struct File {
         base = (const uint8_t *) p;
         parse();
     }
-    ~File() { if (base) munmap((void *) base, size); }
+    ~File() { release(); }
+
+    // unmaps the file once its tensors are copied out (keeps the metadata): a mapping held for the engine's life keeps
+    // the whole model in the page cache, which under WSL stays counted against Windows
+    void release() {
+        if (base) munmap((void *) base, size);
+        base = nullptr;
+        tensors.clear();
+    }
 
     const Tensor & get(const std::string & name) const {
         auto it = tensors.find(name);
