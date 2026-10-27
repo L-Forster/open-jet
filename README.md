@@ -17,9 +17,11 @@ Coding agents that run on your own GPU. Numbers are Qwen3.8-27B Q4_K_M on one RT
 Everything runs on your machine: no account, no API key, nothing leaves it, and it works offline once
 the model is downloaded.
 
-<p align="center">
-  <img width="1672" height="941" alt="OpenJet coding agent running in a terminal" src="https://github.com/user-attachments/assets/b06b0b8f-1bbc-443d-920e-bd70bff1479c" />
-</p>
+
+
+https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
+
+
 
 ## Setup
 
