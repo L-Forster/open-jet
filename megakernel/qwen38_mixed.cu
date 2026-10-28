@@ -3424,6 +3424,61 @@ struct MKEngine::Impl {
     PBufs hp{};
     bool pf_ready = false;
 
+    // pk_attn2 / pk_attn8 (prefill_attn.cuh): the prefill attention of the engine's own contiguous cache. MK_ATTN=1: pk_attn;
+    // MK_ATTN_SPLIT=0: no tail split; MK_ATTN_PV16=0: fp32-accumulated P V (pk_attn2 with both off reproduces pk_attn's
+    // unsplit arithmetic); MK_ATTN_S8 (q8 cache, with PV16): 1 = int8 Q K^T, Q scales per 32-dim block (pk_attn8, default);
+    // 2 = per row; 0 = pk_attn2
+    int a2_slots = 0;
+    bool pf_attn_old = false, attn_split = true, attn_pv16 = true;
+    int attn_s8 = 1;
+    // false: the caller runs pk_attn (Turing, MK_ATTN=1, a paged cache)
+    bool pf_attn2(int T, int n, int slot) {
+#if QWEN_MK_SM75
+        (void) T, (void) n, (void) slot;
+        return false;
+#else
+        if (pf_attn_old || false) return false;
+        // y1 (k, v of the layer) is free between pk_attn_prep and the FFN: partials of split items
+        const int N = (T + A2_Q - 1) / A2_Q * NKV;
+        int nfull = N, S = 1;
+        if (attn_split) a2_plan(T, n, a2_slots, (size_t) hp.cap * FF, nfull, S);
+        const int grid = nfull + (N - nfull) * S;
+        if (hb.kvq8) {
+            if (attn_pv16 && attn_s8 == 1) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16 && attn_s8 == 2) pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+        } else {
+            if (attn_pv16) pk_attn2<false, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else pk_attn2<false, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+        }
+        if (N > nfull) pk_attn2_comb<<<N - nfull, 256>>>(T, nfull, S, hp.y1);
+        return true;
+#endif
+    }
+    void pf_attn2_init() {
+#if !QWEN_MK_SM75
+        CK(cudaFuncSetAttribute(pk_attn2<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn2<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn2<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn2<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        int occ = 0;
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn2<true, false>, A2_NT, A2_SMEM));
+        a2_slots = nsm * occ;
+        if (const char * e = getenv("MK_ATTN")) pf_attn_old = atoi(e) == 1;
+        if (const char * e = getenv("MK_ATTN_SPLIT")) attn_split = atoi(e) != 0;
+        if (const char * e = getenv("MK_ATTN_PV16")) attn_pv16 = atoi(e) != 0;
+        if (const char * e = getenv("MK_ATTN_S8")) attn_s8 = atoi(e);
+        if (attn_s8) {
+            int occ8 = 0;
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false>, A2_NT, A8_SMEM));
+            if (occ8 != occ) attn_s8 = 0; // the split plan assumes pk_attn2's residency
+        }
+#endif
+    }
+
     void pf_init() {
         if (pf_ready) return;
         // MK_PF_CAP: tokens per prefill chunk (multiple of 128); scratch is ~0.33 MB per token
@@ -3456,6 +3511,7 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
+        pf_attn2_init();
         pf_ready = true;
     }
 
@@ -3590,6 +3646,7 @@ struct MKEngine::Impl {
                     pf_time("gemm_attn_qkv", [&] { gemm(W.k, T, hp.y1, 2 * KVD, pf::OUT_STORE); gemm(W.v, T, hp.y1 + KVD, 2 * KVD, pf::OUT_STORE); });
                     pf_time("attn_prep", [&] { pk_attn_prep<<<T, 256>>>(n, L / 4, W.qn, W.kn, 1); });
                     pf_time("attn", [&] {
+                        if (pf_attn2(T, n, L / 4)) return;
                         if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, L / 4);
                         else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n, L / 4);
                     });

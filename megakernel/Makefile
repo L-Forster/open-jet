@@ -11,7 +11,7 @@ endif
 all: qwen38_mk libqwen38mk.so tools/vocab_freq tools/llama_ref
 
 # ptxas register / spill report for every phase function goes to ptxas.log
-qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h kv_paged.cuh prefill.cuh prefill_gemm.cuh cuda_compat.cuh bmm.cuh
+qwen38_mk.o: qwen38_mk.cu qwen38_mk.h gguf.h kv_paged.cuh prefill.cuh prefill_attn.cuh prefill_gemm.cuh cuda_compat.cuh bmm.cuh
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas.log || (cat ptxas.log; false)
 
 qwen38_mk: qwen38_mk.o main.cu logit_stats.h
@@ -24,7 +24,7 @@ libqwen38mk.so: qwen38_mk.o capi.cpp qwen38_mk.h
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
 # Extended quant support is opt-in; neither `all` nor the native library builds it.
-qwen38_mixed.o: qwen38_mixed.cu qwen38_mk.h gguf.h kv_paged.cuh prefill.cuh prefill_gemm_mixed.cuh
+qwen38_mixed.o: qwen38_mixed.cu qwen38_mk.h gguf.h kv_paged.cuh prefill.cuh prefill_attn.cuh prefill_gemm_mixed.cuh
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mixed.cu -o $@ 2> ptxas-mixed.log || (cat ptxas-mixed.log; false)
 
 qwen38_mixed: qwen38_mixed.o main.cu logit_stats.h
@@ -35,7 +35,7 @@ libqwen38mk_mixed.so: qwen38_mixed.o capi.cpp qwen38_mk.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mixed.o \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 
-bench/turing_check: bench/turing_check.cu qwen38_mk.cu qwen38_mk.h gguf.h kv_paged.cuh prefill.cuh prefill_gemm.cuh cuda_compat.cuh
+bench/turing_check: bench/turing_check.cu qwen38_mk.cu qwen38_mk.h gguf.h kv_paged.cuh prefill.cuh prefill_attn.cuh prefill_gemm.cuh cuda_compat.cuh
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include $< -L$(LLAMA)/build/bin -lggml-base \
 		-Xlinker -rpath -Xlinker $(abspath $(LLAMA)/build/bin) -o $@
 

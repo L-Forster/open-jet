@@ -3259,7 +3259,7 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] draft sampling: %s\n", draft_prob ? "probabilistic" : "greedy");
         }
         hb.prof = profiling ? dalloc<unsigned long long>(4096 + 1024 * 128) : nullptr;
-        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        cb_set(hb);
 
         CK(cudaFuncSetAttribute(mk_cycle, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
         int nb = 0;
@@ -3517,7 +3517,70 @@ struct MKEngine::Impl {
     static constexpr int ATT_SPLIT_ROWS = 1024;
     float * att_spo = nullptr;
     float2 * att_sml = nullptr;
+    // pk_attn2 / pk_attn8 (prefill_attn.cuh): the prefill attention of the engine's own contiguous cache. MK_ATTN=1: pk_attn;
+    // MK_ATTN_SPLIT=0: no tail split; MK_ATTN_PV16=0: fp32-accumulated P V (pk_attn2 with both off reproduces pk_attn's
+    // unsplit arithmetic); MK_ATTN_S8 (q8 cache, with PV16): 1 = int8 Q K^T, Q scales per 32-dim block (pk_attn8, default);
+    // 2 = per row; 0 = pk_attn2
+    int a2_slots = 0;
+    bool pf_attn_old = false, attn_split = true, attn_pv16 = true;
+    int attn_s8 = 1;
+    // false: the caller runs pk_attn (Turing, MK_ATTN=1, a paged cache)
+    bool pf_attn2(int T, int n, int slot) {
+#if QWEN_MK_SM75
+        (void) T, (void) n, (void) slot;
+        return false;
+#else
+        if (pf_attn_old || cb_paged) return false;
+        // y1 (k, v of the layer) is free between pk_attn_prep and the FFN: partials of split items
+        const int N = (T + A2_Q - 1) / A2_Q * NKV;
+        int nfull = N, S = 1;
+        if (attn_split) a2_plan(T, n, a2_slots, (size_t) hp.cap * FF, nfull, S);
+        const int grid = nfull + (N - nfull) * S;
+        if (hb.kvq8) {
+            if (attn_pv16 && attn_s8 == 1) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16 && attn_s8 == 2) pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+        } else {
+            if (attn_pv16) pk_attn2<false, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            else pk_attn2<false, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+        }
+        if (N > nfull) pk_attn2_comb<<<N - nfull, 256>>>(T, nfull, S, hp.y1);
+        return true;
+#endif
+    }
+    void pf_attn2_init() {
+#if !QWEN_MK_SM75
+        CK(cudaFuncSetAttribute(pk_attn2<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn2<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn2<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn2<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        int occ = 0;
+        CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn2<true, false>, A2_NT, A2_SMEM));
+        a2_slots = nsm * occ;
+        if (const char * e = getenv("MK_ATTN")) pf_attn_old = atoi(e) == 1;
+        if (const char * e = getenv("MK_ATTN_SPLIT")) attn_split = atoi(e) != 0;
+        if (const char * e = getenv("MK_ATTN_PV16")) attn_pv16 = atoi(e) != 0;
+        if (const char * e = getenv("MK_ATTN_S8")) attn_s8 = atoi(e);
+        if (attn_s8) {
+            int occ8 = 0;
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false>, A2_NT, A8_SMEM));
+            if (occ8 != occ) attn_s8 = 0; // the split plan assumes pk_attn2's residency
+        }
+#endif
+    }
+
+    // the K/V view the kernels see (cB): the engine's own contiguous cache, or a parallel slot's paged one
+    bool cb_paged = false;
+    void cb_set(const Bufs & b, bool async = false) {
+        if (async) CK(cudaMemcpyToSymbolAsync(cB, &b, sizeof(Bufs)));
+        else CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
+        cb_paged = b.ptab != nullptr || b.segn > 0;
+    }
     void pf_attn(int T, int n0, int slot) {
+        if (pf_attn2(T, n0, slot)) return;
         const int base = (T + AT_Q - 1) / AT_Q * NKV, keys = n0 + T;
         int nz = std::min({16, (4 * nsm + base - 1) / base, keys / 1024, ATT_SPLIT_ROWS / T});
         if (nz < 2) {
@@ -3565,6 +3628,7 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
+        pf_attn2_init();
         pf_ready = true;
     }
 
@@ -3879,7 +3943,7 @@ struct MKEngine::Impl {
         return p;
     }
     void ms_set(const Bufs & b, const PBufs & p) {
-        CK(cudaMemcpyToSymbolAsync(cB, &b, sizeof(Bufs)));
+        cb_set(b, true);
         CK(cudaMemcpyToSymbolAsync(cP, &p, sizeof(PBufs)));
     }
     // sequence s: state from scratch, prefill all but the last token (the step feeds that one)
@@ -3888,9 +3952,9 @@ struct MKEngine::Impl {
         CK(cudaMemset(ms[s].dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
         CK(cudaMemset(ms[s].conv, 0, sizeof(float) * (size_t) 48 * CONV_RING * QKV));
         const Bufs b = ms_bufs(s);
-        CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
+        cb_set(b);
         if (toks.size() > 1) pf_run(std::vector<int>(toks.begin(), toks.end() - 1), 0, nullptr);
-        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        cb_set(hb);
         ms[s].pos = (int) toks.size() - 1;
         if ((int) msp.size() > s) CK(cudaMemcpy(msp[s].hlast, hp.h, D * sizeof(float), cudaMemcpyDeviceToDevice)); // (pf_run leaves h of its last row in h[0])
     }
@@ -4849,10 +4913,10 @@ struct MKEngine::Impl {
     void slot_prefill_from(int q, const std::vector<int> & toks, int n0, const float * hsrc) {
         pf_init();
         const Bufs b = ms_bufs(q);
-        CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
+        cb_set(b);
         if (n0 > 0) CK(cudaMemcpy(hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, hsrc, D * sizeof(float), cudaMemcpyDeviceToDevice));
         if ((int) toks.size() - 1 > n0) pf_run(std::vector<int>(toks.begin() + n0, toks.end() - 1), n0, nullptr);
-        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        cb_set(hb);
         if ((int) toks.size() - 1 > n0) CK(cudaMemcpy(msp[q].hlast, hp.h, D * sizeof(float), cudaMemcpyDeviceToDevice));
         else if (n0 > 0 && hsrc != msp[q].hlast) CK(cudaMemcpy(msp[q].hlast, hsrc, D * sizeof(float), cudaMemcpyDeviceToDevice));
     }
@@ -5041,7 +5105,7 @@ struct MKEngine::Impl {
         auto & m = msp[q];
         slot_flush(q);
         const Bufs b = ms_bufs(q);
-        CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
+        cb_set(b);
         if (m.pos > 0) CK(cudaMemcpy(hb.h_hist + (size_t) ((m.pos - 1) % H_RING) * D, m.hlast, D * sizeof(float), cudaMemcpyDeviceToDevice));
         CK(cudaMemcpy(&hctl, hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
         solo_saved = {hctl, smp_temp, smp_top_p, smp_min_p, smp_top_k, ndraft, nd_avail, smp_seed, all_acc};
@@ -5084,7 +5148,7 @@ struct MKEngine::Impl {
         solo = -1;
         auto & m = msp[q];
         const int dc = hctl.dn_c;
-        CK(cudaMemcpyToSymbol(cB, &hb, sizeof(Bufs)));
+        cb_set(hb);
         CK(cudaMemcpy(m.hlast, hb.h_hist + (size_t) ((dc - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         slot_prefill_from(q, m.seq, dc, m.hlast);
         const SoloSaved & v = solo_saved;

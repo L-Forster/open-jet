@@ -27,8 +27,8 @@ from .llama_server import (
 from .provisioning import LLAMA_CPP_DIR, _native_tool_path, _run_exec
 
 _BUILD_TAG = ".openjet-build.json"
-_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "prefill.cuh", "prefill_gemm.cuh",
-            "cuda_compat.cuh", "gguf.h", "capi.cpp")
+_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "prefill.cuh", "prefill_attn.cuh",
+            "prefill_gemm.cuh", "cuda_compat.cuh", "gguf.h", "capi.cpp", "bmm.cuh")
 
 
 def _nvcc_path() -> str | None:

@@ -434,7 +434,13 @@ processing the whole conversation as one fresh prompt.
   slice of the state in fp32 MMA accumulators, turning it (and K S, U) into fp16 MMA operands
   in registers with `movmatrix`; gates are carried as log g, so tiny or zero gates are exact.
   ~2% of prefill time; 3.5e-4 relative error against a float64 reference of the recurrence.
-- **Attention**: causal flash attention over the KV cache on tensor cores.
+- **Attention**: causal flash attention over the KV cache on tensor cores. On sm_80+ the engine's own
+  cache runs `pk_attn8` (`prefill_attn.cuh`): Q.K^T as int8 tensor-core MMAs on the q8_0 keys with
+  per-32 Q scales, P.V in fp16, 12 warps per (16 queries, kv head), and the last partial wave of work
+  split along the keys and merged (`pk_attn2_comb`). Not bit-exact with `pk_attn`; KL against
+  llama.cpp is unchanged. `MK_ATTN_S8=0` selects the fp16 `pk_attn2`, `MK_ATTN=1` the original
+  `pk_attn` (also used for a parallel slot's paged cache and on Turing); `MK_ATTN_SPLIT=0` and
+  `MK_ATTN_PV16=0` turn off the tail split and fp16 P.V accumulation.
 - **Small chunks** (a prompt riding along with parallel steps, or a prompt's tail): a GEMM whose
   128-row tiles would leave most SMs idle (5120 output rows: 40 CTAs) splits K in two, the fp32
   halves summed in a fixed order, and attention of few queries over a long context splits the
@@ -482,6 +488,7 @@ and attention paths against references without a model. On multi-GPU machines, p
 
 - `qwen38_mk.cu` / `qwen38_mk.h` - loader, repacking, the megakernel and the `MKEngine` API
 - `prefill.cuh` / `prefill_gemm.cuh` - batched prefill kernels and their quantised fp16 GEMM
+- `prefill_attn.cuh` - prefill attention `pk_attn2` / `pk_attn8` (sm_80+)
 - `capi.cpp` - C API (engine + libllama tokenizer) for `libqwen38mk.so`
 - `server/mk_server.py` - OpenAI-compatible HTTP server
 - `main.cu` - CLI (tokenization via libllama)

@@ -767,6 +767,8 @@ __global__ void __launch_bounds__(HD) pk_attn_comb(int T, int nz, const float * 
     cP.y2[(size_t) t * VD + h * HD + d] = L > 0.f ? acc / L : 0.f;
 }
 
+#include "prefill_attn.cuh"
+
 // attention output * sigmoid(gate) -> fp16 xh (K = VD)
 __global__ void __launch_bounds__(256) pk_attn_out() {
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
