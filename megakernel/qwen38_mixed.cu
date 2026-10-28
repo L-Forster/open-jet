@@ -73,6 +73,15 @@ constexpr int SM_XB = SM_XA + SM_XU * 16;
 constexpr int SM_XM = SM_XB + SM_XU * 16;
 constexpr int SM_MISC = SM_XM + SM_XU * 8;
 constexpr int ATP = 32; // attention: positions per K/V tile (two tiles in flight)
+constexpr int ATT_NCH = 20;               // max split-K chunks per kv head of the T-invariant partition (attn_dims)
+constexpr int ATT_BUCKET = ATT_NCH * ATP; // its chunk size steps by one tile every ATT_BUCKET positions
+static_assert(ATT_NCH <= MAX_CH, "attention partials buffer");
+// largest T <= T_req whose rows n .. n+T-1 all see the same attention partition (see attn_dims)
+inline int att_cap_T(int n, int T_req) {
+    if (QWEN_MK_SM75) return T_req;
+    const int lim = ATT_BUCKET * ((n + ATT_BUCKET) / ATT_BUCKET) - n; // rows with n + 1 + t <= next multiple
+    return T_req < lim ? T_req : lim;
+}
 constexpr int KVQ_ROW = 256 + 16; // staged q8 K or V row: 256 int8 values + 8 fp16 scales
 // K/V tile region: fp16 cache: 2 stages of fp16 K/V tiles; q8 cache: one fp16 K/V tile + 2 stages of q8 tiles
 constexpr int SM_ATTN_KV = (4 * ATP * (256 + 8) * 2 > 2 * ATP * (256 + 8) * 2 + 4 * ATP * KVQ_ROW)
@@ -1337,10 +1346,21 @@ __device__ __forceinline__ void kv_stage(uint8_t * dst, size_t row0, int rows, i
     }
 }
 
-// split-K over the context: at most 20 chunks per kv head so all 4 x nch items run in one wave
+// split-K over the context: at most ATT_NCH chunks per kv head so all 4 x nch items run in one wave.
+// The chunk size is a multiple of the K/V tile that only changes when L_ctx crosses a multiple of
+// ATT_BUCKET, and the host never lets one launch's rows straddle such a boundary (att_cap_T). So the
+// chunk boundaries below any query position p (and the float summation order of its attention) depend
+// on p alone, not on how many tokens the cycle verifies: greedy output is independent of the draft depth.
+// Same tiles per item as the previous ceil(L / 20) split for L > 1280; one tile per item up to 640.
+// (Turing keeps the previous split.)
 __device__ __forceinline__ void attn_dims(int L_ctx, int & nch, int & cs) {
-    nch = max(1, min(20, (L_ctx + 63) / 64));
-    cs = (L_ctx + nch - 1) / nch;
+    if constexpr (QWEN_MK_SM75) {
+        nch = max(1, min(20, (L_ctx + 63) / 64));
+        cs = (L_ctx + nch - 1) / nch;
+    } else {
+        cs = ATP * max(1, (L_ctx + ATT_BUCKET - 1) / ATT_BUCKET);
+        nch = max(1, (L_ctx + cs - 1) / cs);
+    }
 }
 
 // attention q/k/v projections
@@ -3318,7 +3338,7 @@ int MKEngine::prefill(const std::vector<int> & tokens) {
         c.mtp_valid = c.dn_c;
     }
     while (i < feed.size()) {
-        const int T = (int) std::min<size_t>(MAXT, feed.size() - i);
+        const int T = att_cap_T(c.dn_c, (int) std::min<size_t>(MAXT, feed.size() - i));
         const bool last = i + T == feed.size();
         c.n = c.dn_c;
         for (int k = 0; k < T; k++) c.tok[k] = feed[i + k];
@@ -3375,7 +3395,7 @@ std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
     CK(cudaMemcpy(&c, p_->hb.ctl, sizeof(Ctl), cudaMemcpyDeviceToHost));
     size_t i = 0;
     while (i < tokens.size()) {
-        const int T = (int) std::min<size_t>(MAXT, tokens.size() - i);
+        const int T = att_cap_T((int) i, (int) std::min<size_t>(MAXT, tokens.size() - i));
         c.n = (int) i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -3401,7 +3421,7 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
     c.dn_c = mk_from;
     std::vector<float> rows((size_t) MAXT * VOCAB);
     for (int i = mk_from; i < N;) {
-        const int T = std::min(MAXT, N - i);
+        const int T = att_cap_T(i, std::min(MAXT, N - i));
         c.n = i;
         for (int k = 0; k < T; k++) c.tok[k] = tokens[i + k];
         CK(cudaMemcpy(p_->hb.ctl, &c, sizeof(Ctl), cudaMemcpyHostToDevice));
@@ -3420,7 +3440,9 @@ void MKEngine::score_logits(const std::vector<int> & tokens, int mk_from, int fi
 int MKEngine::step(std::vector<int> & out) {
     Ctl & c = p_->hctl;
     if (c.n + MAXT + 2 >= p_->ctx) throw std::runtime_error("context full");
-    const int T = 1 + p_->nd_avail;
+    // verify the previous launch's drafts, minus any that would put this launch's rows across an
+    // attention-partition boundary (once per ATT_BUCKET positions; keeps greedy output depth-independent)
+    const int T = att_cap_T(c.n, 1 + p_->nd_avail);
     // Draft depth: after a cycle that rejected a draft, draft one token less (but at least 3), since a
     // deeper draft is then unlikely to be accepted; the full depth again after a fully accepted cycle.
     p_->ndraft = (!p_->all_acc && n_draft_ > 3) ? n_draft_ - 1 : n_draft_;
