@@ -392,10 +392,12 @@ openjet-engine --model /absolute/path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
   surely-accepted token; accepted drafts are replayed from a small (k, v, g, beta) ring at the
   start of the next cycle, so rejected drafts cost no state snapshots or extra state traffic.
 - **Attention**: split-K flash decoding with tensor-core MMAs (Q.K^T and P.V in fp16 with fp32
-  accumulation, online softmax), double-buffered 32-position K/V tiles in shared memory (the next
-  tile streams in while the current one is processed: ~5% faster cycles at 30K context). The split is a
-  function of the context length in 640-position steps (the host never lets one cycle's rows straddle a
-  step), so greedy output does not depend on the draft depth.
+  accumulation, online softmax). The split is a function of the context length in 640-position steps
+  (the host never lets one cycle's rows straddle a step), so greedy output does not depend on the
+  draft depth. Past 640 positions the q8_0 cache runs `attn_core_q8`, a three-deep software pipeline
+  with one block barrier per 32-position tile: warps 0-3 compute Q.K^T, 4-11 P.V, 12-15 the online
+  softmax, K / V stream through separate `cp.async` rings and are converted to fp16 MMA operands in
+  registers; the partials are bit-identical to the simple kernel's (`MK_DATTN=0` selects it).
 - **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent
   tokens (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers
   ~99.4% of tokens), plus the tokens of the current sequence that are missing from it, added on the

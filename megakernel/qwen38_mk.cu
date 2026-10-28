@@ -88,7 +88,13 @@ constexpr int KVQ_ROW = 256 + 16; // staged q8 K or V row: 256 int8 values + 8 f
 constexpr int SM_ATTN_KV = (4 * ATP * (256 + 8) * 2 > 2 * ATP * (256 + 8) * 2 + 4 * ATP * KVQ_ROW)
                                ? 4 * ATP * (256 + 8) * 2 : 2 * ATP * (256 + 8) * 2 + 4 * ATP * KVQ_ROW;
 constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (ATP + 8) * 2 + 96 * 4; // Q, K/V, S, P, stats
-constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN ? SM_MISC + 2048 : SM_ATTN);
+// attn_core_q8 (pipelined decode attention, sm_80+): q8 K / V ring stages, double-buffered S and P
+constexpr int AQ_NSK = 3, AQ_NSV = 4; // K(t) is issued in interval t - 2 and read in t; V(t) issued in t - 1, read in t + 2
+constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks
+constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
+constexpr int SM_ATTN_Q8 = QWEN_MK_SM75 ? 0 : 32 * (256 + 8) * 2 + (AQ_NSK + AQ_NSV) * AQ_STG + 2 * 32 * AQ_LDS * 4 + 2 * 32 * (ATP + 8) * 2 + 4 * 32 * 4;
+constexpr int SM_ATTN_MAX = SM_ATTN > SM_ATTN_Q8 ? SM_ATTN : SM_ATTN_Q8;
+constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATTN_MAX);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 static_assert(!QWEN_MK_SM75 || SM_TOTAL + 16 <= 64 * 1024, "Turing shared memory including aligned s_bar_k");
 
@@ -155,6 +161,7 @@ struct Bufs {
     void *kc, *vc;     // KV cache [slot][kv head][ctx][HD]: fp16, or int8 (q8_0) when kvq8 ...
     __half *ksc, *vsc; // ... with one fp16 scale per 32 values: [slot][kv head][ctx][HD / 32]
     int kvq8;
+    int dattn; // q8 decode attention: 1 the pipelined kernel at long context (default), 0 attn_core_t (MK_DATTN=0)
     float * apart;
     float2 * aml;
     float *h_hist, *hm;
@@ -1725,8 +1732,369 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
     }
 }
 
+#if !QWEN_MK_SM75 // (shared-memory rings of ~91 KB, cp.async: sm_80+)
+// ---------------------------------------------------------------------------------------------------------------------
+// Decode attention on the all-q8 cache: attn_core_t's per-row arithmetic (bit-identical partials, so also T-invariant),
+// restructured for long contexts (one 32-position tile per SM every ~4.8 us before: 5 dependent stages and 5 block
+// barriers per tile, ~290 GB/s of q8 KV at 101k on an RTX 3090; this kernel: ~600 GB/s for 3-5 query tokens, ~740 GB/s
+// = the DRAM stream rate for 1-2).
+// - Three-deep software pipeline with ONE block barrier per tile: interval j computes S(j) = Q K(j)^T, the online softmax
+//   of tile j - 1 and O = O * alpha + P(j - 2) V(j - 2) on specialised warps, and issues the next copies:
+//     warps 0-3   S for positions 8 w .. 8 w + 7, all row tiles (one K fragment conversion feeds the MT chains)
+//     warps 4-11  P V for dims 32 (w - 4) .. + 31, all row tiles (one V fragment conversion feeds the MT tiles)
+//     warps 12-15 softmax, a quad of lanes per query row (8 positions per lane)
+// - q8 K / V tiles stream through separate cp.async rings (K(t) issued in interval t - 2 and read in t: 3 stages; V(t)
+//   issued in t - 1 and read in t + 2: 4 stages). No fp16 K / V tiles: both MMA B operands are converted from the q8
+//   rows in registers with q8_to_f16's rounding (d * q, exact in fp32, rounded once to fp16; here one fp16 multiply).
+// - P V B fragments: lane (g8, tig) of column group wn holds dims 32 wn + 4 g8 + jj of n8 tile jj, so one 32-bit q8 load
+//   per position feeds 4 tiles. Each output element is the same MMA dot product (same operand values, same k order),
+//   only its column slot in the MMA differs.
+// - The softmax keeps attn_core_t's float operations and its butterfly sum tree (position bit 4 first, then 3 .. 0).
+// Chunks of a single tile (L_ctx <= ATT_BUCKET), a parallel slot's paged cache and MK_DATTN=0 run attn_core_t.
+
+// d * q rounded once to fp16 for the two int8 values in bytes 0 and 1 of u: 0x6400 | (q ^ 0x80) is the fp16 1152 + q,
+// minus 1152 is q exactly, and one fp16 multiply rounds the exact product (= q8_to_f16's value)
+__device__ __forceinline__ unsigned aq_q8x2(unsigned u, __half2 d) {
+    const unsigned h = __byte_perm(u ^ 0x8080u, 0x64646464u, 0x4140);
+    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), __half2half2(__ushort_as_half(0x6480)));
+    const __half2 r = __hmul2(q, d);
+    return *reinterpret_cast<const unsigned *>(&r);
+}
+// the same for bytes 0 / 2 or 1 / 3 of y (selector 0x4140 / 0x4342 after the caller's interleave)
+__device__ __forceinline__ unsigned aq_q8x2p(unsigned y, unsigned sel, __half2 d) {
+    const unsigned h = __byte_perm(y, 0x64646464u, sel);
+    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), __half2half2(__ushort_as_half(0x6480)));
+    const __half2 r = __hmul2(q, d);
+    return *reinterpret_cast<const unsigned *>(&r);
+}
+
+// one commit group's copies: K rows krow0 .. of the cache (kn valid rows, kn < 0: none) -> K stage dk, V rows -> dv;
+// rows >= the valid count get zero scales (their values are never used: masked S, P = 0)
+__device__ __forceinline__ void aq_issue(uint8_t * dk, size_t krow0, int kn, uint8_t * dv, size_t vrow0, int vn) {
+#pragma unroll
+    for (int k = 0; k < (2 * ATP * 17 + NT - 1) / NT; k++) {
+        const int i = threadIdx.x + NT * k;
+        if (i < 2 * ATP * 17) {
+            const int which = i >= ATP * 17, j = which ? i - ATP * 17 : i, r = j / 17, c = j - 17 * r;
+            const int np = which ? vn : kn;
+            if (np < 0) continue;
+            uint8_t * d = (which ? dv : dk) + r * KVQ_ROW + 16 * c;
+            if (r < np) {
+                const size_t row = (which ? vrow0 : krow0) + r;
+                if (c < 16) cp_async16(d, static_cast<const int8_t *>(which ? cB.vc : cB.kc) + row * HD + 16 * c);
+                else cp_async16(d, (which ? cB.vsc : cB.ksc) + row * (HD / 32));
+            } else if (c == 16) {
+                *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+template <int T>
+__device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n) {
+    uint8_t * const sm = smem;
+    constexpr int R = 6 * T;
+    constexpr int MT = (R + 15) / 16; // 16-row MMA tiles of query rows
+    constexpr int TP = ATP;
+    constexpr int LDH = HD + 8;
+    constexpr int LDP = TP + 8;
+    constexpr int LDS = AQ_LDS;
+    constexpr int NSK = AQ_NSK, NSV = AQ_NSV;
+    static_assert(R <= 32 && TP == 32 && MT <= 2, "8 rows per softmax warp, 32-position tiles");
+    const int L_ctx = n + T;
+    int nch, CS;
+    attn_dims(L_ctx, nch, CS);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, tig = lane & 3;
+    __half * sQ = reinterpret_cast<__half *>(sm);                 // [32][LDH]
+    uint8_t * kring = reinterpret_cast<uint8_t *>(sQ + 32 * LDH); // NSK stages
+    uint8_t * vring = kring + NSK * AQ_STG;                       // NSV stages
+    float * sS = reinterpret_cast<float *>(vring + NSV * AQ_STG); // [2][32][LDS]
+    __half * sP = reinterpret_cast<__half *>(sS + 2 * 32 * LDS);  // [2][32][LDP]
+    float * sM = reinterpret_cast<float *>(sP + 2 * 32 * LDP);
+    float * sL = sM + 32;
+    float * sAl = sL + 32; // [2][32]
+    const size_t ctx = cB.ctx;
+    const size_t slot0 = (size_t) slot * NKV * ctx; // first row of this slot
+
+    for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
+        const int g = item / nch, c = item % nch;
+        const int c0 = c * CS, c1 = min(L_ctx, c0 + CS);
+        // ---- item prologue, attn_core_t's (q rows -> sQ, this cycle's K / V rows -> cache, m / l init)
+        float qv[2][8], qw[8];
+        float2 rc[2][8];
+        load8(W.qn + lane * 8, qw);
+#pragma unroll
+        for (int k2 = 0; k2 < 2; k2++) {
+            const int r = min(warp + 16 * k2, R - 1);
+            const int hq = r / T, t = r % T, head = g * 6 + hq;
+            load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
+            const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
+#pragma unroll
+            for (int k = 0; k < 8; k++) rc[k2][k] = __ldg(tab + k);
+        }
+#pragma unroll
+        for (int k2 = 0; k2 < 2; k2++) {
+            const int r = warp + 16 * k2;
+            if (r < R) {
+                float v[8];
+#pragma unroll
+                for (int k = 0; k < 8; k++) v[k] = qv[k2][k];
+                float ss = 0.f;
+#pragma unroll
+                for (int k = 0; k < 8; k++) ss += v[k] * v[k];
+                const float rs = rsqrtf(wsum(ss) / 256.0f + EPS);
+#pragma unroll
+                for (int k = 0; k < 8; k++) v[k] *= rs * qw[k];
+                float o[8];
+#pragma unroll
+                for (int k = 0; k < 8; k++) o[k] = __shfl_xor_sync(0xffffffffu, v[k], 4);
+                if (lane < 8) {
+#pragma unroll
+                    for (int k = 0; k < 8; k++)
+                        v[k] = lane < 4 ? v[k] * rc[k2][k].x - o[k] * rc[k2][k].y : o[k] * rc[k2][k].y + v[k] * rc[k2][k].x;
+                }
+                __half2 hq2[4];
+#pragma unroll
+                for (int k = 0; k < 4; k++) hq2[k] = __floats2half2_rn(v[2 * k] * 0.0625f, v[2 * k + 1] * 0.0625f);
+                *reinterpret_cast<int4 *>(sQ + r * LDH + lane * 8) = *reinterpret_cast<int4 *>(hq2);
+            } else {
+                *reinterpret_cast<int4 *>(sQ + r * LDH + lane * 8) = make_int4(0, 0, 0, 0);
+                if (2 * lane < TP) { // padded rows of both P buffers stay 0
+                    *reinterpret_cast<unsigned *>(sP + r * LDP + 2 * lane) = 0u;
+                    *reinterpret_cast<unsigned *>(sP + 32 * LDP + r * LDP + 2 * lane) = 0u;
+                }
+            }
+        }
+        const int pn0 = max(c0, n), pn1 = min(c1, n + T);
+        for (int pp = pn0 + warp; pp < pn1; pp += NW) {
+            const int t = pp - n;
+            float v[8];
+            load8(cB.kbuf + t * KVD + g * 256 + lane * 8, v);
+            float ss = 0.f;
+#pragma unroll
+            for (int k = 0; k < 8; k++) ss += v[k] * v[k];
+            const float rs = rsqrtf(wsum(ss) / 256.0f + EPS);
+#pragma unroll
+            for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
+            rope8(v, lane, pp);
+            const size_t row = slot0 + (size_t) g * ctx + pp;
+            kv_store_q8(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v);
+            load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
+            kv_store_q8(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v);
+        }
+        if (tid < 32) {
+            sM[tid] = -INFINITY;
+            sL[tid] = 0.f;
+        }
+        __threadfence_block();
+        __syncthreads();
+
+        // ---- ring prologue: commit groups {K(0)}, {K(1), V(0)}; then per interval jt {K(jt + 2), V(jt + 1)}
+        const int ntl = (c1 - c0 + TP - 1) / TP;
+        const size_t grow = slot0 + (size_t) g * ctx + c0;
+        auto tnp = [&](int t) { return t < ntl ? min(TP, c1 - c0 - t * TP) : -1; }; // valid rows of tile t, -1: none
+        aq_issue(kring, grow, tnp(0), vring, grow, -1);
+        mk_cuda::commit();
+        aq_issue(kring + AQ_STG, grow + TP, tnp(1), vring, grow, tnp(0));
+        mk_cuda::commit();
+        mk_cuda::wait<1>();
+        __syncthreads();
+
+        float acc[MT][4][4]; // P V warps: O rows 16 i + {g8, g8 + 8}, dims 32 wn + 8 tig + jj and + 4
+#pragma unroll
+        for (int i = 0; i < MT; i++)
+#pragma unroll
+            for (int j = 0; j < 4; j++)
+#pragma unroll
+                for (int k = 0; k < 4; k++) acc[i][j][k] = 0.f;
+
+        for (int jt = 0; jt < ntl + 2; jt++) {
+            if (warp < 4) {
+                // ---- S(jt) = Q K(jt)^T: B = positions 8 wn + g8 (all 16 k-steps converted first), all row tiles
+                if (jt < ntl) {
+                    const int wn = warp;
+                    const uint8_t * krow = kring + (jt % NSK) * AQ_STG + (8 * wn + g8) * KVQ_ROW;
+                    const uint4 scv = *reinterpret_cast<const uint4 *>(krow + 256);
+                    const unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
+                    unsigned kb[HD / 16][2];
+#pragma unroll
+                    for (int ks = 0; ks < HD / 16; ks++) {
+                        const unsigned sw = __byte_perm(scw[ks >> 2], 0, (ks & 2) ? 0x3232 : 0x1010);
+                        const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
+                        kb[ks][0] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd);
+                        kb[ks][1] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd);
+                    }
+                    float s[MT][4];
+#pragma unroll
+                    for (int i = 0; i < MT; i++)
+#pragma unroll
+                        for (int k = 0; k < 4; k++) s[i][k] = 0.f;
+                    const unsigned qaddr = (unsigned) __cvta_generic_to_shared(sQ + (lane & 15) * LDH + (lane >> 4) * 8);
+#pragma unroll
+                    for (int ks = 0; ks < HD / 16; ks++) {
+#pragma unroll
+                        for (int i = 0; i < MT; i++) {
+                            unsigned a[4];
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                                         : "r"(qaddr + 2 * (16 * i * LDH + 16 * ks)));
+                            mma16816(s[i], a[0], a[1], a[2], a[3], kb[ks][0], kb[ks][1]);
+                        }
+                    }
+#pragma unroll
+                    for (int i = 0; i < MT; i++) {
+                        float * so = sS + (jt & 1) * 32 * LDS + (16 * i + g8) * LDS + 8 * wn + 2 * tig;
+                        so[0] = s[i][0];
+                        so[1] = s[i][1];
+                        so[8 * LDS] = s[i][2];
+                        so[8 * LDS + 1] = s[i][3];
+                    }
+                }
+            } else if (warp < 12) {
+                // ---- O = O * alpha + P(jt - 2) V(jt - 2): B = dims 32 wn + 4 g8 + jj of n8 tile jj, all row tiles
+                if (jt >= 2) {
+                    const int wn = warp - 4, jp = jt - 2, b = jp & 1;
+#pragma unroll
+                    for (int i = 0; i < MT; i++) {
+                        const float al0 = sAl[b * 32 + 16 * i + g8], al1 = sAl[b * 32 + 16 * i + g8 + 8];
+#pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            acc[i][j][0] *= al0;
+                            acc[i][j][1] *= al0;
+                            acc[i][j][2] *= al1;
+                            acc[i][j][3] *= al1;
+                        }
+                    }
+                    const unsigned paddr = (unsigned) __cvta_generic_to_shared(sP + b * 32 * LDP + (lane & 15) * LDP + (lane >> 4) * 8);
+                    const uint8_t * vst = vring + (jp % NSV) * AQ_STG + 32 * wn + 4 * g8;
+                    const uint8_t * vsc = vring + (jp % NSV) * AQ_STG + 256 + 2 * wn;
+#pragma unroll
+                    for (int ks = 0; ks < TP / 16; ks++) {
+                        unsigned bf[2][4]; // [b0 / b1][tile jj]
+#pragma unroll
+                        for (int h = 0; h < 2; h++) {
+                            const int p = 16 * ks + 2 * tig + 8 * h; // k rows p, p + 1 of the fragment
+                            const unsigned xa = *reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) ^ 0x80808080u;
+                            const unsigned xb = *reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) ^ 0x80808080u;
+                            const unsigned sw = (unsigned) *reinterpret_cast<const unsigned short *>(vsc + p * KVQ_ROW) |
+                                                ((unsigned) *reinterpret_cast<const unsigned short *>(vsc + (p + 1) * KVQ_ROW) << 16);
+                            const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
+                            const unsigned y0 = __byte_perm(xa, xb, 0x5140), y1 = __byte_perm(xa, xb, 0x7362);
+                            bf[h][0] = aq_q8x2p(y0, 0x4140, dd);
+                            bf[h][1] = aq_q8x2p(y0, 0x4342, dd);
+                            bf[h][2] = aq_q8x2p(y1, 0x4140, dd);
+                            bf[h][3] = aq_q8x2p(y1, 0x4342, dd);
+                        }
+#pragma unroll
+                        for (int i = 0; i < MT; i++) {
+                            unsigned a[4];
+                            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3])
+                                         : "r"(paddr + 2 * (16 * i * LDP + 16 * ks)));
+#pragma unroll
+                            for (int j = 0; j < 4; j++) mma16816(acc[i][j], a[0], a[1], a[2], a[3], bf[0][j], bf[1][j]);
+                        }
+                    }
+                }
+            } else {
+                // ---- online softmax of tile jt - 1 (causal mask: row token t sees positions <= n + t); lane l4 of the
+                // row's quad holds positions l4 + 4 k
+                if (jt >= 1 && jt <= ntl && 8 * (warp - 12) < R) {
+                    const int r = 8 * (warp - 12) + (lane >> 2), l4 = lane & 3; // rows >= R (zero S) are not stored
+                    const int jp = jt - 1, b = jp & 1;
+                    const int tb = c0 + jp * TP, np_ = min(TP, c1 - tb);
+                    const int lim = n + (r % T);
+                    const float * srow = sS + b * 32 * LDS + r * LDS;
+                    float sv[8];
+#pragma unroll
+                    for (int k = 0; k < 8; k++) {
+                        const int q = l4 + 4 * k;
+                        sv[k] = srow[q];
+                        if (q >= np_ || tb + q > lim) sv[k] = -INFINITY;
+                    }
+                    float m = sv[0];
+#pragma unroll
+                    for (int k = 1; k < 8; k++) m = fmaxf(m, sv[k]);
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
+                    const float mold = sM[r];
+                    const float mnew = fmaxf(mold, m);
+                    float p[8], al = 1.f;
+#pragma unroll
+                    for (int k = 0; k < 8; k++) p[k] = 0.f;
+                    if (mnew != -INFINITY) {
+#pragma unroll
+                        for (int k = 0; k < 8; k++) p[k] = expf(sv[k] - mnew);
+                        al = expf(mold - mnew);
+                    }
+                    // attn_core_t's wsum tree: position bit 4 (k, k + 4), bit 3 (k, k + 2), bit 2 (k, k + 1), then lanes
+                    const float t0 = p[0] + p[4], t1 = p[1] + p[5], t2 = p[2] + p[6], t3 = p[3] + p[7];
+                    const float u0 = t0 + t2, u1 = t1 + t3;
+                    float ps = u0 + u1;
+                    ps += __shfl_xor_sync(0xffffffffu, ps, 2);
+                    ps += __shfl_xor_sync(0xffffffffu, ps, 1);
+                    if (r < R) {
+                        __half * prow = sP + b * 32 * LDP + r * LDP;
+#pragma unroll
+                        for (int k = 0; k < 8; k++) prow[l4 + 4 * k] = __float2half_rn(p[k]);
+                        if (l4 == 0) {
+                            sL[r] = sL[r] * al + ps;
+                            sM[r] = mnew;
+                            sAl[b * 32 + r] = al;
+                        }
+                    }
+                }
+            }
+            // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt + 1) into the stage of V(jt - 3) (both read in
+            // interval jt - 1); then wait for K(jt + 1) and V(jt)
+            if (jt + 1 < ntl)
+                aq_issue(kring + ((jt + 2) % NSK) * AQ_STG, grow + (jt + 2) * TP, tnp(jt + 2), vring + ((jt + 1) % NSV) * AQ_STG,
+                         grow + (jt + 1) * TP, tnp(jt + 1));
+            mk_cuda::commit();
+            mk_cuda::wait<1>();
+            __syncthreads();
+        }
+        if (warp >= 4 && warp < 12) {
+            const int wn = warp - 4;
+#pragma unroll
+            for (int i = 0; i < MT; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    const int r0 = 16 * i + g8, d0 = 32 * wn + 8 * tig + j; // columns 2 tig, 2 tig + 1: dims d0, d0 + 4
+                    if (r0 < R) {
+                        float * o = cB.apart + ((size_t) item * AR + r0) * 256 + d0;
+                        o[0] = acc[i][j][0];
+                        o[4] = acc[i][j][1];
+                    }
+                    if (r0 + 8 < R) {
+                        float * o = cB.apart + ((size_t) item * AR + r0 + 8) * 256 + d0;
+                        o[0] = acc[i][j][2];
+                        o[4] = acc[i][j][3];
+                    }
+                }
+        }
+        if (tid < R) cB.aml[item * AR + tid] = make_float2(sM[tid], sL[tid]);
+        __syncthreads();
+    }
+}
+
+template <int T>
+__device__ __noinline__ void attn_core_q8(const LayerW & W, int slot, int n) {
+    attn_core_q8_t<T>(W, slot, n);
+}
+#endif
+
+// q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET), attn_core_t for one-tile
+// chunks (the pipeline fill does not pay there) and with MK_DATTN=0 (same partials). The pipelined kernel addresses the
+// engine's own contiguous cache: a slot's paged view (parallel agents) keeps attn_core_t.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
+#if !QWEN_MK_SM75
+    if (cB.kvq8 && cB.dattn && n + T > ATT_BUCKET && !cB.ptab && cB.segn == 0) {
+        attn_core_q8<T>(W, slot, n);
+        return;
+    }
+#endif
     if (cB.kvq8) attn_core_t<T, true>(W, slot, n);
     else attn_core_t<T, false>(W, slot, n);
 }
@@ -2853,6 +3221,7 @@ struct MKEngine::Impl {
             const bool q8 = kv_mode == 1 ||
                             (kv_mode < 0 && rows * HD * 4 + (copies - 1) * (slot_rows * HD * 4 + slot_state) + (size_t) 1536 * 1024 * 1024 > free_b);
             hb.kvq8 = q8;
+            hb.dattn = !(getenv("MK_DATTN") && atoi(getenv("MK_DATTN")) == 0);
             hb.kc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
             hb.vc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
             hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
