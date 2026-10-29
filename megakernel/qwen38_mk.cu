@@ -5336,7 +5336,7 @@ struct MKEngine::Impl {
         auto & m = msp[solo];
         const int segn = m.seg ? (int) m.seg->toks.size() : 0; // (the own cache holds positions segn ..)
         if (!own_reserve(solo, hctl.n - segn + MAXT + 2)) return {}; // (context full)
-        const int T = 1 + nd_avail;
+        const int T = att_cap_T(hctl.n, 1 + nd_avail); // (as MKEngine::step: greedy output independent of the depth)
         ndraft = (!all_acc && n_draft_max > 3) ? n_draft_max - 1 : n_draft_max; // (as MKEngine::step)
         launch(MODE_DECODE, T, 0);
         nd_avail = ndraft;
