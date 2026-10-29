@@ -103,6 +103,32 @@ class AgentSetupTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(agent_setup.SetupError, "--context-tokens"):
             await agent_setup.run_setup(dry_run=True, context=999999)
 
+    async def test_long_context_raises_the_limit_and_is_saved(self):
+        with patch.object(agent_setup, "megakernel_long_context_reason", return_value=None):
+            base = (await agent_setup.run_setup(dry_run=True))["context_window_tokens"]
+            planned = await agent_setup.run_setup(dry_run=True, long_context=True)
+        self.assertEqual(planned["context_window_tokens"], agent_setup._long_context_limit(base, 8192))
+        self.assertEqual(agent_setup._long_context_limit(120000, 262144), 180460)
+        self.assertEqual(agent_setup._long_context_limit(200000, 262144), 262144)
+
+        async def provision(payload, **kwargs):
+            self.assertTrue(payload["megakernel_long_context"])
+            return {**payload, "llama_model": str(self.model_dir / "test.gguf")}
+
+        async def verify(cfg):
+            self.assertTrue(cfg["megakernel_long_context"])
+            return {"passed": True, "backend": "megakernel", "context_window_tokens": 2048, "gpu_layers": 99}
+
+        with patch.object(agent_setup, "megakernel_long_context_reason", return_value=None), \
+                patch.object(agent_setup, "provision_setup_artifacts", side_effect=provision), \
+                patch.object(agent_setup, "verify_inference", side_effect=verify):
+            await agent_setup.run_setup(yes=True, long_context=True)
+        self.assertTrue(agent_setup.yaml.safe_load(self.target.read_text())["megakernel_long_context"])
+
+    async def test_long_context_needs_the_megakernel(self):
+        with self.assertRaisesRegex(agent_setup.SetupError, "--long-context needs the megakernel"):
+            await agent_setup.run_setup(dry_run=True, long_context=True)
+
     async def test_no_fit_fails_instead_of_downloading_fallback(self):
         hardware = HardwareInfo("small CPU", total_ram_gb=0.5, has_cuda=False)
         with patch.object(agent_setup, "inspect_hardware", return_value=(hardware, {})):

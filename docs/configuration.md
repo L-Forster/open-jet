@@ -189,6 +189,12 @@ Turing (`sm_75`, e.g. Quadro RTX 8000) is experimental and runs only the origina
 UD-Q4_K_XL uses `llama-server` there. On multi-GPU systems, set `CUDA_VISIBLE_DEVICES` to the GPU's
 UUID for both setup and runtime. See [Turing (RTX 8000)](../megakernel/README.md#turing-rtx-8000).
 
+`megakernel_long_context: true` (set by `openjet setup --long-context`) starts the megakernel with its compact KV cache
+(5-bit K and V, K Hadamard-rotated, the newest 2,048 positions at 8 bits), which holds about 1.5x the positions of the
+default q8_0 cache in the same memory: where the q8_0 cache's limit is 120,000 tokens (a 24 GB card), setup offers about
+180,000. Without it the default cache and context limit stay as they are. See
+[KV cache presets](../megakernel/README.md#kv-cache-presets-mk_kv).
+
 ## Shell Targets
 
 You can expose named remote shell targets for the `shell` tool. OpenJet stays on the local machine, and when the model sets `target` on a shell call, OpenJet writes a temporary script locally, copies it to the target with `scp`, runs it with `ssh`, and returns stdout/stderr.

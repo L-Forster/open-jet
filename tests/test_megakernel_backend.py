@@ -64,6 +64,18 @@ class MegakernelSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             LlamaServerClient(model=MODEL, backend="vllm")
 
+    def test_registry_passes_the_long_context_setting(self) -> None:
+        cfg = {"runtime": "llama_cpp", "llama_model": MODEL, "megakernel_long_context": True}
+        self.assertTrue(create_runtime_client(cfg).megakernel_long_context)
+        self.assertFalse(create_runtime_client({"runtime": "llama_cpp", "llama_model": MODEL}).megakernel_long_context)
+
+    def test_long_context_needs_a_supported_model_and_an_ampere_or_newer_gpu(self) -> None:
+        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")):
+            self.assertIsNone(llama_server.megakernel_long_context_reason(MODEL))
+            self.assertIn("only supports", llama_server.megakernel_long_context_reason("/m/Qwen3.5-9B-Q4_K_M.gguf"))
+        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "7.5")):
+            self.assertIn("RTX 30/40/50", llama_server.megakernel_long_context_reason(MODEL))
+
     def test_registry_passes_the_backend_setting(self) -> None:
         cfg = {"runtime": "llama_cpp", "llama_model": MODEL, "llama_backend": "llama"}
         client = create_runtime_client(cfg)
@@ -234,6 +246,32 @@ class MegakernelStartTests(unittest.TestCase):
             await client._http.aclose()
 
         self._run(scenario())
+
+
+class MegakernelLongContextLaunchTests(unittest.TestCase):
+    def _launch_env(self, long_context: bool, env: dict) -> dict:
+        async def scenario() -> dict:
+            client = LlamaServerClient(model=MODEL, binary="/opt/llama-server", backend="megakernel",
+                                       megakernel_long_context=long_context)
+            client._proc = mock.Mock(pid=123)
+            client._spawn_until_healthy = mock.AsyncMock(return_value="ready")
+            with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
+                    mock.patch.object(llama_server, "_megakernel_gpu", return_value=None):
+                await client._start_megakernel(env=dict(env), ctx=200000)
+            await client._http.aclose()
+            return client._spawn_until_healthy.call_args.kwargs["env"]
+        return asyncio.run(scenario())
+
+    def test_the_default_launch_sets_no_kv_cache_format(self) -> None:
+        self.assertNotIn("MK_KV", self._launch_env(False, {}))
+
+    def test_long_context_starts_the_compact_cache(self) -> None:
+        env = self._launch_env(True, {})
+        self.assertEqual(env["MK_KV"], "K*=5r,V*=5")
+        self.assertEqual(env["MK_KV_WIN"], "2048")
+
+    def test_an_explicit_mk_kv_wins(self) -> None:
+        self.assertEqual(self._launch_env(True, {"MK_KV": "K*=6,V*=5"})["MK_KV"], "K*=6,V*=5")
 
 
 class MegakernelServerParsingTests(unittest.TestCase):

@@ -391,6 +391,9 @@ from (attention weight concentrates on recent positions). Single-stream engine, 
 
 plus 114 MiB of q8_0 window rings for `MK_KV_WIN=2048`.
 
+`openjet setup --long-context` (optionally with `--context-tokens N`) configures OpenJet to start the megakernel with
+preset F and a context past the q8_0 limit; by hand:
+
 ```sh
 MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf -c 131072
 ```
