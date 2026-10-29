@@ -56,6 +56,20 @@ _MEGAKERNEL_TURING_CAP = "7.5"
 # 5-bit V with the newest 2,048 positions at q8_0 (megakernel/README.md, KV cache presets), for contexts past what the
 # q8_0 cache fits on a 24 GB card. An MK_KV already in the environment wins.
 MEGAKERNEL_LONG_CONTEXT_ENV = {"MK_KV": "K*=5r,V*=5", "MK_KV_WIN": "2048"}
+# It stores 23,936 bytes per position against q8_0's 36,992, plus 114 MiB of q8_0 window rings. With it the engine also
+# keeps less of its own in device memory (memory pool, smaller stack reservation, no copy of the draft head's rows, the
+# prompt checkpoint in host memory: ~0.9 GiB), so it takes 1.2 GiB more than the q8_0 limit's KV budget: 120,000 ->
+# about 234,000 positions on a 24 GB card. Measured on an RTX 3090 with ~1 GiB used by the desktop: 250,000 positions
+# peaked at 23,962 of 24,576 MiB at full decode speed, so 234,000 leaves about 1 GiB.
+_Q8_KV_BYTES, _COMPACT_KV_BYTES, _WINDOW_RING_BYTES = 36992, 23936, 114 * 1024 * 1024
+_LONG_CONTEXT_EXTRA_BYTES = int(1.2 * 1024**3)
+_QWEN38_MAX_CONTEXT = 262144
+
+
+def megakernel_long_context_limit(q8_limit: int, model_max: int) -> int:
+    """The positions the compact cache holds where the q8_0 cache's limit is *q8_limit*."""
+    budget = q8_limit * _Q8_KV_BYTES - _WINDOW_RING_BYTES + _LONG_CONTEXT_EXTRA_BYTES
+    return max(q8_limit, min(model_max or _QWEN38_MAX_CONTEXT, budget // _COMPACT_KV_BYTES))
 
 
 def _megakernel_root() -> Path:

@@ -398,6 +398,16 @@ preset F and a context past the q8_0 limit; by hand:
 MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf -c 131072
 ```
 
+On a 24 GB RTX 3090 (Q4_K_M, about 1 GiB used by the desktop) preset F holds 250,000 positions at full decode speed:
+23,962 of 24,576 MiB peak in a short conversation, 24,094 MiB with 229,353 tokens in context; about 100 tok/s decode
+in a short conversation and 68 tok/s with the 229,353 tokens (the prompt read at 755 tok/s). Setup offers about
+234,000, which leaves about 1 GiB.
+The room comes from device memory the engine no longer keeps: buffers from the CUDA memory pool instead of one
+`cudaMalloc` each, a 624-byte `mk_cycle` stack frame instead of 2,496 (the driver reserves it for every thread slot),
+the draft head reading lm_head rows through its id list instead of a copy, and with `MK_KV` the prompt checkpoint in
+host memory. The low-bit KV cache, its recent window and these memory savings are Benjamin Cutler's work
+([qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel)).
+
 - `MK_KV`: comma-separated `<K|V|*><slot>=<bits>[r]`. Bits 4 to 8 (8 = q8_0); slot 0-15 = the attention layers 3, 7,
   .., 63, 16 = the MTP layer, empty or `*` = all of them; `r` = stored Hadamard-rotated (a 256-point Walsh-Hadamard
   transform, orthonormal: for K the queries get the same rotation, a rotated V's attention output is rotated back). The

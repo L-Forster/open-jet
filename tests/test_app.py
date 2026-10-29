@@ -920,6 +920,65 @@ class SetupWizardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["setup_model_history"], {"llama_cpp": [normalized_model]})
         self.assertEqual(payload["model_profile_name"], profile_name)
 
+    async def _wizard_context_choice(self, *, reason: str | None, pick_long: bool) -> tuple[dict, list]:
+        hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)
+        offered: list = []
+        choices = iter(["manual", "auto", "__local__", "__manual__", None, 99])
+
+        async def fake_choice(_session, _console, title, options, **_kwargs):
+            choice = next(choices)
+            if title != "Context window":
+                return choice
+            offered.extend(options)
+            long = [value for label, value in options if "long context" in label]
+            return long[0] if pick_long else 4096
+
+        texts = iter(["/models/Qwen3.8-27B-Q4_K_M.gguf", "Qwen"])
+
+        async def fake_text(*_args, **_kwargs):
+            return next(texts)
+
+        with patch("src.setup._prompt_choice", side_effect=fake_choice), patch(
+            "src.setup._prompt_text", side_effect=fake_text
+        ), patch("src.setup.discover_model_files", return_value=[]), patch(
+            "src.setup.recommended_context_window_tokens", return_value=4096
+        ), patch(
+            "src.setup.recommended_context_window_tokens_from_total", return_value=4096
+        ), patch("src.setup.recommended_gpu_layers", return_value=99), patch(
+            "src.setup.megakernel_long_context_reason", return_value=reason
+        ), patch("pathlib.Path.is_file", return_value=True):
+            payload = await run_setup_wizard(
+                session=None, console=Mock(), hardware_info=hardware, recommended_ctx=4096, current_cfg={},
+            )
+        return payload, offered
+
+    async def test_run_setup_wizard_offers_the_long_context_option(self) -> None:
+        from src.setup import megakernel_long_context_limit
+
+        payload, offered = await self._wizard_context_choice(reason=None, pick_long=True)
+        long_value = megakernel_long_context_limit(4096, 0)
+        self.assertIn(long_value, [value for _label, value in offered])
+        self.assertEqual(payload["context_window_tokens"], long_value)
+        self.assertTrue(payload["megakernel_long_context"])
+
+        payload, _offered = await self._wizard_context_choice(reason=None, pick_long=False)
+        self.assertEqual(payload["context_window_tokens"], 4096)
+        self.assertFalse(payload["megakernel_long_context"])
+
+    async def test_run_setup_wizard_hides_long_context_without_the_megakernel(self) -> None:
+        payload, offered = await self._wizard_context_choice(reason="no megakernel GPU", pick_long=False)
+        self.assertFalse(any("long context" in label for label, _value in offered))
+        self.assertFalse(payload["megakernel_long_context"])
+
+    def test_long_context_is_saved_with_the_model_profile(self) -> None:
+        from src.model_profiles import apply_model_profile, build_model_profile
+
+        profile = build_model_profile({"runtime": "llama_cpp", "llama_model": "/m/a.gguf", "megakernel_long_context": True})
+        self.assertTrue(profile["megakernel_long_context"])
+        cfg = {"megakernel_long_context": True}
+        apply_model_profile(cfg, {"runtime": "llama_cpp", "llama_model": "/m/b.gguf"})
+        self.assertNotIn("megakernel_long_context", cfg)
+
     async def test_run_setup_wizard_lists_saved_llama_model_path_on_next_run(self) -> None:
         console = Console(file=io.StringIO(), force_terminal=False, color_system=None)
         hardware = HardwareInfo(label="CUDA-capable device", total_ram_gb=16.0, has_cuda=True)

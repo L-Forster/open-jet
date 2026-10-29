@@ -401,7 +401,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--model", help="catalog GGUF filename/label or existing local GGUF path")
     setup_parser.add_argument("--context-tokens", type=int, help="context window, within the recommended memory limit")
     setup_parser.add_argument("--long-context", action="store_true",
-                              help="the megakernel's compact KV cache: about 1.5x the context the q8_0 cache fits")
+                              help="the megakernel's compact KV cache: about 234K tokens of context on a 24 GB card")
     project_parser = subparsers.add_parser(
         "project",
         help="provision this project's embedded model (build-time; the SDK never downloads at runtime)",

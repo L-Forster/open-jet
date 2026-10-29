@@ -107,9 +107,9 @@ class AgentSetupTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_setup, "megakernel_long_context_reason", return_value=None):
             base = (await agent_setup.run_setup(dry_run=True))["context_window_tokens"]
             planned = await agent_setup.run_setup(dry_run=True, long_context=True)
-        self.assertEqual(planned["context_window_tokens"], agent_setup._long_context_limit(base, 8192))
-        self.assertEqual(agent_setup._long_context_limit(120000, 262144), 180460)
-        self.assertEqual(agent_setup._long_context_limit(200000, 262144), 262144)
+        self.assertEqual(planned["context_window_tokens"], agent_setup.megakernel_long_context_limit(base, 8192))
+        self.assertEqual(agent_setup.megakernel_long_context_limit(120000, 262144), 234291)
+        self.assertEqual(agent_setup.megakernel_long_context_limit(200000, 262144), 262144)
 
         async def provision(payload, **kwargs):
             self.assertTrue(payload["megakernel_long_context"])

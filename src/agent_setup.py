@@ -19,7 +19,7 @@ import yaml
 
 from .config import CONFIG_PATH, load_config, load_project_config, setup_direct_model_catalog
 from .hardware import detect_hardware_info, recommended_device_for_hardware
-from .llama_server import megakernel_long_context_reason
+from .llama_server import megakernel_long_context_limit, megakernel_long_context_reason
 from .model_profiles import sync_active_model_profile
 from .provisioning import provision_setup_artifacts, recommend_direct_model
 from .runtime_limits import read_memory_snapshot
@@ -119,17 +119,6 @@ async def verify_inference(cfg: dict) -> dict:
         await client.close()
 
 
-# --long-context: the megakernel's compact KV cache (llama_server.MEGAKERNEL_LONG_CONTEXT_ENV) stores 23,936 bytes per
-# position against q8_0's 36,992, plus 114 MiB of q8_0 window rings: the positions the q8_0 limit's KV budget holds in it
-_Q8_KV_BYTES, _COMPACT_KV_BYTES, _WINDOW_RING_BYTES = 36992, 23936, 114 * 1024 * 1024
-_QWEN38_MAX_CONTEXT = 262144
-
-
-def _long_context_limit(q8_limit: int, model_max: int) -> int:
-    budget = q8_limit * _Q8_KV_BYTES - _WINDOW_RING_BYTES
-    return max(q8_limit, min(model_max or _QWEN38_MAX_CONTEXT, budget // _COMPACT_KV_BYTES))
-
-
 async def run_setup(*, model: str | None = None, context: int | None = None, dry_run: bool = False, yes: bool = False,
                     long_context: bool = False, log=None) -> dict:
     if log is None:
@@ -185,7 +174,7 @@ async def run_setup(*, model: str | None = None, context: int | None = None, dry
         reason = megakernel_long_context_reason(planned)
         if reason:
             raise SetupError("model", f"--long-context needs the megakernel: {reason}.")
-        recommended_context = _long_context_limit(recommended_context, int(payload.get("max_context_tokens") or 0))
+        recommended_context = megakernel_long_context_limit(recommended_context, int(payload.get("max_context_tokens") or 0))
         payload["megakernel_long_context"] = True
     if context is not None and (context < 512 or context > recommended_context):
         raise SetupError("model", f"--context-tokens must be between 512 and the recommended memory limit ({recommended_context}).")
