@@ -377,6 +377,38 @@ openjet-engine --model /absolute/path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
   no cost to the prompt's own speed, and its state is bit-identical to prefilling it alone.
 - Q4_K_M engine only; the mixed-quant library serves one conversation at a time.
 
+## KV cache presets (MK_KV)
+
+The KV cache is q8_0 (or fp16, `--kv`). `MK_KV` stores it in fewer bits, per attention layer and for K and V
+separately, and `MK_KV_WIN` keeps the most recent positions at q8_0, where most of a low-bit cache's error would come
+from (attention weight concentrates on recent positions). Single-stream engine, both quant engines, sm_80+.
+
+| preset | environment | K / V bits | cache bytes per position |
+|---|---|---|---|
+| default | (none) | 8 / 8 | 36,992 |
+| D | `MK_KV='K*=6,V*=5' MK_KV_WIN=2048` | 6 / 5 | 26,112 |
+| F | `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048` | 5 / 5, K Hadamard-rotated | 23,936 |
+
+plus 114 MiB of q8_0 window rings for `MK_KV_WIN=2048`.
+
+```sh
+MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf -c 131072
+```
+
+- `MK_KV`: comma-separated `<K|V|*><slot>=<bits>[r]`. Bits 4 to 8 (8 = q8_0); slot 0-15 = the attention layers 3, 7,
+  .., 63, 16 = the MTP layer, empty or `*` = all of them; `r` = stored Hadamard-rotated (a 256-point Walsh-Hadamard
+  transform, orthonormal: for K the queries get the same rotation, a rotated V's attention output is rotated back). The
+  formats are q4_0-style grids of 32 values with one fp16 scale; 5 to 7 bits store the 4-bit nibbles plus 1 to 3 high
+  bits. `D'` = `K*=6,V*=5,*16=8` keeps the MTP layer at q8_0 (+640 bytes per position; its drafts are accepted
+  more often).
+- `MK_KV_WIN=W`: every low-bit layer also keeps its last W to W + 640 positions in a q8_0 ring. The window start
+  moves in 640-position steps, like the attention split, so greedy output stays independent of the draft depth. A
+  rewind (checkpoint restore, truncate) refills the window rows the abandoned tokens overwrote from the low-bit cache.
+- A non-empty `MK_KV` selects the q8_0 cache in `--kv auto`; `--kv f16` with `MK_KV` is an error, as are `--parallel` /
+  `--agents` (for now), Turing and `MK_ATTN=1`.
+- The accuracy check is the usual one (see Correctness) with the variables set:
+  `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 ./qwen38_mk -m model.gguf --kld llama.ref --score-path mixed --kv q8`.
+
 ## How it gets its speed
 
 - **Weights stay in their GGUF k-quant encoding** (Q4_K / Q5_K / Q6_K / Q8_0), read once per
@@ -397,7 +429,8 @@ openjet-engine --model /absolute/path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
   draft depth. Past 640 positions the q8_0 cache runs `attn_core_q8`, a three-deep software pipeline
   with one block barrier per 32-position tile: warps 0-3 compute Q.K^T, 4-11 P.V, 12-15 the online
   softmax, K / V stream through separate `cp.async` rings and are converted to fp16 MMA operands in
-  registers; the partials are bit-identical to the simple kernel's (`MK_DATTN=0` selects it).
+  registers; the partials are bit-identical to the simple kernel's (`MK_DATTN=0` selects it). Low-bit
+  `MK_KV` layers run the same kernel with their tiles expanded to int8 in shared memory.
 - **MTP drafting on device**, with the draft lm_head restricted to the 32,768 most frequent
   tokens (`draft_vocab_32k.bin`, built by `tools/vocab_freq` from local code + docs; covers
   ~99.4% of tokens), plus the tokens of the current sequence that are missing from it, added on the
@@ -435,12 +468,12 @@ processing the whole conversation as one fresh prompt.
   in registers with `movmatrix`; gates are carried as log g, so tiny or zero gates are exact.
   ~2% of prefill time; 3.5e-4 relative error against a float64 reference of the recurrence.
 - **Attention**: causal flash attention over the KV cache on tensor cores. On sm_80+ the engine's own
-  cache runs `pk_attn8` (`prefill_attn.cuh`): Q.K^T as int8 tensor-core MMAs on the q8_0 keys with
-  per-32 Q scales, P.V in fp16, 12 warps per (16 queries, kv head), and the last partial wave of work
-  split along the keys and merged (`pk_attn2_comb`). Not bit-exact with `pk_attn`; KL against
-  llama.cpp is unchanged. `MK_ATTN_S8=0` selects the fp16 `pk_attn2`, `MK_ATTN=1` the original
-  `pk_attn` (also used for a parallel slot's paged cache and on Turing); `MK_ATTN_SPLIT=0` and
-  `MK_ATTN_PV16=0` turn off the tail split and fp16 P.V accumulation.
+  cache runs `pk_attn8` (`prefill_attn.cuh`): Q.K^T as int8 tensor-core MMAs on the q8_0 (or expanded
+  low-bit) keys with per-32 Q scales, P.V in fp16, 12 warps per (16 queries, kv head), and the last
+  partial wave of work split along the keys and merged (`pk_attn2_comb`). Not bit-exact with `pk_attn`;
+  KL against llama.cpp is unchanged. `MK_ATTN_S8=0` selects the fp16 `pk_attn2`, `MK_ATTN=1` the
+  original `pk_attn` (also used for a parallel slot's paged cache and on Turing); `MK_ATTN_SPLIT=0`
+  and `MK_ATTN_PV16=0` turn off the tail split and fp16 P.V accumulation.
 - **Small chunks** (a prompt riding along with parallel steps, or a prompt's tail): a GEMM whose
   128-row tiles would leave most SMs idle (5120 output rows: 40 CTAs) splits K in two, the fp32
   halves summed in a fixed order, and attention of few queries over a long context splits the
@@ -483,12 +516,14 @@ and attention paths against references without a model. On multi-GPU machines, p
   re-prompting).
 - `--parallel`: at most 8 conversations (16 rows per step), Q4_K_M engine only. With 4 agents on
   a 24 GB card, each has about 33K tokens of context.
+- `MK_KV` low-bit caches: single conversation, sm_80+ (see [KV cache presets](#kv-cache-presets-mk_kv)).
 
 ## Files
 
 - `qwen38_mk.cu` / `qwen38_mk.h` - loader, repacking, the megakernel and the `MKEngine` API
 - `prefill.cuh` / `prefill_gemm.cuh` - batched prefill kernels and their quantised fp16 GEMM
 - `prefill_attn.cuh` - prefill attention `pk_attn2` / `pk_attn8` (sm_80+)
+- `kv_lowbit.cuh` / `kv_spec.h` - `MK_KV` cache formats, the window ring, their parsing and allocation
 - `capi.cpp` - C API (engine + libllama tokenizer) for `libqwen38mk.so`
 - `server/mk_server.py` - OpenAI-compatible HTTP server
 - `main.cu` - CLI (tokenization via libllama)

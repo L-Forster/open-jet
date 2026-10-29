@@ -482,6 +482,7 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * __ldg(nw + lane * 8 + k);
             rope8(v, lane, pos);
+            if (it < NH && cB.kvlow && cB.kvr[slot]) fwht256(v); // the slot's K is stored rotated (MK_KV "r")
         }
         const float sc = it < NH ? 0.0625f : 1.0f;
         __half2 hv[4];
@@ -491,7 +492,8 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
             *reinterpret_cast<int4 *>(cP.qh + ((size_t) t * NH + it) * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         } else {
             const size_t row = kv_own_row(cB.ptab, ctx, slot, (it - NH) % NKV, pos - cB.segn); // (own cache: pos >= segn)
-            if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
+            if (cB.kvlow) kv_store_row(isv, slot, (it - NH) % NKV, pos, v); // MK_KV: the slot's format (+ window ring)
+            else if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
             else *reinterpret_cast<int4 *>(static_cast<__half *>(isv ? cB.vc : cB.kc) + row * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         }
     }
@@ -768,6 +770,20 @@ __global__ void __launch_bounds__(HD) pk_attn_comb(int T, int nz, const float * 
 }
 
 #include "prefill_attn.cuh"
+
+// MK_KV, a slot whose V is stored rotated: the attention output rotated back in place (WHT, its own inverse), before
+// pk_attn_out. One warp per head.
+__global__ void __launch_bounds__(256) pk_attn_vrot() {
+    const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int h = warp; h < NH; h += 8) {
+        float * y = cP.y2 + (size_t) t * VD + h * HD + lane * 8;
+        float v[8];
+        load8(y, v);
+        fwht256(v);
+        *reinterpret_cast<float4 *>(y) = make_float4(v[0], v[1], v[2], v[3]);
+        *reinterpret_cast<float4 *>(y + 4) = make_float4(v[4], v[5], v[6], v[7]);
+    }
+}
 
 // attention output * sigmoid(gate) -> fp16 xh (K = VD)
 __global__ void __launch_bounds__(256) pk_attn_out() {

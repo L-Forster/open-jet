@@ -35,6 +35,7 @@
 #include "ggml.h"
 #include "gguf.h"
 #include "qwen38_mk.h"
+#include "kv_spec.h"
 
 #define CK(x)                                                                                   \
     do {                                                                                        \
@@ -90,9 +91,12 @@ constexpr int SM_ATTN_KV = (4 * ATP * (256 + 8) * 2 > 2 * ATP * (256 + 8) * 2 + 
 constexpr int SM_ATTN = 32 * (256 + 8) * 2 + SM_ATTN_KV + 32 * ATP * 4 + 32 * (ATP + 8) * 2 + 96 * 4; // Q, K/V, S, P, stats
 // attn_core_q8 (pipelined decode attention, sm_80+): q8 K / V ring stages, double-buffered S and P
 constexpr int AQ_NSK = 3, AQ_NSV = 4; // K(t) is issued in interval t - 2 and read in t; V(t) issued in t - 1, read in t + 2
-constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks
+constexpr int AQ_NSKM = 4;            // MIX (low-bit MK_KV slots): K(t) issued in t - 3, expanded to int8 in t - 1, read in t
+constexpr int AQ_LDS = ATP + 4;       // S row stride (floats): the softmax quads of 8 rows hit distinct banks; the pad
+                                      // columns 32 .. 34 hold the rows' m, l and alpha (the 99 KB budget with AQ_NSKM)
 constexpr int AQ_STG = ATP * KVQ_ROW; // one K or V ring stage
-constexpr int SM_ATTN_Q8 = QWEN_MK_SM75 ? 0 : 32 * (256 + 8) * 2 + (AQ_NSK + AQ_NSV) * AQ_STG + 2 * 32 * AQ_LDS * 4 + 2 * 32 * (ATP + 8) * 2 + 4 * 32 * 4;
+constexpr int SM_ATTN_Q8 = QWEN_MK_SM75 ? 0 : 32 * (256 + 8) * 2 + (AQ_NSKM + AQ_NSV) * AQ_STG + 2 * 32 * AQ_LDS * 4 + 2 * 32 * (ATP + 8) * 2;
+static_assert(SM_ATTN_Q8 + 16 <= 99 * 1024, "attention ring budget (mk_cycle has a few bytes of static shared memory)");
 constexpr int SM_ATTN_MAX = SM_ATTN > SM_ATTN_Q8 ? SM_ATTN : SM_ATTN_Q8;
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATTN_MAX);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
@@ -161,6 +165,22 @@ struct Bufs {
     void *kc, *vc;     // KV cache [slot][kv head][ctx][HD]: fp16, or int8 (q8_0) when kvq8 ...
     __half *ksc, *vsc; // ... with one fp16 scale per 32 values: [slot][kv head][ctx][HD / 32]
     int kvq8;
+    // MK_KV (kv_lowbit.cuh), q8 cache only: per attention slot and K / V, kvb bits per value (8 = q8_0, 4..7 low-bit),
+    // kvp its values [kv head][ctx][HD * bits / 8] (slots packed one after the other in kc / vc), kvs its scales
+    // [kv head][ctx][HD / 32] (= ksc / vsc + slot offset); kvr / kvrv: K / V stored Hadamard-rotated. kvlow = 0: none
+    // of this is read (MK_KV unset).
+    int8_t * kvp[2][N_ATT_SLOTS];
+    __half * kvs[2][N_ATT_SLOTS];
+    int kvb[2][N_ATT_SLOTS];
+    int kvr[N_ATT_SLOTS];
+    int kvrv[N_ATT_SLOTS];
+    // MK_KV_WIN=W: a low-bit side also keeps its most recent rows as q8 in a ring of kvrc rows per kv head: kvrp
+    // [kv head][kvrc][HD] values, kvrs [kv head][kvrc][HD / 32] scales (nullptr: no ring). Positions >= kv_ws(L_ctx) are
+    // read from the ring.
+    int8_t * kvrp[2][N_ATT_SLOTS];
+    __half * kvrs[2][N_ATT_SLOTS];
+    int kvwin, kvrc;
+    int kvlow;
     int dattn; // q8 decode attention: 1 the pipelined kernel at long context (default), 0 attn_core_t (MK_DATTN=0)
     float * apart;
     float2 * aml;
@@ -1387,6 +1407,8 @@ __device__ __forceinline__ void kv_tile_to_f16(const uint8_t * src, __half * dK,
     }
 }
 
+#include "kv_lowbit.cuh"
+
 // async copy of q8 K/V rows r < np (positions tb + r of attention slot `slot`, kv head g) into the staging layout
 // (rows >= np: zero scales)
 __device__ __forceinline__ void kv_stage(uint8_t * dst, int slot, int g, int tb, int rows, int np) {
@@ -1442,6 +1464,19 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     int nch, CS;
     attn_dims(n + T, nch, CS);
     const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
+    if (cB.kvlow) { // MK_KV: the slot's packed rows (HD bits / 8 bytes)
+        const int rk = HD * cB.kvb[0][slot] / 8, rv = HD * cB.kvb[1][slot] / 8, lk = rk / 128, lv = rv / 128, nl = max(lk, lv);
+        for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
+            const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
+            for (int i = threadIdx.x; i < (c1 - c0) * nl; i += NT) {
+                const size_t pos = (size_t) g * cB.ctx + c0 + i / nl;
+                const int l = i % nl;
+                if (l < lk) pf_l2(reinterpret_cast<const uint8_t *>(cB.kvp[0][slot]) + pos * rk + l * 128);
+                if (l < lv) pf_l2(reinterpret_cast<const uint8_t *>(cB.kvp[1][slot]) + pos * rv + l * 128);
+            }
+        }
+        return;
+    }
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
         for (int i = threadIdx.x; i < (c1 - c0) * lines; i += NT) {
@@ -1732,7 +1767,7 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
     }
 }
 
-#if !QWEN_MK_SM75 // (shared-memory rings of ~91 KB, cp.async: sm_80+)
+#if !QWEN_MK_SM75 // (99 KB of shared memory, cp.async rings: sm_80+)
 // ---------------------------------------------------------------------------------------------------------------------
 // Decode attention on the all-q8 cache: attn_core_t's per-row arithmetic (bit-identical partials, so also T-invariant),
 // restructured for long contexts (one 32-position tile per SM every ~4.8 us before: 5 dependent stages and 5 block
@@ -1750,47 +1785,65 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
 //   per position feeds 4 tiles. Each output element is the same MMA dot product (same operand values, same k order),
 //   only its column slot in the MMA differs.
 // - The softmax keeps attn_core_t's float operations and its butterfly sum tree (position bit 4 first, then 3 .. 0).
-// Chunks of a single tile (L_ctx <= ATT_BUCKET), a parallel slot's paged cache and MK_DATTN=0 run attn_core_t.
+// Low-bit MK_KV slots run the MIX instantiation (attn_core_q8m). On the plain q8 cache, chunks of a single tile
+// (L_ctx <= ATT_BUCKET) and MK_DATTN=0 run attn_core_t (same partials).
 
 // d * q rounded once to fp16 for the two int8 values in bytes 0 and 1 of u: 0x6400 | (q ^ 0x80) is the fp16 1152 + q,
-// minus 1152 is q exactly, and one fp16 multiply rounds the exact product (= q8_to_f16's value)
-__device__ __forceinline__ unsigned aq_q8x2(unsigned u, __half2 d) {
-    const unsigned h = __byte_perm(u ^ 0x8080u, 0x64646464u, 0x4140);
-    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), __half2half2(__ushort_as_half(0x6480)));
+// minus 1152 is q exactly, and one fp16 multiply rounds the exact product (= q8_to_f16's value).
+// xm / sub generalise it to a tile of biased bytes n = q + 2^(b-1) (MIX, kv_rows_expand<_, false>): xm = 0, sub = 1024 +
+// 2^(b-1) (aq_sub) gives n - 2^(b-1) = q, the very same fp16 q; the all-q8 path's constants fold at compile time.
+__device__ __forceinline__ unsigned aq_q8x2(unsigned u, __half2 d, unsigned xm = 0x8080u, unsigned sub = 0x64806480u) {
+    const unsigned h = __byte_perm(u ^ xm, 0x64646464u, 0x4140);
+    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), *reinterpret_cast<const __half2 *>(&sub));
     const __half2 r = __hmul2(q, d);
     return *reinterpret_cast<const unsigned *>(&r);
 }
-// the same for bytes 0 / 2 or 1 / 3 of y (selector 0x4140 / 0x4342 after the caller's interleave)
-__device__ __forceinline__ unsigned aq_q8x2p(unsigned y, unsigned sel, __half2 d) {
+// the same for bytes 0 / 2 or 1 / 3 of y (selector 0x4140 / 0x4342 after the caller's interleave; the caller applied xm)
+__device__ __forceinline__ unsigned aq_q8x2p(unsigned y, unsigned sel, __half2 d, unsigned sub = 0x64806480u) {
     const unsigned h = __byte_perm(y, 0x64646464u, sel);
-    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), __half2half2(__ushort_as_half(0x6480)));
+    const __half2 q = __hsub2(*reinterpret_cast<const __half2 *>(&h), *reinterpret_cast<const __half2 *>(&sub));
     const __half2 r = __hmul2(q, d);
     return *reinterpret_cast<const unsigned *>(&r);
 }
-
-// one commit group's copies: K rows krow0 .. of the cache (kn valid rows, kn < 0: none) -> K stage dk, V rows -> dv;
-// rows >= the valid count get zero scales (their values are never used: masked S, P = 0)
-__device__ __forceinline__ void aq_issue(uint8_t * dk, size_t krow0, int kn, uint8_t * dv, size_t vrow0, int vn) {
+// the magic-number subtrahend (as a half2 bit pattern) for a tile of bits b: q8 tiles hold q ^ 0x80 after xm (1152),
+// expanded low-bit tiles hold n = q + 2^(b-1) (1024 + 2^(b-1): 0x6400 | 2^(b-1), exact below 2048)
+__device__ __forceinline__ unsigned aq_sub(int bits) {
+    const unsigned s = bits == 8 ? 0x6480u : 0x6400u | (1u << (bits - 1));
+    return s * 0x10001u;
+}
+// one commit group's copies, issued by NTH threads (this one is thread t of them): K rows of a tile (kn valid rows,
+// kn < 0: none) -> K stage dk, V rows of a tile -> dv; rows >= the valid count get zero scales (their values are
+// never used: masked S, P = 0). MIX: q4..q7 rows (kbits / vbits) copy 2 bits value chunks (kv_stage's staging layout).
+// Kq / Ks and Vq / Vs: the tiles' first rows (kv_src: the slot's main buffer, or the MK_KV_WIN q8 ring).
+// Thread -> chunk by shifts and masks (16 value chunks per row, then one scale chunk per row on the first 2 * ATP threads):
+// with a row of 17 chunks the per-thread j / 17 indices were hoisted out of the tile loop and spilled (reloaded per tile).
+template <int NTH, bool MIX = false>
+__device__ __forceinline__ void aq_issue(int t, uint8_t * dk, const int8_t * Kq, const __half * Ks, int kn, uint8_t * dv, const int8_t * Vq,
+                                         const __half * Vs, int vn, int kbits = 8, int vbits = 8) {
+    static_assert((ATP & (ATP - 1)) == 0 && HD == 256, "row = 16 value chunks of 16 B, power-of-two tile");
 #pragma unroll
-    for (int k = 0; k < (2 * ATP * 17 + NT - 1) / NT; k++) {
-        const int i = threadIdx.x + NT * k;
-        if (i < 2 * ATP * 17) {
-            const int which = i >= ATP * 17, j = which ? i - ATP * 17 : i, r = j / 17, c = j - 17 * r;
-            const int np = which ? vn : kn;
-            if (np < 0) continue;
-            uint8_t * d = (which ? dv : dk) + r * KVQ_ROW + 16 * c;
-            if (r < np) {
-                const size_t row = (which ? vrow0 : krow0) + r;
-                if (c < 16) cp_async16(d, static_cast<const int8_t *>(which ? cB.vc : cB.kc) + row * HD + 16 * c);
-                else cp_async16(d, (which ? cB.vsc : cB.ksc) + row * (HD / 32));
-            } else if (c == 16) {
-                *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
-            }
+    for (int k = 0; k < (2 * ATP * 16 + NTH - 1) / NTH; k++) {
+        const int i = t + NTH * k;
+        if (i < 2 * ATP * 16) {
+            const int which = i >= ATP * 16, r = (i >> 4) & (ATP - 1), c = i & 15;
+            const int bits = MIX ? (which ? vbits : kbits) : 8;
+            if (r < (which ? vn : kn) && c < 2 * bits)
+                cp_async16((which ? dv : dk) + r * KVQ_ROW + 16 * c, (which ? Vq : Kq) + (size_t) r * (HD * bits / 8) + 16 * c);
         }
+    }
+    if (t < 2 * ATP) {
+        const int which = t >= ATP, r = t & (ATP - 1), np = which ? vn : kn;
+        uint8_t * d = (which ? dv : dk) + r * KVQ_ROW + 16 * 16;
+        if (r < np) cp_async16(d, (which ? Vs : Ks) + (size_t) r * (HD / 32));
+        else if (np >= 0) *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
     }
 }
 
-template <int T>
+// MIX = false: all-q8 slots (attn_core_q8). MIX = true (attn_core_q8m): K and V of the slot each q8 or q4 .. q7 (MK_KV), the
+// low-bit tiles staged in their packed layout and expanded to int8 once in shared memory (kv_row_expand: q = n - 2^(bits-1)
+// with the scale unchanged, by warps 4 - 15 one interval before the tile is read; the K pipeline is one stage deeper for
+// it), so the MMA path is the q8 one for every tile and the partials equal attn_core_t's for every MK_KV format.
+template <int T, bool MIX = false>
 __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
     constexpr int R = 6 * T;
@@ -1799,7 +1852,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     constexpr int LDH = HD + 8;
     constexpr int LDP = TP + 8;
     constexpr int LDS = AQ_LDS;
-    constexpr int NSK = AQ_NSK, NSV = AQ_NSV;
+    constexpr int NSK = MIX ? AQ_NSKM : AQ_NSK, NSV = AQ_NSV;
     static_assert(R <= 32 && TP == 32 && MT <= 2, "8 rows per softmax warp, 32-position tiles");
     const int L_ctx = n + T;
     int nch, CS;
@@ -1808,13 +1861,16 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     __half * sQ = reinterpret_cast<__half *>(sm);                 // [32][LDH]
     uint8_t * kring = reinterpret_cast<uint8_t *>(sQ + 32 * LDH); // NSK stages
     uint8_t * vring = kring + NSK * AQ_STG;                       // NSV stages
-    float * sS = reinterpret_cast<float *>(vring + NSV * AQ_STG); // [2][32][LDS]
+    float * sS = reinterpret_cast<float *>(vring + NSV * AQ_STG); // [2][32][LDS]; pad columns: m (32), l (33), alpha (34)
     __half * sP = reinterpret_cast<__half *>(sS + 2 * 32 * LDS);  // [2][32][LDP]
-    float * sM = reinterpret_cast<float *>(sP + 2 * 32 * LDP);
-    float * sL = sM + 32;
-    float * sAl = sL + 32; // [2][32]
+    auto sM = [&](int r) -> float & { return sS[r * LDS + 32]; };
+    auto sL = [&](int r) -> float & { return sS[r * LDS + 33]; };
+    auto sAl = [&](int b, int r) -> float & { return sS[(b * 32 + r) * LDS + 34]; };
     const size_t ctx = cB.ctx;
-    const size_t slot0 = (size_t) slot * NKV * ctx; // first row of this slot
+    // MK_KV per-slot formats (MIX only): tiles are copied in the slot's format (per tile: kv_tbits, since with MK_KV_WIN the
+    // tiles at positions >= wsr are the ring's q8 copies) and the low-bit ones expanded to int8 in their stage before use
+    const int wsr = MIX ? kv_ws(L_ctx) : 0, wsm = MIX ? kv_wsm(wsr) : 0;
+    const KvFmt kf = MIX ? kv_fmt(slot) : KvFmt{8, 8, 0, 0}; // per-slot formats, once per launch (kv_ring_tile per item)
 
     for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
         const int g = item / nch, c = item % nch;
@@ -1853,6 +1909,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     for (int k = 0; k < 8; k++)
                         v[k] = lane < 4 ? v[k] * rc[k2][k].x - o[k] * rc[k2][k].y : o[k] * rc[k2][k].y + v[k] * rc[k2][k].x;
                 }
+                if (cB.kvr[slot]) fwht256(v); // K of this slot is stored rotated (MK_KV "r")
                 __half2 hq2[4];
 #pragma unroll
                 for (int k = 0; k < 4; k++) hq2[k] = __floats2half2_rn(v[2 * k] * 0.0625f, v[2 * k + 1] * 0.0625f);
@@ -1877,28 +1934,67 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
             rope8(v, lane, pp);
-            const size_t row = slot0 + (size_t) g * ctx + pp;
-            kv_store_q8(static_cast<int8_t *>(cB.kc) + row * HD, cB.ksc + row * (HD / 32), v);
+            kv_store_row(0, slot, g, pp, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
-            kv_store_q8(static_cast<int8_t *>(cB.vc) + row * HD, cB.vsc + row * (HD / 32), v);
+            kv_store_row(1, slot, g, pp, v);
         }
         if (tid < 32) {
-            sM[tid] = -INFINITY;
-            sL[tid] = 0.f;
+            sM(tid) = -INFINITY;
+            sL(tid) = 0.f;
         }
         __threadfence_block();
         __syncthreads();
 
         // ---- ring prologue: commit groups {K(0)}, {K(1), V(0)}; then per interval jt {K(jt + 2), V(jt + 1)}
+        // (MIX: {K(0), K(1)}, {K(2), V(0)}; per interval {K(jt + 3), V(jt + 1)}, and the low-bit tiles that landed at the
+        // end of interval jt - 1, K(jt + 1) and V(jt - 1), are expanded to int8 in interval jt)
         const int ntl = (c1 - c0 + TP - 1) / TP;
-        const size_t grow = slot0 + (size_t) g * ctx + c0;
         auto tnp = [&](int t) { return t < ntl ? min(TP, c1 - c0 - t * TP) : -1; }; // valid rows of tile t, -1: none
-        aq_issue(kring, grow, tnp(0), vring, grow, -1);
-        mk_cuda::commit();
-        aq_issue(kring + AQ_STG, grow + TP, tnp(1), vring, grow, tnp(0));
-        mk_cuda::commit();
-        mk_cuda::wait<1>();
-        __syncthreads();
+        // MIX: tiles jtr_k / jtr_v .. of this chunk come from the q8 rings (MK_KV_WIN, positions >= wsr), the others from
+        // the slot's main buffer in its format: one compare per tile (kv_ring_tile)
+        const int jtr_k = MIX ? kv_ring_tile(kf.kr, wsr, c0, TP) : 0x7fffffff, jtr_v = MIX ? kv_ring_tile(kf.vr, wsr, c0, TP) : 0x7fffffff;
+        auto kbt = [&](int t) { return t >= jtr_k ? 8 : kf.kb; }; // format of K tile t (MIX; 8 otherwise)
+        auto vbt = [&](int t) { return t >= jtr_v ? 8 : kf.vb; };
+        auto issue = [&](int t_, uint8_t * dk, int tk, uint8_t * dv, int tv, int nth_tid) {
+            const int8_t *kq, *vq;
+            const __half *ks, *vs;
+            int kb_ = 8, vb_ = 8;
+            if constexpr (MIX) {
+                kb_ = kbt(tk);
+                vb_ = vbt(max(tv, 0));
+                kv_tile_src(0, slot, g, c0 + tk * TP, wsr, wsm, kf.kb, tk >= jtr_k, kq, ks);
+                kv_tile_src(1, slot, g, c0 + max(tv, 0) * TP, wsr, wsm, kf.vb, max(tv, 0) >= jtr_v, vq, vs);
+            } else { // all-q8 slot: the plain layout
+                const size_t kr = (size_t) g * ctx + c0 + tk * TP, vr = (size_t) g * ctx + c0 + max(tv, 0) * TP;
+                kq = cB.kvp[0][slot] + kr * HD;
+                ks = cB.kvs[0][slot] + kr * (HD / 32);
+                vq = cB.kvp[1][slot] + vr * HD;
+                vs = cB.kvs[1][slot] + vr * (HD / 32);
+            }
+            if (nth_tid == NT) aq_issue<NT, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
+            else aq_issue<NT - 128, MIX>(t_, dk, kq, ks, tnp(tk), dv, vq, vs, tv < 0 ? -1 : tnp(tv), kb_, vb_);
+        };
+        if constexpr (MIX) {
+            issue(tid, kring, 0, vring, -1, NT);
+            issue(tid, kring + AQ_STG, 1, vring, -1, NT);
+            mk_cuda::commit();
+            issue(tid, kring + 2 * AQ_STG, 2, vring, 0, NT);
+            mk_cuda::commit();
+            mk_cuda::wait<1>();
+            __syncthreads();
+            const int kb0 = kbt(0); // K(0) -> bytes now (all warps); K(1) in interval 0
+            if (kb0 != 8) {
+                kv_tile_expand<false>(kring, kb0, TP, warp, NW, KVQ_ROW);
+                __syncthreads();
+            }
+        } else {
+            issue(tid, kring, 0, vring, -1, NT);
+            mk_cuda::commit();
+            issue(tid, kring + AQ_STG, 1, vring, 0, NT);
+            mk_cuda::commit();
+            mk_cuda::wait<1>();
+            __syncthreads();
+        }
 
         float acc[MT][4][4]; // P V warps: O rows 16 i + {g8, g8 + 8}, dims 32 wn + 8 tig + jj and + 4
 #pragma unroll
@@ -1916,13 +2012,17 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     const uint8_t * krow = kring + (jt % NSK) * AQ_STG + (8 * wn + g8) * KVQ_ROW;
                     const uint4 scv = *reinterpret_cast<const uint4 *>(krow + 256);
                     const unsigned scw[4] = {scv.x, scv.y, scv.z, scv.w};
+                    // MIX: a low-bit tile was expanded to biased bytes n = q + 2^(b-1) in interval jt - 1; its xm / sub make
+                    // the conversion below yield the same fp16 q (aq_q8x2). All-q8: the constants fold.
+                    const int kbj = kbt(jt);
+                    const unsigned kxm = kbj == 8 ? 0x8080u : 0u, ksub = aq_sub(kbj);
                     unsigned kb[HD / 16][2];
 #pragma unroll
                     for (int ks = 0; ks < HD / 16; ks++) {
                         const unsigned sw = __byte_perm(scw[ks >> 2], 0, (ks & 2) ? 0x3232 : 0x1010);
                         const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
-                        kb[ks][0] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd);
-                        kb[ks][1] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd);
+                        kb[ks][0] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig), dd, kxm, ksub);
+                        kb[ks][1] = aq_q8x2(*reinterpret_cast<const unsigned short *>(krow + 16 * ks + 2 * tig + 8), dd, kxm, ksub);
                     }
                     float s[MT][4];
 #pragma unroll
@@ -1956,7 +2056,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     const int wn = warp - 4, jp = jt - 2, b = jp & 1;
 #pragma unroll
                     for (int i = 0; i < MT; i++) {
-                        const float al0 = sAl[b * 32 + 16 * i + g8], al1 = sAl[b * 32 + 16 * i + g8 + 8];
+                        const float al0 = sAl(b, 16 * i + g8), al1 = sAl(b, 16 * i + g8 + 8);
 #pragma unroll
                         for (int j = 0; j < 4; j++) {
                             acc[i][j][0] *= al0;
@@ -1966,24 +2066,27 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                         }
                     }
                     const unsigned paddr = (unsigned) __cvta_generic_to_shared(sP + b * 32 * LDP + (lane & 15) * LDP + (lane >> 4) * 8);
+                    // (MIX: a low-bit V tile was expanded to biased bytes in interval jt - 1: xm / sub as for K)
                     const uint8_t * vst = vring + (jp % NSV) * AQ_STG + 32 * wn + 4 * g8;
                     const uint8_t * vsc = vring + (jp % NSV) * AQ_STG + 256 + 2 * wn;
+                    const int vbj = vbt(jp);
+                    const unsigned vxm = vbj == 8 ? 0x80808080u : 0u, vsub = aq_sub(vbj);
 #pragma unroll
                     for (int ks = 0; ks < TP / 16; ks++) {
                         unsigned bf[2][4]; // [b0 / b1][tile jj]
 #pragma unroll
                         for (int h = 0; h < 2; h++) {
                             const int p = 16 * ks + 2 * tig + 8 * h; // k rows p, p + 1 of the fragment
-                            const unsigned xa = *reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) ^ 0x80808080u;
-                            const unsigned xb = *reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) ^ 0x80808080u;
+                            const unsigned xa = *reinterpret_cast<const unsigned *>(vst + p * KVQ_ROW) ^ vxm;
+                            const unsigned xb = *reinterpret_cast<const unsigned *>(vst + (p + 1) * KVQ_ROW) ^ vxm;
                             const unsigned sw = (unsigned) *reinterpret_cast<const unsigned short *>(vsc + p * KVQ_ROW) |
                                                 ((unsigned) *reinterpret_cast<const unsigned short *>(vsc + (p + 1) * KVQ_ROW) << 16);
                             const __half2 dd = *reinterpret_cast<const __half2 *>(&sw);
                             const unsigned y0 = __byte_perm(xa, xb, 0x5140), y1 = __byte_perm(xa, xb, 0x7362);
-                            bf[h][0] = aq_q8x2p(y0, 0x4140, dd);
-                            bf[h][1] = aq_q8x2p(y0, 0x4342, dd);
-                            bf[h][2] = aq_q8x2p(y1, 0x4140, dd);
-                            bf[h][3] = aq_q8x2p(y1, 0x4342, dd);
+                            bf[h][0] = aq_q8x2p(y0, 0x4140, dd, vsub);
+                            bf[h][1] = aq_q8x2p(y0, 0x4342, dd, vsub);
+                            bf[h][2] = aq_q8x2p(y1, 0x4140, dd, vsub);
+                            bf[h][3] = aq_q8x2p(y1, 0x4342, dd, vsub);
                         }
 #pragma unroll
                         for (int i = 0; i < MT; i++) {
@@ -2017,7 +2120,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     for (int k = 1; k < 8; k++) m = fmaxf(m, sv[k]);
                     m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
                     m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 1));
-                    const float mold = sM[r];
+                    const float mold = sM(r);
                     const float mnew = fmaxf(mold, m);
                     float p[8], al = 1.f;
 #pragma unroll
@@ -2038,18 +2141,36 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
 #pragma unroll
                         for (int k = 0; k < 8; k++) prow[l4 + 4 * k] = __float2half_rn(p[k]);
                         if (l4 == 0) {
-                            sL[r] = sL[r] * al + ps;
-                            sM[r] = mnew;
-                            sAl[b * 32 + r] = al;
+                            sL(r) = sL(r) * al + ps;
+                            sM(r) = mnew;
+                            sAl(b, r) = al;
                         }
                     }
                 }
             }
             // ---- copies: K(jt + 2) into the stage of K(jt - 1), V(jt + 1) into the stage of V(jt - 3) (both read in
-            // interval jt - 1); then wait for K(jt + 1) and V(jt)
-            if (jt + 1 < ntl)
-                aq_issue(kring + ((jt + 2) % NSK) * AQ_STG, grow + (jt + 2) * TP, tnp(jt + 2), vring + ((jt + 1) % NSV) * AQ_STG,
-                         grow + (jt + 1) * TP, tnp(jt + 1));
+            // interval jt - 1), issued by warps 4-15 (the S warps carry the longest MMA chains: -5% per tile at T >= 3);
+            // then wait for K(jt + 1) and V(jt)
+            if (warp >= 4) {
+                if constexpr (MIX) {
+                    // K(jt + 3) into the stage of K(jt - 1); then the low-bit tiles that landed at the end of interval jt - 1
+                    // are expanded to bytes for interval jt + 1: K(jt + 1)
+                    // (S warps) and V(jt - 1) (P V warps), up to 3 rows per warp per call; all TP rows (rows >= np hold stale
+                    // but finite bytes under zero scales: masked S, P = 0). Their stages are not touched by any copy in flight.
+                    if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 3) % NSK) * AQ_STG, jt + 3, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                    const int r0 = warp - 4, rs = NW - 4, r1 = TP; // tile rows round-robin over warps 4-15
+                    if (jt + 1 < ntl) {
+                        const int kb_ = kbt(jt + 1);
+                        if (kb_ != 8) kv_tile_expand<false>(kring + ((jt + 1) % NSK) * AQ_STG, kb_, r1, r0, rs, KVQ_ROW);
+                    }
+                    if (jt >= 1 && jt - 1 < ntl) {
+                        const int vb_ = vbt(jt - 1);
+                        if (vb_ != 8) kv_tile_expand<false>(vring + ((jt - 1) % NSV) * AQ_STG, vb_, r1, r0, rs, KVQ_ROW);
+                    }
+                } else {
+                    if (jt + 1 < ntl) issue(tid - 128, kring + ((jt + 2) % NSK) * AQ_STG, jt + 2, vring + ((jt + 1) % NSV) * AQ_STG, jt + 1, NT - 128);
+                }
+            }
             mk_cuda::commit();
             mk_cuda::wait<1>();
             __syncthreads();
@@ -2073,7 +2194,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
                     }
                 }
         }
-        if (tid < R) cB.aml[item * AR + tid] = make_float2(sM[tid], sL[tid]);
+        if (tid < R) cB.aml[item * AR + tid] = make_float2(sM(tid), sL(tid));
         __syncthreads();
     }
 }
@@ -2082,14 +2203,25 @@ template <int T>
 __device__ __noinline__ void attn_core_q8(const LayerW & W, int slot, int n) {
     attn_core_q8_t<T>(W, slot, n);
 }
+
+template <int T>
+__device__ __noinline__ void attn_core_q8m(const LayerW & W, int slot, int n) {
+    attn_core_q8_t<T, true>(W, slot, n);
+}
 #endif
 
 // q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET), attn_core_t for one-tile
-// chunks (the pipeline fill does not pay there) and with MK_DATTN=0 (same partials). The pipelined kernel addresses the
-// engine's own contiguous cache: a slot's paged view (parallel agents) keeps attn_core_t.
+// chunks (the pipeline fill does not pay there) and with MK_DATTN=0. MK_KV (packed slots): the pipelined kernels at every
+// context, attn_core_q8m for the slots with a low-bit side. Every choice gives the same partials. The pipelined kernels
+// address the engine's own contiguous cache: a slot's paged view (parallel agents) keeps attn_core_t.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
 #if !QWEN_MK_SM75
+    if (cB.kvlow) {
+        if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_q8m<T>(W, slot, n);
+        else attn_core_q8<T>(W, slot, n);
+        return;
+    }
     if (cB.kvq8 && cB.dattn && n + T > ATT_BUCKET && !cB.ptab && cB.segn == 0) {
         attn_core_q8<T>(W, slot, n);
         return;
@@ -2101,12 +2233,16 @@ __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_
 
 // combine split-K partials, apply sigmoid output gate, quantise for o_proj
 template <int T>
-__device__ __noinline__ void attn_combine(int n) {
+__device__ __noinline__ void attn_combine(int n, int slot) {
     const int L_ctx = n + T;
     int nch, CS;
     attn_dims(L_ctx, nch, CS);
-    const int tid = threadIdx.x, d = tid & 255, wh = (tid & 255) >> 5;
-    for (int it = blockIdx.x * 2 + (tid >> 8); it < NH * T; it += 2 * gridDim.x) {
+    const int tid = threadIdx.x, d = tid & 255, wh = (tid & 255) >> 5, hf = tid >> 8;
+    // V stored rotated (MK_KV "r" on V): the head's output is rotated back (WHT, its own inverse) before the gate.
+    // Both halves of the block run the same number of items (NH T is even), so the barriers below match.
+    const bool rotv = cB.kvlow && cB.kvrv[slot];
+    float * so = reinterpret_cast<float *>(smem) + hf * 256; // scratch (the attention phase's shared memory is free)
+    for (int it = blockIdx.x * 2 + hf; it < NH * T; it += 2 * gridDim.x) {
         const int h = it / T, t = it % T, g = h / 6, r = (h % 6) * T + t;
         float M = -INFINITY;
         for (int c = 0; c < nch; c++) M = fmaxf(M, __ldcg(&cB.aml[(g * nch + c) * AR + r].x));
@@ -2117,8 +2253,23 @@ __device__ __noinline__ void attn_combine(int n) {
             num += w * __ldcg(cB.apart + ((size_t) (g * nch + c) * AR + r) * 256 + d);
             den += w * ml.y;
         }
+        float y = num / den;
+        if (rotv) {
+            so[d] = y;
+            __syncthreads();
+            if (wh == 0) {
+                float v[8];
+#pragma unroll
+                for (int k = 0; k < 8; k++) v[k] = so[8 * (tid & 31) + k];
+                fwht256(v);
+#pragma unroll
+                for (int k = 0; k < 8; k++) so[8 * (tid & 31) + k] = v[k];
+            }
+            __syncthreads();
+            y = so[d];
+        }
         const float gate = __ldcg(cB.qbuf + t * QG + h * 512 + 256 + d);
-        const float o = num / den / (1.0f + expf(-gate));
+        const float o = y / (1.0f + expf(-gate));
         q32_store(cB.qo, t, 8 * h + wh, o, 0.f, false);
     }
 }
@@ -2473,7 +2624,7 @@ __device__ void main_forward(const Launch & P, uint8_t * /*sm*/, unsigned & epoc
             gsync(epoch, PH_ATTN_PROJ);
             attn_core<T>(W, L / 4, n, sm);
             gsync(epoch, PH_ATTN_CORE);
-            attn_combine<T>(n);
+            attn_combine<T>(n, L / 4);
             gsync(epoch, PH_ATTN_COMB);
             resid32<T, 6, T_Q4K>(W.o, cB.qo, cB.x, true, W.post_norm, sm);
             gsync(epoch, PH_RESID_O);
@@ -2566,7 +2717,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
     gsync(epoch, PH_MTP_ATTN_PROJ);
     attn_core<R>(W, 16, pos0, sm);
     gsync(epoch, PH_MTP_ATTN_CORE);
-    attn_combine<R>(pos0);
+    attn_combine<R>(pos0, 16);
     gsync(epoch, PH_MTP_ATTN_COMB);
     resid32<R, 6, T_Q4K>(W.o, cB.qo, cB.xm, true, W.post_norm, sm);
     gsync(epoch, PH_MTP_RESID_O);
@@ -2805,6 +2956,7 @@ struct MKEngine::Impl {
         hctl.mtp_valid = std::min(hctl.mtp_valid, ck_pos);
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
         seq.resize(ck_pos);
+        ring_rewind(ck_pos);
     }
     // draft vocabulary: ids of head_d rows (base list + tokens added from the sequence)
     std::vector<int> dv_ids;
@@ -3218,16 +3370,29 @@ struct MKEngine::Impl {
             // (kv_mode -n): the engine's copy (kv_ctx positions) and n - 1 parallel slots of ctx positions (each with
             // its delta-net state), all in this format
             const size_t copies = kv_mode < 0 ? (size_t) -kv_mode : 1, slot_state = (size_t) 48 * NVH * 128 * 128 * 4;
+            // MK_KV (kv_lowbit.cuh): the low-bit formats need the q8 cache, so a non-empty MK_KV picks it in auto mode
+            const KvSpec<N_ATT_SLOTS> ks = kv_spec_from_env<N_ATT_SLOTS>();
             const bool q8 = kv_mode == 1 ||
-                            (kv_mode < 0 && rows * HD * 4 + (copies - 1) * (slot_rows * HD * 4 + slot_state) + (size_t) 1536 * 1024 * 1024 > free_b);
+                            (kv_mode < 0 && (ks.low || rows * HD * 4 + (copies - 1) * (slot_rows * HD * 4 + slot_state) + (size_t) 1536 * 1024 * 1024 > free_b));
             hb.kvq8 = q8;
             hb.dattn = !(getenv("MK_DATTN") && atoi(getenv("MK_DATTN")) == 0);
-            hb.kc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
-            hb.vc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
-            hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
-            hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
-            fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? "q8_0" : "fp16",
-                    rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, kv_ctx);
+            hb.kvlow = ks.low;
+            if (ks.low) {
+                if (QWEN_MK_SM75) throw std::runtime_error("MK_KV: the low-bit KV formats need sm_80 or newer");
+                if (!q8) throw std::runtime_error("MK_KV needs the q8 KV cache (--kv q8 or auto, not f16)");
+                const size_t b = kv_alloc_lowbit(hb, ks, (size_t) NKV * kv_ctx, HD, NKV, ATT_BUCKET, ATP,
+                                                 [&](size_t n) { return (void *) dalloc<int8_t>(n); });
+                fprintf(stderr, "[mk] KV cache q8_0 + low-bit (MK_KV), %.2f GB for %d positions\n", b / 1e9, kv_ctx);
+                kv_spec_log(ks);
+            } else {
+                hb.kc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+                hb.vc = q8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+                hb.ksc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+                hb.vsc = q8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
+                if (q8) kv_bind_q8<N_ATT_SLOTS>(hb, rows / N_ATT_SLOTS, HD);
+                fprintf(stderr, "[mk] KV cache %s, %.2f GB for %d positions\n", q8 ? "q8_0" : "fp16",
+                        rows * HD * (q8 ? 2.0 + 2.0 * 2 / 32 : 4.0) / 1e9, kv_ctx);
+            }
         }
         hb.apart = dalloc<float>((size_t) NKV * MAX_CH * AR * 256);
         hb.aml = dalloc<float2>((size_t) NKV * MAX_CH * AR);
@@ -3277,6 +3442,7 @@ struct MKEngine::Impl {
     }
 
     void launch(int mode, int T, int last, int score = 0) {
+        kv_top = std::max(kv_top, hctl.n + T + ndraft); // (ring_rewind: rows hctl.n .. + T - 1, the MTP's draft rows after them)
         Launch L{mode, T, last, ndraft, score, smp_temp, smp_top_p, smp_min_p, smp_top_k, smp_seed, draft_prob};
         void * args[] = {&L};
         CK(cudaMemsetAsync(hb.bar, 0, 16));
@@ -3524,6 +3690,9 @@ struct MKEngine::Impl {
     int a2_slots = 0;
     bool pf_attn_old = false, attn_split = true, attn_pv16 = true;
     int attn_s8 = 1;
+    bool kv_k6v5(int slot) const { return hb.kvb[0][slot] == 6 && hb.kvb[1][slot] == 5; }
+    bool kv_k5v5(int slot) const { return hb.kvb[0][slot] == 5 && hb.kvb[1][slot] == 5; }
+    bool rot_v(int slot) const { return hb.kvlow && hb.kvrv[slot]; }
     // false: the caller runs pk_attn (Turing, MK_ATTN=1, a paged cache)
     bool pf_attn2(int T, int n, int slot) {
 #if QWEN_MK_SM75
@@ -3537,9 +3706,22 @@ struct MKEngine::Impl {
         if (attn_split) a2_plan(T, n, a2_slots, (size_t) hp.cap * FF, nfull, S);
         const int grid = nfull + (N - nfull) * S;
         if (hb.kvq8) {
-            if (attn_pv16 && attn_s8 == 1) pk_attn8<false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
-            else if (attn_pv16 && attn_s8 == 2) pk_attn8<true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
-            else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            // pk_attn8 reads K in any MK_KV format (low-bit tiles expanded to int8 in its staging) and any V format (a8_cv_v
+            // converts). Rotated K too: pk_attn_prep rotates Q (fp32 fwht256) before its fp16 store to qh, so the int8 Q
+            // fragments are rotated as well; pk_attn_vrot un-rotates a rotated V's output for every kernel.
+            const bool kl = hb.kvb[0][slot] != 8; // low-bit K: the expanding instantiation (q8 K: the plain kernel)
+            const bool q8s = !kl && hb.kvb[1][slot] == 8; // all-q8 slot (the default cache): no V format switch either
+            if (attn_pv16 && attn_s8 == 1) {
+                if (kv_k6v5(slot)) pk_attn8<false, true, 6, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else if (kv_k5v5(slot)) pk_attn8<false, true, 5, 5><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else if (kl) pk_attn8<false, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else if (q8s) pk_attn8<false, false, 0, 8><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else pk_attn8<false, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            } else if (attn_pv16 && attn_s8 == 2) {
+                if (kl) pk_attn8<true, true><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else if (q8s) pk_attn8<true, false, 0, 8><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+                else pk_attn8<true, false><<<grid, A2_NT, A8_SMEM>>>(T, n, slot, nfull, S, hp.y1);
+            } else if (attn_pv16) pk_attn2<true, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
             else pk_attn2<true, false><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
         } else {
             if (attn_pv16) pk_attn2<false, true><<<grid, A2_NT, A2_SMEM>>>(T, n, slot, nfull, S, hp.y1);
@@ -3555,8 +3737,14 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pk_attn2<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
         CK(cudaFuncSetAttribute(pk_attn2<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A2_SMEM));
-        CK(cudaFuncSetAttribute(pk_attn8<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
-        CK(cudaFuncSetAttribute(pk_attn8<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, true, 6, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, true, 5, 5>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<false, false, 0, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
+        CK(cudaFuncSetAttribute(pk_attn8<true, false, 0, 8>, cudaFuncAttributeMaxDynamicSharedMemorySize, A8_SMEM));
         int occ = 0;
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, pk_attn2<true, false>, A2_NT, A2_SMEM));
         a2_slots = nsm * occ;
@@ -3566,12 +3754,18 @@ struct MKEngine::Impl {
         if (const char * e = getenv("MK_ATTN_S8")) attn_s8 = atoi(e);
         if (attn_s8) {
             int occ8 = 0;
-            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false>, A2_NT, A8_SMEM));
+            CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ8, pk_attn8<false, false>, A2_NT, A8_SMEM));
             if (occ8 != occ) attn_s8 = 0; // the split plan assumes pk_attn2's residency
         }
 #endif
+        if (pf_attn_old && hb.kvlow) throw std::runtime_error("MK_ATTN=1 (pk_attn) reads the plain q8 layout only: no MK_KV");
     }
 
+    // MK_KV_WIN: the sequence goes back to position P (checkpoint restore, truncate). The abandoned positions P .. kv_top - 1
+    // (kv_top: every launch's rows, draft rows included) occupied the ring slots of the window rows P - kvrc .. kv_top - kvrc - 1,
+    // so exactly those rows are refilled from the main buffer (they stay at its precision until they age out of the window;
+    // a fresh prefill of the same text has them at q8). Positions >= P are rewritten before they are read.
+    int kv_top = 0;
     // the K/V view the kernels see (cB): the engine's own contiguous cache, or a parallel slot's paged one
     bool cb_paged = false;
     void cb_set(const Bufs & b, bool async = false) {
@@ -3579,6 +3773,17 @@ struct MKEngine::Impl {
         else CK(cudaMemcpyToSymbol(cB, &b, sizeof(Bufs)));
         cb_paged = b.ptab != nullptr || b.segn > 0;
     }
+    void ring_rewind(int P) {
+        if (hb.kvwin > 0) {
+            const int p0 = std::max(0, P - hb.kvrc), p1 = std::min(P, kv_top - hb.kvrc);
+            if (p1 > p0) {
+                k_ring_refill<<<std::min(1024, (p1 - p0) * NKV * N_ATT_SLOTS * 2 / 8 + 1), 256>>>(p0, p1);
+                CK(cudaGetLastError());
+            }
+        }
+        kv_top = std::min(kv_top, P);
+    }
+
     void pf_attn(int T, int n0, int slot) {
         if (pf_attn2(T, n0, slot)) return;
         const int base = (T + AT_Q - 1) / AT_Q * NKV, keys = n0 + T;
@@ -3745,6 +3950,7 @@ struct MKEngine::Impl {
                 int first = 0) {
         pf_init();
         const int N = (int) toks.size(), cap = hp.cap;
+        kv_top = std::max(kv_top, n0 + N); // (ring_rewind)
         if (n0 == 0) CK(cudaMemset(hp.h, 0, D * sizeof(float)));
         else CK(cudaMemcpy(hp.h, hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, D * sizeof(float), cudaMemcpyDeviceToDevice));
         for (int c0 = 0; c0 < N; c0 += cap) {
@@ -3762,6 +3968,7 @@ struct MKEngine::Impl {
                     pf_time("attn", [&] {
                         pf_attn(T, n, L / 4);
                     });
+                    if (rot_v(L / 4)) pf_time("attn_out", [&] { pk_attn_vrot<<<T, 256>>>(); });
                     pf_time("attn_out", [&] { pk_attn_out<<<T, 256>>>(); });
                     pf_time("gemm_attn_o", [&] { gemm(W.o, T, hp.x, D, pf::OUT_ADD); });
                 } else {
@@ -3839,6 +4046,7 @@ struct MKEngine::Impl {
     size_t page_bytes() const { return (size_t) KV_PG * kv_pos_bytes(); }
     size_t slot_state_bytes() const { return (size_t) 48 * (NVH * 128 * 128 + CONV_RING * QKV) * 4; }
     void ms_alloc(int S, int pages) {
+        if (hb.kvlow) throw std::runtime_error("MK_KV: not supported with parallel slots (--parallel / --agents) yet");
         if ((int) ms.size() >= S && pages <= npages) return;
         // (test path: more than the slots hold reallocates them; the server opens its slots once)
         for (auto & q : ms) dfree({q.conv, q.dstate, q.dptab});
@@ -5369,6 +5577,7 @@ struct MKEngine::Impl {
         memset(&hctl, 0, sizeof(hctl));
         CK(cudaMemcpy(hb.ctl, &hctl, sizeof(Ctl), cudaMemcpyHostToDevice));
         CK(cudaMemset(hb.cnt, 0, 16));
+        kv_top = 0; // (MK_KV_WIN: every position is rewritten before it is read)
     }
 };
 
@@ -5572,6 +5781,7 @@ void MKEngine::truncate(int len) {
     if (len < p_->hctl.dn_c || len > (int) seq.size())
         throw std::runtime_error("truncate: can only drop tokens emitted after the committed position");
     seq.resize(len);
+    p_->ring_rewind(len); // MK_KV_WIN: the dropped positions' ring slots held window rows
 }
 
 std::vector<int> MKEngine::score(const std::vector<int> & tokens) {
