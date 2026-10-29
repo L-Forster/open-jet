@@ -1576,24 +1576,26 @@ __device__ __forceinline__ void attn_core_t(const LayerW & W, int slot, int n) {
         float qv[2][8], qw[8];
         float2 rc[2][8];
         load8(W.qn + lane * 8, qw);
+        // Unconditional loads (rows >= R and lanes >= 8 load valid, unused data): conditionally assigned arrays
+        // were carried across the item loop in local memory, part of mk_cycle's stack frame, which the driver
+        // reserves for all 1,536 thread slots of every SM.
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
-            const int r = warp + 16 * k2;
-            if (r < R) {
-                const int hq = r / T, t = r % T, head = g * 6 + hq;
-                load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
-                if (lane < 8) {
-                    const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
+            const int r = min(warp + 16 * k2, R - 1);
+            const int hq = r / T, t = r % T, head = g * 6 + hq;
+            load8(cB.qbuf + t * QG + head * 512 + lane * 8, qv[k2]);
+            const float2 * tab = cB.rope + (size_t) (n + t) * 32 + (lane & 3) * 8;
 #pragma unroll
-                    for (int k = 0; k < 8; k++) rc[k2][k] = __ldg(tab + k);
-                }
-            }
+            for (int k = 0; k < 8; k++) rc[k2][k] = __ldg(tab + k);
         }
 #pragma unroll
         for (int k2 = 0; k2 < 2; k2++) {
             const int r = warp + 16 * k2;
             if (r < R) {
-                float * v = qv[k2];
+                // a copy, not a pointer into qv: a pointer made ptxas keep qv / qw / rc in local memory
+                float v[8];
+#pragma unroll
+                for (int k = 0; k < 8; k++) v[k] = qv[k2][k];
                 float ss = 0.f;
 #pragma unroll
                 for (int k = 0; k < 8; k++) ss += v[k] * v[k];
@@ -2322,7 +2324,19 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const SX sx = make_sx(sm, U_D);
     float * m = misc(sm);
-    pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
+    // the draft head reads lm_head rows through cW.draft_ids (row r of head_d is lm_head row draft_ids[r]); a gathered
+    // copy of those rows exists only for the parallel slots' batched draft pass (dv_copy_ensure)
+    const int * ids = draft ? cW.draft_ids : nullptr;
+    if (ids) {
+        const int r0 = 2 * gwarp();
+        if (r0 < cW.head_d.N)
+            for (int k = 0; k < 2; k++) {
+                const uint8_t * p = cW.head.w + (size_t) __ldg(ids + r0 + k) * cW.head.rb;
+                for (int off = lane * 128; off < 896; off += 32 * 128) asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
+            }
+    } else {
+        pf_rows(draft ? cW.head_d : cW.head, 2 * gwarp(), 2, 896);
+    }
     fill_xs<TL>(cB.qn, t0, true, sx, m);
     float bv[TL];
     int bi[TL];
@@ -2335,7 +2349,13 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
         zero_acc<TL, 2>(a);
-        mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
+        if (ids) {
+            const uint8_t * rp[2] = {cW.head.w + (size_t) __ldg(ids + r) * cW.head.rb,
+                                     cW.head.w + (size_t) __ldg(ids + r + 1) * cW.head.rb};
+            rows_q6k<TL, 5, 2>(rp, sx, a);
+        } else {
+            mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
+        }
         wsum_acc<TL, 2>(a);
         if constexpr (FULL) {
             if (lane == 0) {
@@ -2936,10 +2956,13 @@ struct MKEngine::Impl {
     int ck_pos = -1;
     void ck_save() {
         const size_t ns = (size_t) 48 * NVH * 128 * 128, nc = (size_t) 48 * CONV_RING * QKV, nh = (size_t) H_RING * D;
-        if (!ck_dstate) { // (in host memory when the engine's own K/V is reduced: a parallel server's slots need the room)
-            ck_dstate = kv_ctx < ctx ? halloc<float>(ns) : dalloc<float>(ns, false);
-            ck_conv = kv_ctx < ctx ? halloc<float>(nc) : dalloc<float>(nc, false);
-            ck_hhist = kv_ctx < ctx ? halloc<float>(nh) : dalloc<float>(nh, false);
+        // (in host memory when the engine's own K/V is reduced, since a parallel server's slots need the room, and with
+        // a low-bit MK_KV cache, whose long contexts need it for K/V: ~0.16 GB, for one PCIe copy per prompt)
+        if (!ck_dstate) {
+            const bool host = kv_ctx < ctx || hb.kvlow;
+            ck_dstate = host ? halloc<float>(ns) : dalloc<float>(ns, false);
+            ck_conv = host ? halloc<float>(nc) : dalloc<float>(nc, false);
+            ck_hhist = host ? halloc<float>(nh) : dalloc<float>(nh, false);
         }
         CK(cudaMemcpy(ck_dstate, hb.dstate, ns * 4, cudaMemcpyDefault));
         CK(cudaMemcpy(ck_conv, hb.conv, nc * 4, cudaMemcpyDefault));
@@ -2963,7 +2986,24 @@ struct MKEngine::Impl {
     std::vector<uint8_t> dv_in;
     int dv_base = 0;
 
-    // Adds the tokens not yet in the draft head's vocabulary (copies their lm_head rows).
+    int dv_cap = 0;        // rows the draft id list (and a gathered copy) has room for
+    bool dv_copy = false;  // head_d's rows gathered into their own buffer (the parallel slots' batched draft pass)
+    // The batched draft pass (tc_mv) reads head_d's rows contiguously, so opening parallel slots gathers them; the
+    // single-stream megakernel reads lm_head through draft_ids and keeps no copy (~160 MB).
+    void dv_copy_ensure() {
+        if (dv_copy || !hw.draft_ids) return;
+        Mat & m = hw.head_d;
+        uint8_t * w = dalloc<uint8_t>((size_t) dv_cap * m.rb, false);
+        __half * d = m.nd ? dalloc<__half>((size_t) dv_cap * m.nd, false) : nullptr;
+        gather_rows<<<m.N, 256>>>(hw.head.w, w, hw.head.d, d, hw.draft_ids, m.rb, m.nd);
+        CK(cudaDeviceSynchronize());
+        m.w = w;
+        m.d = d;
+        CK(cudaMemcpyToSymbol(cW, &m, sizeof(Mat), offsetof(ModelW, head_d)));
+        dv_copy = true;
+    }
+
+    // Adds the tokens not yet in the draft head's vocabulary (and copies their lm_head rows into a gathered copy).
     void dv_add(const int * toks, size_t n) {
         if (dv_in.empty()) return; // full-vocabulary draft head
         const int n0 = (int) dv_ids.size();
@@ -2977,8 +3017,9 @@ struct MKEngine::Impl {
         const int k = (int) dv_ids.size() - n0;
         Mat & m = hw.head_d;
         CK(cudaMemcpy(const_cast<int *>(hw.draft_ids) + n0, dv_ids.data() + n0, k * 4, cudaMemcpyHostToDevice));
-        gather_rows<<<k, 256>>>(hw.head.w, const_cast<uint8_t *>(m.w) + (size_t) n0 * m.rb, hw.head.d,
-                                m.d ? const_cast<__half *>(m.d) + (size_t) n0 * m.nd : nullptr, hw.draft_ids + n0, m.rb, m.nd);
+        if (dv_copy)
+            gather_rows<<<k, 256>>>(hw.head.w, const_cast<uint8_t *>(m.w) + (size_t) n0 * m.rb, hw.head.d,
+                                    m.d ? const_cast<__half *>(m.d) + (size_t) n0 * m.nd : nullptr, hw.draft_ids + n0, m.rb, m.nd);
         m.N = (int) dv_ids.size();
         CK(cudaMemcpyToSymbol(cW, &m.N, sizeof(int), offsetof(ModelW, head_d) + offsetof(Mat, N)));
     }
@@ -3005,12 +3046,40 @@ struct MKEngine::Impl {
                         arr_last = std::vector<double>(PH_COUNT, 0.0);
     std::vector<long> arr_n = std::vector<long>(PH_COUNT, 0);
 
+    // Device buffers come from the default memory pool, which packs them: cudaMalloc rounds each one up to whole
+    // 2 MiB pages (about 0.5 GB over the ~900 weight tensors). MK_CUDAMALLOC=1: plain cudaMalloc.
+    int use_pool = -1; // (decided on the first allocation)
+    cudaMemPool_t pool{};
+    bool pool_on() {
+        if (use_pool < 0) {
+            int ok = 0;
+            cudaDeviceGetAttribute(&ok, cudaDevAttrMemoryPoolsSupported, 0);
+            const char * cm = getenv("MK_CUDAMALLOC");
+            use_pool = ok && !(cm && cm[0] == '1');
+            if (use_pool) {
+                CK(cudaDeviceGetDefaultMemPool(&pool, 0));
+                unsigned long long keep = ~0ull; // no release at every synchronisation; dfree trims explicitly
+                CK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep));
+            }
+        }
+        return use_pool;
+    }
+    void dfree_raw(void * p) {
+        if (use_pool > 0) {
+            CK(cudaFreeAsync(p, 0));
+            CK(cudaStreamSynchronize(0));
+        } else {
+            CK(cudaFree(p));
+        }
+    }
     void dfree(std::initializer_list<void *> ps) {
         for (void * p : ps) {
             if (!p) continue;
             allocs.erase(std::find(allocs.begin(), allocs.end(), p));
-            CK(cudaFree(p));
+            dfree_raw(p);
         }
+        // hand the freed memory back to the device: the slot sizing that follows reads cudaMemGetInfo
+        if (use_pool > 0) CK(cudaMemPoolTrimTo(pool, 0));
     }
     template <class T> T * halloc(size_t n) { // (pageable: pinned memory is scarce under WSL and the memory caps)
         void * p = std::malloc(n * sizeof(T));
@@ -3020,7 +3089,12 @@ struct MKEngine::Impl {
     }
     template <class T> T * dalloc(size_t n, bool zero = true) {
         void * p;
-        CK(cudaMalloc(&p, n * sizeof(T) + 16));
+        if (pool_on()) {
+            CK(cudaMallocAsync(&p, n * sizeof(T) + 16, 0));
+            CK(cudaStreamSynchronize(0));
+        } else {
+            CK(cudaMalloc(&p, n * sizeof(T) + 16));
+        }
         if (zero) CK(cudaMemset(p, 0, n * sizeof(T) + 16));
         allocs.push_back(p);
         return (T *) p;
@@ -3309,14 +3383,11 @@ struct MKEngine::Impl {
             CK(cudaMemcpy(did, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice));
             Mat m = hw.head;
             m.N = (int) ids.size();
-            uint8_t * w = dalloc<uint8_t>((size_t) cap * m.rb, false);
-            __half * d = m.nd ? dalloc<__half>((size_t) cap * m.nd, false) : nullptr;
-            gather_rows<<<m.N, 256>>>(hw.head.w, w, hw.head.d, d, did, m.rb, m.nd);
-            CK(cudaDeviceSynchronize());
-            m.w = w;
-            m.d = d;
+            m.w = nullptr; // (the megakernel reads lm_head through did; dv_copy_ensure gathers a copy for the slots)
+            m.d = nullptr;
             hw.head_d = m;
             hw.draft_ids = did;
+            dv_cap = cap;
             dv_ids = ids;
             dv_base = (int) ids.size();
             dv_in.assign(VOCAB, 0);
@@ -3430,13 +3501,24 @@ struct MKEngine::Impl {
         int nb = 0;
         CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, mk_cycle, NT, SM_TOTAL));
         if (nb < 1) throw std::runtime_error("megakernel does not fit on an SM");
+        // The driver reserves local memory for every thread slot of the device (1,536 per SM), sized by the larger of
+        // the stack-size limit (default 1 KB per thread) and the launched kernels' own frames. No kernel here needs a
+        // dynamic stack, so the limit only adds a floor: drop it. MK_STACK_LIMIT=<bytes> sets it.
+        {
+            const char * sl = getenv("MK_STACK_LIMIT");
+            CK(cudaDeviceSetLimit(cudaLimitStackSize, sl ? (size_t) atol(sl) : 0));
+        }
         fprintf(stderr, "[mk] weights %.2f GB on device, %d SMs, ctx %d, n_draft %d\n", wbytes / 1e9, nsm, ctx, ndraft);
         file.release();
     }
 
     ~Impl() {
         print_profile();
-        for (void * p : allocs) cudaFree(p);
+        for (void * p : allocs) use_pool > 0 ? (void) cudaFreeAsync(p, 0) : (void) cudaFree(p);
+        if (use_pool > 0) {
+            cudaStreamSynchronize(0);
+            cudaMemPoolTrimTo(pool, 0);
+        }
         for (void * p : hallocs) std::free(p);
         if (embd_host) cudaFreeHost(embd_host);
     }
@@ -4697,6 +4779,7 @@ struct MKEngine::Impl {
     }
     // per-phase GEMV timing of the speculative path at R rows over all layers (real weights, arbitrary activations)
     void bench_sp(int R) {
+        dv_copy_ensure();
         auto bytes = [](const Mat & m) { return (double) m.rb * m.N + (m.d ? (double) m.nd * m.N * 2 : 0.0); };
         auto time = [&](const char * name, auto f, double by, int nl) {
             double best = 1e30;
@@ -5027,6 +5110,7 @@ struct MKEngine::Impl {
     // ctx_s 0: the most positions per slot that fit in the device memory left (after each slot's fixed state and a
     // reserve for the work buffers), at most the engine's ctx; returns the positions per slot
     int slots_open(int n, int ctx_s, int seg_tokens = 0) {
+        dv_copy_ensure(); // (the batched draft pass reads head_d's rows contiguously)
         // MTP drafts per slot: 2 while the slots' rows fit (4 x 3 = 12): measured 4 x 2 drafts 49 tok/s each against
         // 46 with 1 at short context, 41 against 35 at 8k (the GEMVs cost about the same at 8 or 12 rows)
         slot_nd = getenv("MS_ND") ? std::max(1, std::min(2, atoi(getenv("MS_ND")))) : n * 3 <= bmm::TM ? 2 : 1;
