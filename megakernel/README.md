@@ -386,6 +386,11 @@ python3 server/mk_server.py -m ../models/Qwen3.8-27B-Q4_K_M.gguf --port 18080 -c
   The default is 2048, and 1024 under `--parallel`, where the memory goes to context (a 9.1K-token
   prompt measured 1248-1508 tok/s at either cap). Smaller caps also limit scoring/logit tiles to
   the scratch allocation. These options apply to both quant engines.
+- The MTP layer's matrices stored wider than Q4_K are re-quantized to Q4_K at load (`attn_v` and
+  `ffn_down` in unsloth's Q4_K_M; the whole layer and `nextn.eh_proj` in UD-Q4_K_XL). Only the drafts
+  change: the main model verifies every draft, so greedy output is unchanged and sampling keeps its
+  distribution; acceptance can move. Each MTP pass streams fewer bytes. `MK_MTP_Q4=0` keeps the
+  stored types.
 
 ### Parallel serving
 

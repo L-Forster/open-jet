@@ -3076,6 +3076,14 @@ struct MKEngine::Impl {
     };
     int n_conv = 0;
     double conv_s = 0;
+    // MK_MTP_Q4 (default 1): while the MTP layer and nextn.eh_proj load, their matrices stored wider than Q4_K
+    // (Q5_K, Q6_K, Q8_0) are re-quantized to Q4_K, lossy by design. Only the drafts change and the main model verifies
+    // every draft, so greedy output and the sampled distribution are unchanged; acceptance can move, and each MTP
+    // pass streams fewer bytes.
+    // MK_MTP_Q4=0 keeps the stored types.
+    bool req_q4 = false;
+    int n_req = 0;
+    double req_s = 0;
 
     Src want(const std::string & name, int to = -1) {
         const auto & t = file.get(name);
@@ -3085,11 +3093,13 @@ struct MKEngine::Impl {
         s.data = t.data;
         s.nbytes = t.nbytes;
         const bool to_f32 = to == T_F32 && t.type != gguf::F32;
+        const bool to_q4 = req_q4 && (int) t.type == to &&
+                           (t.type == gguf::Q5_K || t.type == gguf::Q6_K || t.type == gguf::Q8_0);
         const bool to_q6 = !to_f32 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
         const bool to_q8 = !to_f32 && t.type == gguf::IQ4_NL;
-        if (!to_f32 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
+        if (!to_f32 && !to_q4 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
         const ggml_type from = (ggml_type) t.type;
-        const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
+        const ggml_type dst = to_f32 ? GGML_TYPE_F32 : to_q4 ? GGML_TYPE_Q4_K : to_q6 ? GGML_TYPE_Q6_K : GGML_TYPE_Q8_0;
         const int64_t K = (int64_t) t.ne[0];
         int64_t rows = 1;
         for (size_t d = 1; d < t.ne.size(); d++) rows *= (int64_t) t.ne[d];
@@ -3109,6 +3119,10 @@ struct MKEngine::Impl {
                 memcpy(out, f.data(), (size_t) K * 4);
                 return;
             }
+            if (to_q4) {
+                ggml_quantize_chunk(GGML_TYPE_Q4_K, f.data(), out, 0, 1, K, nullptr);
+                return;
+            }
             if (to_q6) reencode_q6k(t.type, src, f.data(), out, K);
             else reencode_iq4nl_q80(src, out, K);
             g.resize((size_t) K);
@@ -3122,8 +3136,14 @@ struct MKEngine::Impl {
         s.type = (uint32_t) dst;
         s.data = s.own.data();
         s.nbytes = s.own.size();
-        n_conv++;
-        conv_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (to_q4) {
+            n_req++;
+            req_s += dt;
+        } else {
+            n_conv++;
+            conv_s += dt;
+        }
         return s;
     }
 
@@ -3297,9 +3317,15 @@ struct MKEngine::Impl {
                                      " (see README: the GGUF)");
         };
         auto needq = [&](const std::string & name, int got) { need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X}); };
+        int mtp_q4 = 1;
+        if (const char * e = getenv("MK_MTP_Q4")) {
+            if (strcmp(e, "0") != 0 && strcmp(e, "1") != 0) throw std::runtime_error("MK_MTP_Q4: 0 or 1");
+            mtp_q4 = e[0] - '0';
+        }
         for (int i = 0; i < NLA; i++) {
             LayerW & L = hw.L[i];
             const bool mtp = i == NL;
+            req_q4 = mtp && mtp_q4;
             L.attn = mtp || ((i + 1) % 4 == 0);
             L.attn_norm = up_f32(blk(i, "attn_norm.weight"), D);
             L.post_norm = up_f32(blk(i, "post_attention_norm.weight"), D);
@@ -3355,7 +3381,9 @@ struct MKEngine::Impl {
             needq(blk(i, "ffn_up.weight"), L.fu.type);
             needq(blk(i, "ffn_down.weight"), L.fd.type);
         }
+        req_q4 = mtp_q4;
         hw.eh = up_mat(blk(NL, "nextn.eh_proj.weight"), 2 * D, D);
+        req_q4 = false;
         needq(blk(NL, "nextn.eh_proj.weight"), hw.eh.type);
         hw.enorm = up_f32(blk(NL, "nextn.enorm.weight"), D);
         hw.hnorm = up_f32(blk(NL, "nextn.hnorm.weight"), D);
@@ -3417,6 +3445,9 @@ struct MKEngine::Impl {
         if (n_conv)
             fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: Q3_K / IQ3_S -> Q6_K, IQ4_NL -> Q8_0; ssm_alpha / beta -> F32)\n",
                     n_conv, conv_s);
+        if (n_req)
+            fprintf(stderr, "[mk] MTP layer: %d matrices re-quantized to Q4_K in %.1f s (drafts only; MK_MTP_Q4=0 keeps the stored types)\n",
+                    n_req, req_s);
 
         hb.x = dalloc<float>(MAXT * D);
         hb.xm = dalloc<float>(MAXT * D);
