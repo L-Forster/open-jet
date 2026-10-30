@@ -10,7 +10,10 @@ RTX 30, 40 and 50-series with 24 GB · works with Claude Code, Codex, OpenCode a
   <a href="https://discord.com/invite/pspKHtExSa"><img src="https://img.shields.io/badge/Discord-join-5865F2" alt="Discord"></a>
 </p>
 
-https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
+
+
+https://github.com/user-attachments/assets/c9ac0b21-67b1-4f20-af70-21741accc774
+
 
 | RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
 |---|---|---|
@@ -102,6 +105,9 @@ back. See [the runtime docs](docs/runtimes/llama-cpp.md#openjets-engine-rtx-3040
 [how the engine works](megakernel/README.md).
 
 ## 4 coding agents on one GPU
+
+https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
+
 
 Same hardware as OpenJet's engine above. Build the engine from a source checkout:
 
