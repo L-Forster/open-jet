@@ -644,7 +644,7 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot, int chun
                     for (int ni = 0; ni < AT_K / 8; ni++) mma16816(s[ni], a0, a1, a2, a3, kb_[ni][2 * h], kb_[ni][2 * h + 1]);
                 }
             }
-        } else
+        } else {
 #pragma unroll
         for (int ks = 0; ks < HD / 16; ks++) {
             const unsigned a0 = *reinterpret_cast<const unsigned *>(qa + 16 * ks);
@@ -657,6 +657,7 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot, int chun
                 mma16816(s[ni], a0, a1, a2, a3, *reinterpret_cast<const unsigned *>(kp),
                          *reinterpret_cast<const unsigned *>(kp + 8));
             }
+        }
         }
         // causal mask + online softmax (rows g8 and g8 + 8; a row's 4 lanes share it)
         float mx0 = -INFINITY, mx1 = -INFINITY;
