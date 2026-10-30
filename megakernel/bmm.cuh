@@ -1988,12 +1988,71 @@ struct AttnMs {
     const int * ptab[TM]; // the own cache's pages (nullptr: contiguous, stride ctx)
     // k_attn_ms2: positions lo .., as splits soff .. of the rows; ns: all splits of the rows (k_attn_comb)
     int lo[TM], soff[TM], ns[TM];
+    int ring[TM]; // MK_KV_WIN: the sequence's block of q8 rings in cKP.ring (its slot)
 };
 // K/V row of sequence s (attention slot, kv head g, position p) and its cache: segment below segn, own (stride ctx) above
 __device__ __forceinline__ size_t ms_kv_row(const AttnMs & A, int s, int slot, int g, int p, int ctx, bool & seg) {
     seg = p < A.segn[s];
     return seg ? kv_own_row(A.segptab[s], A.segctx[s], slot, g, p) : kv_own_row(A.ptab[s], ctx, slot, g, p - A.segn[s]);
 }
+// MK_KV: K (which 0) / V (1) row of sequence s at position p: its q8 ring at p >= ws if the side has one (8 bits), else
+// the segment (p < segn) or its own pages in the slot's format; returns the bits, q / sc <- values / scales
+__device__ __forceinline__ int ms_kv_src(const AttnMs & A, int s, int which, int slot, int g, int p, int ws, const int8_t *& q, const __half *& sc) {
+    const int ro = cKP.ro[which][slot];
+    if (ro >= 0 && p >= ws) {
+        const size_t rr = (size_t) g * cB.kvrc + p % cB.kvrc;
+        const int8_t * blk = cKP.ring + A.ring[s] * cKP.rstride;
+        q = blk + ro + rr * HD;
+        sc = reinterpret_cast<const __half *>(blk + cKP.rso[which][slot]) + rr * (HD / 32);
+        return 8;
+    }
+    const bool seg = p < A.segn[s];
+    const int * pt = seg ? A.segptab[s] : A.ptab[s];
+    const int i = seg ? p : p - A.segn[s];
+    q = static_cast<const int8_t *>(seg ? (which ? A.vseg[s] : A.kseg[s]) : (which ? A.vc[s] : A.kc[s])) + kv_pg_voff(which, slot, g, i, pt);
+    sc = (seg ? (which ? A.vsseg[s] : A.ksseg[s]) : (which ? A.vsc[s] : A.ksc[s])) + kv_own_row(pt, 0, slot, g, i) * (HD / 32);
+    return cB.kvb[which][slot];
+}
+// a staged row (values | scales, ld ATQ_ROW) of `bits` -> the q8 layout in place (kv_rows_expand); bits is warp-uniform
+__device__ __forceinline__ void kv_row_expand_any(uint8_t * row, int bits) {
+    switch (bits) {
+    case 4: kv_rows_expand<4, true>(row, 1, 0, 1, 0); break;
+    case 5: kv_rows_expand<5, true>(row, 1, 0, 1, 0); break;
+    case 6: kv_rows_expand<6, true>(row, 1, 0, 1, 0); break;
+    case 7: kv_rows_expand<7, true>(row, 1, 0, 1, 0); break;
+    default: break;
+    }
+}
+// MK_KV_WIN, parallel slots: the ring rows of positions p0 .. p1 - 1 of the slot in cB (ms_bufs) after it went back
+// (rewind; their ring slots held the abandoned continuation's rows): positions below cB.segn from its segment's ring
+// block sring (the exact q8 rows the segment's builder wrote), the others re-stored as q8 from the own cache (the main
+// format's precision until they age out, as k_ring_refill). One warp per row.
+__global__ void __launch_bounds__(256) k_ring_fill_ms(int p0, int p1, const int8_t * sring) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n = p1 - p0;
+    for (int i = blockIdx.x * 8 + warp; i < n * NKV * N_ATT_SLOTS * 2; i += gridDim.x * 8) {
+        const int w = i & 1, slot = (i >> 1) % N_ATT_SLOTS, g = ((i >> 1) / N_ATT_SLOTS) % NKV;
+        const int p = p0 + (i >> 1) / (N_ATT_SLOTS * NKV);
+        if (!cB.kvrp[w][slot]) continue;
+        const size_t rr = (size_t) g * cB.kvrc + p % cB.kvrc;
+        int8_t * q = cB.kvrp[w][slot] + rr * HD;
+        __half * sc = cB.kvrs[w][slot] + rr * (HD / 32);
+        if (p < cB.segn) {
+            *reinterpret_cast<uint2 *>(q + 8 * lane) = *reinterpret_cast<const uint2 *>(sring + cKP.ro[w][slot] + rr * HD + 8 * lane);
+            if (lane < HD / 32) sc[lane] = reinterpret_cast<const __half *>(sring + cKP.rso[w][slot])[rr * (HD / 32) + lane];
+            continue;
+        }
+        const __half * ms;
+        const int bits = cB.kvb[w][slot];
+        const uint8_t * rp = reinterpret_cast<const uint8_t *>(kv_vptr(w, slot, g, p, ms));
+        float v[8];
+        kv_row_load(rp, bits, __half2float(ms[lane >> 2]), v);
+        __syncwarp();
+        kv_store_q8(q, sc, v);
+    }
+}
+// LB: MK_KV (the slot's packed format in the pages, Hadamard rotation, MK_KV_WIN ring rows)
+template <bool LB = false>
 __global__ void __launch_bounds__(256) k_attn_prep_ms(const AttnMs A, int slot, int ctx, const float * qn, const float * kn,
                                                        const float * y0, const float * y1, __half * qh) {
     const int t = blockIdx.x, s = A.rseq[t], pos = A.pos[s] + t - A.r0[s], lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -2011,6 +2070,7 @@ __global__ void __launch_bounds__(256) k_attn_prep_ms(const AttnMs A, int slot, 
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * __ldg(nw + lane * 8 + k);
             rope8(v, lane, pos);
+            if constexpr (LB) if (it < NH && cB.kvr[slot]) fwht256(v); // (the slot's K is stored rotated)
         }
         const float sc = it < NH ? 0.0625f : 1.0f;
         __half2 hv[4];
@@ -2018,6 +2078,16 @@ __global__ void __launch_bounds__(256) k_attn_prep_ms(const AttnMs A, int slot, 
         for (int k = 0; k < 4; k++) hv[k] = __floats2half2_rn(v[2 * k] * sc, v[2 * k + 1] * sc);
         if (it < NH) {
             *reinterpret_cast<int4 *>(qh + ((size_t) t * NH + it) * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
+        } else if constexpr (LB) {
+            const int w = isv, g = (it - NH) % NKV, i = pos - A.segn[s];
+            if (w ? cB.kvrv[slot] : cB.kvr[slot]) fwht256(v);
+            kv_store_fmt(static_cast<int8_t *>(w ? A.vc[s] : A.kc[s]) + kv_pg_voff(w, slot, g, i, A.ptab[s]),
+                         (w ? A.vsc[s] : A.ksc[s]) + kv_own_row(A.ptab[s], ctx, slot, g, i) * (HD / 32), v, cB.kvb[w][slot]);
+            if (cKP.ro[w][slot] >= 0) {
+                const size_t rr = (size_t) g * cB.kvrc + pos % cB.kvrc;
+                int8_t * blk = cKP.ring + A.ring[s] * cKP.rstride;
+                kv_store_q8(blk + cKP.ro[w][slot] + rr * HD, reinterpret_cast<__half *>(blk + cKP.rso[w][slot]) + rr * (HD / 32), v);
+            }
         } else {
             const size_t row = kv_own_row(A.ptab[s], ctx, slot, (it - NH) % NKV, pos - A.segn[s]); // (new positions: own cache)
             if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? A.vc[s] : A.kc[s]) + row * HD, (isv ? A.vsc[s] : A.ksc[s]) + row * (HD / 32), v);
@@ -2437,11 +2507,16 @@ struct AttnJobs {
 };
 constexpr int ATT_SEG_SPL = 20; // most splits of a segment (one wave of blocks for a group on 82 SMs)
 static_assert(KV_PG % AT_K == 0, "a K / V tile lies in one page");
+static_assert(sizeof(AttnMs) + sizeof(AttnJobs) + 32 <= 4096, "k_attn_jobs' parameters (4 KB before CUDA 12.1)");
 // Q, the V tile (fp16), the raw K / V tile (q8), scores, row maxima
 template <int MT> constexpr int att_smem_jobs() {
     return (16 * MT + AT_K) * AT_LD * 2 + ATQ_STAGE + (16 * MT * ATP_LS + 4 * 16 * MT) * 4;
 }
-template <int MT>
+// LB (MK_KV): rows are staged one by one from where ms_kv_src puts them (an own job: q8 ring at positions >= the
+// sequence's ws, else its pages in the slot's format; a segment job: the segment's pages), the low-bit ones expanded to
+// the q8 layout in place, then the q8 path as is. A segment job's sequences may have different windows: each row masks
+// the keys from its sequence's ws on (the host starts that sequence's own job at min(segn, ws) instead).
+template <int MT, bool LB = false>
 __global__ void __launch_bounds__(256, 1) k_attn_jobs(const AttnMs A, const AttnJobs G, int slot, int chunk, const __half * qh, float * po, float2 * pml) {
     extern __shared__ __align__(16) uint8_t asm_[];
     constexpr int NR = 16 * MT, MH = (MT + 1) / 2; // (odd MT: warps 4 .. 7 have one m-tile fewer)
@@ -2460,6 +2535,9 @@ __global__ void __launch_bounds__(256, 1) k_attn_jobs(const AttnMs A, const Attn
     const __half * Ks = G.ks[gi], * Vs = G.vs[gi];
     const int * ptab = G.ptab[gi];
     const int stride = G.stride[gi], off = G.off[gi];
+    const int s0 = G.seq[gi][0];
+    const bool own = LB && off == A.segn[s0];           // (a segment job: off 0, its sequences' segn > 0)
+    const int ws0 = LB ? kv_ws(A.pos[s0] + A.nt[s0]) : 0; // (own job: its sequence's window start)
     // packed row r -> its row in qh, its q head and query position (false: padding)
     auto locate = [&](int r, int & qrow, int & hq, int & qp) {
         for (int j = 0; j < ng; j++) {
@@ -2484,6 +2562,30 @@ __global__ void __launch_bounds__(256, 1) k_attn_jobs(const AttnMs A, const Attn
     auto issue = [&](int kb, int which) { // raw rows of tile kb (values, scales) of K (0) or V (1) (cp.async)
         uint8_t * base = sRaw + which * AT_K * ATQ_ROW;
         const int np = min(AT_K, k_hi - kb);
+        if constexpr (LB) {
+            for (int i = tid; i < AT_K * 17; i += 256) {
+                const int r = i / 17, cc = i % 17;
+                uint8_t * d = base + r * ATQ_ROW + 16 * cc;
+                if (r < np) {
+                    const int8_t * q;
+                    const __half * sc;
+                    int bits;
+                    if (own) bits = ms_kv_src(A, s0, which, slot, g, kb + r, ws0, q, sc);
+                    else {
+                        bits = cB.kvb[which][slot];
+                        q = (which ? Vq : Kq) + kv_pg_voff(which, slot, g, kb + r, ptab);
+                        sc = (which ? Vs : Ks) + kv_own_row(ptab, stride, slot, g, kb + r) * (HD / 32);
+                    }
+                    if (cc < 16) {
+                        if (cc < 2 * bits) cp_async16(d, q + 16 * cc);
+                    } else cp_async16(d, sc);
+                } else if (cc == 16) {
+                    *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
+                }
+            }
+            pf::cpa_commit();
+            return;
+        }
         const size_t rb = kv_own_row(ptab, stride, slot, g, kb - off); // (tiles start at multiples of AT_K past off: one page)
         for (int i = tid; i < AT_K * 17; i += 256) {
             const int r = i / 17, cc = i % 17;
@@ -2512,6 +2614,16 @@ __global__ void __launch_bounds__(256, 1) k_attn_jobs(const AttnMs A, const Attn
         for (int hr = 0; hr < 2; hr++) {
             int qrow, hq;
             if (!locate(16 * (wm + 2 * j) + g8 + 8 * hr, qrow, hq, qr[j][hr])) qr[j][hr] = -1;
+            else if constexpr (LB) {
+                if (!own && (cKP.ro[0][slot] >= 0 || cKP.ro[1][slot] >= 0)) { // (keys >= the row's ws: its own job)
+                    int r = 16 * (wm + 2 * j) + g8 + 8 * hr;
+                    for (int k = 0; k < ng; k++) {
+                        const int sj = G.seq[gi][k];
+                        if (r < 6 * A.nt[sj]) { qr[j][hr] = min(qr[j][hr], kv_ws(A.pos[sj] + A.nt[sj]) - 1); break; }
+                        r -= 6 * A.nt[sj];
+                    }
+                }
+            }
         }
     }
     const uint8_t * kr = sRaw + (8 * wq + g8) * ATQ_ROW; // this lane's K row (scores)
@@ -2519,6 +2631,14 @@ __global__ void __launch_bounds__(256, 1) k_attn_jobs(const AttnMs A, const Attn
         const bool more = kb + AT_K < k_hi;
         pf::cpa_wait<0>();
         __syncthreads();
+        if constexpr (LB) { // low-bit rows -> the q8 layout (one warp per row)
+            for (int rr = w; rr < 2 * AT_K; rr += 8) {
+                const int which = rr / AT_K, p = kb + rr % AT_K;
+                if (p >= k_hi) continue;
+                kv_row_expand_any(sRaw + rr * ATQ_ROW, own && cKP.ro[which][slot] >= 0 && p >= ws0 ? 8 : cB.kvb[which][slot]);
+            }
+            __syncthreads();
+        }
         for (int i = tid; i < AT_K * 32; i += 256) { // V -> fp16
             const int r = i >> 5, cc = i & 31;
             const uint8_t * src = sRaw + (AT_K + r) * ATQ_ROW;

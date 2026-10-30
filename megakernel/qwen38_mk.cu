@@ -1464,6 +1464,19 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     int nch, CS;
     attn_dims(n + T, nch, CS);
     const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
+    if (cB.kvlow && cB.ptab) { // MK_KV, a parallel slot's pages (the agents' solo route): row by row
+        const int lk = HD * cB.kvb[0][slot] / 8 / 128, lv = HD * cB.kvb[1][slot] / 8 / 128, nl = max(lk, lv);
+        for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
+            const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
+            for (int i = threadIdx.x; i < (c1 - c0) * nl; i += NT) {
+                const int p = c0 + i / nl, l = i % nl;
+                __half * s;
+                if (l < lk) pf_l2(reinterpret_cast<const uint8_t *>(kv_vptr_paged(0, slot, g, p, s)) + l * 128);
+                if (l < lv) pf_l2(reinterpret_cast<const uint8_t *>(kv_vptr_paged(1, slot, g, p, s)) + l * 128);
+            }
+        }
+        return;
+    }
     if (cB.kvlow) { // MK_KV: the slot's packed rows (HD bits / 8 bytes)
         const int rk = HD * cB.kvb[0][slot] / 8, rv = HD * cB.kvb[1][slot] / 8, lk = rk / 128, lv = rv / 128, nl = max(lk, lv);
         for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
@@ -1845,7 +1858,10 @@ __device__ __forceinline__ void aq_issue(int t, uint8_t * dk, const int8_t * Kq,
 // low-bit tiles staged in their packed layout and expanded to int8 once in shared memory (kv_row_expand: q = n - 2^(bits-1)
 // with the scale unchanged, by warps 4 - 15 one interval before the tile is read; the K pipeline is one stage deeper for
 // it), so the MMA path is the q8 one for every tile and the partials equal attn_core_t's for every MK_KV format.
-template <int T, bool MIX = false>
+// PG (attn_core_q8p, MIX): a parallel slot's paged view, every main-buffer tile from its page (kv_tile_src<true>). The
+// pipeline also computes addresses of up to 3 tiles past a chunk (nothing copied): at most one page-table entry past the
+// slot's pages, inside the table (pool capacity, plus dalloc's 16-byte pad).
+template <int T, bool MIX = false, bool PG = false>
 __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n) {
     uint8_t * const sm = smem;
     constexpr int R = 6 * T;
@@ -1856,6 +1872,7 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
     constexpr int LDS = AQ_LDS;
     constexpr int NSK = MIX ? AQ_NSKM : AQ_NSK, NSV = AQ_NSV;
     static_assert(R <= 32 && TP == 32 && MT <= 2, "8 rows per softmax warp, 32-position tiles");
+    static_assert(!PG || (MIX && KV_PG % TP == 0), "paged views: the MIX tile path, every tile in one page");
     const int L_ctx = n + T;
     int nch, CS;
     attn_dims(L_ctx, nch, CS);
@@ -1964,8 +1981,8 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
             if constexpr (MIX) {
                 kb_ = kbt(tk);
                 vb_ = vbt(max(tv, 0));
-                kv_tile_src(0, slot, g, c0 + tk * TP, wsr, wsm, kf.kb, tk >= jtr_k, kq, ks);
-                kv_tile_src(1, slot, g, c0 + max(tv, 0) * TP, wsr, wsm, kf.vb, max(tv, 0) >= jtr_v, vq, vs);
+                kv_tile_src<PG>(0, slot, g, c0 + tk * TP, wsr, wsm, kf.kb, tk >= jtr_k, kq, ks);
+                kv_tile_src<PG>(1, slot, g, c0 + max(tv, 0) * TP, wsr, wsm, kf.vb, max(tv, 0) >= jtr_v, vq, vs);
             } else { // all-q8 slot: the plain layout
                 const size_t kr = (size_t) g * ctx + c0 + tk * TP, vr = (size_t) g * ctx + c0 + max(tv, 0) * TP;
                 kq = cB.kvp[0][slot] + kr * HD;
@@ -2210,17 +2227,23 @@ template <int T>
 __device__ __noinline__ void attn_core_q8m(const LayerW & W, int slot, int n) {
     attn_core_q8_t<T, true>(W, slot, n);
 }
+
+template <int T>
+__device__ __noinline__ void attn_core_q8p(const LayerW & W, int slot, int n) {
+    attn_core_q8_t<T, true, true>(W, slot, n);
+}
 #endif
 
 // q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET), attn_core_t for one-tile
 // chunks (the pipeline fill does not pay there) and with MK_DATTN=0. MK_KV (packed slots): the pipelined kernels at every
-// context, attn_core_q8m for the slots with a low-bit side. Every choice gives the same partials. The pipelined kernels
-// address the engine's own contiguous cache: a slot's paged view (parallel agents) keeps attn_core_t.
+// context, attn_core_q8m for the slots with a low-bit side. Every choice gives the same partials. A slot's paged view
+// (parallel agents, a lone one decoding here) keeps attn_core_t on the q8 cache and runs attn_core_q8p under MK_KV.
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
 #if !QWEN_MK_SM75
     if (cB.kvlow) {
-        if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_q8m<T>(W, slot, n);
+        if (cB.ptab) attn_core_q8p<T>(W, slot, n);
+        else if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_q8m<T>(W, slot, n);
         else attn_core_q8<T>(W, slot, n);
         return;
     }
@@ -3871,14 +3894,16 @@ struct MKEngine::Impl {
         const int base = (T + AT_Q - 1) / AT_Q * NKV, keys = n0 + T;
         int nz = std::min({16, (4 * nsm + base - 1) / base, keys / 1024, ATT_SPLIT_ROWS / T});
         if (nz < 2) {
-            if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n0, slot);
+            if (hb.kvlow) pk_attn<true, true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n0, slot); // (paged views)
+            else if (hb.kvq8) pk_attn<true><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n0, slot);
             else pk_attn<false><<<dim3((T + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(T, n0, slot);
             return;
         }
         const int chunk = ((keys + nz - 1) / nz + AT_K - 1) / AT_K * AT_K;
         nz = (keys + chunk - 1) / chunk;
         const dim3 grid((T + AT_Q - 1) / AT_Q, NKV, nz);
-        if (hb.kvq8) pk_attn<true><<<grid, 192, AT_SMEM>>>(T, n0, slot, chunk, att_spo, att_sml);
+        if (hb.kvlow) pk_attn<true, true><<<grid, 192, AT_SMEM>>>(T, n0, slot, chunk, att_spo, att_sml);
+        else if (hb.kvq8) pk_attn<true><<<grid, 192, AT_SMEM>>>(T, n0, slot, chunk, att_spo, att_sml);
         else pk_attn<false><<<grid, 192, AT_SMEM>>>(T, n0, slot, chunk, att_spo, att_sml);
         pk_attn_comb<<<dim3(T, NH), HD>>>(T, nz, att_spo, att_sml);
     }
@@ -3915,6 +3940,7 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
+        if (hb.kvlow) CK(cudaFuncSetAttribute(pk_attn<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         pf_attn2_init();
         pf_ready = true;
     }
@@ -4126,9 +4152,60 @@ struct MKEngine::Impl {
     long ms_clock = 0;
     std::vector<int> stepping; // the slots of the last step
     size_t page_bytes() const { return (size_t) KV_PG * kv_pos_bytes(); }
-    size_t slot_state_bytes() const { return (size_t) 48 * (NVH * 128 * 128 + CONV_RING * QKV) * 4; }
+    size_t slot_state_bytes() const { return (size_t) 48 * (NVH * 128 * 128 + CONV_RING * QKV) * 4 + ring_block_bytes(); }
+    // MK_KV in the slots (kv_paged.cuh): the pages' packed layout and, with MK_KV_WIN, one block of q8 rings per slot (the
+    // engine's ring sides, in their layout) plus a copy per shared segment: its window rows as its builder wrote them, given
+    // to every slot that attaches (rows of a segment are never written again)
+    KvPaged kvpg{};
+    std::vector<int> ring_top; // per slot: the positions written since its rings were last whole are < ring_top
+    size_t ring_block_bytes() const {
+        size_t r = 0;
+        for (int w = 0; w < 2; w++)
+            for (int k = 0; k < N_ATT_SLOTS; k++)
+                if (hb.kvlow && hb.kvrp[w][k]) r += (size_t) NKV * hb.kvrc * (HD + HD / 16);
+        return r;
+    }
+    void kv_paged_init(int S) {
+        dfree({kvpg.ring});
+        kvpg = KvPaged{};
+        ring_top.assign(S, 0);
+        for (int w = 0; w < 2; w++)
+            for (int k = 0; k < N_ATT_SLOTS; k++) kvpg.ro[w][k] = kvpg.rso[w][k] = -1;
+        if (!hb.kvlow) return;
+        long long r = 0;
+        for (int w = 0; w < 2; w++) {
+            long long off = 0;
+            for (int k = 0; k < N_ATT_SLOTS; k++) {
+                kvpg.pgo[w][k] = (int) off;
+                off += (long long) NKV * KV_PG * HD * hb.kvb[w][k] / 8;
+                if (hb.kvrp[w][k]) {
+                    kvpg.ro[w][k] = (int) r;
+                    r += (long long) NKV * hb.kvrc * HD;
+                    kvpg.rso[w][k] = (int) r;
+                    r += (long long) NKV * hb.kvrc * (HD / 32) * 2;
+                }
+            }
+            kvpg.pgb[w] = off;
+        }
+        kvpg.rstride = r;
+        if (r) kvpg.ring = dalloc<int8_t>((size_t) S * r);
+        CK(cudaMemcpyToSymbol(cKP, &kvpg, sizeof(KvPaged)));
+    }
+    // MK_KV_WIN: slot q goes back to position P (as ring_rewind): the ring rows of its window that its abandoned
+    // positions P .. ring_top - 1 took are refilled, below its segment from the segment's copy (exact), above from its pages
+    void ms_ring_rewind(int q, int P) {
+        if (!kvpg.rstride) return;
+        const int p0 = std::max(0, P - hb.kvrc), p1 = std::min(P, ring_top[q] - hb.kvrc);
+        if (p1 > p0) {
+            const Segment * g = msp[q].seg;
+            cb_set(ms_bufs(q));
+            bmm::k_ring_fill_ms<<<std::min(1024, (p1 - p0) * NKV * N_ATT_SLOTS * 2 / 8 + 1), 256>>>(p0, p1, g ? g->ring : nullptr);
+            CK(cudaGetLastError());
+            cb_set(hb);
+        }
+        ring_top[q] = P;
+    }
     void ms_alloc(int S, int pages) {
-        if (hb.kvlow) throw std::runtime_error("MK_KV: not supported with parallel slots (--parallel / --agents) yet");
         if ((int) ms.size() >= S && pages <= npages) return;
         // (test path: more than the slots hold reallocates them; the server opens its slots once)
         for (auto & q : ms) dfree({q.conv, q.dstate, q.dptab});
@@ -4149,8 +4226,14 @@ struct MKEngine::Impl {
         npages = pages;
         ms_ctx = npages * KV_PG;
         const size_t rows = (size_t) npages * N_ATT_SLOTS * NKV * KV_PG;
-        pk = hb.kvq8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
-        pv = hb.kvq8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+        kv_paged_init(S);
+        if (hb.kvlow) { // MK_KV: the values packed per page (kvpg.pgb), the scales as for q8
+            pk = dalloc<int8_t>((size_t) npages * kvpg.pgb[0]);
+            pv = dalloc<int8_t>((size_t) npages * kvpg.pgb[1]);
+        } else {
+            pk = hb.kvq8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+            pv = hb.kvq8 ? (void *) dalloc<int8_t>(rows * HD) : (void *) dalloc<__half>(rows * HD);
+        }
         pks = hb.kvq8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
         pvs = hb.kvq8 ? dalloc<__half>(rows * (HD / 32)) : nullptr;
         pfree.clear();
@@ -4218,6 +4301,15 @@ struct MKEngine::Impl {
             b.ptab = g->dptab;
             b.ctx = (int) g->toks.size();
         }
+        if (hb.kvlow) // MK_KV: the slot's own rings (also while it builds a segment); the engine's cache is not addressed
+            for (int w = 0; w < 2; w++)
+                for (int k = 0; k < N_ATT_SLOTS; k++) {
+                    int8_t * blk = kvpg.ring + (size_t) s * kvpg.rstride;
+                    b.kvp[w][k] = nullptr;
+                    b.kvs[w][k] = nullptr;
+                    b.kvrp[w][k] = kvpg.ro[w][k] >= 0 ? blk + kvpg.ro[w][k] : nullptr;
+                    b.kvrs[w][k] = kvpg.ro[w][k] >= 0 ? reinterpret_cast<__half *>(blk + kvpg.rso[w][k]) : nullptr;
+                }
         return b;
     }
     // the work buffers seen from row s (attention: q|gate rows of QG, k|v of 2 KVD; delta net: qkv rows of QKV)
@@ -4246,6 +4338,7 @@ struct MKEngine::Impl {
         if (toks.size() > 1) pf_run(std::vector<int>(toks.begin(), toks.end() - 1), 0, nullptr);
         cb_set(hb);
         ms[s].pos = (int) toks.size() - 1;
+        ring_top[s] = ms[s].pos;
         if ((int) msp.size() > s) CK(cudaMemcpy(msp[s].hlast, hp.h, D * sizeof(float), cudaMemcpyDeviceToDevice)); // (pf_run leaves h of its last row in h[0])
     }
     // tensor-core path buffers: per-32 int8 activations for K = D and K = FF
@@ -4424,12 +4517,14 @@ struct MKEngine::Impl {
                     for (int s = 0; s < S; s++) {
                         ms_set(ms_bufs(s), ms_rows(s, true));
                         pk_attn_prep<<<1, 256>>>(ms[s].pos, L / 4, W.qn, W.kn, 1);
-                        if (hb.kvq8) pk_attn<true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                        if (hb.kvlow) pk_attn<true, true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                        else if (hb.kvq8) pk_attn<true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
                         else pk_attn<false><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
                     }
                     ms_set(hb, hp);
                 });
                 pf_time("ms_gemm_attn_o", [&] {
+                    if (rot_v(L / 4)) pk_attn_vrot<<<S, 256>>>();
                     bmm::k_gate_attn<<<S, 256>>>(hp.y0, hp.y2, hp.y1);
                     tc_quant(hp.y1, nullptr, VD, nullptr, nullptr, VD, S, a6x, a6d);
                     tc_mv6(W.o, S, hp.x, D, 1);
@@ -4491,6 +4586,7 @@ struct MKEngine::Impl {
         std::vector<int> pages;     // its K/V: pages of the slots' pool
         int * dptab = nullptr;      // ... (device)
         float *dstate = nullptr, *conv = nullptr, *h = nullptr; // state after toks; h: final hidden of position n - 1
+        int8_t * ring = nullptr;    // MK_KV_WIN: its builder's rings when it was made (its window rows, exact)
         int refs = 0;               // slots attached
         bool pinned = false;        // kept while unused (the shared-context mode)
         bool ready = false;         // its prefix has been prefilled (a slot is still writing it otherwise)
@@ -4500,10 +4596,16 @@ struct MKEngine::Impl {
     std::vector<Segment *> segs;
     size_t seg_reserve = 0, seg_used = 0; // device memory set aside for segments' states (their K/V: pool pages)
     long seg_clock = 0;
-    size_t kv_pos_bytes() const { return (size_t) 2 * N_ATT_SLOTS * NKV * (hb.kvq8 ? HD + HD / 32 * 2 : HD * 2); } // K + V, one position
-    static size_t seg_state_bytes() { return ((size_t) 48 * (NVH * 128 * 128 + CONV_RING * QKV) + D) * 4; }
+    size_t kv_pos_bytes() const { // K + V, one position
+        if (!hb.kvlow) return (size_t) 2 * N_ATT_SLOTS * NKV * (hb.kvq8 ? HD + HD / 32 * 2 : HD * 2);
+        size_t b = (size_t) 2 * N_ATT_SLOTS * NKV * (HD / 32) * 2; // (MK_KV: the q8 scales, the values packed)
+        for (int w = 0; w < 2; w++)
+            for (int k = 0; k < N_ATT_SLOTS; k++) b += (size_t) NKV * HD * hb.kvb[w][k] / 8;
+        return b;
+    }
+    size_t seg_state_bytes() const { return ((size_t) 48 * (NVH * 128 * 128 + CONV_RING * QKV) + D) * 4 + ring_block_bytes(); }
     void seg_free(Segment * s) {
-        for (void * p : {(void *) s->dptab, (void *) s->dstate, (void *) s->conv, (void *) s->h})
+        for (void * p : {(void *) s->dptab, (void *) s->dstate, (void *) s->conv, (void *) s->h, (void *) s->ring})
             if (p) CK(cudaFree(p));
         pfree.insert(pfree.end(), s->pages.begin(), s->pages.end());
         seg_used -= s->bytes;
@@ -4602,6 +4704,13 @@ struct MKEngine::Impl {
             CK(cudaFuncSetAttribute(bmm::k_attn_jobs<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<3>()));
             CK(cudaFuncSetAttribute(bmm::k_attn_jobs<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<4>()));
             CK(cudaFuncSetAttribute(bmm::k_attn_jobs<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<6>()));
+            if (hb.kvlow) {
+                CK(cudaFuncSetAttribute(bmm::k_attn_jobs<1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<1>()));
+                CK(cudaFuncSetAttribute(bmm::k_attn_jobs<2, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<2>()));
+                CK(cudaFuncSetAttribute(bmm::k_attn_jobs<3, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<3>()));
+                CK(cudaFuncSetAttribute(bmm::k_attn_jobs<4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<4>()));
+                CK(cudaFuncSetAttribute(bmm::k_attn_jobs<6, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, bmm::att_smem_jobs<6>()));
+            }
         }
         if (!mh) { mh = dalloc<float>((size_t) bmm::TM * D); mhm = dalloc<float>((size_t) bmm::TM * D); mhc = dalloc<float>((size_t) bmm::TM * D); dtok = dalloc<int>(bmm::TM); dcand = dalloc<float2>((size_t) bmm::TM * 32); }
     }
@@ -4630,7 +4739,7 @@ struct MKEngine::Impl {
                     A.kseg[s] = pk; A.vseg[s] = pv; A.ksseg[s] = pks; A.vsseg[s] = pvs; A.segptab[s] = g->dptab;
                     A.segn[s] = A.segctx[s] = (int) g->toks.size();
                 }
-                A.pos[s] = pos[s]; A.nt[s] = nt[s]; A.r0[s] = r0[s];
+                A.pos[s] = pos[s]; A.nt[s] = nt[s]; A.r0[s] = r0[s]; A.ring[s] = sl[s];
                 for (int i = 0; i < nt[s]; i++) A.rseq[r0[s] + i] = s;
                 if (nt[s]) maxp = std::max(maxp, pos[s] + nt[s]);
             }
@@ -4640,10 +4749,18 @@ struct MKEngine::Impl {
             for (int s = 0; s < S; s++) ntmax = std::max(ntmax, nt[s]);
             static const bool ms2 = getenv("MS_ATTN_MS2") != nullptr; // (k_attn_ms2 / k_attn_ms for all of it)
             int chunk = 0, nspl = 0;
-            if (hb.kvq8 && !ms2) {
+            if (hb.kvq8 && (!ms2 || hb.kvlow)) { // (MK_KV: the jobs only)
                 auto launch = [&](const bmm::AttnJobs & J, int nj, int rows, int ch, int nsp) {
                     const dim3 jg(nj, NKV, nsp);
                     const int mt = (rows + 15) / 16;
+                    if (hb.kvlow) { // MK_KV: rows from where ms_kv_src puts them, low-bit rows expanded (bmm.cuh)
+                        if (mt <= 1) bmm::k_attn_jobs<1, true><<<jg, 256, bmm::att_smem_jobs<1>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                        else if (mt == 2) bmm::k_attn_jobs<2, true><<<jg, 256, bmm::att_smem_jobs<2>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                        else if (mt == 3) bmm::k_attn_jobs<3, true><<<jg, 256, bmm::att_smem_jobs<3>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                        else if (mt == 4) bmm::k_attn_jobs<4, true><<<jg, 256, bmm::att_smem_jobs<4>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                        else bmm::k_attn_jobs<6, true><<<jg, 256, bmm::att_smem_jobs<6>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
+                        return;
+                    }
                     if (mt <= 1) bmm::k_attn_jobs<1><<<jg, 256, bmm::att_smem_jobs<1>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
                     else if (mt == 2) bmm::k_attn_jobs<2><<<jg, 256, bmm::att_smem_jobs<2>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
                     else if (mt == 3) bmm::k_attn_jobs<3><<<jg, 256, bmm::att_smem_jobs<3>()>>>(A, J, slot, ch, v.qh, att_po, att_ml);
@@ -4653,26 +4770,31 @@ struct MKEngine::Impl {
                 // jobs: each shared segment once for the sequences on it (<= 96 packed rows a job), each own cache
                 bmm::AttnJobs G{}, J{};
                 int ng = 0, nj = 0, grows[bmm::TM] = {}, own_of[bmm::TM] = {}, segmax = 0, ownmax = 0, ownsum = 0, orows = 0;
+                // MK_KV_WIN: a sequence reads the positions from its window start on from its rings, in its own job (the
+                // segment's job serves sequences of other windows): sh = the segment positions it reads in the segment's job
+                const bool rwin = hb.kvlow && (kvpg.ro[0][slot] >= 0 || kvpg.ro[1][slot] >= 0);
                 for (int s = 0; s < S; s++) {
                     if (!nt[s]) continue;
-                    if (A.segn[s]) {
+                    const int sh = std::min(A.segn[s], rwin ? kv_ws_of(pos[s] + nt[s], hb.kvwin) : A.segn[s]);
+                    if (sh > 0) {
                         int gi = 0;
                         while (gi < ng && !(G.ptab[gi] == A.segptab[s] && grows[gi] + 6 * nt[s] <= 96)) gi++;
                         if (gi == ng) {
                             G.k[gi] = A.kseg[s]; G.v[gi] = A.vseg[s]; G.ks[gi] = A.ksseg[s]; G.vs[gi] = A.vsseg[s]; G.ptab[gi] = A.segptab[s];
-                            G.stride[gi] = A.segctx[s]; G.hi[gi] = A.segn[s];
+                            G.stride[gi] = A.segctx[s]; G.hi[gi] = sh;
                             ng++;
                         }
+                        G.hi[gi] = std::max(G.hi[gi], sh);
                         G.seq[gi][G.n[gi]++] = s;
                         grows[gi] += 6 * nt[s];
-                        segmax = std::max(segmax, A.segn[s]);
+                        segmax = std::max(segmax, sh);
                     }
                     J.k[nj] = A.kc[s]; J.v[nj] = A.vc[s]; J.ks[nj] = A.ksc[s]; J.vs[nj] = A.vsc[s];
-                    J.stride[nj] = ms_ctx; J.ptab[nj] = A.ptab[s]; J.lo[nj] = J.off[nj] = A.segn[s]; J.hi[nj] = pos[s] + nt[s];
+                    J.stride[nj] = ms_ctx; J.ptab[nj] = A.ptab[s]; J.lo[nj] = sh; J.off[nj] = A.segn[s]; J.hi[nj] = pos[s] + nt[s];
                     J.seq[nj][0] = s; J.n[nj] = 1;
                     own_of[s] = nj++;
-                    ownmax = std::max(ownmax, pos[s] + nt[s] - A.segn[s]);
-                    ownsum += pos[s] + nt[s] - A.segn[s];
+                    ownmax = std::max(ownmax, pos[s] + nt[s] - sh);
+                    ownsum += pos[s] + nt[s] - sh;
                     orows = std::max(orows, 6 * nt[s]);
                 }
                 // segments: one wave of blocks; own caches: about one wave over all of them, splits of >= 256
@@ -4697,7 +4819,8 @@ struct MKEngine::Impl {
                 while (chunk < ownmax && blocks(chunk) > nsm) chunk += std::max(32, chunk / 64 / 32 * 32);
                 nspl = (ownmax + chunk - 1) / chunk;
                 for (int j = 0; j < nj; j++) A.ns[J.seq[j][0]] = J.soff[j] + (J.hi[j] - J.lo[j] + chunk - 1) / chunk;
-                bmm::k_attn_prep_ms<<<R, 256>>>(A, slot, ms_ctx, W.qn, W.kn, v.y0, v.y1, v.qh);
+                if (hb.kvlow) bmm::k_attn_prep_ms<true><<<R, 256>>>(A, slot, ms_ctx, W.qn, W.kn, v.y0, v.y1, v.qh);
+                else bmm::k_attn_prep_ms<false><<<R, 256>>>(A, slot, ms_ctx, W.qn, W.kn, v.y0, v.y1, v.qh);
                 if (ng) launch(G, ng, grmax, segchunk, segspl);
                 launch(J, nj, orows, chunk, nspl);
             } else {
@@ -4705,7 +4828,7 @@ struct MKEngine::Impl {
             chunk = std::max(256, (maxp + 15) / 16 + 31) / 32 * 32;
             nspl = (maxp + chunk - 1) / chunk;
             for (int s = 0; s < S; s++) A.ns[s] = (pos[s] + nt[s] + chunk - 1) / chunk;
-            bmm::k_attn_prep_ms<<<R, 256>>>(A, slot, ms_ctx, W.qn, W.kn, v.y0, v.y1, v.qh);
+            bmm::k_attn_prep_ms<false><<<R, 256>>>(A, slot, ms_ctx, W.qn, W.kn, v.y0, v.y1, v.qh);
             const dim3 ag(S, NKV, nspl);
             if (ntmax <= 2 && !getenv("MS_ATTN1")) { // the GQA group packed into the MMA rows (6 nq <= 16, or 32)
                 if (hb.kvq8) bmm::k_attn_ms2<true, 1><<<ag, 256, bmm::att_smem2<1, true>()>>>(A, slot, ms_ctx, chunk, v.qh, att_po, att_ml);
@@ -4723,7 +4846,8 @@ struct MKEngine::Impl {
                 for (int s = 0; s < S; s++) {
                     if (!nt[s]) continue;
                     ms_set(ms_bufs(sl[s]), rows_at(off + r0[s], true));
-                    if (hb.kvq8) pk_attn<true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+                    if (hb.kvlow) pk_attn<true, true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+                    else if (hb.kvq8) pk_attn<true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
                     else pk_attn<false><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
                 }
                 ms_set(hb, hp);
@@ -4739,7 +4863,8 @@ struct MKEngine::Impl {
             if (!nt[s]) continue;
             ms_set(ms_bufs(sl[s]), rows_at(off + r0[s], true));
             pk_attn_prep<<<nt[s], 256>>>(pos[s], slot, W.qn, W.kn, 1);
-            if (hb.kvq8) pk_attn<true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+            if (hb.kvlow) pk_attn<true, true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
+            else if (hb.kvq8) pk_attn<true><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
             else pk_attn<false><<<dim3((nt[s] + AT_Q - 1) / AT_Q, NKV), 192, AT_SMEM>>>(nt[s], pos[s], slot);
         }
         ms_set(hb, hp);
@@ -4756,6 +4881,7 @@ struct MKEngine::Impl {
         });
         sp_attn_core(W, slot, S, R, r0, nt, pos, 0);
         pf_time("sp_attn_o", [&] {
+        if (rot_v(slot)) pk_attn_vrot<<<R, 256>>>();
         bmm::k_gate_attn_q<<<dim3(VD / 256, R), 256>>>(hp.y0, hp.y2, a6x, a6d);
         tc_mv6(W.o, R, x, D, 1);
         });
@@ -4959,6 +5085,7 @@ struct MKEngine::Impl {
         if (T < 1 || N > hp.cap) throw std::runtime_error("mix_main: bad chunk");
         const Bufs bq = ms_bufs(q);
         ms_set(bq, hp);
+        ring_top[q] = std::max(ring_top[q], n0 + T);
         if (n0 == 0) CK(cudaMemsetAsync(hp.h, 0, D * sizeof(float)));
         else CK(cudaMemcpyAsync(hp.h, hsrc, D * sizeof(float), cudaMemcpyDeviceToDevice));
         std::vector<int> all(ptoks);
@@ -4981,6 +5108,7 @@ struct MKEngine::Impl {
                 });
                 sp_attn_core(W, L / 4, S, R, r0, nt, pos, T);
                 ms_set(bq, hp); // (its test paths swap the buffers)
+                if (rot_v(L / 4)) pf_time("mix_misc", [&] { pk_attn_vrot<<<N, 256>>>(); }); // (prompt and step rows)
                 pf_time("mix_misc", [&] { pk_attn_out<<<N, 256>>>(); });
                 pf_time("gemm_attn_o", [&] { gemm(W.o, N, hp.x, D, pf::OUT_ADD); });
             } else {
@@ -5134,7 +5262,7 @@ struct MKEngine::Impl {
         size_t free_b = 0, total_b = 0;
         CK(cudaMemGetInfo(&free_b, &total_b));
         fprintf(stderr, "[mk] %d slots and shared segments draw on a pool of %d positions (%s K/V, pages of %d); %.2f GB of device memory left\n",
-                n, ms_ctx, hb.kvq8 ? "q8_0" : "fp16", KV_PG, free_b / 1e9);
+                n, ms_ctx, hb.kvlow ? "MK_KV" : hb.kvq8 ? "q8_0" : "fp16", KV_PG, free_b / 1e9);
         return ms_ctx;
     }
     // Prompt lookup: the tokens after d1 where the sequence's last LK tokens, followed by d1, occurred before (the most
@@ -5207,6 +5335,7 @@ struct MKEngine::Impl {
         const Bufs b = ms_bufs(q);
         cb_set(b);
         if (n0 > 0) CK(cudaMemcpy(hb.h_hist + (size_t) ((n0 - 1) % H_RING) * D, hsrc, D * sizeof(float), cudaMemcpyDeviceToDevice));
+        ring_top[q] = std::max(ring_top[q], (int) toks.size() - 1);
         if ((int) toks.size() - 1 > n0) pf_run(std::vector<int>(toks.begin() + n0, toks.end() - 1), n0, nullptr);
         cb_set(hb);
         if ((int) toks.size() - 1 > n0) CK(cudaMemcpy(msp[q].hlast, hp.h, D * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -5246,6 +5375,7 @@ struct MKEngine::Impl {
         size_t lcp = 0;
         while (lcp < m.seq.size() && lcp < prompt.size() && m.seq[lcp] == prompt[lcp]) lcp++;
         int n0 = 0;
+        bool attach = false;
         // the most reused of: extending the slot's processed tokens (through pos - 1; `last` itself is unprocessed, so
         // a stop or token budget that dropped the step's final token still extends), the last prompt's checkpoint, a
         // shared segment
@@ -5270,6 +5400,7 @@ struct MKEngine::Impl {
                 g->refs++;
                 g->last_use = ++seg_clock;
                 n0 = (int) g->toks.size();
+                attach = true;
             } else {
                 CK(cudaMemset(ms[q].dstate, 0, sizeof(float) * (size_t) 48 * NVH * 128 * 128));
                 CK(cudaMemset(ms[q].conv, 0, sizeof(float) * (size_t) 48 * CONV_RING * QKV));
@@ -5277,6 +5408,10 @@ struct MKEngine::Impl {
             }
         }
         if (m.seg_build) { seg_free(m.seg_build); m.seg_build = nullptr; } // (an abandoned build)
+        if (attach && kvpg.rstride) { // MK_KV_WIN: the segment's window rows
+            CK(cudaMemcpy(kvpg.ring + (size_t) q * kvpg.rstride, m.seg->ring, kvpg.rstride, cudaMemcpyDeviceToDevice));
+            ring_top[q] = n0;
+        } else ms_ring_rewind(q, n0);
         m.share_at = -1;
         if (!m.seg && share_len >= 1024 && share_len < P && seg_room(seg_state_bytes()) &&
             (m.seg_build = seg_new(std::vector<int>(prompt.begin(), prompt.begin() + share_len), pin, q)))
@@ -5346,6 +5481,7 @@ struct MKEngine::Impl {
         g->dstate = (float *) dev(sizeof(float) * (size_t) 48 * NVH * 128 * 128);
         g->conv = (float *) dev(sizeof(float) * (size_t) 48 * CONV_RING * QKV);
         g->h = (float *) dev(sizeof(float) * D);
+        if (kvpg.rstride) g->ring = (int8_t *) dev(kvpg.rstride);
         seg_used += g->bytes;
         segs.push_back(g);
         return g;
@@ -5361,6 +5497,7 @@ struct MKEngine::Impl {
         CK(cudaMemcpy(g->dstate, ms[q].dstate, sizeof(float) * (size_t) 48 * NVH * 128 * 128, cudaMemcpyDeviceToDevice));
         CK(cudaMemcpy(g->conv, ms[q].conv, sizeof(float) * (size_t) 48 * CONV_RING * QKV, cudaMemcpyDeviceToDevice));
         CK(cudaMemcpy(g->h, m.hlast, sizeof(float) * D, cudaMemcpyDeviceToDevice));
+        if (g->ring) CK(cudaMemcpy(g->ring, kvpg.ring + (size_t) q * kvpg.rstride, kvpg.rstride, cudaMemcpyDeviceToDevice));
         g->ready = true;
         m.seg = g; // (nothing at positions >= share_at is written yet: the own cache starts there)
         g->refs = 1;
@@ -5393,6 +5530,9 @@ struct MKEngine::Impl {
         bool all_acc;
     } solo_saved;
     bool solo_on = !getenv("MS_SOLO") || atoi(getenv("MS_SOLO")) != 0;
+    // MK_KV: the megakernel reads a slot's pages a tile (ATP positions) at a time, so its shared segment has to end on a
+    // tile boundary (the server rounds share_len down to one); a slot whose segment does not decodes in the batched path
+    bool solo_fits(int q) const { return !hb.kvlow || !msp[q].seg || msp[q].seg->toks.size() % ATP == 0; }
     std::vector<int> solo_enter(int q) {
         auto & m = msp[q];
         slot_flush(q);
@@ -5421,6 +5561,7 @@ struct MKEngine::Impl {
         const int segn = m.seg ? (int) m.seg->toks.size() : 0; // (the own cache holds positions segn ..)
         if (!own_reserve(solo, hctl.n - segn + MAXT + 2)) return {}; // (context full)
         const int T = att_cap_T(hctl.n, 1 + nd_avail); // (as MKEngine::step: greedy output independent of the depth)
+        ring_top[solo] = std::max(ring_top[solo], hctl.n + T + n_draft_max + 2);
         ndraft = (!all_acc && n_draft_max > 3) ? n_draft_max - 1 : n_draft_max; // (as MKEngine::step)
         launch(MODE_DECODE, T, 0);
         nd_avail = ndraft;
@@ -5468,7 +5609,10 @@ struct MKEngine::Impl {
         for (int q : ss) {
             const auto & m = msp[q];
             const int segn = m.seg ? (int) m.seg->toks.size() : 0, p = q == solo ? hctl.n : m.pos;
-            if (own_reserve(q, p + std::max(2 * bmm::DMAX, MAXT) + 2 - segn)) run.push_back(q);
+            if (own_reserve(q, p + std::max(2 * bmm::DMAX, MAXT) + 2 - segn)) {
+                run.push_back(q);
+                ring_top[q] = std::max(ring_top[q], p + std::max(2 * bmm::DMAX, MAXT) + 2); // (the rows it may write)
+            }
         }
         if (run.size() == ss.size()) return slots_run(ss, pj);
         std::vector<std::vector<int>> out(ss.size());
@@ -5502,7 +5646,7 @@ struct MKEngine::Impl {
     std::vector<std::vector<int>> slots_run(const std::vector<int> & ss, PfJob * pj = nullptr) {
         bool pf = false;
         for (const auto & m : msp) pf |= m.pf_at >= 0;
-        if (ss.size() == 1 && solo_on && !pf) return {solo == ss[0] ? solo_step() : (solo_exit(), solo_enter(ss[0]))};
+        if (ss.size() == 1 && solo_on && !pf && solo_fits(ss[0])) return {solo == ss[0] ? solo_step() : (solo_exit(), solo_enter(ss[0]))};
         solo_exit();
         const int S = (int) ss.size();
         { // drafts were allotted for the slots stepping then: slots joined since may push the rows past TM
@@ -5615,11 +5759,13 @@ struct MKEngine::Impl {
                 for (int s = 0; s < S; s++) {
                     ms_set(ms_bufs(s), ms_rows(s, true));
                     pk_attn_prep<<<1, 256>>>(ms[s].pos, L / 4, W.qn, W.kn, 1);
-                    if (hb.kvq8) pk_attn<true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                    if (hb.kvlow) pk_attn<true, true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
+                    else if (hb.kvq8) pk_attn<true><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
                     else pk_attn<false><<<dim3(1, NKV), 192, AT_SMEM>>>(1, ms[s].pos, L / 4);
                 }
                 ms_set(hb, hp);
                 });
+                if (rot_v(L / 4)) pf_time("ms_misc", [&] { pk_attn_vrot<<<S, 256>>>(); });
                 pf_time("ms_misc", [&] { pk_attn_out<<<S, 256>>>(); });
                 pf_time("ms_gemm_attn_o", [&] { gemm(W.o, S, hp.x, D, pf::OUT_ADD); });
             } else {

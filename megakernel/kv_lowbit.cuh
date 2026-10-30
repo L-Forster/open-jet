@@ -90,15 +90,22 @@ __device__ __forceinline__ void kv_store_fmt(int8_t * q, __half * sc, const floa
 
 // one K (w = 0) or V (w = 1) row (kv head g, position pos) of attention slot `slot` in its MK_KV format; with a
 // recent-window ring (MK_KV_WIN) the row is also stored q8 in the ring (same rotation: every tile of a slot must share
-// the basis). The engine's own contiguous cache (single stream).
+// the basis). The engine's own contiguous cache, or a parallel slot's paged one (cB.ptab).
 __device__ __forceinline__ void kv_store_row(int w, int slot, int g, int pos, const float (&vin)[8]) {
     float v[8];
 #pragma unroll
     for (int k = 0; k < 8; k++) v[k] = vin[k];
     if (w == 0 ? cB.kvr[slot] : cB.kvrv[slot]) fwht256(v);
     const int bits = cB.kvb[w][slot];
-    const size_t row = (size_t) g * cB.ctx + pos;
-    kv_store_fmt(cB.kvp[w][slot] + row * (HD * bits / 8), cB.kvs[w][slot] + row * (HD / 32), v, bits);
+    int8_t * q;
+    __half * sc;
+    if (KV_SLOTS && cB.ptab) q = kv_vptr_paged(w, slot, g, pos, sc); // (parallel slots: packed pages, kv_paged.cuh)
+    else {
+        const size_t row = (size_t) g * cB.ctx + pos;
+        q = cB.kvp[w][slot] + row * (HD * bits / 8);
+        sc = cB.kvs[w][slot] + row * (HD / 32);
+    }
+    kv_store_fmt(q, sc, v, bits);
     if (cB.kvrp[w][slot]) {
         const size_t rr = (size_t) g * cB.kvrc + pos % cB.kvrc;
         kv_store_q8(cB.kvrp[w][slot] + rr * HD, cB.kvrs[w][slot] + rr * (HD / 32), v);
@@ -134,7 +141,9 @@ __device__ __forceinline__ int kv_ring_tile(int ring, int ws, int base, int tp) 
 }
 // the tile's rows: q / s = values / scales of its first row (ring: the slot's q8 ring, else the main buffer of `bits`).
 // wsm = kv_wsm(ws): a ring tile's row is p0 % kvrc = wsm + (p0 - ws) folded once (positions ws .. L_ctx - 1 span at most
-// kvrc rows)
+// kvrc rows). PG: a parallel slot's paged view (cB.ptab), whose tiles each lie in one page on one side of the segment
+// end (p0 and cB.segn multiples of ATP, KV_PG of ATP)
+template <bool PG = false>
 __device__ __forceinline__ void kv_tile_src(int w, int slot, int g, int p0, int ws, int wsm, int bits, bool ring, const int8_t *& q, const __half *& s) {
     if (ring) {
         int r0 = wsm + (p0 - ws);
@@ -142,6 +151,10 @@ __device__ __forceinline__ void kv_tile_src(int w, int slot, int g, int p0, int 
         const size_t rr = (size_t) g * cB.kvrc + r0;
         q = cB.kvrp[w][slot] + rr * HD;
         s = cB.kvrs[w][slot] + rr * (HD / 32);
+    } else if constexpr (PG) {
+        __half * s_;
+        q = kv_vptr_paged(w, slot, g, p0, s_);
+        s = s_;
     } else {
         const size_t row = (size_t) g * cB.ctx + p0;
         q = cB.kvp[w][slot] + row * (HD * bits / 8);

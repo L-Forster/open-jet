@@ -689,6 +689,8 @@ class Server:
                 break
             n += 1
         n -= 8
+        if os.environ.get("MK_KV"):  # (the megakernel reads a low-bit segment's pages 32 positions at a time)
+            n -= n % 32
         return n if n >= 1024 else 0
 
     def template_args(self, body, messages, generation_prompt):

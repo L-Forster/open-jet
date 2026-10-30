@@ -264,7 +264,11 @@ int main(int argc, char ** argv) {
                     q.insert(q.end(), u.begin(), u.end());
                     ps.push_back(q);
                 }
-                const int share = (int) pre.size();
+                // (MK_KV: the segment ends on a 32-position tile, as the server's share_len, so the solo test below reads it
+                // in the megakernel; MS_SEG_ALIGN=n sets the rounding, e.g. for a q8_0 run to compare with)
+                const char * sa_env = getenv("MS_SEG_ALIGN");
+                const int sa = std::max(1, sa_env ? atoi(sa_env) : getenv("MK_KV") && getenv("MK_KV")[0] ? 32 : 1);
+                const int share = (int) pre.size() / sa * sa;
                 eng.slots_open(ms_n, (int) pre.size() + 2048, (int) pre.size() + 512); // (room for the long prompts, and a segment)
                 // reference: fresh prefills, no segment (share_len 0; a prompt differing in the first token drops the slot's state)
                 std::vector<std::vector<float>> href(ms_n);
