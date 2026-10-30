@@ -60,6 +60,12 @@ jobs:
       fail-fast: false
       matrix:
         arch: ["75", "86", "89", "120"]
+        include:
+          - cuda: "12.8.1"
+          # 12.8.1's Windows ptxas dies (ACCESS_VIOLATION) on the sm_120 engine; 13.2 builds it.
+          # A CUDA 13 runtime needs NVIDIA driver 580 or newer.
+          - arch: "120"
+            cuda: "13.2.2"
     runs-on: windows-2022
     defaults:
       run:
@@ -68,9 +74,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: "12.8.1"
+          cuda: ${{ matrix.cuda }}
           method: network
-          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+          # CUDA 13 splits the toolkit differently (crt is its own package), so it installs in full
+          sub-packages: ${{ matrix.cuda == '12.8.1' && '["nvcc", "cudart", "visual_studio_integration"]' || '[]' }}
       - uses: ilammy/msvc-dev-cmd@v1.13.0
       - name: Build llama.cpp's tokenizer libraries (CPU only)
         run: |
