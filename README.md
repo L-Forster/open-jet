@@ -33,11 +33,26 @@ agreement 99.08% ([results and reproduction scripts](megakernel/README.md#result
 
 ## Install
 
+Linux and macOS:
+
 ```bash
-pipx install open-jet
+curl -fsSL https://github.com/L-Forster/open-jet/releases/latest/download/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://github.com/L-Forster/open-jet/releases/latest/download/install.ps1 | iex
+```
+
+The installer brings its own Python, so you don't need Python or pipx. Then, in a new terminal:
+
+```bash
 openjet setup      # finds your GPU, downloads the model and OpenJet's engine
 openjet            # OpenJet's own coding agent
 ```
+
+Already use Python? `pipx install open-jet` works too.
 
 Or serve the model to the coding tool you already use:
 
@@ -70,39 +85,13 @@ Each `connect` command prints the exact configuration for your server address an
 
 ## What you need
 
-For OpenJet's engine:
+OpenJet's engine runs Qwen3.8-27B on an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB, on Linux. The
+model is unsloth's [Qwen3.8-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf),
+which `openjet setup` downloads for you. On any other GPU, Apple silicon or CPU only, OpenJet sets up
+the best model that fits and runs it on llama.cpp; `openjet serve` and `openjet connect` work the same way.
 
-- an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB or more (sm_86, sm_89, sm_120, including the
-  matching RTX workstation cards)
-- Linux, and an NVIDIA driver that supports CUDA 12.8 (570 or newer)
-- the Qwen3.8 27B Q4_K_M model, which `openjet setup` downloads
-- context: about 120K tokens with the default q8_0 KV cache, or up to about 234K on a 24 GB card with
-  `openjet setup --long-context`, which stores the cache in 5 bits and keeps the most recent 2K
-  positions at q8_0 ([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv))
-
-`openjet setup` downloads the engine prebuilt for your GPU, so you don't need the CUDA toolkit. If
-no prebuilt engine matches, setup compiles it instead, which needs `nvcc` (CUDA 12+, or 12.8+ for
-RTX 50). Turing GPUs (sm_75, such as the 48 GB Quadro RTX 8000) are supported experimentally: a
-contributor measured 54 vs 33 tok/s reasoning decode against llama.cpp
-([Turing](megakernel/README.md#turing-rtx-8000)). Windows builds of the engine are new and
-untested on hardware; [report how they run](https://github.com/L-Forster/open-jet/issues).
-
-Which model files run on OpenJet's engine. `openjet setup` shows the engine in brackets next to each
-model:
-
-| In setup | Model file |
-|---|---|
-| `(OpenJet engine, 1.5x faster)` | unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads |
-| `(OpenJet engine, semi compatible)` | a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis |
-| `(OpenJet engine, mixed quant)` | unsloth Qwen3.8-27B `UD-Q4_K_XL` |
-| `(llama.cpp)` | everything else, including other Qwen3.8-27B quants (other unsloth `UD-*`, bartowski, GSQ-RCO) |
-
-If none of your models runs on the engine, setup offers to download one. To check which engine is
-serving, run `pgrep -af mk_server.py`: it prints a line when OpenJet's engine is serving.
-`llama_backend` in `config.yaml` controls the choice: `auto` (the default) uses the engine whenever
-the model and GPU match, `llama` always uses llama.cpp, and `megakernel` fails instead of falling
-back. See [the runtime docs](docs/runtimes/llama-cpp.md#openjets-engine-rtx-304050-series) and
-[how the engine works](megakernel/README.md).
+[Requirements](docs/installation.md#what-you-need) · [Which model fits your hardware](docs/models.md) ·
+[How the engine works](megakernel/README.md)
 
 ## 4 coding agents on one GPU
 
@@ -144,27 +133,6 @@ and task per agent):
 ```bash
 python3 megakernel/tools/mk_top.py
 ```
-
-## Smaller GPU?
-
-OpenJet sets up the best model your hardware can run through llama.cpp: a GPU with 14 GB or more,
-Apple silicon with 24 GB or more unified memory, or CPU only
-([Deployment: CPU-only](docs/deployment/cpu-only.md)). `openjet serve` and `openjet connect` work the
-same way there.
-
-| Model in the setup catalog | Target memory (GB) |
-|---|---|
-| Qwen3.5 4B | 6 |
-| Qwen3.5 9B | 12 |
-| Qwen3.6 27B UD-IQ2_XXS MTP | 12 |
-| Qwen3.6 27B UD-IQ3_XXS MTP | 16 |
-| Qwen3.8 27B Q4_K_M MTP | 20 |
-| Gemma 4 26B A4B (unified memory only) | 24 |
-| Qwen3.6 35B A3B UD-IQ2_XXS MTP (unified memory only) | 24 |
-| Qwen3.6 35B A3B UD-Q3_K_XL MTP (unified memory only) | 32 |
-
-Any GGUF that llama.cpp loads also works. Already have a `.gguf`? Pick **Use a local .gguf model
-file** during setup. See [Choosing a model](docs/models.md).
 
 ## Results on your GPU
 

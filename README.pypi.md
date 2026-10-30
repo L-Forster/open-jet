@@ -27,11 +27,26 @@ temperature 1.0, 5 prompts x 4 seeds, and one 98K-token prompt); the others are 
 
 ## Quick Start
 
+Linux and macOS:
+
 ```bash
-pipx install open-jet
+curl -fsSL https://github.com/L-Forster/open-jet/releases/latest/download/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://github.com/L-Forster/open-jet/releases/latest/download/install.ps1 | iex
+```
+
+The installer brings its own Python, so you don't need Python or pipx. Then, in a new terminal:
+
+```bash
 openjet setup      # finds your GPU, downloads the model and OpenJet's engine
 openjet            # OpenJet's own coding agent
 ```
+
+Already use Python? `pipx install open-jet` works too.
 
 Or serve the model to the coding tool you already use:
 
@@ -55,15 +70,13 @@ To accept the hardware recommendation without the wizard, run `openjet setup --y
 
 ## What you need
 
-For OpenJet's engine: an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB or more (sm_86, sm_89,
-sm_120), Linux, and an NVIDIA driver that supports CUDA 12.8 (570 or newer). `openjet setup`
-downloads the engine prebuilt for your GPU, so you don't need the CUDA toolkit; if no prebuilt
-engine matches, setup compiles it, which needs `nvcc`. If the engine can't be installed, setup
-says why and serves the model with llama.cpp instead. `pgrep -af mk_server.py` prints a line while
-OpenJet's engine is serving.
+OpenJet's engine runs Qwen3.8-27B on an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB, on Linux. The
+model is unsloth's [Qwen3.8-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf),
+which `openjet setup` downloads for you. On any other GPU, Apple silicon or CPU only, OpenJet sets up
+the best model that fits and runs it on llama.cpp.
 
-On smaller GPUs, Apple silicon or CPU only, OpenJet sets up the best model your hardware runs
-through llama.cpp. Recommended: a GPU with 14 GB+ VRAM, or Apple silicon with 24 GB+ unified memory.
+[Requirements](https://github.com/l-forster/open-jet/blob/master/docs/installation.md#what-you-need) ·
+[Which model fits your hardware](https://github.com/l-forster/open-jet/blob/master/docs/models.md)
 
 ## CLI
 

@@ -94,6 +94,12 @@ jobs:
           pattern: engine-*
           path: release-assets
           merge-multiple: true
+      # the one-line installers, served from releases/latest/download/
+      - uses: actions/checkout@v4
+        with:
+          path: source
+          sparse-checkout: scripts/installer
+      - run: cp source/scripts/installer/install.sh source/scripts/installer/install.ps1 release-assets/
       - uses: softprops/action-gh-release@v2
         if: github.event_name == 'release'
         with:
