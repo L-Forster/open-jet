@@ -107,3 +107,5 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}
+          # a version already uploaded (e.g. by a manual run) is not an error
+          skip-existing: true

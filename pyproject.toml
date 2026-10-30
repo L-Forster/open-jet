@@ -1,6 +1,6 @@
 [project]
 name = "open-jet"
-version = "0.5.3"
+version = "0.5.4"
 description = "Run Qwen3.8-27B on your own GPU, 1.5x faster than llama.cpp, for Claude Code, Codex, OpenCode, OpenClaw or OpenJet's own coding agent."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
