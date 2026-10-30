@@ -13,7 +13,7 @@ constexpr int TS = 12;                              // rows staged in shared mem
 constexpr int SMEM = 101376;                        // dynamic shared memory of the bmm kernels (sm_86 opt-in maximum)
 constexpr int NJ5 = D / 32, XS5 = NJ5 * 8 + 8;      // K = D: sub-blocks, activation row stride (words)
 constexpr int DCB = 17, DCP = 2 * DCB, NCH = FF / 256 / DCB, DXS = DCB * 64 + 8; // K = FF: 4 chunks of 17 blocks
-constexpr int Q6B = 224;
+constexpr int Q6B = 192, Q6M = 18; // Q6_K per block: values (Mat::w), meta (Mat::d, in pairs of blocks)
 
 __device__ const unsigned * g_bx;  // [TM][FF / 4] per-32 quantised activations (ffn_down input)
 __device__ const float2 * g_bd;    // [FF / 32][TM] (scale, scale * sum)
@@ -42,6 +42,16 @@ __device__ __forceinline__ unsigned ld1(const void * p) {
     unsigned r;
     asm volatile("ld.global.nc.u32 %0, [%1];" : "=r"(r) : "l"(p));
     return r;
+}
+// Q6_K meta (Mat::d): per pair of blocks sc[16] even | sc[16] odd | d even | d odd (2 Q6M bytes). Word tg of a
+// quad for 64-groups pc, pc + 1 of block b (absolute in the row): sc(pc) | d pair | sc(pc + 1) | d pair.
+__device__ __forceinline__ unsigned q6_meta(const Mat & m, int row, int b, int pc, int tg) {
+    const uint8_t * mp = reinterpret_cast<const uint8_t *>(m.d) + (size_t) row * m.nd * 2 + (b >> 1) * (2 * Q6M);
+    return ld1(tg & 1 ? mp + 2 * Q6M - 4 : mp + 16 * (b & 1) + 4 * (pc + (tg >> 1)));
+}
+// block b's d from a d-pair word
+__device__ __forceinline__ float q6_d(unsigned dw, int b) {
+    return __half2float(__ushort_as_half((unsigned short) (dw >> (16 * (b & 1)))));
 }
 // activation B fragment (8 bytes at word w of row n): staged rows from shared memory (row stride xs words), the rest
 // from global (row stride gs words); per-32 scale pairs (cols col, col + 1) likewise ([j][TS] staged, [j][TM] global)
@@ -537,7 +547,7 @@ __device__ __forceinline__ void qk(const Mat m, float * out, int ld, int add, in
 #undef BK_STEP
 }
 
-// Q6_K GEMV (K = D, repacked 224-byte blocks) of matrix m for T rows -> out [T][m.N]: masked-half mma pairs
+// Q6_K GEMV (K = D, repacked 192-byte blocks + the meta stream) of matrix m for T rows -> out [T][m.N]: masked-half mma pairs
 template <int NTL_>
 __device__ __forceinline__ void q6(const Mat m, float * out, int ld, int add, int T, const unsigned * sgx = nullptr, const float2 * sgd = nullptr) {
     constexpr int SP = 2;
@@ -569,7 +579,7 @@ __device__ __forceinline__ void q6(const Mat m, float * out, int ld, int add, in
                     const int4 v = ld4(blk + 64 * (P % 2) + 16 * tg);                                \
                     W[k][i] = make_uint4(v.x, v.y, v.z, v.w);                                          \
                     QH[k][i] = ld2(blk + 128 + 8 * (2 * pc + tg)); /* unit (pc + tg / 2, tg & 1) */            \
-                    MT[k][i] = ld1(blk + 192 + 8 * pc + 4 * tg); /* word tg of the pair's 16-byte meta */ \
+                    MT[k][i] = q6_meta(m, 16 * (IT_) + g + 8 * k, P / 2, pc, tg); \
                 } else { W[k][i] = make_uint4(0, 0, 0, 0); QH[k][i] = make_uint2(0, 0); MT[k][i] = 0u; } \
             }                                                                                          \
         }                                                                                              \
@@ -598,7 +608,7 @@ __device__ __forceinline__ void q6(const Mat m, float * out, int ld, int add, in
                     const unsigned qb_ = lane & ~3;                                                    \
                     const uint4 m4 = make_uint4(__shfl_sync(~0u, MT[k][i], qb_), __shfl_sync(~0u, MT[k][i], qb_ + 1), __shfl_sync(~0u, MT[k][i], qb_ + 2), __shfl_sync(~0u, MT[k][i], qb_ + 3)); \
                     const unsigned scw = hc ? m4.z : m4.x, dw = hc ? m4.w : m4.y;                      \
-                    dd[k] = __half2float(__ushort_as_half((unsigned short) (dw & 0xffff)));            \
+                    dd[k] = q6_d(dw, bk);            \
                     sc[k][0][0] = (int) (int8_t) (scw); sc[k][0][1] = (int) (int8_t) (scw >> 8);       \
                     sc[k][1][0] = (int) (int8_t) (scw >> 16); sc[k][1][1] = (int) (int8_t) (scw >> 24); \
                     hw[k][0] = __shfl_sync(~0u, QH[k][i].x, qb + 2 * hc + hh);                         \
@@ -671,7 +681,7 @@ __device__ __forceinline__ void q6(const Mat m, float * out, int ld, int add, in
 }
 
 
-// ffn_down (N = D rows, K = FF), Q4_K or Q6_K (repacked 224-byte blocks): K in NCH chunks staged in shared memory
+// ffn_down (N = D rows, K = FF), Q4_K or Q6_K (repacked 192-byte blocks + the meta stream): K in NCH chunks staged in shared memory
 // from g_bx / g_bd; block = 4 groups x 1 item (16 rows) each; out [T][D]
 template <int NTL_, int TYPE>
 __device__ __forceinline__ void down(const Mat m, const unsigned * gx, const float2 * gd, float * out, int ld, int add, int T) {
@@ -705,7 +715,7 @@ __device__ __forceinline__ void down(const Mat m, const unsigned * gx, const flo
                             const int4 v = ld4(blk + 64 * (P % 2) + 16 * tg);                          \
                             W[k][i] = make_uint4(v.x, v.y, v.z, v.w);                                  \
                             QH[k][i] = ld2(blk + 128 + 8 * (2 * pc + tg));                             \
-                            MT[k][i] = ld1(blk + 192 + 8 * pc + 4 * tg);                               \
+                            MT[k][i] = q6_meta(m, 16 * (active ? item : 0) + g + 8 * k, ch_ * DCB + P / 2, pc, tg);                               \
                         } else {                                                                       \
                             const int4 v = ld4(blk + 16 + 64 * (P % 2) + 16 * tg);                     \
                             W[k][i] = make_uint4(v.x, v.y, v.z, v.w);                                  \
@@ -748,7 +758,7 @@ __device__ __forceinline__ void down(const Mat m, const unsigned * gx, const flo
                         int sc[2][2][2]; float dd[2]; unsigned hw[2][2];                               \
                         _Pragma("unroll") for (int k = 0; k < 2; k++) {                                \
                             const unsigned scw = hc ? m4[k].z : m4[k].x, dw = hc ? m4[k].w : m4[k].y;  \
-                            dd[k] = __half2float(__ushort_as_half((unsigned short) (dw & 0xffff)));    \
+                            dd[k] = q6_d(dw, ch_ * DCB + bk);    \
                             sc[k][0][0] = (int) (int8_t) (scw); sc[k][0][1] = (int) (int8_t) (scw >> 8); \
                             sc[k][1][0] = (int) (int8_t) (scw >> 16); sc[k][1][1] = (int) (int8_t) (scw >> 24); \
                             hw[k][0] = __shfl_sync(~0u, QH[k][i].x, qb + 2 * hc + hh);                 \
@@ -877,7 +887,7 @@ __device__ __forceinline__ void down2(const Mat m, const unsigned * gx, const fl
                             const int4 v = ld4(blk + 64 * (P % 2) + 16 * tg);                          \
                             W[k][i] = make_uint4(v.x, v.y, v.z, v.w);                                  \
                             QH[k][i] = ld2(blk + 128 + 8 * (2 * pc + tg));                             \
-                            MT[k][i] = ld1(blk + 192 + 8 * pc + 4 * tg);                               \
+                            MT[k][i] = q6_meta(m, 16 * item_of(S_) + g + 8 * k, kr * DCB + P / 2, pc, tg);                               \
                         } else {                                                                       \
                             const int4 v = ld4(blk + 16 + 64 * (P % 2) + 16 * tg);                     \
                             W[k][i] = make_uint4(v.x, v.y, v.z, v.w);                                  \
@@ -911,7 +921,7 @@ __device__ __forceinline__ void down2(const Mat m, const unsigned * gx, const fl
                         int sc[2][2][2]; float dd[2]; unsigned hw[2][2];                               \
                         _Pragma("unroll") for (int k = 0; k < 2; k++) {                                \
                             const unsigned scw = hc ? m4[k].z : m4[k].x, dw = hc ? m4[k].w : m4[k].y;  \
-                            dd[k] = __half2float(__ushort_as_half((unsigned short) (dw & 0xffff)));    \
+                            dd[k] = q6_d(dw, kr * DCB + bk);    \
                             sc[k][0][0] = (int) (int8_t) (scw); sc[k][0][1] = (int) (int8_t) (scw >> 8); \
                             sc[k][1][0] = (int) (int8_t) (scw >> 16); sc[k][1][1] = (int) (int8_t) (scw >> 24); \
                             hw[k][0] = __shfl_sync(~0u, QH[k][i].x, qb + 2 * hc + hh);                 \

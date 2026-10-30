@@ -100,8 +100,9 @@ __global__ void __launch_bounds__(NT, 1) check_resid(Mat w, QBuf q, float * x, c
 }
 
 template <int T, int TYPE> void resid_test() {
-    constexpr int units = U_FF, blocks = FF / 256, bsz = TYPE == T_Q4K ? 144 : 224;
+    constexpr int units = U_FF, blocks = FF / 256, bsz = TYPE == T_Q4K ? 144 : Q6_BLK;
     std::vector<uint8_t> w((size_t) D * blocks * bsz, 0);
+    std::vector<uint8_t> md(TYPE == T_Q6K ? (size_t) D * blocks * Q6_META : 0, 0); // Q6_K meta stream
     const __half one = __float2half(1), small = __float2half(1.f / 32);
     for (int r = 0; r < D; r++)
         for (int b = 0; b < blocks; b++) {
@@ -114,10 +115,9 @@ template <int T, int TYPE> void resid_test() {
                 memset(p + 16, value * 17, 128);
             } else {
                 memset(p, value * 17, 128);
-                for (int j = 0; j < 4; j++) {
-                    memset(p + 192 + 8 * j, 1, 4);
-                    memcpy(p + 196 + 8 * j, &small, 2);
-                }
+                uint8_t * mp = md.data() + ((size_t) r * blocks + (b & ~1)) * Q6_META;
+                memset(mp + 16 * (b & 1), 1, 16);
+                memcpy(mp + 32 + 2 * (b & 1), &small, 2);
             }
         }
     QBuf q = quant_buffer(units, T);
@@ -141,7 +141,9 @@ template <int T, int TYPE> void resid_test() {
     CK(cudaMemcpyToSymbol(cB, &bufs, sizeof(bufs)));
     float * x = buffer<float>((size_t) T * D);
     const float * norm = upload(std::vector<float>(D, 1));
-    const Mat mat{upload(w), nullptr, TYPE, FF, D, blocks * bsz, 0};
+    const __half * mdev = nullptr;
+    if constexpr (TYPE == T_Q6K) mdev = reinterpret_cast<const __half *>(upload(md));
+    const Mat mat{upload(w), mdev, TYPE, FF, D, blocks * bsz, TYPE == T_Q6K ? blocks * (Q6_META / 2) : 0};
     CK(cudaFuncSetAttribute(check_resid<T, TYPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM_TOTAL));
     check_resid<T, TYPE><<<4, NT, SM_TOTAL>>>(mat, q, x, norm);
     CK(cudaGetLastError());

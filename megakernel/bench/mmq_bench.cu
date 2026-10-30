@@ -42,13 +42,15 @@ __device__ float deq(const WMat & W, int row, int e) {
         }
         return d * s * q - dmin * m;
     } else if (W.type == TQ6K) {
-        const uint8_t * blk = r + b * 224;
+        const uint8_t * blk = r + b * 192;
+        // meta stream: per pair of blocks sc[16] even | sc[16] odd | d even | d odd
+        const uint8_t * mp = reinterpret_cast<const uint8_t *>(W.d + (size_t) row * W.nd) + (b >> 1) * 36;
         const int p = w >> 6, ww = w & 63, sub = ww >> 5, i = ww & 31, hh = i >> 4, ii = i & 15;
         const int lo = sub ? (blk[32 * p + i] >> 4) : (blk[32 * p + i] & 0xF);
         const unsigned hw = *reinterpret_cast<const unsigned *>(blk + 128 + 8 * (2 * p + hh) + 4 * sub);
         const int hi = (hw >> (8 * (ii % 4) + 2 * (ii / 4))) & 3;
-        const int8_t sc = (int8_t) blk[192 + 8 * p + (ww >> 4)];
-        const float d = __half2float(*reinterpret_cast<const __half *>(blk + 192 + 8 * p + 4));
+        const int8_t sc = (int8_t) mp[16 * (b & 1) + 4 * p + (ww >> 4)];
+        const float d = __half2float(*reinterpret_cast<const __half *>(mp + 32 + 2 * (b & 1)));
         return d * sc * ((lo | (hi << 4)) - 32);
     } else {
         const int p = w >> 6, ww = w & 63, sub = ww >> 5, i = ww & 31, hh = i >> 4, ii = i & 15;
@@ -83,10 +85,12 @@ int main(int argc, char ** argv) {
                           {TQ6K, 5120, 10240, "q6k qkv"}, {TQ80, 10240, 5120, "q8_0 eh_proj"}};
     for (const Case & cs : cases) {
         const int K = cs.K, N = check_only ? 256 : cs.N, nb = K / 256;
-        const int bsz = cs.type == TQ4K ? 144 : cs.type == TQ5K ? 176 : cs.type == TQ6K ? 224 : 256;
+        const int bsz = cs.type == TQ4K ? 144 : cs.type == TQ5K ? 176 : cs.type == TQ6K ? 192 : 256;
         std::vector<uint8_t> w((size_t) N * nb * bsz);
         for (auto & b : w) b = rng() & 0xff;
         std::vector<uint16_t> dsc;
+        std::vector<uint8_t> meta6(cs.type == TQ6K ? (size_t) N * nb * 18 : 0); // Q6_K meta stream (W.d)
+        for (auto & b : meta6) b = rng() & 0xff;
         for (int r = 0; r < N; r++)
             for (int b = 0; b < nb; b++) {
                 uint8_t * blk = w.data() + ((size_t) r * nb + b) * bsz;
@@ -96,8 +100,8 @@ int main(int argc, char ** argv) {
                     memcpy(blk, &d, 2);
                     memcpy(blk + 2, &dm, 2);
                 } else if (cs.type == TQ6K) {
-                    uint16_t d = h(u(rng));
-                    for (int p = 0; p < 4; p++) memcpy(blk + 192 + 8 * p + 4, &d, 2); // d per super-block
+                    uint16_t d = h(u(rng)); // d per super-block
+                    memcpy(meta6.data() + ((size_t) r * nb + (b & ~1)) * 18 + 32 + 2 * (b & 1), &d, 2);
                 }
             }
         if (cs.type == TQ80) {
@@ -115,12 +119,15 @@ int main(int argc, char ** argv) {
         if (!dsc.empty()) {
             CK(cudaMalloc(&dd, dsc.size() * 2));
             CK(cudaMemcpy(dd, dsc.data(), dsc.size() * 2, cudaMemcpyHostToDevice));
+        } else if (!meta6.empty()) {
+            CK(cudaMalloc(&dd, meta6.size()));
+            CK(cudaMemcpy(dd, meta6.data(), meta6.size(), cudaMemcpyHostToDevice));
         }
         CK(cudaMalloc(&dx, xh.size() * 2));
         CK(cudaMemcpy(dx, xh.data(), xh.size() * 2, cudaMemcpyHostToDevice));
         CK(cudaMalloc(&dy, (size_t) ntok * N * 4));
         CK(cudaMalloc(&dr, (size_t) ntok * N * 4));
-        const WMat W{dw, dd, cs.type, K, N, nb * bsz, K / 32};
+        const WMat W{dw, dd, cs.type, K, N, nb * bsz, cs.type == TQ6K ? nb * 9 : K / 32};
         const Out O{dy, N, OUT_STORE, nullptr};
         const dim3 grid(N / BM, (ntok + BN - 1) / BN);
         void (*kern)(WMat, const __half *, int, Out, const uint8_t *) = nullptr;

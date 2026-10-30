@@ -562,31 +562,37 @@ __device__ __forceinline__ void rows_q5k(const uint8_t * const (&rp)[R], const S
     }
 }
 
-// repacked Q6_K block (224 B): qlo[128] (q4k-style nibbles) | qhi[64] (8 B per unit) |
-// meta[32]: for each 64-group p: sc[4p..4p+3], d (fp16), 2 pad bytes  -> one 8-byte load per unit
-constexpr int Q6_BLK = 224;
+// repacked Q6_K, 210 B per 256 weights like the GGUF block, in two streams per row:
+//   rows (Mat::w, Q6_BLK = 192 B per block): qlo[128] (q4k-style nibbles) | qhi[64] (8 B per unit);
+//   meta (Mat::d, 18 B per block, in pairs of blocks: sc[16] even | sc[16] odd | d even | d odd, 36 B).
+// A unit reads its 4 scales sc[4p..4p+3] and the pair's two d (one 4-byte load each).
+constexpr int Q6_BLK = 192, Q6_META = 18;
 template <int T, int IT, int R>
-__device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const SX & s, float (&acc)[R][T]) {
+__device__ __forceinline__ void rows_q6k(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
+                                         float (&acc)[R][T]) {
     const int lane = threadIdx.x & 31;
 #pragma unroll(IT > 8 ? (T >= 5 ? 1 : 4) : IT)
     for (int i = 0; i < IT; i++) {
         const int u = lane + 32 * i, b = u >> 3, p = (u >> 1) & 3, hh = u & 1;
         int4 q[R];
-        int2 hb[R], meta[R];
+        int2 hb[R];
+        int sc4[R], dd[R];
 #pragma unroll
         for (int k = 0; k < R; k++) {
             const uint8_t * blk = rp[k] + b * Q6_BLK;
+            const uint8_t * mp = reinterpret_cast<const uint8_t *>(dp[k]) + (b >> 1) * (2 * Q6_META);
             q[k] = ldw4(blk + 32 * p + 16 * hh);
             hb[k] = ldw2(blk + 128 + 8 * (u & 7));
-            meta[k] = ldw2(blk + 192 + 8 * p);
+            sc4[k] = ldw1(mp + 16 * (b & 1) + 4 * p);
+            dd[k] = ldw1(mp + 32);
         }
         int A[R][4], B[R][4];
         float fA[R], gA[R], fB[R], gB[R];
 #pragma unroll
         for (int k = 0; k < R; k++) {
-            const float d = __half2float(__ushort_as_half((unsigned short) (meta[k].y & 0xffff)));
-            fA[k] = d * (float) (int8_t) (meta[k].x >> (8 * hh));
-            fB[k] = d * (float) (int8_t) (meta[k].x >> (16 + 8 * hh));
+            const float d = __half2float(__ushort_as_half((unsigned short) ((unsigned) dd[k] >> (16 * (b & 1)))));
+            fA[k] = d * (float) (int8_t) (sc4[k] >> (8 * hh));
+            fB[k] = d * (float) (int8_t) (sc4[k] >> (16 + 8 * hh));
             gA[k] = 32.0f * fA[k];
             gB[k] = 32.0f * fB[k];
             const unsigned hx = (unsigned) hb[k].x, hy = (unsigned) hb[k].y;
@@ -711,7 +717,7 @@ __device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __h
                                        float (&acc)[R][T]) {
     if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
     else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
-    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, dp, s, acc);
     else if constexpr (TYPE == T_IQ4X) rows_iq4x<T, IT, R>(rp, s, acc);
     else rows_q80<T, IT, R>(rp, dp, s, acc);
 }
@@ -722,7 +728,7 @@ __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, flo
 #pragma unroll
     for (int k = 0; k < R; k++) {
         rp[k] = m.w + (size_t) (row0 + k) * m.rb + unit_bytes<TYPE>(u0);
-        dp[k] = m.d + (size_t) (row0 + k) * m.nd + u0;
+        dp[k] = m.d + (size_t) (row0 + k) * m.nd + (TYPE == T_Q6K ? (u0 >> 3) * (Q6_META / 2) : u0); // Q6_K: meta, Q8_0: d
     }
     rows_t<T, IT, R, TYPE>(rp, dp, s, acc);
 }
@@ -2300,9 +2306,10 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
         float a[2][TL];
         zero_acc<TL, 2>(a);
         if (ids) {
-            const uint8_t * rp[2] = {cW.head.w + (size_t) __ldg(ids + r) * cW.head.rb,
-                                     cW.head.w + (size_t) __ldg(ids + r + 1) * cW.head.rb};
-            rows_q6k<TL, 5, 2>(rp, sx, a);
+            const int p0 = __ldg(ids + r), p1 = __ldg(ids + r + 1);
+            const uint8_t * rp[2] = {cW.head.w + (size_t) p0 * cW.head.rb, cW.head.w + (size_t) p1 * cW.head.rb};
+            const __half * dp[2] = {cW.head.d + (size_t) p0 * cW.head.nd, cW.head.d + (size_t) p1 * cW.head.nd};
+            rows_q6k<TL, 5, 2>(rp, dp, sx, a);
         } else {
             mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
         }
@@ -3146,9 +3153,12 @@ struct MKEngine::Impl {
             m.w = d;
             wbytes += t.nbytes;
         } else if (t.type == gguf::Q6_K) {
-            m.rb = nb * 224;
-            m.nd = 0;
-            std::vector<uint8_t> q((size_t) N * m.rb, 0);
+            // two streams (rows_q6k): 192 B of values per block, and per row a meta stream of 18 B per block in
+            // pairs (sc even | sc odd | d even | d odd)
+            if (nb & 1) throw std::runtime_error(name + ": Q6_K rows need an even number of 256-blocks");
+            m.rb = nb * Q6_BLK;
+            m.nd = nb * (Q6_META / 2); // halves
+            std::vector<uint8_t> q((size_t) N * m.rb, 0), meta((size_t) N * nb * Q6_META, 0);
             const uint8_t * src = t.data;
             parallel_rows(N, [&](int64_t r) {
                 for (int b = 0; b < nb; b++) {
@@ -3168,7 +3178,7 @@ struct MKEngine::Impl {
                             vals[128 * nn + l + 64] = (L[l] >> 4) | (((H[l] >> 4) & 3) << 4);
                             vals[128 * nn + l + 96] = (L[l + 32] >> 4) | (((H[l] >> 6) & 3) << 4);
                         }
-                    uint8_t * dst = q.data() + (size_t) r * m.rb + b * 224;
+                    uint8_t * dst = q.data() + (size_t) r * m.rb + b * Q6_BLK;
                     for (int p = 0; p < 4; p++)
                         for (int i = 0; i < 32; i++)
                             dst[32 * p + i] = (vals[64 * p + i] & 0xF) | ((vals[64 * p + 32 + i] & 0xF) << 4);
@@ -3183,17 +3193,18 @@ struct MKEngine::Impl {
                             memcpy(dst + 128 + 8 * (2 * p + hh), &hA, 4);
                             memcpy(dst + 128 + 8 * (2 * p + hh) + 4, &hB, 4);
                         }
-                    for (int p = 0; p < 4; p++) {
-                        memcpy(dst + 192 + 8 * p, sc + 4 * p, 4);
-                        memcpy(dst + 192 + 8 * p + 4, &dbits, 2);
-                    }
+                    uint8_t * mp = meta.data() + ((size_t) r * nb + (b & ~1)) * Q6_META;
+                    memcpy(mp + 16 * (b & 1), sc, 16);
+                    memcpy(mp + 32 + 2 * (b & 1), &dbits, 2);
                 }
             });
             uint8_t * dq = dalloc<uint8_t>(q.size(), false);
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
+            uint8_t * dm = dalloc<uint8_t>(meta.size(), false);
+            CK(cudaMemcpy(dm, meta.data(), meta.size(), cudaMemcpyHostToDevice));
             m.w = dq;
-            m.d = nullptr;
-            wbytes += q.size();
+            m.d = reinterpret_cast<const __half *>(dm);
+            wbytes += q.size() + meta.size();
         } else if (t.type == gguf::IQ4_XS) {
             m.type = T_IQ4X;
             m.rb = nb * 144;
