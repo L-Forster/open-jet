@@ -105,7 +105,9 @@ jobs:
               Where-Object { $_.FullName -notmatch "onecore|debug" } | Select-Object -First 1
             Copy-Item $crt.FullName pkg/
           }
-          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('pkg')); [ctypes.CDLL(os.path.abspath('pkg/' + n)).mk_last_error for n in os.listdir('pkg') if n.startswith('qwen38mk')]"
+          # nvcc -shared also writes the import library and exports file; only the DLLs are loaded
+          Remove-Item pkg/*.lib, pkg/*.exp
+          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('pkg')); [ctypes.CDLL(os.path.abspath('pkg/' + n)).mk_last_error for n in os.listdir('pkg') if n.startswith('qwen38mk') and n.endswith('.dll')]"
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-windows-x64-sm${{ matrix.arch }}.zip
           Get-ChildItem pkg, dist
