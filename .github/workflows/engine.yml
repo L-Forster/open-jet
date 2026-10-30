@@ -1,0 +1,115 @@
+name: Build prebuilt engine libraries
+
+# One archive per GPU architecture, so `openjet setup` can serve Qwen3.8-27B without the CUDA toolkit.
+# Each archive holds the engine library (and the mixed-quant one, except on Turing) plus a CPU-only
+# libllama for the tokenizer, all resolved next to each other. CUDA's runtime is linked statically, so
+# users only need the NVIDIA driver.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["75", "86", "89", "120"]
+    runs-on: ubuntu-latest
+    # glibc 2.35 baseline; CUDA 12.8 is the first with sm_120
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: apt-get update && apt-get install -y --no-install-recommends git cmake make g++ ca-certificates python3 binutils
+      - name: Build llama.cpp's tokenizer libraries (CPU only)
+        run: |
+          ref=$(python3 -c "import re; print(re.search(r'LLAMA_CPP_MTP_REF = .(\w+)', open('src/provisioning.py').read()).group(1))")
+          git clone --depth 1 --branch "$ref" https://github.com/ggml-org/llama.cpp /opt/llama.cpp
+          cmake -S /opt/llama.cpp -B /opt/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          cmake --build /opt/llama.cpp/build --target llama -j4
+      - name: Build the engine for sm_${{ matrix.arch }}
+        run: |
+          make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
+          # the mixed-quant engine needs sm_80+; its compile uses about 11 GiB of RAM
+          if [ "${{ matrix.arch }}" != "75" ]; then
+            make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_mixed.so
+          fi
+      - name: Package and check that the libraries resolve from their own directory
+        run: |
+          mkdir -p pkg dist
+          cp megakernel/libqwen38mk*.so pkg/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* pkg/
+          for lib in pkg/libqwen38mk*.so; do
+            readelf -d "$lib" | grep -q 'R.*PATH.*\$ORIGIN'
+            if env -u LD_LIBRARY_PATH ldd "$lib" | grep 'not found'; then exit 1; fi
+          done
+          tar -czf dist/openjet-engine-linux-x64-sm${{ matrix.arch }}.tar.gz -C pkg .
+          ls -l pkg dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-linux-sm${{ matrix.arch }}
+          path: dist/*
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["75", "86", "89", "120"]
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.8.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "visual_studio_integration"]'
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: Build llama.cpp's tokenizer libraries (CPU only)
+        run: |
+          $ref = python -c "import re; print(re.search(r'LLAMA_CPP_MTP_REF = .(\w+)', open('src/provisioning.py').read()).group(1))"
+          git clone --depth 1 --branch $ref https://github.com/ggml-org/llama.cpp C:/llama.cpp
+          cmake -S C:/llama.cpp -B C:/llama.cpp/build -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF `
+            -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF
+          cmake --build C:/llama.cpp/build --config Release --target llama -j 4
+      - name: Build the engine for sm_${{ matrix.arch }}
+        run: |
+          $libs = @("llama.lib", "ggml-base.lib") | ForEach-Object {
+            (Get-ChildItem C:/llama.cpp/build -Recurse -Filter $_ | Select-Object -First 1).FullName
+          }
+          $flags = @("-O3", "-std=c++17", "-arch=sm_${{ matrix.arch }}", "-lineinfo")
+          if ("${{ matrix.arch }}" -eq "75") { $flags += "-DQWEN_MK_SM75=1" }
+          $variants = @(@{ src = "qwen38_mk.cu"; dll = "qwen38mk.dll" })
+          if ("${{ matrix.arch }}" -ne "75") { $variants += @{ src = "qwen38_mixed.cu"; dll = "qwen38mk_mixed.dll" } }
+          New-Item -ItemType Directory -Force pkg | Out-Null
+          foreach ($v in $variants) {
+            nvcc @flags -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/$($v.src)" -o engine.obj
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/capi.cpp engine.obj @libs -o "pkg/$($v.dll)"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+      - name: Package
+        run: |
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName pkg/
+          # the C++ runtime, for machines without the Visual C++ redistributable (Python ships vcruntime140 only)
+          foreach ($name in "msvcp140.dll", "vcruntime140_1.dll") {
+            $crt = Get-ChildItem "$env:VCToolsRedistDir/x64" -Recurse -Filter $name |
+              Where-Object { $_.FullName -notmatch "onecore|debug" } | Select-Object -First 1
+            Copy-Item $crt.FullName pkg/
+          }
+          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('pkg')); [ctypes.CDLL(os.path.abspath('pkg/' + n)).mk_last_error for n in os.listdir('pkg') if n.startswith('qwen38mk')]"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-windows-x64-sm${{ matrix.arch }}.zip
+          Get-ChildItem pkg, dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-windows-sm${{ matrix.arch }}
+          path: dist/*

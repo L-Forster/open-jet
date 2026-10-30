@@ -10,10 +10,20 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace gguf {
 
@@ -53,6 +63,29 @@ struct File {
     std::map<std::string, uint64_t> ints;
     std::map<std::string, std::string> strs;
 
+#ifdef _WIN32
+    explicit File(const std::string & path) {
+        // the path is UTF-8 (from Python); the wide API takes any user's file name
+        const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        std::wstring wpath(n > 0 ? n : 1, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], n);
+        HANDLE fh = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (fh == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path);
+        LARGE_INTEGER sz;
+        GetFileSizeEx(fh, &sz);
+        size = (size_t) sz.QuadPart;
+        HANDLE mh = CreateFileMappingW(fh, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        CloseHandle(fh);
+        if (!mh) throw std::runtime_error("CreateFileMapping failed");
+        void * p = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(mh);  // the view keeps the mapping alive
+        if (!p) throw std::runtime_error("MapViewOfFile failed");
+        base = (const uint8_t *) p;
+        parse();
+    }
+    ~File() { if (base) UnmapViewOfFile(base); }
+#else
     explicit File(const std::string & path) {
         int fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path);
@@ -66,6 +99,7 @@ struct File {
         parse();
     }
     ~File() { if (base) munmap((void *) base, size); }
+#endif
 
     const Tensor & get(const std::string & name) const {
         auto it = tensors.find(name);

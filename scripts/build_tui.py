@@ -59,6 +59,11 @@ def main() -> int:
     parser.add_argument("--skip-install", action="store_true")
     parser.add_argument("--target", choices=tuple(TARGETS), default=target_tag())
     args = parser.parse_args()
+    if not (UI / "package.json").is_file():
+        raise SystemExit(
+            "ui/ is empty: the TUI lives in the open-jet-harness submodule. "
+            "Run `git submodule update --init ui` first."
+        )
     # The toolchain (typescript, bun) lives in devDependencies, so the build
     # breaks on machines whose npm config or NODE_ENV omits dev installs.
     env = {**os.environ, "NODE_ENV": "development", "NPM_CONFIG_OMIT": ""}

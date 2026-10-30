@@ -61,7 +61,8 @@ def _megakernel_root() -> Path:
 
 
 def _megakernel_library(model: str = "") -> str:
-    return "libqwen38mk_mixed.so" if _megakernel_variant(model) == "mixed" else "libqwen38mk.so"
+    stem = "qwen38mk_mixed" if _megakernel_variant(model) == "mixed" else "qwen38mk"
+    return f"{stem}.dll" if sys.platform == "win32" else f"lib{stem}.so"
 
 
 def _megakernel_dir(model: str = "") -> Path | None:
@@ -78,12 +79,12 @@ def _megakernel_model_supported(model: str) -> bool:
 
 
 # decode speed in the agent's reasoning mode on an RTX 3090, megakernel/README.md
-MEGAKERNEL_RUNTIME_LABEL = "OpenJet megakernel, 1.5x faster"
-MEGAKERNEL_TURING_LABEL = "OpenJet megakernel, experimental Turing"
+MEGAKERNEL_RUNTIME_LABEL = "OpenJet engine, 1.5x faster"
+MEGAKERNEL_TURING_LABEL = "OpenJet engine, experimental Turing"
 
 
-MEGAKERNEL_SEMI_LABEL = "OpenJet megakernel, semi compatible"
-MEGAKERNEL_MIXED_LABEL = "OpenJet megakernel, mixed quant"
+MEGAKERNEL_SEMI_LABEL = "OpenJet engine, semi compatible"
+MEGAKERNEL_MIXED_LABEL = "OpenJet engine, mixed quant"
 _GGUF_SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
 
@@ -292,19 +293,19 @@ def _megakernel_gpu_info() -> tuple[str, str] | None:
 def megakernel_unavailable_reason(model: str) -> str | None:
     """None when the megakernel can serve *model* on this machine, else why not."""
     if not _megakernel_model_supported(model):
-        return "the megakernel only supports Qwen3.8-27B Q4_K_M and UD-Q4_K_XL"
+        return "OpenJet's engine only supports Qwen3.8-27B Q4_K_M and UD-Q4_K_XL"
     if _megakernel_variant(model) is None:
         return "the GGUF tensor types are unsupported or its header is unreadable"
     if _megakernel_dir(model) is None:
-        return "the megakernel is not built (rerun `openjet setup` with the CUDA toolkit installed)"
+        return "OpenJet's engine is not installed (rerun `openjet setup`)"
     if importlib.util.find_spec("jinja2") is None:
-        return "the megakernel server needs jinja2"
+        return "OpenJet's engine server needs jinja2"
     gpu = _megakernel_gpu_info()
     if gpu is None:
-        return (f"the megakernel needs a Turing or RTX 30/40/50-series GPU (sm_75, sm_86, sm_89 or sm_120) "
+        return (f"OpenJet's engine needs a Turing or RTX 30/40/50-series GPU (sm_75, sm_86, sm_89 or sm_120) "
                 f"with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB")
     if gpu[1] == _MEGAKERNEL_TURING_CAP and _megakernel_variant(model) == "mixed":
-        return "the mixed-quant megakernel (UD-Q4_K_XL) does not support Turing GPUs; use Q4_K_M"
+        return "OpenJet's mixed-quant engine (UD-Q4_K_XL) does not support Turing GPUs; use Q4_K_M"
     return None
 
 
@@ -638,7 +639,7 @@ class LlamaServerClient:
             if self.backend != "llama":
                 if resolved_device != "cuda" or is_jetson:
                     device_name = "jetson" if is_jetson else resolved_device
-                    reason = f"the megakernel needs a desktop CUDA GPU (resolved device: {device_name})"
+                    reason = f"OpenJet's engine needs a desktop CUDA GPU (resolved device: {device_name})"
                 else:
                     reason = megakernel_unavailable_reason(self.model)
                 if reason is None:
@@ -838,12 +839,12 @@ class LlamaServerClient:
         if outcome == "exited":
             detail = _stderr_detail(stderr_lines)
             self._proc = None
-            raise RuntimeError(f"megakernel server exited: {detail}")
+            raise RuntimeError(f"OpenJet engine server exited: {detail}")
         if outcome == "ready":
             self._emit_diagnostic("runtime_megakernel_start_ready", pid=self._proc.pid, ctx=ctx)
             return
         await self._stop_server()
-        raise TimeoutError("megakernel server did not become ready")
+        raise TimeoutError("OpenJet engine server did not become ready")
 
     async def _spawn_until_healthy(
         self,
@@ -1024,6 +1025,7 @@ class LlamaServerClient:
                 await asyncio.wait_for(self._proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 self._proc.kill()
+                await self._proc.wait()
         self._proc = None
 
     def _resolve_device(self, binary: str | None = None) -> str:

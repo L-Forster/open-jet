@@ -49,7 +49,7 @@ def main() -> int:
         temporary.unlink(missing_ok=True)
         raise SystemExit(
             f"Could not install the OpenJet TUI ({exc}). Install Node.js 22.19+ and Bun, "
-            "then run `cd ui && npm ci --ignore-scripts --legacy-peer-deps && npm run build:binary`."
+            "then run `git submodule update --init ui && python scripts/build_tui.py`."
         ) from exc
     print(f"Installed {local_build}")
     return 0

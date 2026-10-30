@@ -1,0 +1,32 @@
+name: Check benchmark results
+
+on:
+  pull_request:
+    paths:
+      - "benchmarks/community/**"
+      - "scripts/bench_table.py"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate the results files
+        run: python scripts/bench_table.py --check
+      - name: Say whether this is a results-only pull request
+        run: |
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          echo "$changed"
+          if echo "$changed" | grep -qv '^benchmarks/community/[^/]*\.json$'; then
+            echo "Changes files outside benchmarks/community/*.json: review as a normal pull request." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Results-only pull request: only adds or changes files in benchmarks/community/." >> "$GITHUB_STEP_SUMMARY"
+          fi

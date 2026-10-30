@@ -823,7 +823,7 @@ async def run_setup_wizard(
             (_direct_catalog_label(row), row)
             for row in direct_catalog
             if (MODELS_DIR / str(row.get("filename") or "")).is_file()
-            or model_runtime_label(str(row.get("filename") or "")).startswith("OpenJet megakernel")
+            or model_runtime_label(str(row.get("filename") or "")).startswith("OpenJet engine")
             or str(row.get("url") or "") == recommended_url
         ]
         selected_direct = await _prompt_choice(

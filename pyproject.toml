@@ -1,7 +1,7 @@
 [project]
 name = "open-jet"
 version = "0.5.1"
-description = "Local AI coding agent and LLM inference engine with a Python SDK, CUDA acceleration, and support for llama.cpp, Ollama and LM Studio."
+description = "Run Qwen3.8-27B on your own GPU, 1.5x faster than llama.cpp, for Claude Code, Codex, OpenCode, OpenClaw or OpenJet's own coding agent."
 readme = { file = "README.pypi.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 authors = [
@@ -85,7 +85,8 @@ Homepage = "https://openjet.dev/"
 Documentation = "https://github.com/l-forster/open-jet/blob/master/docs/getting-started.md"
 Repository = "https://github.com/l-forster/open-jet"
 Issues = "https://github.com/l-forster/open-jet/issues"
-"OpenJet Engine" = "https://github.com/l-forster/open-jet/tree/master/megakernel"
+"Coding tools" = "https://github.com/l-forster/open-jet/blob/master/docs/clients.md"
+Engine = "https://github.com/l-forster/open-jet/tree/master/megakernel"
 "Python SDK" = "https://github.com/l-forster/open-jet/blob/master/docs/sdk/quickstart.md"
 Benchmarks = "https://github.com/l-forster/open-jet/blob/master/docs/benchmarking.md"
 Discord = "https://discord.gg/pspKHtExSa"

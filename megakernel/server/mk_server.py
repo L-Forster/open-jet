@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""OpenJet Engine: OpenAI-compatible chat server for the Qwen3.8-27B megakernel (a drop-in for the parts of
-llama-server's API that open-jet uses).
+"""OpenJet's Qwen3.8-27B server: OpenAI- and Anthropic-compatible HTTP API in front of the CUDA engine
+(a drop-in for the parts of llama-server's API that open-jet uses).
 
   python3 server/mk_server.py -m model.gguf --port 18080 [--ctx 32768] [--draft 4]
 
@@ -10,6 +10,8 @@ via `tools`), reasoning is returned as `reasoning_content`, Qwen's XML tool call
 `tool_calls`.  Sampling: temperature, top_p, top_k (<= 32), min_p, seed.  Successive requests of a
 conversation reuse the processed tokens: the new prompt is matched against the sequence so far and
 only the rest is prefilled (rewinding to the end of the previous prompt if it diverges after that).
+POST /v1/messages (+ /count_tokens, Anthropic Messages: Claude Code) and POST /v1/responses (OpenAI
+Responses: Codex CLI) are translated to a chat completion and back, streaming or not.
 GET /health, GET /v1/models.  One request at a time.
 """
 import argparse
@@ -161,6 +163,13 @@ class BadRequest(Exception):
     pass
 
 
+class ContextOverflow(BadRequest):
+    def __init__(self, n_prompt, ctx):
+        # llama-server's wording: agent clients (Pi) match it to compact and retry
+        super().__init__(f"the request exceeds the available context size ({n_prompt} prompt tokens, context {ctx})")
+        self.n_prompt, self.ctx = n_prompt, ctx
+
+
 def normalize_messages(messages):
     out = []
     for m in messages:
@@ -282,6 +291,360 @@ class OutputParser:
 
 
 # ---------------------------------------------------------------------------------------------
+# Anthropic Messages and OpenAI Responses, translated to and from a chat completion
+
+IMAGE_PLACEHOLDER = "[image omitted: this model reads text only]"
+# Claude Code stamps its system prompt with a per-request `cch=xxxxx;`, which would end prompt reuse right
+# there (llama.cpp normalises it the same way, ggml-org/llama.cpp#21793)
+CCH_RE = re.compile(r"^(x-anthropic-billing-header:[^\n]*?cch=)[0-9a-f]{5};")
+# the chat template accepts xhigh (its default), medium and low
+EFFORTS = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh"}
+
+
+def _blocks_text(content, text_types=("text",)):
+    """joins the text of a string or a list of content blocks; images become a placeholder"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for b in content:
+        if isinstance(b, str):
+            parts.append(b)
+        elif b.get("type") in text_types:
+            parts.append(b.get("text") or "")
+        elif b.get("type") in ("image", "input_image", "image_url", "document", "input_file"):
+            parts.append(IMAGE_PLACEHOLDER)
+    return "\n".join(p for p in parts if p)
+
+
+def _sampling_fields(body, out):
+    for k in ("temperature", "top_p", "top_k", "stream"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    return out
+
+
+def anthropic_to_chat(body):
+    """Anthropic Messages request -> chat completion request"""
+    msgs = []
+    system = body.get("system")
+    if isinstance(system, list):
+        system = _blocks_text(system)
+    if system:
+        msgs.append({"role": "system", "content": CCH_RE.sub(r"\1fffff;", system)})
+    for m in body.get("messages") or []:
+        role, content = m.get("role"), m.get("content")
+        if isinstance(content, str):
+            msgs.append({"role": role, "content": content})
+            continue
+        text, reasoning, calls = [], [], []
+        for b in content or []:
+            t = b.get("type")
+            if t == "thinking":
+                reasoning.append(b.get("thinking") or "")
+            elif t == "tool_use":
+                calls.append({"id": b.get("id"), "type": "function",
+                              "function": {"name": b.get("name"), "arguments": b.get("input") or {}}})
+            elif t == "tool_result":
+                result = _blocks_text(b.get("content"))
+                msgs.append({"role": "tool", "tool_call_id": b.get("tool_use_id"),
+                             "content": ("Error: " + result) if b.get("is_error") else result})
+            elif t != "redacted_thinking":
+                text.append(_blocks_text([b]))
+        if role == "assistant":
+            msg = {"role": "assistant", "content": "".join(text)}
+            if reasoning:
+                msg["reasoning_content"] = "".join(reasoning)
+            if calls:
+                msg["tool_calls"] = calls
+            msgs.append(msg)
+        elif any(text):
+            msgs.append({"role": role, "content": "\n".join(t for t in text if t)})
+    out = {"messages": msgs, "max_tokens": body.get("max_tokens")}
+    tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description") or "",
+                                                 "parameters": t.get("input_schema") or {"type": "object", "properties": {}}}}
+             for t in body.get("tools") or [] if t.get("name") and (t.get("input_schema") or t.get("type") in (None, "custom"))]
+    if tools:
+        out["tools"] = tools
+    thinking = (body.get("thinking") or {}).get("type")
+    if thinking:
+        out["chat_template_kwargs"] = {"enable_thinking": thinking != "disabled"}
+    return _sampling_fields(body, out)
+
+
+def _call_args(call):
+    try:
+        args = json.loads(call["function"]["arguments"] or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    return args if isinstance(args, dict) else {}
+
+
+def anthropic_tool_use(call):
+    return {"type": "tool_use", "id": "toolu_" + call["id"].removeprefix("call_"), "name": call["function"]["name"],
+            "input": _call_args(call)}
+
+
+ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
+
+
+def anthropic_usage(usage):
+    cached = usage["prompt_tokens_details"]["cached_tokens"]
+    return {"input_tokens": usage["prompt_tokens"] - cached, "cache_read_input_tokens": cached,
+            "cache_creation_input_tokens": 0, "output_tokens": usage["completion_tokens"]}
+
+
+def anthropic_message(mid, model, reasoning, content, calls, finish, usage):
+    blocks = []
+    if reasoning:
+        blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+    if content:
+        blocks.append({"type": "text", "text": content})
+    blocks += [anthropic_tool_use(c) for c in calls]
+    return {"id": mid, "type": "message", "role": "assistant", "model": model, "content": blocks,
+            "stop_reason": ANTHROPIC_STOP.get(finish, "end_turn"), "stop_sequence": None, "usage": anthropic_usage(usage)}
+
+
+class AnthropicStream:
+    """Anthropic SSE events for one message; send(event, data) writes one event"""
+
+    def __init__(self, send, mid, model):
+        self.send, self.mid, self.model = send, mid, model
+        self.index, self.kind = -1, None
+
+    def start(self, n_prompt, reused):
+        usage = {"input_tokens": n_prompt - reused, "cache_read_input_tokens": reused,
+                 "cache_creation_input_tokens": 0, "output_tokens": 0}
+        self.send("message_start", {"type": "message_start", "message": {
+            "id": self.mid, "type": "message", "role": "assistant", "model": self.model, "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": usage}})
+
+    def _close(self):
+        if self.kind == "reasoning":
+            self.send("content_block_delta", {"type": "content_block_delta", "index": self.index,
+                                              "delta": {"type": "signature_delta", "signature": ""}})
+        if self.kind is not None:
+            self.send("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        self.kind = None
+
+    def _open(self, block):
+        self.index += 1
+        self.send("content_block_start", {"type": "content_block_start", "index": self.index, "content_block": block})
+
+    def delta(self, kind, text):
+        if kind != self.kind:
+            self._close()
+            self._open({"type": "thinking", "thinking": "", "signature": ""} if kind == "reasoning"
+                       else {"type": "text", "text": ""})
+            self.kind = kind
+        delta = {"type": "thinking_delta", "thinking": text} if kind == "reasoning" else {"type": "text_delta", "text": text}
+        self.send("content_block_delta", {"type": "content_block_delta", "index": self.index, "delta": delta})
+
+    def finish(self, finish, calls, usage):
+        self._close()
+        for c in calls:
+            block = anthropic_tool_use(c)
+            args = json.dumps(block["input"], ensure_ascii=False)
+            self._open({**block, "input": {}})
+            self.send("content_block_delta", {"type": "content_block_delta", "index": self.index,
+                                              "delta": {"type": "input_json_delta", "partial_json": args}})
+            self.send("content_block_stop", {"type": "content_block_stop", "index": self.index})
+        self.send("message_delta", {"type": "message_delta",
+                                    "delta": {"stop_reason": ANTHROPIC_STOP.get(finish, "end_turn"), "stop_sequence": None},
+                                    "usage": anthropic_usage(usage)})
+        self.send("message_stop", {"type": "message_stop"})
+
+
+def responses_to_chat(body, warn=lambda key, msg: None):
+    """OpenAI Responses request -> chat completion request. Custom (freeform) tools become functions with a
+    single string argument `input`."""
+    if body.get("previous_response_id"):
+        raise BadRequest("previous_response_id is not supported: send the whole conversation in `input`")
+    msgs = []
+    if body.get("instructions"):
+        msgs.append({"role": "system", "content": body["instructions"]})
+    items = body.get("input")
+    if isinstance(items, str):
+        items = [{"role": "user", "content": items}]
+    reasoning = None
+    text_types = ("input_text", "output_text", "text", "refusal")
+
+    def assistant():
+        nonlocal reasoning
+        last = msgs[-1] if msgs else None
+        if last is not None and last["role"] == "assistant" and reasoning is None:
+            return last
+        msg = {"role": "assistant", "content": ""}
+        if reasoning is not None:
+            msg["reasoning_content"] = reasoning
+            reasoning = None
+        msgs.append(msg)
+        return msg
+
+    for item in items or []:
+        t = item.get("type") or ("message" if "role" in item else None)
+        if t == "message":
+            role = "system" if item.get("role") == "developer" else item.get("role")
+            text = _blocks_text(item.get("content"), text_types)
+            if role == "assistant":
+                msg = assistant()
+                msg["content"] += text
+            else:
+                msgs.append({"role": role, "content": text})
+        elif t in ("function_call", "custom_tool_call"):
+            args = item.get("arguments") if t == "function_call" else {"input": item.get("input") or ""}
+            assistant().setdefault("tool_calls", []).append(
+                {"id": item.get("call_id"), "type": "function", "function": {"name": item.get("name"), "arguments": args}})
+        elif t in ("function_call_output", "custom_tool_call_output"):
+            msgs.append({"role": "tool", "tool_call_id": item.get("call_id"),
+                         "content": _blocks_text(item.get("output"), text_types)})
+        elif t == "reasoning":
+            reasoning = _blocks_text(item.get("content"), ("reasoning_text",)) or \
+                _blocks_text(item.get("summary"), ("summary_text",))
+        else:
+            warn(f"item:{t}", f"Responses input item type {t!r} is not supported and is skipped")
+    out = {"messages": msgs, "max_tokens": body.get("max_output_tokens")}
+    tools = []
+    for t in body.get("tools") or []:
+        if t.get("type") == "function":
+            fn = {k: t[k] for k in ("name", "description", "parameters") if k in t}
+            tools.append({"type": "function", "function": fn})
+        elif t.get("type") == "custom":
+            desc = (t.get("description") or "") + "\nPass the raw input as the `input` string."
+            tools.append({"type": "function", "function": {
+                "name": t["name"], "description": desc.strip(),
+                "parameters": {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}}})
+        else:
+            warn(f"tool:{t.get('type')}", f"Responses tool type {t.get('type')!r} is not supported and is skipped")
+    if tools:
+        out["tools"] = tools
+    effort = (body.get("reasoning") or {}).get("effort")
+    if effort == "none":
+        out["chat_template_kwargs"] = {"enable_thinking": False}
+    elif effort in EFFORTS:
+        out["chat_template_kwargs"] = {"reasoning_effort": EFFORTS[effort]}
+    return _sampling_fields(body, out)
+
+
+def responses_tool_item(call, custom):
+    """a chat tool call -> a Responses output item (a custom_tool_call for the tools in `custom`)"""
+    cid, name = call["id"], call["function"]["name"]
+    if name in custom:
+        return {"type": "custom_tool_call", "id": "ctc_" + cid.removeprefix("call_"), "call_id": cid, "name": name,
+                "input": str(_call_args(call).get("input", "")), "status": "completed"}
+    return {"type": "function_call", "id": "fc_" + cid.removeprefix("call_"), "call_id": cid, "name": name,
+            "arguments": call["function"]["arguments"], "status": "completed"}
+
+
+def responses_usage(usage):
+    return {"input_tokens": usage["prompt_tokens"], "input_tokens_details": usage["prompt_tokens_details"],
+            "output_tokens": usage["completion_tokens"], "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": usage["total_tokens"]}
+
+
+def response_object(rid, model, created, output, finish=None, usage=None):
+    obj = {"id": rid, "object": "response", "created_at": created, "model": model, "output": output,
+           "status": "in_progress" if finish is None else "incomplete" if finish == "length" else "completed",
+           "incomplete_details": {"reason": "max_output_tokens"} if finish == "length" else None,
+           "parallel_tool_calls": True, "tool_choice": "auto", "tools": []}
+    if usage is not None:
+        obj["usage"] = responses_usage(usage)
+    return obj
+
+
+def _reasoning_item(rid, text):
+    return {"type": "reasoning", "id": rid, "summary": [], "content": [{"type": "reasoning_text", "text": text}]}
+
+
+def _message_item(mid, text, status="completed"):
+    return {"type": "message", "id": mid, "status": status, "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}] if text is not None else []}
+
+
+def responses_output(reasoning, content, calls, custom):
+    out = []
+    if reasoning:
+        out.append(_reasoning_item("rs_" + uuid.uuid4().hex, reasoning))
+    if content:
+        out.append(_message_item("msg_" + uuid.uuid4().hex, content))
+    return out + [responses_tool_item(c, custom) for c in calls]
+
+
+class ResponsesStream:
+    """OpenAI Responses SSE events for one response; send(event, data) writes one event"""
+
+    def __init__(self, send, rid, model, custom):
+        self.send, self.rid, self.model, self.custom = send, rid, model, custom
+        self.created, self.seq = int(time.time()), 0
+        self.output, self.kind, self.item, self.text = [], None, None, []
+
+    def _send(self, event, **data):
+        data = {"type": event, "sequence_number": self.seq, **data}
+        self.seq += 1
+        self.send(event, data)
+
+    def start(self, n_prompt, reused):
+        response = response_object(self.rid, self.model, self.created, [])
+        self._send("response.created", response=response)
+        self._send("response.in_progress", response=response)
+
+    def _close(self):
+        if self.kind is None:
+            return
+        text, i = "".join(self.text), len(self.output)
+        if self.kind == "reasoning":
+            item = _reasoning_item(self.item, text)
+            self._send("response.reasoning_text.done", item_id=self.item, output_index=i, content_index=0, text=text)
+        else:
+            item = _message_item(self.item, text)
+            part = item["content"][0]
+            self._send("response.output_text.done", item_id=self.item, output_index=i, content_index=0, text=text)
+            self._send("response.content_part.done", item_id=self.item, output_index=i, content_index=0, part=part)
+        self._send("response.output_item.done", output_index=i, item=item)
+        self.output.append(item)
+        self.kind, self.text = None, []
+
+    def delta(self, kind, text):
+        i = len(self.output)
+        if kind != self.kind:
+            self._close()
+            i = len(self.output)
+            self.kind = kind
+            if kind == "reasoning":
+                self.item = "rs_" + uuid.uuid4().hex
+                self._send("response.output_item.added", output_index=i,
+                           item={"type": "reasoning", "id": self.item, "summary": [], "content": []})
+            else:
+                self.item = "msg_" + uuid.uuid4().hex
+                self._send("response.output_item.added", output_index=i, item=_message_item(self.item, None, "in_progress"))
+                self._send("response.content_part.added", item_id=self.item, output_index=i, content_index=0,
+                           part={"type": "output_text", "text": "", "annotations": []})
+        self.text.append(text)
+        event = "response.reasoning_text.delta" if kind == "reasoning" else "response.output_text.delta"
+        self._send(event, item_id=self.item, output_index=i, content_index=0, delta=text)
+
+    def finish(self, finish, calls, usage):
+        self._close()
+        for c in calls:
+            item, i = responses_tool_item(c, self.custom), len(self.output)
+            self._send("response.output_item.added", output_index=i, item={**item, "status": "in_progress",
+                       **({"input": ""} if item["type"] == "custom_tool_call" else {"arguments": ""})})
+            if item["type"] == "custom_tool_call":
+                self._send("response.custom_tool_call_input.delta", item_id=item["id"], output_index=i, delta=item["input"])
+                self._send("response.custom_tool_call_input.done", item_id=item["id"], output_index=i, input=item["input"])
+            else:
+                self._send("response.function_call_arguments.delta", item_id=item["id"], output_index=i,
+                           delta=item["arguments"])
+                self._send("response.function_call_arguments.done", item_id=item["id"], output_index=i,
+                           arguments=item["arguments"])
+            self._send("response.output_item.done", output_index=i, item=item)
+            self.output.append(item)
+        response = response_object(self.rid, self.model, self.created, self.output, finish, usage)
+        self._send("response.incomplete" if finish == "length" else "response.completed", response=response)
+
+
+# ---------------------------------------------------------------------------------------------
 
 
 class Server:
@@ -371,22 +734,25 @@ class Server:
         else:
             self.eng.set_sampling(temp, top_p, top_k, min_p, seed)
 
-    def generate(self, body, emit):
+    def generate(self, body, emit, on_prompt=None):
         """runs one chat completion; emit(kind, payload) is called with ('reasoning'|'content', text) deltas.
-        Returns (finish_reason, tool_calls, usage). emit returning False aborts."""
+        on_prompt(prompt tokens, reused tokens) is called once the prompt is processed, before the first delta.
+        Returns (finish_reason, tool_calls, usage, timings). emit returning False aborts."""
         text, thinking = self.render(body)
         toks = self.eng.tokenize(text)
         max_new = body.get("max_tokens") or body.get("max_completion_tokens") or body.get("n_predict") or -1
         max_new = int(max_new)
         limit = self.args.ctx - len(toks) - 16
         if limit <= 0:
-            raise BadRequest(f"prompt of {len(toks)} tokens does not fit the context of {self.args.ctx}")
+            raise ContextOverflow(len(toks), self.args.ctx)
         max_new = limit if max_new <= 0 else min(max_new, limit)
         tools = body.get("tools") or []
         self.sampling(body)
         t0 = time.time()
         tok, reused = self.load_prompt(toks)
         t1 = time.time()
+        if on_prompt is not None:
+            on_prompt(len(toks), reused)
         parser = OutputParser(thinking, tools)
         dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         n_gen, finish, pending, aborted = 0, "length", [tok], False
@@ -443,35 +809,130 @@ def make_handler(srv):
             else:
                 self._json(404, {"error": {"message": "not found", "type": "not_found_error"}})
 
+        def _error(self, code, kind, message, anthropic):
+            if anthropic:
+                self._json(code, {"type": "error", "error": {"type": kind, "message": message}})
+            else:
+                self._json(code, {"error": {"message": message, "type": kind}})
+
         def do_POST(self):
             path = self.path.split("?")[0]
             n = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(n) if n else b""
-            if path not in ("/v1/chat/completions", "/chat/completions"):
-                self._json(404 if not path.startswith("/slots") else 501,
-                           {"error": {"message": f"{path} is not supported by the megakernel server", "type": "not_supported"}})
+            routes = {"/v1/chat/completions": self._chat, "/chat/completions": self._chat,
+                      "/v1/messages": self._messages, "/v1/messages/count_tokens": self._count_tokens,
+                      "/v1/responses": self._responses, "/responses": self._responses}
+            anthropic = path.startswith("/v1/messages")
+            if path not in routes:
+                self._error(404 if not path.startswith("/slots") else 501, "not_supported",
+                            f"{path} is not supported by the OpenJet engine server", anthropic)
                 return
             try:
                 body = json.loads(raw or b"{}")
             except json.JSONDecodeError:
-                self._json(400, {"error": {"message": "invalid JSON", "type": "invalid_request_error"}})
+                self._error(400, "invalid_request_error", "invalid JSON", anthropic)
                 return
+            if path == "/v1/messages/count_tokens":  # tokenizer only: does not wait for a running generation
+                try:
+                    self._count_tokens(body)
+                except BadRequest as e:
+                    self._error(400, "invalid_request_error", str(e), True)
+                return
+            self._sse_started = False
             with srv.lock:
                 try:
-                    if body.get("stream"):
-                        self._stream(body)
-                    else:
-                        self._complete(body)
+                    routes[path](body)
                 except BadRequest as e:
-                    self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
+                    if anthropic and isinstance(e, ContextOverflow):  # Claude Code compacts on this wording
+                        e = BadRequest(f"prompt is too long: {e.n_prompt} tokens > {e.ctx} maximum")
+                    self._fail(400, "invalid_request_error", str(e), anthropic)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 except Exception as e:  # engine failure: report it, keep serving
                     log("error:", repr(e))
                     try:
-                        self._json(500, {"error": {"message": str(e), "type": "server_error"}})
+                        self._fail(500, "api_error" if anthropic else "server_error", str(e), anthropic)
                     except Exception:
                         pass
+
+        def _fail(self, code, kind, message, anthropic):
+            """an error response, or an error event when an Anthropic / Responses stream has started"""
+            if not self._sse_started:
+                self._error(code, kind, message, anthropic)
+            else:
+                self._sse("error", {"type": "error", "error": {"type": kind, "message": message}} if anthropic
+                          else {"type": "error", "code": kind, "message": message, "param": None})
+                self._sse_end()
+
+        # Server-sent events with chunked transfer encoding, for /v1/messages and /v1/responses
+
+        def _sse_head(self):
+            if not self._sse_started:
+                self._sse_started = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+
+        def _sse(self, event, obj):
+            self._sse_head()
+            data = f"event: {event}\ndata: ".encode() + json.dumps(obj, ensure_ascii=False).encode() + b"\n\n"
+            self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+            self.wfile.flush()
+
+        def _sse_end(self):
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+
+        def _run_stream(self, chat, stream):
+            """runs `chat` through a protocol stream (AnthropicStream / ResponsesStream)"""
+            def emit(kind, text):
+                try:
+                    stream.delta(kind, text)
+                except (BrokenPipeError, ConnectionResetError):
+                    return False
+                return True
+            finish, calls, usage, _ = srv.generate(chat, emit, on_prompt=stream.start)
+            stream.finish(finish, calls, usage)
+            self._sse_end()
+
+        def _collect(self, chat):
+            parts = {"reasoning": [], "content": []}
+            finish, calls, usage, timings = srv.generate(chat, lambda k, t: parts[k].append(t))
+            return "".join(parts["reasoning"]).strip(), "".join(parts["content"]), calls, finish, usage, timings
+
+        def _messages(self, body):
+            chat = anthropic_to_chat(body)
+            mid = "msg_" + uuid.uuid4().hex
+            if body.get("stop_sequences"):
+                srv.warn_once("stop_sequences", "stop_sequences is not supported by the OpenJet engine and is ignored")
+            if chat.get("stream"):
+                self._run_stream(chat, AnthropicStream(self._sse, mid, srv.model_id))
+                return
+            reasoning, content, calls, finish, usage, _ = self._collect(chat)
+            self._json(200, anthropic_message(mid, srv.model_id, reasoning, content, calls, finish, usage))
+
+        def _count_tokens(self, body):
+            text, _ = srv.render(anthropic_to_chat(body))
+            self._json(200, {"input_tokens": len(srv.eng.tokenize(text))})
+
+        def _responses(self, body):
+            chat = responses_to_chat(body, srv.warn_once)
+            custom = {t["name"] for t in body.get("tools") or [] if t.get("type") == "custom"}
+            rid = "resp_" + uuid.uuid4().hex
+            if chat.get("stream"):
+                self._run_stream(chat, ResponsesStream(self._sse, rid, srv.model_id, custom))
+                return
+            reasoning, content, calls, finish, usage, _ = self._collect(chat)
+            output = responses_output(reasoning, content, calls, custom)
+            self._json(200, response_object(rid, srv.model_id, int(time.time()), output, finish, usage))
+
+        def _chat(self, body):
+            if body.get("stream"):
+                self._stream(body)
+            else:
+                self._complete(body)
 
         def _complete(self, body):
             parts = {"reasoning": [], "content": []}
@@ -536,7 +997,7 @@ def make_handler(srv):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="OpenJet Engine: CUDA inference for Qwen3.8-27B with an OpenAI-compatible HTTP API."
+        description="OpenJet: CUDA inference for Qwen3.8-27B with OpenAI- and Anthropic-compatible HTTP APIs."
     )
     ap.add_argument("-m", "--model", required=True)
     ap.add_argument("--host", default="127.0.0.1")
@@ -544,7 +1005,7 @@ def main():
     ap.add_argument("-c", "--ctx", type=int, default=32768)
     ap.add_argument("-d", "--draft", type=int, default=4)
     ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
-    ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "libqwen38mk.so"))
+    ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "qwen38mk.dll" if os.name == "nt" else "libqwen38mk.so"))
     ap.add_argument("--kv", choices=["auto", "f16", "q8"], default="auto",
                     help="KV cache format (auto: q8_0 only when the fp16 cache does not fit)")
     args = ap.parse_args()

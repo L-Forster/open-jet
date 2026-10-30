@@ -63,6 +63,8 @@ def create_runtime_client(
     cfg: dict,
     *,
     diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
+    host: str = "127.0.0.1",
+    port: int = 18080,
 ) -> RuntimeClient:
     runtime = active_runtime(cfg)
     if runtime == CODEX_RUNTIME:
@@ -105,6 +107,8 @@ def create_runtime_client(
     return LlamaServerClient(
         model=model,
         binary=str(cfg.get("llama_server_path") or "") or None,
+        host=host,
+        port=port,
         context_window_tokens=int(cfg.get("context_window_tokens", 2048)),
         device=str(cfg.get("device", "auto")),
         gpu_layers=int(cfg.get("gpu_layers", 99)),

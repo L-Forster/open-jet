@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import struct
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -48,6 +49,7 @@ class EnsureMegakernelTests(unittest.TestCase):
             mock.patch.object(mb, "_megakernel_gpu_info", return_value=("0", "8.9")),
             mock.patch.object(mb, "_nvcc_path", return_value="/usr/local/cuda/bin/nvcc"),
             mock.patch.object(mb, "LLAMA_CPP_DIR", self.llama),
+            mock.patch.object(mb, "install_prebuilt_megakernel", mock.AsyncMock(return_value=False)),
         ]
         for patch in self.patches:
             patch.start()
@@ -126,6 +128,97 @@ class EnsureMegakernelTests(unittest.TestCase):
             changed = (self.root / "libqwen38mk.so").stat().st_mtime + 1
             os.utime(header, (changed, changed))
             self.assertFalse(mb._build_is_current(self.root, "sm_89"))
+
+
+class PrebuiltMegakernelTests(unittest.TestCase):
+    """an installed wheel downloads the engine for its GPU instead of compiling it"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.model = str(base / Path(MODEL).name)
+        types = {"token_embd.weight": 12, "output.weight": 14}
+        with open(self.model, "wb") as f:
+            f.write(b"GGUF" + struct.pack("<IQQ", 3, len(types), 0))
+            for name, kind in types.items():
+                name = name.encode()
+                f.write(struct.pack("<Q", len(name)) + name + struct.pack("<IQIQ", 1, 256, kind, 0))
+        self.root = base / "site-packages" / "megakernel"
+        (self.root / "server").mkdir(parents=True)
+        for name in ("Makefile", "draft_vocab_32k.bin", "server/mk_server.py"):
+            (self.root / name).write_text("")
+        self.archive = base / "engine.tar.gz"
+        staged = base / "staged"
+        staged.mkdir()
+        for name in ("libqwen38mk.so", "libqwen38mk_mixed.so", "libllama.so.0.0.1"):
+            (staged / name).write_text(name)
+        os.symlink("libllama.so.0.0.1", staged / "libllama.so.0")
+        with tarfile.open(self.archive, "w:gz") as tf:
+            for entry in staged.iterdir():
+                tf.add(entry, arcname=entry.name)
+        self.urls: list[str] = []
+        self.patches = [
+            mock.patch.object(mb.sys, "platform", "linux"),
+            mock.patch.object(mb.platform, "machine", return_value="x86_64"),
+            mock.patch.object(mb, "_openjet_version", return_value="0.6.0"),
+            mock.patch.object(mb, "_megakernel_root", return_value=self.root),
+            mock.patch("src.llama_server._megakernel_root", return_value=self.root),
+            mock.patch.object(mb, "_megakernel_gpu_info", return_value=("0", "8.6")),
+            mock.patch.object(mb, "_nvcc_path", return_value=None),
+            mock.patch.object(mb, "_download_to_path", side_effect=self._download),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self) -> None:
+        for patch in reversed(self.patches):
+            patch.stop()
+        self.tmp.cleanup()
+
+    async def _download(self, url, target, **_kwargs):
+        self.urls.append(url)
+        if self.archive is None:
+            raise RuntimeError("Client error '404 Not Found'")
+        target.write_bytes(self.archive.read_bytes())
+
+    def test_downloads_this_releases_engine_without_the_cuda_toolkit(self) -> None:
+        log = _Log()
+        with mock.patch.object(mb, "_run_exec") as run:
+            _run({"llama_model": self.model}, log)
+        run.assert_not_called()
+        self.assertEqual(self.urls, ["https://github.com/L-Forster/open-jet/releases/download/v0.6.0/"
+                                     "openjet-engine-linux-x64-sm86.tar.gz"])
+        self.assertTrue((self.root / "libqwen38mk.so").is_file())
+        self.assertEqual(os.readlink(self.root / "libllama.so.0"), "libllama.so.0.0.1")
+        for tag in (".openjet-build.json", ".openjet-build-mixed.json"):
+            self.assertEqual(json.loads((self.root / tag).read_text()), {"arch": "sm_86", "prebuilt": "0.6.0"})
+        self.assertIn("OpenJet engine installed", log.lines[-1])
+        # current until the next release, whatever the source mtimes
+        self.assertTrue(mb._build_is_current(self.root, "sm_86", self.model))
+        with mock.patch.object(mb, "_openjet_version", return_value="0.6.1"):
+            self.assertFalse(mb._build_is_current(self.root, "sm_86", self.model))
+
+    def test_a_release_without_the_engine_falls_back_to_compiling(self) -> None:
+        self.archive = None
+        log = _Log()
+        _run({"llama_model": self.model}, log)
+        self.assertEqual(len(self.urls), 1)
+        self.assertIn("No prebuilt engine for sm_86 in v0.6.0", log.lines[0])
+        self.assertIn("CUDA toolkit not found", log.lines[-1])
+
+    def test_a_source_checkout_compiles_its_own_engine(self) -> None:
+        (self.root.parent / ".git").mkdir()
+        _run({"llama_model": self.model}, _Log())
+        self.assertEqual(self.urls, [])
+
+    def test_windows_uses_the_prebuilt_dll_and_never_compiles(self) -> None:
+        self.archive = None
+        log = _Log()
+        with mock.patch.object(mb.sys, "platform", "win32"), mock.patch.object(mb, "_run_exec") as run:
+            _run({"llama_model": self.model}, log)
+        run.assert_not_called()
+        self.assertTrue(self.urls[0].endswith("/openjet-engine-windows-x64-sm86.zip"))
+        self.assertIn("no prebuilt engine for sm_86", log.lines[-1])
 
 
 if __name__ == "__main__":

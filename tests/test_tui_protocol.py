@@ -138,6 +138,15 @@ class ProtocolServerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProtocolEncodingTests(unittest.TestCase):
+    def test_harness_schema_copy_matches(self) -> None:
+        harness_copy = Path("ui/protocol/openjet-tui-v1.schema.json")
+        if not harness_copy.is_file():
+            self.skipTest("ui submodule is not checked out")
+        self.assertEqual(
+            json.loads(harness_copy.read_text(encoding="utf-8")),
+            json.loads(Path("protocol/openjet-tui-v1.schema.json").read_text(encoding="utf-8")),
+        )
+
     def test_schema_is_valid_json_and_pins_v1(self) -> None:
         with open("protocol/openjet-tui-v1.schema.json", encoding="utf-8") as handle:
             schema = json.load(handle)
@@ -325,7 +334,7 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["piModel"]["id"], "gpt-5.6-terra")
         self.assertEqual(payload["piModel"]["thinkingLevel"], "high")
         self.assertFalse(payload["localReasoning"])
-        self.assertFalse(payload["localModel"]["reasoning"])
+        self.assertEqual(payload["localModel"]["thinkingLevel"], "off")
         self.assertTrue(payload["agentChanged"])
 
     async def test_model_command_selects_gpt_6_astra_for_codex(self) -> None:
@@ -460,6 +469,8 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(model)
         self.assertEqual(model["nativeContextWindow"], 262144)
         self.assertEqual(model["maxTokens"], 131072)
+        self.assertEqual(model["thinkingLevel"], "medium")
+        self.assertEqual(model["input"], ["text"])
         self.assertEqual(
             model["samplingParams"],
             {
@@ -488,6 +499,24 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model["contextWindow"], 80000)
         self.assertEqual(model["maxTokens"], 75904)
 
+    def test_pi_context_window_follows_the_served_context(self) -> None:
+        self.controller.cfg.update(
+            {
+                "runtime": "llama_cpp",
+                "llama_model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
+                "context_window_tokens": 262144,
+            }
+        )
+        self.controller.runtime_client = SimpleNamespace(
+            base_url="http://127.0.0.1:18080", context_window_tokens=65536
+        )
+
+        model = self.controller._pi_model()
+
+        self.assertIsNotNone(model)
+        self.assertEqual(model["contextWindow"], 65536)
+        self.assertEqual(model["maxTokens"], 65536 - 4096)
+
     async def test_qwen38_reasoning_off_uses_instruct_defaults(self) -> None:
         self.controller.cfg.update(
             {
@@ -502,9 +531,11 @@ class ServiceControllerTests(unittest.IsolatedAsyncioTestCase):
         model = result["payload"]["piModel"]
 
         self.assertTrue(result["payload"]["modelChanged"])
-        self.assertFalse(model["reasoning"])
+        # Thinking stays advertised so Pi sends enable_thinking=false to the template.
+        self.assertTrue(model["reasoning"])
+        self.assertEqual(model["thinkingLevel"], "off")
         self.assertEqual(
-            model["samplingParams"],
+            model["samplingParamsByThinkingLevel"]["off"],
             {
                 "temperature": 0.7,
                 "top_p": 0.8,

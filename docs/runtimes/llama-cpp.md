@@ -2,8 +2,8 @@
 
 `openjet` uses `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) as its local/offline inference backend.
 
-OpenJet can also use its specialised [OpenJet Engine](../../megakernel/README.md)
-for supported Qwen3.8-27B models. Its README covers standalone installation and the HTTP API.
+For supported Qwen3.8-27B models OpenJet uses [its own engine](../../megakernel/README.md) instead.
+Its README covers standalone installation and the HTTP API.
 
 Pre-built binaries are available for x86, while Jetson/ARM64 commonly requires source build with device-appropriate flags.
 
@@ -15,7 +15,7 @@ Use the deployment-specific build guides:
 
 The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/bin/`.
 
-## OpenJet Engine backend (RTX 30/40/50 series)
+## OpenJet's engine (RTX 30/40/50 series)
 
 For one specific setup, Qwen3.8-27B Q4_K_M on an RTX 30, 40 or 50-series GPU with 24 GB+ (sm_86, sm_89,
 sm_120), OpenJet ships a
@@ -24,17 +24,20 @@ instead of `llama-server`. Turing (sm_75) is supported experimentally for Q4_K_M
 [Turing (RTX 8000)](../../megakernel/README.md#turing-rtx-8000). Measured on an RTX 3090 against
 `llama-server` with OpenJet's flags:
 
-| | llama.cpp | megakernel |
+| | llama.cpp | OpenJet |
 |---|---|---|
 | reasoning mode, OpenJet's thinking preset (decode) | 51 tok/s | 78 tok/s (1.5x) |
 | greedy decode, chat prompts (mean) | 63 tok/s | 107 tok/s (1.7x) |
 | prompt processing, 2-8K tokens | 1050-1140 tok/s | 1530-1600 tok/s (1.3-1.5x) |
 | pasting a 12K-token file into the next turn | 10.5 s | 8.1 s |
 
-`openjet setup` builds it when it selects this model on a supported GPU: it compiles the megakernel
-source that ships in the wheel for that GPU's architecture, against the CUDA `llama.cpp` build setup
-makes (for its tokenizer). That needs the CUDA toolkit (`nvcc`) and takes about 2 minutes; without
-it, setup says so and OpenJet uses `llama-server`. In a source checkout you can also build by hand:
+`openjet setup` installs it when it selects this model on a supported GPU. An installed wheel
+downloads the engine prebuilt for that GPU's architecture from the matching GitHub release, which
+needs only the NVIDIA driver. A source checkout, or a release without a matching archive, compiles
+the engine source for that architecture against the CUDA `llama.cpp` build setup makes (for its
+tokenizer). That needs the CUDA toolkit (`nvcc`) and takes about 2 minutes; without it, setup says
+so and OpenJet uses `llama-server`. On Windows the engine only comes prebuilt. In a source checkout
+you can also build by hand:
 
 ```bash
 cd megakernel && make
@@ -52,7 +55,8 @@ sm_120 with at least 23 GB and `jinja2` is installed; in every other case, or if
 it starts `llama-server` as usual. `llama_backend: llama` turns it off, `llama_backend: megakernel`
 makes it required. `OPENJET_MEGAKERNEL_DIR` points at a megakernel build elsewhere.
 
-The server speaks the parts of the OpenAI API OpenJet uses: streaming chat completions rendered with
+The server speaks OpenAI Chat Completions and Responses and Anthropic Messages (see
+[Coding tools](../clients.md)). For OpenJet's agent: streaming chat completions rendered with
 the model's own chat template, reasoning as `reasoning_content`, tool calls as structured
 `tool_calls`, and reuse of the processed conversation between turns. Differences from
 `llama-server`:

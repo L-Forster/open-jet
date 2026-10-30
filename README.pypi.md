@@ -1,77 +1,66 @@
-# OpenJet — Local AI Coding Agent and LLM Inference Engine
+# OpenJet: run Qwen3.8-27B on your own GPU, 1.5x faster than llama.cpp
 
-OpenJet is an open-source, self-hosted AI coding assistant and local LLM runtime. Run a
-coding agent in your terminal with llama.cpp, Ollama or LM Studio, embed an on-device model
-with the Python SDK, or serve Qwen3.8-27B with the standalone CUDA inference engine.
-
-The `open-jet` Python package installs the `openjet` CLI, `openjet.sdk` and the
-`openjet-engine` server. Local mode needs no account, API key or hosted service.
-Once your model is installed, it works offline.
+OpenJet sets up Qwen3.8-27B, or another open model that fits your hardware, and serves it to your
+coding tools: Claude Code, Codex, OpenCode, OpenClaw, OpenJet's own terminal agent, or your
+application. On NVIDIA RTX 30, 40 and 50-series GPUs with 24 GB, it serves Qwen3.8-27B with its own
+CUDA engine. Local mode needs no account, API key or hosted service, and works offline once the
+model is installed.
 
 [GitHub repository](https://github.com/l-forster/open-jet) ·
 [Documentation](https://github.com/l-forster/open-jet/blob/master/docs/getting-started.md) ·
-[OpenJet Engine](https://github.com/l-forster/open-jet/tree/master/megakernel) ·
+[Coding tools](https://github.com/l-forster/open-jet/blob/master/docs/clients.md) ·
+[How the engine works](https://github.com/l-forster/open-jet/tree/master/megakernel) ·
 [Discord](https://discord.gg/pspKHtExSa)
 
-Install from PyPI:
+| RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
+|---|---|---|
+| Reasoning mode (what coding agents use) | 51 tok/s | **78 tok/s** (1.5x) |
+| Greedy, average of 4 prompts | 63 tok/s | **107 tok/s** (1.7x) |
+| Greedy, writing code | 73 tok/s | **140 tok/s** (1.9x) |
+| Reading your prompt, 2-8K tokens | 1050-1140 tok/s | **1530-1600 tok/s** |
 
-```bash
-pip install open-jet
-```
-
-## Local AI coding assistant, inference server and Python SDK
-
-- **Terminal coding agent** — read and edit files, run approved shell commands, use MCP
-  tools, and resume sessions on your machine.
-- **Hardware-aware setup** — detect GPU and memory, download a GGUF model that fits,
-  and configure local inference without assembling a separate AI stack.
-- **Local server support** — connect to Ollama, LM Studio, llama.cpp and other
-  OpenAI-compatible servers.
-- **CUDA inference engine** — serve Qwen3.8-27B on supported NVIDIA RTX GPUs through
-  the standalone OpenJet Engine, with an HTTP API for your own applications.
-- **Python SDK** — embed local LLM inference, provision on-device models at build time,
-  and automate agent sessions.
-- **Benchmarking tools** — measure prompt processing and generation on your hardware.
+Each figure is one conversation on one RTX 3090. llama.cpp runs with OpenJet's flags, including
+MTP speculative decoding.
 
 ## Quick Start
 
-Use your coding agent to install OpenJet. Paste this into Codex, Claude Code, or another agent with terminal access:
+```bash
+pipx install open-jet
+openjet setup      # finds your GPU, downloads the model and OpenJet's engine
+openjet            # OpenJet's own coding agent
+```
+
+Or serve the model to the coding tool you already use:
+
+```bash
+openjet serve                     # OpenAI and Anthropic APIs on http://127.0.0.1:8080
+openjet connect claude-code       # or codex, opencode, openclaw
+```
+
+| Tool | API | Set up with |
+|---|---|---|
+| Claude Code | Anthropic Messages (`/v1/messages`) | `openjet connect claude-code` |
+| Codex CLI | OpenAI Responses (`/v1/responses`) | `openjet connect codex` |
+| OpenCode | OpenAI Chat Completions | `openjet connect opencode` |
+| OpenClaw | OpenAI Chat Completions | `openjet connect openclaw` |
+
+Or paste this into Claude Code, Codex or another agent with terminal access:
 
 > Install OpenJet on this machine by following https://github.com/l-forster/open-jet/blob/master/docs/agent-install.md. Inspect my hardware, choose a suitable local coding model, configure it without the setup wizard, verify inference works, and tell me how to use OpenJet.
 
-Your agent checks GPU and memory, downloads a model that fits, and verifies the local runtime. [Agent installation instructions](https://github.com/l-forster/open-jet/blob/master/docs/agent-install.md).
-
-For manual installation:
-
-```bash
-pip install open-jet
-openjet setup
-openjet
-```
-
 To accept the hardware recommendation without the wizard, run `openjet setup --yes`.
 
-`openjet setup` detects your hardware, picks a model that fits your RAM, downloads it, and gets everything running. Already have a `.gguf`? It finds that too.
+## What you need
 
-Recommended hardware: Apple silicon with 24GB+ unified memory, or a GPU with 14GB+ VRAM.
+For OpenJet's engine: an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB or more (sm_86, sm_89,
+sm_120), Linux, and an NVIDIA driver that supports CUDA 12.8 (570 or newer). `openjet setup`
+downloads the engine prebuilt for your GPU, so you don't need the CUDA toolkit; if no prebuilt
+engine matches, setup compiles it, which needs `nvcc`. If the engine can't be installed, setup
+says why and serves the model with llama.cpp instead. `pgrep -af mk_server.py` prints a line while
+OpenJet's engine is serving.
 
-## OpenJet Engine: CUDA LLM inference on NVIDIA RTX GPUs
-
-For Qwen3.8-27B Q4_K_M on Linux with an RTX 30, 40 or 50-series GPU that has 24GB or more, OpenJet serves the model through its own CUDA engine instead of `llama-server`. On an RTX 3090 it decodes at 1.5x llama.cpp's speed in the agent's reasoning mode (78 vs 51 tok/s) and up to 1.9x when writing code (140 vs 73 tok/s).
-
-The engine ships in this package as source, from version 0.4.32. `openjet setup` compiles it for your GPU:
-
-```bash
-pip install --upgrade open-jet
-openjet setup        # choose "Qwen3.8 27B Q4_K_M MTP"
-openjet
-```
-
-You need the CUDA toolkit installed, for `nvcc` (CUDA 12 or newer; 12.8 or newer for RTX 50). The compile takes about 2 minutes and ends with `Megakernel built: OpenJet will serve Qwen3.8-27B with it.` If you set OpenJet up before 0.4.32, upgrade and run `openjet setup` again.
-
-If setup can't build it, it prints `Skipping the Qwen3.8-27B megakernel (...)` with the reason and OpenJet uses `llama-server` instead, so setup still finishes. While OpenJet is running, `pgrep -af mk_server.py` prints a line when the megakernel is serving.
-
-It has been benchmarked on an RTX 3090 only. Benchmarks and details: [megakernel README](https://github.com/l-forster/open-jet/tree/master/megakernel).
+On smaller GPUs, Apple silicon or CPU only, OpenJet sets up the best model your hardware runs
+through llama.cpp. Recommended: a GPU with 14 GB+ VRAM, or Apple silicon with 24 GB+ unified memory.
 
 ## CLI
 
@@ -81,7 +70,8 @@ The primary entrypoint is the `openjet` command:
 openjet                     # start interactive session
 openjet setup               # provision a coding model for this machine
 openjet project             # provision the model your application ships with
-openjet benchmark --sweep   # run a hardware benchmark sweep
+openjet bench               # measure this machine and write a results file to share
+openjet benchmark --sweep   # tune llama.cpp settings with llama-bench
 ```
 
 The CLI is a full terminal agent that can:
@@ -237,9 +227,10 @@ This wheel includes the full OpenJet package:
 
 - `openjet.sdk` — Python integrations
 - CLI entrypoint `openjet` (installed as `open-jet` on PyPI)
-- Benchmark entrypoints via `openjet benchmark`
+- Benchmark entrypoints via `openjet bench` and `openjet benchmark`
 - The local/session runtime shared by the SDK and CLI
-- Source for the Qwen3.8-27B megakernel (`megakernel/`), compiled by `openjet setup`
+- OpenJet's Qwen3.8-27B engine server and source (`megakernel/`); `openjet setup` downloads the
+  prebuilt library for your GPU, or compiles it when none matches
 
 ## Frequently asked questions
 
@@ -254,20 +245,25 @@ endpoints. Cloud modes are optional.
 
 **Which hardware can run OpenJet?** A GPU with 14 GB+ VRAM or Apple silicon with 24 GB+
 unified memory is recommended for the coding agent. CPU-only inference is also supported.
-The CUDA engine requires Linux, a supported RTX 30, 40 or 50-series GPU with 24 GB+,
-the CUDA toolkit and a compatible Qwen3.8-27B model.
+OpenJet's engine requires Linux, a supported RTX 30, 40 or 50-series GPU with 24 GB+,
+a recent NVIDIA driver and a compatible Qwen3.8-27B model.
 
-**Can I use the inference engine without the coding agent?** Yes. The
-[OpenJet Engine quickstart](https://github.com/l-forster/open-jet/tree/master/megakernel)
-covers standalone installation, the `openjet-engine` command and HTTP API usage.
+**Can I use it without OpenJet's coding agent?** Yes. `openjet serve` serves the model to Claude
+Code, Codex, OpenCode, OpenClaw or any OpenAI- or Anthropic-compatible client; see
+[Coding tools](https://github.com/l-forster/open-jet/blob/master/docs/clients.md). The
+[engine docs](https://github.com/l-forster/open-jet/tree/master/megakernel) cover the standalone
+`openjet-engine` command and its HTTP API.
 
 ## Documentation and community
 
 - [GitHub repository](https://github.com/l-forster/open-jet)
+- [Coding tools: Claude Code, Codex, OpenCode, OpenClaw](https://github.com/l-forster/open-jet/blob/master/docs/clients.md)
 - [Installation guide](https://github.com/l-forster/open-jet/blob/master/docs/installation.md)
 - [Model selection and GGUF support](https://github.com/l-forster/open-jet/blob/master/docs/models.md)
 - [Python SDK quickstart](https://github.com/l-forster/open-jet/blob/master/docs/sdk/quickstart.md)
 - [Local inference benchmarks](https://github.com/l-forster/open-jet/blob/master/docs/benchmarking.md)
+- [AI reference](https://github.com/l-forster/open-jet/blob/master/docs/AI_REFERENCE.md) and
+  [media kit](https://github.com/l-forster/open-jet/blob/master/docs/MEDIA_KIT.md), for AI tools and writers
 - [Issues](https://github.com/l-forster/open-jet/issues)
 - [Discord](https://discord.gg/pspKHtExSa)
 

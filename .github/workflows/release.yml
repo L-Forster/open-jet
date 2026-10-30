@@ -32,6 +32,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -63,8 +65,13 @@ jobs:
           name: binary-${{ matrix.artifact }}
           path: release/*
 
+  engine:
+    uses: ./.github/workflows/engine.yml
+
   publish:
-    needs: build-wheel
+    needs: [build-wheel, engine]
+    # a failed engine build must not hold back the wheels: setup falls back to compiling the engine
+    if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -78,6 +85,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: binary-*
+          path: release-assets
+          merge-multiple: true
+      # prebuilt engine archives that `openjet setup` downloads for this release's version
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: engine-*
           path: release-assets
           merge-multiple: true
       - uses: softprops/action-gh-release@v2

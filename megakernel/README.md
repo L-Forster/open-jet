@@ -1,24 +1,28 @@
-# OpenJet Engine
+# OpenJet's Qwen3.8-27B engine
 
-OpenJet Engine is a specialised CUDA inference engine for Qwen3.8-27B on NVIDIA RTX
-30, 40 and 50-series GPUs with 24 GB+ (sm_86, sm_89, sm_120). It combines persistent
-megakernel decoding, on-device MTP speculative verification, and batched tensor-core
-prefill, exposed through an OpenAI-compatible HTTP API.
+OpenJet serves Qwen3.8-27B on NVIDIA RTX 30, 40 and 50-series GPUs with 24 GB+ (sm_86, sm_89,
+sm_120) with its own CUDA engine. It combines persistent megakernel decoding (each decode step is
+one kernel launch), on-device MTP speculative verification, and batched tensor-core prefill, behind
+an HTTP server that speaks the OpenAI Chat Completions, OpenAI Responses and Anthropic Messages APIs.
 
-It is the inference engine developed for [OpenJet](../README.md), the local coding
-agent. You can serve it directly for your own application without installing or running
-the agent. The source remains in `megakernel/`; existing binaries, C API symbols and
-OpenJet's `llama_backend: megakernel` setting keep their names.
+This page documents the engine on its own: how to serve it from your application without OpenJet's
+agent, its API, how it works, and its measurements. The source lives in `megakernel/`; the binaries,
+C API symbols and OpenJet's `llama_backend: megakernel` setting keep that name.
 
 On an RTX 3090 with Qwen3.8-27B Q4_K_M, measured reasoning decode is **78 vs 51 tok/s**
-for llama.cpp with MTP, and greedy code generation reaches **140 vs 73 tok/s**.
+for llama.cpp with MTP, greedy decode averages **107 vs 63 tok/s** over four prompts, and greedy
+code generation reaches **140 vs 73 tok/s**.
 These are single-conversation results on that GPU; see [Results](#results) for settings,
 reproduction scripts, and correctness comparisons.
 
 ## Standalone installation
 
-Requires Linux, a supported NVIDIA GPU with 24 GB+ VRAM, Python 3.10+, a C++ compiler,
-CMake, Make, and the CUDA toolkit (`nvcc`: CUDA 12+, or 12.8+ for RTX 50).
+The quickest route is `pipx install open-jet`, then `openjet setup`, which downloads the engine
+prebuilt for your GPU, and `openjet serve` (see [Coding tools](../docs/clients.md)). The rest of
+this section builds and serves the engine from source without the OpenJet CLI.
+
+Building from source requires Linux, a supported NVIDIA GPU with 24 GB+ VRAM, Python 3.10+, a C++
+compiler, CMake, Make, and the CUDA toolkit (`nvcc`: CUDA 12+, or 12.8+ for RTX 50).
 Supply a supported Qwen3.8-27B GGUF yourself; see the [model table](#quick-guide).
 
 From a source checkout, build llama.cpp for the tokenizer, install the engine's Python
@@ -57,8 +61,8 @@ for build headroom. See [Build / run](#build--run) for manual CLI builds and qua
 
 ## HTTP API
 
-The server listens on `127.0.0.1:18080` by default. Use this base URL in any client
-that supports OpenAI chat completions: `http://127.0.0.1:18080/v1`.
+The server listens on `127.0.0.1:18080` by default. Use `http://127.0.0.1:18080/v1` as the base
+URL for OpenAI clients and `http://127.0.0.1:18080` for Anthropic clients.
 
 ```sh
 curl http://127.0.0.1:18080/health
@@ -66,19 +70,35 @@ curl http://127.0.0.1:18080/v1/models
 curl http://127.0.0.1:18080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"Qwen3.8-27B-Q4_K_M.gguf","messages":[{"role":"user","content":"Write quicksort in Python."}],"max_tokens":512,"temperature":0.6,"top_k":20,"stream":false}'
+curl http://127.0.0.1:18080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"any","max_tokens":512,"messages":[{"role":"user","content":"Write quicksort in Python."}]}'
 ```
 
-Use the model ID returned by `/v1/models` in your client configuration.
+The server serves one model and ignores the `model` field; `/v1/models` returns its ID.
 
 | Endpoint | Behavior |
 |---|---|
 | `GET /health` | Readiness after the model has loaded |
 | `GET /v1/models` | Loaded model ID |
-| `POST /v1/chat/completions` | Chat completions; `stream: true` returns SSE ending in `[DONE]` |
+| `POST /v1/chat/completions` | OpenAI Chat Completions; `stream: true` returns SSE ending in `[DONE]` |
+| `POST /v1/responses` | OpenAI Responses (Codex CLI); streaming or not |
+| `POST /v1/messages` | Anthropic Messages (Claude Code); streaming or not |
+| `POST /v1/messages/count_tokens` | Anthropic token count, without waiting for a running request |
 
-Responses include `choices`, `usage`, and engine `timings`. Thinking output uses
+Chat completions include `choices`, `usage`, and engine `timings`. Thinking output uses
 `reasoning_content`; tool calls use structured `tool_calls`. Requests accept `tools`,
 `chat_template_kwargs`, `temperature`, `top_p`, `top_k` (at most 32), `min_p`, and `seed`.
+
+The Responses and Messages endpoints translate the request to a chat completion and the result
+back: reasoning becomes a `reasoning` item or a `thinking` block, tool calls become `function_call`
+(or `custom_tool_call`) items or `tool_use` blocks, and cached prompt tokens are reported as
+`cached_tokens` / `cache_read_input_tokens`. Responses' `reasoning.effort` selects the chat
+template's thinking level, and Messages' `thinking: {"type": "disabled"}` turns thinking off. A
+prompt longer than the context returns Anthropic's `prompt is too long` error on `/v1/messages`, so
+Claude Code compacts and retries. See [Coding tools](../docs/clients.md) for client setup and the
+limits of each API.
+
 One request runs at a time. Text only; presence and repetition penalties are ignored with
 a warning. See [Server](#server) and [Limitations](#limitations) for conversation reuse
 and other API constraints.
@@ -86,11 +106,11 @@ and other API constraints.
 ## Use with OpenJet
 
 The full `open-jet` package also installs `openjet-engine`. Run `openjet setup` to download
-a model and build the appropriate library automatically, then run `openjet` for the coding
-agent. OpenJet selects this engine when supported and falls back to llama.cpp otherwise;
-see [runtime configuration](../docs/runtimes/llama-cpp.md).
+a model and the matching engine library automatically, then run `openjet` for the coding agent or
+`openjet serve` for other tools. OpenJet selects this engine when supported and falls back to
+llama.cpp otherwise; see [runtime configuration](../docs/runtimes/llama-cpp.md).
 
-To serve a library built by setup directly, pass `openjet-engine --lib /path/to/libqwen38mk.so`
+To serve a library installed by setup directly, pass `openjet-engine --lib /path/to/libqwen38mk.so`
 (or the mixed library) together with `--model`. Standalone serving loads the requested engine
 and reports errors directly; automatic runtime selection belongs to OpenJet setup.
 
@@ -100,9 +120,9 @@ Which model file runs on it (details in [The GGUF](#the-gguf)):
 
 | Model file | Runs on |
 |---|---|
-| unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads | megakernel |
-| a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis | megakernel, semi compatible |
-| unsloth Qwen3.8-27B `UD-Q4_K_XL` | separate mixed-quant megakernel |
+| unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads | OpenJet |
+| a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis | OpenJet, semi compatible |
+| unsloth Qwen3.8-27B `UD-Q4_K_XL` | OpenJet's separate mixed-quant build |
 | any other quant (other unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
 
 ## How it works
@@ -127,14 +147,14 @@ predictability (draft acceptance) and other GPU load.
 **Reasoning mode as open-jet runs it** (thinking on, xhigh effort, temperature 1.0, top_p 0.95,
 top_k 20; 5 coding prompts x 2 seeds, up to 1024 tokens each):
 
-| | llama.cpp | megakernel | |
+| | llama.cpp | OpenJet | |
 |---|---|---|---|
 | decode through the HTTP servers (`/v1/chat/completions`) | 50.9 tok/s | **78.0 tok/s** | **1.53x** |
 | decode, CLI (`bench/think_bench.py`, `-d 4`) | 50.7 tok/s | 77.4 tok/s | 1.53x |
 
 **Greedy decode, 4 chat prompts x 512 tokens** (`bench/code_bench.py`):
 
-| prompt | llama.cpp | megakernel `-d 3` | megakernel `-d 4` |
+| prompt | llama.cpp | OpenJet `-d 3` | OpenJet `-d 4` |
 |---|---|---|---|
 | Python function (code) | 72.5 | 126.3 | **139.7** (1.93x) |
 | hash map explanation | 64.1 | 107.4 | 106.5 |
@@ -149,7 +169,7 @@ almost no extra cost.
 **A source file in the prompt, then a coding task** (greedy, 256 tokens; prompt = batched prefill of
 the whole prompt incl. the first token):
 
-| context | decode llama.cpp | decode megakernel | prompt llama.cpp | prompt megakernel |
+| context | decode llama.cpp | decode OpenJet | prompt llama.cpp | prompt OpenJet |
 |---|---|---|---|---|
 | 1.8K | 57.4 | 84.8 | 1050 | 1595 |
 | 3.6K | 56.3 | 95.3 | 1124 | 1595 |
@@ -162,7 +182,7 @@ which add 1-8% to the megakernel's decode here.)
 
 **Pasting a file into the next turn of a conversation** (prompt processing time):
 
-| new tokens | llama.cpp (prompt cache) | megakernel |
+| new tokens | llama.cpp (prompt cache) | OpenJet |
 |---|---|---|
 | 2.7K | 2.41 s | 1.68 s |
 | 12K | 10.45 s | 8.10 s |
@@ -308,8 +328,9 @@ decode, context sweep, second turn), `bench/bench.py` (decode on the 4 chat prom
 
 ## Server
 
-`server/mk_server.py` serves the engine (through `libqwen38mk.so`, the C API in `capi.cpp`) with an
-OpenAI-compatible `/v1/chat/completions`, streaming or not, plus `/health` and `/v1/models`.
+`server/mk_server.py` serves the engine (through `libqwen38mk.so`, the C API in `capi.cpp`) with
+OpenAI's `/v1/chat/completions` and `/v1/responses` and Anthropic's `/v1/messages`, streaming or not,
+plus `/health` and `/v1/models` (see [HTTP API](#http-api)).
 open-jet starts it itself; standalone:
 
 ```sh
@@ -396,7 +417,7 @@ Turing. `make ARCH=sm_75` (or setup, on a Turing GPU) defines `QWEN_MK_SM75`, wh
 split into two k8 ones, no L2 cache-policy hints, and tiles shrunk to Turing's 64 KiB of shared
 memory. Builds for other GPUs are unchanged. CUDA 12 and 13 both compile sm_75.
 
-| RTX 8000, Qwen3.8-27B Q4_K_M | llama.cpp (MTP 2) | megakernel |
+| RTX 8000, Qwen3.8-27B Q4_K_M | llama.cpp (MTP 2) | OpenJet |
 |---|---|---|
 | decode, reasoning mode | 32.9 tok/s | **54.1 tok/s** (1.65x) |
 | prompt processing, 2-8K tokens | 515-634 tok/s | **597-731 tok/s** (1.10-1.16x) |
@@ -426,7 +447,7 @@ and attention paths against references without a model. On multi-GPU machines, p
 - `qwen38_mk.cu` / `qwen38_mk.h` - loader, repacking, the megakernel and the `MKEngine` API
 - `prefill.cuh` / `prefill_gemm.cuh` - batched prefill kernels and their quantised fp16 GEMM
 - `capi.cpp` - C API (engine + libllama tokenizer) for `libqwen38mk.so`
-- `server/mk_server.py` - OpenAI-compatible HTTP server
+- `server/mk_server.py` - HTTP server: OpenAI Chat Completions and Responses, Anthropic Messages
 - `main.cu` - CLI (tokenization via libllama)
 - `gguf.h` - minimal mmap GGUF reader
 - `draft_vocab_32k.bin` - MTP draft-head token subset (int32 ids)

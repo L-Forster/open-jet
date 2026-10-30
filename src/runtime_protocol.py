@@ -169,6 +169,8 @@ class StreamChunk:
     done: bool = False
     reasoning: str = ""
     tool_args_delta: str = ""
+    # Provider-reported token usage, set on the final chunk when the runtime reports it.
+    usage: dict | None = None
 
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
@@ -619,7 +621,9 @@ async def stream_openai_responses(
                     detail = _response_incomplete_detail(data)
                     raise RuntimeError(f"OpenAI Codex response incomplete: {detail}")
                 tool_calls = parse_tool_calls(f"{content_buf}\n{reasoning_buf}") if use_tools else []
-                yield StreamChunk(tool_calls=tool_calls, done=True)
+                response = data.get("response")
+                usage = response.get("usage") if isinstance(response, dict) else None
+                yield StreamChunk(tool_calls=tool_calls, done=True, usage=usage if isinstance(usage, dict) else None)
                 return
 
 

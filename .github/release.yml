@@ -1,0 +1,12 @@
+# Categories for GitHub's "Generate release notes". Each entry names the pull request's author, and new
+# contributors get their own section. Label pull requests that add community results `benchmark`.
+changelog:
+  categories:
+    - title: Community benchmark results
+      labels: [benchmark]
+    - title: Engine
+      labels: [engine]
+    - title: Fixes
+      labels: [bug]
+    - title: Everything else
+      labels: ["*"]

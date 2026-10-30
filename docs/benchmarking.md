@@ -1,15 +1,48 @@
 # Benchmarking
 
-OpenJet includes a benchmarking surface built around `llama-bench` and the
-currently active model profile from `config.yaml`.
+OpenJet has two benchmark commands:
 
-Use it when you want to answer questions like:
+- `openjet bench` measures the configured model, on whichever engine serves it, with a fixed
+  workload, and writes a results file to share. Use it to compare machines.
+- `openjet benchmark` runs `llama-bench` against the active llama.cpp profile. Use it to tune
+  llama.cpp settings on one machine.
+
+## `openjet bench`: a results file to share
+
+```bash
+openjet bench --github <your-handle>      # --notes "power limit 300 W", -o results.json
+```
+
+It starts the model `openjet setup` configured, runs a fixed workload through the server's chat
+endpoint and writes `openjet-bench-<gpu>-<time>.json`. Stop `openjet serve` and other GPU work first.
+The workload:
+
+- 4 short coding prompts with thinking on and OpenJet's thinking preset (temperature 1.0, top_p 0.95,
+  top_k 20, min_p 0, seed 1000), 512 tokens each
+- 4 short chat prompts with thinking off and greedy decoding, 256 tokens each
+- at 4K, 32K and 96K tokens of context, as far as the configured context window allows: a fresh
+  prompt of synthetic source code with a coding task (prompt speed, then decode speed at that depth),
+  then a recall question about a line hidden halfway into the code
+
+Speeds are the timings the server reports, so HTTP is not included. The file records the GPU, VRAM,
+driver, power limit, OS, CPU, RAM, OpenJet version, model file name and size, engine, context window
+and every request's timings, and no host name, user name or paths.
+
+Send the file as a pull request to [`benchmarks/community/`](../benchmarks/community/README.md), or
+paste it into a [Benchmark issue](https://github.com/l-forster/open-jet/issues/new?template=benchmark.yml).
+`python scripts/bench_table.py` validates the files there and rebuilds the community table in the
+README.
+
+## `openjet benchmark`: tune llama.cpp
+
+This surface is built around `llama-bench` and the currently active model profile from
+`config.yaml`. Use it when you want to answer questions like:
 
 - how fast does this model run on this machine
 - what `gpu_layers` setting is best here
 - how does throughput change with batch size or thread count
 
-## Single run
+### Single run
 
 Run one benchmark against the active model profile:
 
@@ -27,7 +60,7 @@ openjet benchmark -- -ub 512
 OpenJet passes the active model path, configured device, and GPU layer count to
 `llama-bench`, then prints the result directly.
 
-## Sweep mode
+### Sweep mode
 
 Run a one-variable-at-a-time sweep:
 
@@ -44,7 +77,7 @@ Sweep mode currently checks:
 This is the quickest way to compare settings on the same machine without
 rewriting config by hand.
 
-## Prerequisites
+### Prerequisites
 
 OpenJet expects `llama-bench` to exist in one of these places:
 
@@ -59,7 +92,7 @@ cd ~/llama.cpp
 cmake --build build --target llama-bench
 ```
 
-## How it picks settings
+### How it picks settings
 
 Benchmarking reuses the same configuration model as the CLI and SDK:
 

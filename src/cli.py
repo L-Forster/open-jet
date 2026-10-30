@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .airgap import airgapped_from_cfg
 from .config import active_config_sources, load_config, save_config
+from .connect import CLIENTS, DEFAULT_SERVE_PORT, connect_recipe, run_serve
 from .device_sources import assign_device_alias, list_device_sources, set_device_enabled, sync_devices_registry
 from .embed_catalog import DEFAULT_EMBED_CONTEXT_TOKENS, EMBED_USE_CASES, TARGET_DEVICE_PRESETS
 from .model_profiles import list_model_profiles, sync_active_model_profile
@@ -423,7 +424,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"context window to size the KV cache for (default {DEFAULT_EMBED_CONTEXT_TOKENS})",
     )
-    bench_parser = subparsers.add_parser("benchmark", aliases=("bench",), help="run a model benchmark with the active profile")
+    serve_parser = subparsers.add_parser(
+        "serve", help="serve the local model over OpenAI and Anthropic APIs for Claude Code, Codex, OpenCode or OpenClaw"
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=DEFAULT_SERVE_PORT, help=f"port (default: {DEFAULT_SERVE_PORT})")
+    connect_parser = subparsers.add_parser("connect", help="show how to point another coding tool at `openjet serve`")
+    connect_parser.add_argument("client", choices=CLIENTS, help="the tool to connect")
+    connect_parser.add_argument("--host", default="127.0.0.1", help="address `openjet serve` listens on")
+    connect_parser.add_argument("--port", type=int, default=DEFAULT_SERVE_PORT, help="port `openjet serve` listens on")
+    community_parser = subparsers.add_parser(
+        "bench", help="measure the configured model on this machine and write a results file to share"
+    )
+    community_parser.add_argument("--github", dest="contributor", metavar="HANDLE",
+                                  help="your GitHub handle, to be credited in the community table")
+    community_parser.add_argument("--notes", help="anything that affects speed: power limit, overclock, other load")
+    community_parser.add_argument("-o", "--output", help="results file (default: openjet-bench-<gpu>-<time>.json)")
+    bench_parser = subparsers.add_parser("benchmark", help="tune llama.cpp settings with llama-bench on the active profile")
     bench_parser.add_argument("-p", "--n-prompt", type=int, default=512, help="prompt tokens for pp test (default: 512)")
     bench_parser.add_argument("-n", "--n-gen", type=int, default=128, help="tokens to generate for tg test (default: 128)")
     bench_parser.add_argument("-r", "--repetitions", type=int, default=5, help="repetitions per test (default: 5)")
@@ -501,8 +518,6 @@ def _entrypoint_label(args: argparse.Namespace) -> str:
     command = str(getattr(args, "command", "") or "").strip().lower()
     if not command:
         return "app"
-    if command in {"bench", "benchmark"}:
-        return "benchmark"
     if command in {"device", "devices"}:
         return "device"
     if command in {"skill", "skills"}:
@@ -696,7 +711,12 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
         return
-    if args.command in {"benchmark", "bench"}:
+    if args.command == "bench":
+        from .community_bench import run_bench
+
+        run_bench(output=args.output, contributor=args.contributor, notes=args.notes)
+        return
+    if args.command == "benchmark":
         from .benchmark import run_benchmark, run_benchmark_sweep
         if args.sweep:
             run_benchmark_sweep(repetitions=args.repetitions)
@@ -724,6 +744,12 @@ def main(argv: list[str] | None = None) -> None:
                 )
             )
         )
+        return
+    if args.command == "serve":
+        run_serve(host=args.host, port=args.port)
+        return
+    if args.command == "connect":
+        print(connect_recipe(args.client, load_config(), host=args.host, port=args.port))
         return
     if args.command == "project":
         _start_project(args)

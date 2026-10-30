@@ -19,11 +19,18 @@ struct Handle {
 thread_local std::string g_err;
 }
 
+// MSVC exports nothing from a DLL unless asked
+#ifdef _WIN32
+#define MK_API __declspec(dllexport)
+#else
+#define MK_API
+#endif
+
 extern "C" {
 
-const char * mk_last_error() { return g_err.c_str(); }
+MK_API const char * mk_last_error() { return g_err.c_str(); }
 
-void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode) {
+MK_API void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab, int kv_mode) {
     try {
         llama_backend_init();
         llama_model_params mp = llama_model_default_params();
@@ -40,7 +47,7 @@ void * mk_new(const char * model, int ctx, int n_draft, const char * draft_vocab
     }
 }
 
-void mk_free(void * hp) {
+MK_API void mk_free(void * hp) {
     auto * h = static_cast<Handle *>(hp);
     delete h->eng;
     llama_model_free(h->lm);
@@ -48,7 +55,7 @@ void mk_free(void * hp) {
 }
 
 // chat template stored in the GGUF (tokenizer.chat_template); returns its length, copies up to cap
-int mk_chat_template(void * hp, char * buf, int cap) {
+MK_API int mk_chat_template(void * hp, char * buf, int cap) {
     auto * h = static_cast<Handle *>(hp);
     const char * t = llama_model_chat_template(h->lm, nullptr);
     if (!t) return -1;
@@ -58,20 +65,20 @@ int mk_chat_template(void * hp, char * buf, int cap) {
 }
 
 // text -> token ids (special tokens such as <|im_start|> parsed); returns the count (negative: -needed)
-int mk_tokenize(void * hp, const char * text, int len, int * out, int cap) {
+MK_API int mk_tokenize(void * hp, const char * text, int len, int * out, int cap) {
     auto * h = static_cast<Handle *>(hp);
     return llama_tokenize(h->vocab, text, len, out, cap, false, true);
 }
 
 // token -> its bytes (special tokens rendered as text); returns the byte count
-int mk_piece(void * hp, int tok, char * buf, int cap) {
+MK_API int mk_piece(void * hp, int tok, char * buf, int cap) {
     auto * h = static_cast<Handle *>(hp);
     return llama_token_to_piece(h->vocab, tok, buf, cap, 0, true);
 }
 
-int mk_is_eog(void * hp, int tok) { return llama_vocab_is_eog(static_cast<Handle *>(hp)->vocab, tok) ? 1 : 0; }
+MK_API int mk_is_eog(void * hp, int tok) { return llama_vocab_is_eog(static_cast<Handle *>(hp)->vocab, tok) ? 1 : 0; }
 
-int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
+MK_API int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, unsigned long long seed) {
     try {
         static_cast<Handle *>(hp)->eng->set_sampling(temp, top_p, top_k, min_p, seed);
         return 0;
@@ -82,7 +89,7 @@ int mk_set_sampling(void * hp, float temp, float top_p, int top_k, float min_p, 
 }
 
 // appends tokens to the sequence; returns the first generated token (negative on error)
-int mk_prefill(void * hp, const int * toks, int n) {
+MK_API int mk_prefill(void * hp, const int * toks, int n) {
     try {
         return static_cast<Handle *>(hp)->eng->prefill(std::vector<int>(toks, toks + n));
     } catch (const std::exception & e) {
@@ -92,7 +99,7 @@ int mk_prefill(void * hp, const int * toks, int n) {
 }
 
 // one decode cycle; writes 1..n_draft+1 tokens; returns the count (negative on error)
-int mk_step(void * hp, int * out, int cap) {
+MK_API int mk_step(void * hp, int * out, int cap) {
     try {
         std::vector<int> v;
         static_cast<Handle *>(hp)->eng->step(v);
@@ -105,9 +112,9 @@ int mk_step(void * hp, int * out, int cap) {
     }
 }
 
-void mk_reset(void * hp) { static_cast<Handle *>(hp)->eng->reset(); }
+MK_API void mk_reset(void * hp) { static_cast<Handle *>(hp)->eng->reset(); }
 
-int mk_truncate(void * hp, int len) {
+MK_API int mk_truncate(void * hp, int len) {
     try {
         static_cast<Handle *>(hp)->eng->truncate(len);
         return 0;
@@ -118,7 +125,7 @@ int mk_truncate(void * hp, int len) {
 }
 
 // copies the sequence so far (up to cap tokens); returns its length
-int mk_sequence(void * hp, int * out, int cap) {
+MK_API int mk_sequence(void * hp, int * out, int cap) {
     const auto & s = static_cast<Handle *>(hp)->eng->sequence();
     const int n = (int) s.size();
     if (out)
@@ -126,11 +133,11 @@ int mk_sequence(void * hp, int * out, int cap) {
     return n;
 }
 
-int mk_committed(void * hp) { return static_cast<Handle *>(hp)->eng->committed(); }
-int mk_checkpoint_pos(void * hp) { return static_cast<Handle *>(hp)->eng->checkpoint_pos(); }
-int mk_rewind_to_checkpoint(void * hp) { return static_cast<Handle *>(hp)->eng->rewind_to_checkpoint() ? 0 : -1; }
+MK_API int mk_committed(void * hp) { return static_cast<Handle *>(hp)->eng->committed(); }
+MK_API int mk_checkpoint_pos(void * hp) { return static_cast<Handle *>(hp)->eng->checkpoint_pos(); }
+MK_API int mk_rewind_to_checkpoint(void * hp) { return static_cast<Handle *>(hp)->eng->rewind_to_checkpoint() ? 0 : -1; }
 
-void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
+MK_API void mk_stats(void * hp, long * cycles, long * drafted, long * accepted) {
     const auto & s = static_cast<Handle *>(hp)->eng->stats;
     *cycles = s.cycles;
     *drafted = s.drafted;

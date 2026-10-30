@@ -6,9 +6,16 @@
 openjet
 openjet chat
 openjet chat Explain the repo layout briefly.
-openjet benchmark
+openjet serve
+openjet connect claude-code
+openjet bench
 openjet benchmark --sweep
 ```
+
+`openjet serve` serves the configured model to other coding tools, and `openjet connect <tool>` prints
+their configuration ([Coding tools](../clients.md)). `openjet bench` measures this machine with a
+fixed workload and writes a results file to share; `openjet benchmark` tunes llama.cpp with
+`llama-bench` ([Benchmarking](../benchmarking.md)).
 
 `openjet chat <text>` runs one prompt through the shared SDK/runtime backend and prints the final response to stdout without launching the TUI.
 
@@ -16,7 +23,7 @@ OpenJet's CLI surface covers three adjacent jobs:
 
 - interactive local agent usage through the chat TUI
 - operational helpers like setup, status, models, and workflows
-- benchmark entrypoints for `llama-bench`
+- benchmarks: `openjet bench` for a shareable results file, `openjet benchmark` for `llama-bench`
 
 Optional setup flow:
 

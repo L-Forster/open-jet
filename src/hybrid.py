@@ -32,6 +32,14 @@ its transcript or reproduce its exploration. Give it a bounded task and acceptan
 criteria, consume its concise result, inspect only the relevant diff/test evidence,
 and delegate corrections when needed. Never claim success until you have reviewed the
 implementation and verification.
+
+Verify the worker's code yourself before accepting it; the handoff is a claim, not
+evidence. Read the actual diff and run the tests. Check that it meets every acceptance
+criterion, including edge cases and invalid input. Treat anything the task did not ask
+for as a defect until justified: hardcoded secrets or keys, network calls,
+file/process/environment access, weakened validation or authorization checks, and
+special-cased inputs. If something is wrong, delegate a fix and verify again. Tell the
+user about anything you could not verify.
 """.strip()
 
 IMPLEMENTER_SYSTEM_PROMPT = """

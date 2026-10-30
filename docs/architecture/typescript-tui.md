@@ -36,11 +36,22 @@ rows come from `src/openrouter_catalog.py` and are generated into
 `ui/src/openrouter-models.generated.ts` during the TUI build so Python and
 TypeScript cannot drift.
 
-The frontend is in `ui/`. It uses Pi's terminal lifecycle, editor, completion,
+The frontend and agent harness live in
+[open-jet-harness](https://github.com/L-Forster/open-jet-harness), checked out as
+the `ui/` git submodule. It uses Pi's terminal lifecycle, editor, completion,
 markdown, layout, AgentSession, model runtime, session manager, coding tools,
 queueing, retry, and compaction primitives. Dependencies are pinned to the
-Earendil Works Pi fork at version `0.84.2`; its MIT attribution is recorded in
-`ui/NOTICE`.
+Earendil Works Pi fork at version `1.4.0`; its MIT attribution is recorded in
+`ui/NOTICE`. The harness keeps a copy of the protocol schema for standalone
+builds; inside an OpenJet checkout its build reads `protocol/` here, and a test
+checks the two copies match.
+
+For the managed local runtime (llama-server or the megakernel server) the Python
+service advertises a text-only model whose thinking is selected by Pi's thinking
+level. Pi then sends `chat_template_kwargs.enable_thinking` on every request and
+picks the Qwen thinking or instruct sampling preset through
+`samplingParamsByThinkingLevel`. The harness sizes Pi's compaction thresholds to
+each model's context window.
 
 ## Building
 
@@ -48,6 +59,7 @@ Release wheels contain a platform-matched Bun standalone executable, so installe
 users do not need Node.js or Bun:
 
 ```bash
+git submodule update --init ui
 python scripts/build_tui.py
 python -m build --wheel
 ```

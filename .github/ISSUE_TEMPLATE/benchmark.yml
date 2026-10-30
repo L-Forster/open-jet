@@ -1,0 +1,39 @@
+name: Benchmark result
+description: Share your card's numbers from `openjet bench`. They go into the community table in the README.
+title: "[Benchmark] "
+labels: ["benchmark"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for measuring. Run `openjet bench --github <your-handle>` with nothing else using the GPU,
+        then paste the file it wrote below. If you can, open a pull request that adds the file to
+        [`benchmarks/community/`](https://github.com/l-forster/open-jet/tree/master/benchmarks/community)
+        instead; this form is for runs that can't become a pull request. Failed runs are useful too:
+        paste the error under Notes.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: RTX 4090 24 GB
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results file
+      description: The whole JSON file `openjet bench` wrote (`openjet-bench-<gpu>-<time>.json`). It holds no host name, user name or paths.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything that affects speed (power limit, overclock, laptop GPU, other load), or the error if the run failed.
+  - type: checkboxes
+    id: credit
+    attributes:
+      label: Credit
+      options:
+        - label: Name me in the community table and the release notes (uses the `contributor` handle in the file, or your GitHub handle if it is empty).

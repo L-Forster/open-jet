@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from src import llama_server
@@ -32,7 +33,7 @@ class MegakernelSelectionTests(unittest.TestCase):
 
     def test_setup_selector_names_the_runtime(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")):
-            self.assertEqual(llama_server.model_runtime_label(MODEL), "OpenJet megakernel, 1.5x faster")
+            self.assertEqual(llama_server.model_runtime_label(MODEL), "OpenJet engine, 1.5x faster")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.8-27B-UD-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.5-9B-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/mmproj-Qwen3.8-27B-BF16.gguf"), "llama.cpp")
@@ -48,7 +49,7 @@ class MegakernelSelectionTests(unittest.TestCase):
 
     def test_missing_build_is_reported(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=None):
-            self.assertIn("not built", megakernel_unavailable_reason(MODEL))
+            self.assertIn("not installed", megakernel_unavailable_reason(MODEL))
 
     def test_unsupported_gpu_is_reported(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
@@ -287,6 +288,16 @@ class MegakernelServerParsingTests(unittest.TestCase):
         with self.assertRaises(self.mk.BadRequest):
             self.mk.normalize_messages([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}])
 
+
+    def test_oversized_prompt_uses_the_llama_cpp_overflow_wording(self) -> None:
+        # Pi compacts and retries only on errors matching its overflow patterns,
+        # which include llama-server's "exceeds the available context size".
+        srv = object.__new__(self.mk.Server)
+        srv.args = SimpleNamespace(ctx=100)
+        srv.render = lambda body: ("prompt", False)
+        srv.eng = SimpleNamespace(tokenize=lambda text: list(range(120)))
+        with self.assertRaisesRegex(self.mk.BadRequest, "exceeds the available context size"):
+            srv.generate({"messages": []}, lambda kind, text: True)
 
 if __name__ == "__main__":
     unittest.main()

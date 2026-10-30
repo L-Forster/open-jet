@@ -407,6 +407,12 @@ class OpenJetServiceController:
         reasoning = bool(self.cfg.get("reasoning", True))
         qwen38 = _is_qwen38_model(model_ref)
         context_window = max(1, int(self.cfg.get("context_window_tokens", 32768)))
+        if runtime == DEFAULT_RUNTIME:
+            # The launch can shrink the context (GGUF training length, Vulkan
+            # allocation cap); Pi must compact against what the server holds.
+            served = getattr(self.runtime_client, "context_window_tokens", None)
+            if served:
+                context_window = min(context_window, int(served))
         configured_max_tokens = self.cfg.get("max_tokens")
         requested_max_tokens = (
             int(configured_max_tokens)
@@ -416,6 +422,7 @@ class OpenJetServiceController:
         # Pi leaves 4096 context tokens as a safety margin. Do not advertise
         # an output ceiling that cannot fit even with an empty conversation.
         max_tokens = min(max(1, requested_max_tokens), max(1, context_window - 4096))
+        managed = runtime == DEFAULT_RUNTIME
         model: dict[str, Any] = {
             "provider": "openjet-local" if runtime == DEFAULT_RUNTIME else str(self.cfg.get("provider") or "openjet-compatible"),
             "id": model_id,
@@ -423,8 +430,15 @@ class OpenJetServiceController:
             "api": "openai-completions",
             "apiKey": "openjet-local" if runtime == DEFAULT_RUNTIME else str(self.cfg.get("api_key") or "openjet"),
             "baseUrl": base_url,
-            "reasoning": reasoning,
-            "input": ["text", "image"],
+            # Advertise thinking support and select it with the thinking level: with
+            # reasoning=False Pi omits chat_template_kwargs, so the Qwen template's
+            # default (thinking on) applied while /reasoning off was set.
+            "reasoning": True,
+            "thinkingLevel": "medium" if reasoning else "off",
+            # OpenJet launches llama-server without an mmproj and the megakernel
+            # server is text-only, so image parts are rejected with a 400. Pi
+            # replaces images with a placeholder for text-only models.
+            "input": ["text"] if managed else ["text", "image"],
             "contextWindow": context_window,
             "maxTokens": max_tokens,
             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
@@ -437,9 +451,8 @@ class OpenJetServiceController:
             },
         }
         if qwen38:
-            model["samplingParams"] = dict(
-                QWEN38_THINKING_SAMPLING if reasoning else QWEN38_INSTRUCT_SAMPLING
-            )
+            model["samplingParams"] = dict(QWEN38_THINKING_SAMPLING)
+            model["samplingParamsByThinkingLevel"] = {"off": dict(QWEN38_INSTRUCT_SAMPLING)}
             model["nativeContextWindow"] = QWEN38_NATIVE_CONTEXT_TOKENS
         return model
 
