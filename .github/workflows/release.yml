@@ -23,7 +23,7 @@ jobs:
           - os: macos-15-intel  # macos-13 runners were retired in December 2025
             artifact: macos-x64
             wheel-platform: macosx_10_15_x86_64
-          - os: macos-14
+          - os: macos-15
             artifact: macos-arm64
             wheel-platform: macosx_11_0_arm64
           - os: windows-latest

@@ -90,11 +90,19 @@ jobs:
           $variants = @(@{ src = "qwen38_mk.cu"; dll = "qwen38mk.dll" })
           if ("${{ matrix.arch }}" -ne "75") { $variants += @{ src = "qwen38_mixed.cu"; dll = "qwen38mk_mixed.dll" } }
           New-Item -ItemType Directory -Force pkg | Out-Null
+          # job logs need a login; annotations don't, so a failure posts its compiler errors as annotations
+          function Fail {
+            Select-String -Path build.log -Pattern " error|fatal|catastrophic|out of memory|LNK[0-9]" |
+              Select-Object -First 15 | ForEach-Object { Write-Host "::error::$($_.Line)" }
+            exit $LASTEXITCODE
+          }
           foreach ($v in $variants) {
-            nvcc @flags -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/$($v.src)" -o engine.obj
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-            nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/capi.cpp engine.obj @libs -o "pkg/$($v.dll)"
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            nvcc @flags -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/$($v.src)" -o engine.obj 2>&1 |
+              Tee-Object -FilePath build.log -Append | Out-Host
+            if ($LASTEXITCODE) { Fail }
+            nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/capi.cpp engine.obj @libs -o "pkg/$($v.dll)" 2>&1 |
+              Tee-Object -FilePath build.log -Append | Out-Host
+            if ($LASTEXITCODE) { Fail }
           }
       - name: Package
         run: |
