@@ -3,8 +3,9 @@
 //   Y[tok][row] (+)= sum_k W[row][k] * X[tok][k]
 //
 // X is fp16 [tok][K] with the elements of every 16-group permuted (hperm) so that the 4-byte weight
-// words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (224-byte
-// repack, see qwen38_mk.cu) or Q8_0 (unit repack) and is dequantised to fp16 in registers.
+// words give m16n8k16 A fragments directly.  W stays Q4_K / Q5_K (GGUF layout), Q6_K (192-byte
+// repack + a meta stream in W.d, see qwen38_mk.cu) or Q8_0 (unit repack) and is dequantised to fp16 in
+// registers.
 // Tile: 128 weight rows x 128 tokens (64 on Turing) per CTA, 8 warps of 16 rows. K is staged 64 at a
 // time (one 64-group of a super-block: two 32-element sub-blocks) through a cp.async pipeline with
 // one block barrier per stage; per-row sub-block scales are decoded one stage ahead.  Products
@@ -30,12 +31,13 @@ struct WMat { // device view of one weight matrix (mirrors Mat in qwen38_mk.cu)
 // Raw bytes of one stage (64-group p of super-block sb) per weight row, copied as 16 B chunks:
 //   Q4_K: [hdr 16 | qs 32]                    src: blk + {0, 16 + 32p}
 //   Q5_K: [hdr 16 | qh 32 | qs 32]            src: blk + {0, 16, 32, 48 + 32p, 64 + 32p}
-//   Q6_K: [qlo 32 | qhi 16 | meta 8]          src: blk + {32p, 16 + 32p, 128 + 16p}, 8 B at 192 + 8p
+//   Q6_K: [qlo 32 | qhi 16 | meta 8]          src: blk + {32p, 16 + 32p, 128 + 16p}; meta from W.d's pair
+//                                             of blocks (36 B): 4 B of scales at 16 (sb & 1) + 4p, 4 B of d at 32
 //   Q8_0: [units 64 | d 4]                    src: blk + {64p + 16c}, 4 B of d at 2 * (2 * st)
 template <int TYPE> struct WT;
 template <> struct WT<TQ4K> { static constexpr int BLK = 144, NCH = 3; };
 template <> struct WT<TQ5K> { static constexpr int BLK = 176, NCH = 5; };
-template <> struct WT<TQ6K> { static constexpr int BLK = 224, NCH = 3; };
+template <> struct WT<TQ6K> { static constexpr int BLK = 192, NCH = 3; }; // + the meta stream (W.d)
 template <> struct WT<TQ80> { static constexpr int BLK = 256, NCH = 4; };
 
 template <int TYPE> __device__ __forceinline__ void chunk_src(int c, int & off, int & inc) {
@@ -122,10 +124,12 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR, NSH = HT<TYPE>::NS;
     constexpr int STG = hm_stage<TYPE>();
     const int ldx = W.K; // (activation row stride)
+    int sb0 = 0;         // the first super-block of this CTA's K range (Q6_K: picks the meta pair and its half)
     if (gridDim.z > 1) { // split K (too few CTAs otherwise): this CTA's 1 / gridDim.z of it, to O.y + z ntok ldy
         W.K /= gridDim.z;
         W.w += (size_t) blockIdx.z * (W.K / 256) * BLK;
-        if (W.d) W.d += (size_t) blockIdx.z * (W.K / BK) * 2;
+        sb0 = blockIdx.z * (W.K / 256);
+        if (TYPE == TQ80) W.d += (size_t) blockIdx.z * (W.K / BK) * 2;
         X += (size_t) blockIdx.z * W.K;
         O.y += (size_t) blockIdx.z * ntok * O.ldy;
     }
@@ -152,8 +156,8 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         winc[k] = inc;
         wdst[k] = r * SR + 16 * (TYPE == TQ6K ? c ^ ((r >> 1) & 3) : c);
     }
-    const uint8_t * esrc = W.w + (size_t) (row0 + (tid & (BM - 1))) * W.rb + 192;
     const __half * dsrc = W.d + (size_t) (row0 + (tid & (BM - 1))) * W.nd;
+    const uint8_t * esrc = reinterpret_cast<const uint8_t *>(dsrc); // Q6_K: the row's meta stream
     const unsigned edst = (tid & (BM - 1)) * SR + (TYPE == TQ6K ? 16 * (3 ^ (((tid & (BM - 1)) >> 1) & 3)) : 64);
     constexpr int XIT = BN * 8 / 256;
     const __half * xsrc[XIT];
@@ -171,8 +175,12 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
 #pragma unroll
         for (int k = 0; k < WIT; k++)
             if (WCH % 256 == 0 || tid + k * 256 < WCH) cpa16(s + wdst[k], wsrc[k] + sb * BLK + p * winc[k]);
-        if constexpr (TYPE == TQ6K) {
-            if (tid < BM) cpa8(s + edst, esrc + sb * BLK + 8 * p);
+        if constexpr (TYPE == TQ6K) { // meta slot: sc[4p..4p+3] | the pair's two d (scales picks one)
+            if (tid < BM) {
+                const int sa = sb0 + sb;
+                cpa4(s + edst, esrc + (sa >> 1) * 36 + 16 * (sa & 1) + 4 * p);
+                cpa4(s + edst + 4, esrc + (sa >> 1) * 36 + 32);
+            }
         } else if constexpr (TYPE == TQ80) {
             if (tid < BM) cpa4(s + edst, dsrc + 2 * st);
         }
@@ -204,7 +212,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         } else if constexpr (TYPE == TQ6K) {
             uint8_t * mrow = const_cast<uint8_t *>(row) + 16 * (3 ^ (((tid >> 1) >> 1) & 3));
             const int2 meta = *reinterpret_cast<const int2 *>(mrow);
-            const float d = __half2float(__ushort_as_half((unsigned short) (meta.y & 0xffff)));
+            const float d = __half2float(__ushort_as_half((unsigned short) ((unsigned) meta.y >> (16 * ((sb0 + (st >> 2)) & 1)))));
             const unsigned sp = (unsigned) meta.x >> (16 * j);
             *reinterpret_cast<__half2 *>(mrow + 8 + 4 * j) =
                 __floats2half2_rn(d * (float) (int8_t) (sp & 0xff), d * (float) (int8_t) ((sp >> 8) & 0xff));
