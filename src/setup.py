@@ -22,7 +22,13 @@ from .hardware import (
     recommended_gpu_layers,
 )
 from .model_profiles import default_profile_name
-from .llama_server import MEGAKERNEL_RUNTIME_LABEL, _find_built_llama_binary, model_runtime_label
+from .llama_server import (
+    MEGAKERNEL_RUNTIME_LABEL,
+    _find_built_llama_binary,
+    megakernel_long_context_limit,
+    megakernel_long_context_reason,
+    model_runtime_label,
+)
 from .provisioning import (
     MODELS_DIR,
     OPENJET_HOME,
@@ -371,6 +377,15 @@ def context_window_options(recommended: int) -> list[int]:
     if recommended not in options:
         options.append(recommended)
     return sorted(set(options))
+
+
+def _long_context_option(payload: Mapping[str, object], device: str, recommended: int) -> int:
+    """The context the megakernel's compact KV cache fits (`openjet setup --long-context`), or 0 when not offered."""
+    model = str(payload.get("llama_model") or payload.get("model_download_path") or "")
+    if device == "cpu" or megakernel_long_context_reason(model) is not None:
+        return 0
+    value = megakernel_long_context_limit(recommended, int(payload.get("max_context_tokens") or 0))
+    return value if value > recommended else 0
 
 
 def gpu_layer_options(device: str, recommended: int) -> list[int]:
@@ -878,12 +893,17 @@ async def run_setup_wizard(
     if setup_mode != "manual" and model_matches_recommendation:
         context_default = int(recommended_payload.get("context_window_tokens", context_default))
     context_values = context_window_options(recommended_ctx_value)
-    if context_default not in context_values:
+    long_context_value = _long_context_option(payload, device, recommended_ctx_value)
+    if context_default not in context_values and context_default != long_context_value:
         context_values = sorted(set([*context_values, context_default]))
     context_options = [
         (f"{value} (recommended)" if value == recommended_ctx_value else str(value), value)
         for value in context_values
     ]
+    if long_context_value:
+        context_options.append(
+            (f"{long_context_value} (long context: compact KV cache, megakernel only)", long_context_value)
+        )
     context_value = int(
         await _prompt_choice(
             session,
@@ -924,6 +944,7 @@ async def run_setup_wizard(
         {
             "device": device,
             "context_window_tokens": context_value,
+            "megakernel_long_context": bool(long_context_value) and context_value == long_context_value,
             "gpu_layers": gpu_value,
             "setup_complete": True,
             "setup_missing_runtime": _discover_llama_server() is None,

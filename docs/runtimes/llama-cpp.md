@@ -26,8 +26,10 @@ instead of `llama-server`. Turing (sm_75) is supported experimentally for Q4_K_M
 
 | | llama.cpp | OpenJet |
 |---|---|---|
-| reasoning mode, OpenJet's thinking preset (decode) | 51 tok/s | 78 tok/s (1.5x) |
-| greedy decode, chat prompts (mean) | 63 tok/s | 107 tok/s (1.7x) |
+| reasoning mode, OpenJet's thinking preset (decode) | 60 tok/s | 92 tok/s (1.5x) |
+| reasoning mode, 98K tokens in context (decode) | 37 tok/s | 79 tok/s (2.2x) |
+| reading a 98K-token prompt | 112 s | 82 s (1.4x) |
+| greedy decode, chat prompts (mean; earlier build) | 63 tok/s | 107 tok/s (1.7x) |
 | prompt processing, 2-8K tokens | 1050-1140 tok/s | 1530-1600 tok/s (1.3-1.5x) |
 | pasting a 12K-token file into the next turn | 10.5 s | 8.1 s |
 

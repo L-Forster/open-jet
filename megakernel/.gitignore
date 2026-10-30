@@ -12,6 +12,7 @@ bench/ffn_bench
 bench/ffn_bench_h*
 bench/gemv_bench
 bench/mmq_bench
+bench/mma_bench
 bench/turing_check
 bench/mmq_e*
 bench/resid_bench

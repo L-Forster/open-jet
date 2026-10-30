@@ -121,6 +121,14 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
     extern __shared__ __align__(16) uint8_t sm[];
     constexpr int BLK = WT<TYPE>::BLK, NCH = WT<TYPE>::NCH, SR = HT<TYPE>::SR, NSH = HT<TYPE>::NS;
     constexpr int STG = hm_stage<TYPE>();
+    const int ldx = W.K; // (activation row stride)
+    if (gridDim.z > 1) { // split K (too few CTAs otherwise): this CTA's 1 / gridDim.z of it, to O.y + z ntok ldy
+        W.K /= gridDim.z;
+        W.w += (size_t) blockIdx.z * (W.K / 256) * BLK;
+        if (W.d) W.d += (size_t) blockIdx.z * (W.K / BK) * 2;
+        X += (size_t) blockIdx.z * W.K;
+        O.y += (size_t) blockIdx.z * ntok * O.ldy;
+    }
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3;
     const int wm = warp % HNWM, wn = warp / HNWM; // warp tile: rows HWR wm .., tokens HWT wn ..
     const int ntt = gridDim.y;
@@ -153,7 +161,7 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
 #pragma unroll
     for (int k = 0; k < XIT; k++) {
         const int i = tid + k * 256, t = i >> 3, c = i & 7;
-        xsrc[k] = X + (size_t) (tok0 + t) * W.K + 8 * c;
+        xsrc[k] = X + (size_t) (tok0 + t) * ldx + 8 * c;
         xdst[k] = SR * BM + t * 128 + ((c ^ (t & 7)) << 4);
     }
 
@@ -431,6 +439,15 @@ __global__ void __launch_bounds__(256, 1) mmh(WMat W, const __half * X, int ntok
         }
         *dst = v;
     }
+}
+
+// y[t][r] (+)= p[0][t][r] + p[1][t][r]: the two halves of a K-split mmh (fixed order: deterministic)
+__global__ void __launch_bounds__(256) ksum2(const float * p, int ntok, int N, float * y, int ldy, int mode) {
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= ntok * N) return;
+    const float v = p[i] + p[(size_t) ntok * N + i];
+    float * d = y + (size_t) (i / N) * ldy + i % N;
+    *d = mode == OUT_ADD ? *d + v : v;
 }
 
 } // namespace pf

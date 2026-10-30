@@ -84,7 +84,6 @@ struct File {
         base = (const uint8_t *) p;
         parse();
     }
-    ~File() { if (base) UnmapViewOfFile(base); }
 #else
     explicit File(const std::string & path) {
         int fd = open(path.c_str(), O_RDONLY);
@@ -98,8 +97,20 @@ struct File {
         base = (const uint8_t *) p;
         parse();
     }
-    ~File() { if (base) munmap((void *) base, size); }
 #endif
+    ~File() { release(); }
+
+    // unmaps the file once its tensors are copied out (keeps the metadata): a mapping held for the engine's life keeps
+    // the whole model in the page cache, which under WSL stays counted against Windows
+    void release() {
+#ifdef _WIN32
+        if (base) UnmapViewOfFile(base);
+#else
+        if (base) munmap((void *) base, size);
+#endif
+        base = nullptr;
+        tensors.clear();
+    }
 
     const Tensor & get(const std::string & name) const {
         auto it = tensors.find(name);

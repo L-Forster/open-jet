@@ -14,13 +14,16 @@ model is installed.
 
 | RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
 |---|---|---|
-| Reasoning mode (what coding agents use) | 51 tok/s | **78 tok/s** (1.5x) |
+| Reasoning mode, short prompts (what coding agents use) | 60 tok/s | **92 tok/s** (1.5x) |
+| Reasoning mode, 98K tokens in context | 37 tok/s | **79 tok/s** (2.2x) |
+| Reading a 98K-token prompt | 112 s | **82 s** (1.4x) |
 | Greedy, average of 4 prompts | 63 tok/s | **107 tok/s** (1.7x) |
 | Greedy, writing code | 73 tok/s | **140 tok/s** (1.9x) |
 | Reading your prompt, 2-8K tokens | 1050-1140 tok/s | **1530-1600 tok/s** |
 
 Each figure is one conversation on one RTX 3090. llama.cpp runs with OpenJet's flags, including
-MTP speculative decoding.
+MTP speculative decoding. The first three rows are the current engine (thinking on at xhigh,
+temperature 1.0, 5 prompts x 4 seeds, and one 98K-token prompt); the others are from an earlier build.
 
 ## Quick Start
 

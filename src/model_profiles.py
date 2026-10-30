@@ -27,6 +27,7 @@ PROFILE_KEYS: tuple[str, ...] = (
     "model_update_applied",
     "device",
     "context_window_tokens",
+    "megakernel_long_context",
     "max_tokens",
     "gpu_layers",
     "llama_cpu_moe",

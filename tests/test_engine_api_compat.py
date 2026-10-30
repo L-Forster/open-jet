@@ -79,6 +79,8 @@ class EngineApiCompatTests(unittest.TestCase):
         srv.template = mk.make_template(TEMPLATE)
         srv.model_id = "Qwen3.8-27B-Q4_K_M.gguf"
         srv.lock = threading.Lock()
+        srv.sched = None  # one request at a time (no --parallel)
+        srv.shared_text = None
         srv.warned = set()
         srv.sampling = lambda body: None
         srv.load_prompt = lambda toks: (cls.eng.start(toks), 2)

@@ -401,6 +401,8 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument("--json", dest="json_output", action="store_true", default=argparse.SUPPRESS, help="return a JSON setup result")
     setup_parser.add_argument("--model", help="catalog GGUF filename/label or existing local GGUF path")
     setup_parser.add_argument("--context-tokens", type=int, help="context window, within the recommended memory limit")
+    setup_parser.add_argument("--long-context", action="store_true",
+                              help="the megakernel's compact KV cache: about 234K tokens of context on a 24 GB card")
     project_parser = subparsers.add_parser(
         "project",
         help="provision this project's embedded model (build-time; the SDK never downloads at runtime)",
@@ -765,7 +767,8 @@ def main(argv: list[str] | None = None) -> None:
         try:
             with redirect_stdout(sys.stderr):
                 result = asyncio.run(run_setup(model=args.model, context=args.context_tokens,
-                                               dry_run=args.dry_run, yes=args.yes, log=SetupLog()))
+                                               dry_run=args.dry_run, yes=args.yes, long_context=args.long_context,
+                                               log=SetupLog()))
         except (SetupError, RuntimeError, ValueError, OSError) as exc:
             failure = {"schema_version": 1, "status": "error", "stage": getattr(exc, "stage", "setup"), "error": str(exc)}
             print(json.dumps(failure) if args.json_output else f"Setup failed ({failure['stage']}): {exc}")
@@ -777,7 +780,7 @@ def main(argv: list[str] | None = None) -> None:
             if result["status"] == "ready":
                 print("Local inference passed. Start in your project with: openjet\nOne prompt: openjet chat \"Explain this repository\"")
         return
-    if args.command == "setup" and (args.model or args.context_tokens is not None or args.json_output):
+    if args.command == "setup" and (args.model or args.context_tokens is not None or args.json_output or args.long_context):
         raise SystemExit("Use --non-interactive, --yes, or --dry-run with setup options.")
     force_setup = bool(args.command == "setup")
     launch_tui(force_setup=force_setup)

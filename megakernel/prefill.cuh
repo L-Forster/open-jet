@@ -482,6 +482,7 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * __ldg(nw + lane * 8 + k);
             rope8(v, lane, pos);
+            if (it < NH && cB.kvlow && cB.kvr[slot]) fwht256(v); // the slot's K is stored rotated (MK_KV "r")
         }
         const float sc = it < NH ? 0.0625f : 1.0f;
         __half2 hv[4];
@@ -490,8 +491,9 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
         if (it < NH) {
             *reinterpret_cast<int4 *>(cP.qh + ((size_t) t * NH + it) * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         } else {
-            const size_t row = ((size_t) slot * NKV + (it - NH) % NKV) * ctx + pos;
-            if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
+            const size_t row = kv_own_row(cB.ptab, ctx, slot, (it - NH) % NKV, pos - cB.segn); // (own cache: pos >= segn)
+            if (cB.kvlow) kv_store_row(isv, slot, (it - NH) % NKV, pos, v); // MK_KV: the slot's format (+ window ring)
+            else if (cB.kvq8) kv_store_q8(static_cast<int8_t *>(isv ? cB.vc : cB.kc) + row * HD, (isv ? cB.vsc : cB.ksc) + row * (HD / 32), v);
             else *reinterpret_cast<int4 *>(static_cast<__half *>(isv ? cB.vc : cB.kc) + row * HD + lane * 8) = *reinterpret_cast<int4 *>(hv);
         }
     }
@@ -499,18 +501,27 @@ __global__ void __launch_bounds__(256) pk_attn_prep(int n0, int slot, const floa
 
 // Causal flash attention over the cache for the chunk's queries.  CTA = (16 query positions, kv
 // head); warp = one of the 6 query heads of the group (16 rows). K/V tiles of 32 (Turing: 16) positions in
-// shared memory, S = Q K^T and O += P V on tensor cores (fp16 operands, fp32 accumulation).
+// shared memory, S = Q K^T and O += P V on tensor cores (fp16 operands, fp32 accumulation). q8 (Ampere on): the
+// next tile's raw rows stream in (cp.async) while this one is used; Q rows unpadded, their 16-byte chunks swizzled
+// (chunk c of row r at c ^ (r & 7): conflict-free fragment reads) to fit. The longest blocks (last queries) go first.
+// gridDim.z > 1 (few queries over a long context): CTA z takes positions [z chunk, (z + 1) chunk) of the cache and
+// leaves its unnormalised O and (max, sum) in po / pml for pk_attn_comb.
 constexpr int AT_Q = 16, AT_K = QWEN_MK_SM75 ? 16 : 32, AT_LD = QWEN_MK_SM75 ? HD : HD + 8;
-constexpr int AT_SMEM = (6 * AT_Q + 2 * AT_K) * AT_LD * 2; // Q, K/V tile
+constexpr bool AT_PIPE = !QWEN_MK_SM75;
+constexpr int AT_SMEM = AT_PIPE ? 6 * AT_Q * HD * 2 + 2 * AT_K * AT_LD * 2 + 2 * AT_K * KVQ_ROW // Q, K/V tile, raw q8 tile
+                                : (6 * AT_Q + 2 * AT_K) * AT_LD * 2;                            // Q, K/V tile
 static_assert(!QWEN_MK_SM75 || AT_SMEM <= 65536, "Turing prefill attention shared memory");
 template <bool Q8>
-__global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
+__global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot, int chunk = 0, float * po = nullptr, float2 * pml = nullptr) {
+    constexpr bool PIPE = Q8 && AT_PIPE;
+    constexpr int QLD = PIPE ? HD : AT_LD;          // (PIPE: swizzled)
     extern __shared__ __align__(16) uint8_t asm_[];
-    __half * sQ = reinterpret_cast<__half *>(asm_); // [96][AT_LD]
-    __half * sK = sQ + 6 * AT_Q * AT_LD;            // [32][AT_LD]
+    __half * sQ = reinterpret_cast<__half *>(asm_); // [96][QLD]
+    __half * sK = sQ + 6 * AT_Q * QLD;              // [32][AT_LD]
     __half * sV = sK + AT_K * AT_LD;                // [32][AT_LD]
+    uint8_t * sRaw = reinterpret_cast<uint8_t *>(sV + AT_K * AT_LD); // PIPE: [K, V][32][KVQ_ROW]
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g8 = lane >> 2, t4 = lane & 3;
-    const int t0 = blockIdx.x * AT_Q, g = blockIdx.y;
+    const int t0 = (gridDim.x - 1 - blockIdx.x) * AT_Q, g = blockIdx.y;
     const size_t ctx = cB.ctx;
     const size_t row0 = ((size_t) slot * NKV + g) * ctx;
     const __half * Kc = static_cast<const __half *>(cB.kc) + row0 * HD;
@@ -518,21 +529,54 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
     const int nq = min(AT_Q, T - t0);
     for (int i = tid; i < 6 * AT_Q * 32; i += 192) { // 96 rows x 32 chunks of 16 B
         const int r = i >> 5, c = i & 31, hq = r / AT_Q, tt = r % AT_Q;
-        __half * d = sQ + r * AT_LD + 8 * c;
+        __half * d = sQ + r * QLD + 8 * (PIPE ? c ^ (r & 7) : c);
         if (tt < nq) cp_async16(d, cP.qh + ((size_t) (t0 + tt) * NH + g * 6 + hq) * HD + 8 * c);
         else *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0);
     }
     pf::cpa_commit();
     const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
+    const int klo = gridDim.z > 1 ? blockIdx.z * chunk : 0, kend = gridDim.z > 1 ? min(pmax + 1, klo + chunk) : pmax + 1;
     float o[32][4];
 #pragma unroll
     for (int i = 0; i < 32; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
     float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f; // rows g8, g8 + 8
     const int qr0 = qpos0 + g8, qr1 = qpos0 + g8 + 8;
-    const __half * qa = sQ + (warp * AT_Q + g8) * AT_LD + 2 * t4;
-    for (int kb = 0; kb <= pmax; kb += AT_K) {
-        const int np = min(AT_K, pmax + 1 - kb);
-        if constexpr (Q8) { // q8 K/V tile -> fp16 in shared memory (all loads issued before the first conversion)
+    const __half * qa = sQ + (warp * AT_Q + g8) * QLD + 2 * t4;
+    auto issue_raw = [&](int kb) { // PIPE: raw q8 rows (values, scales) of tile kb -> sRaw
+        const int np = min(AT_K, kend - kb);
+        for (int i = tid; i < 2 * AT_K * 17; i += 192) {
+            const int which = i / (AT_K * 17), r = (i / 17) % AT_K, cc = i % 17;
+            uint8_t * d = sRaw + (which * AT_K + r) * KVQ_ROW + 16 * cc;
+            if (r < np) {
+                bool seg;
+                const size_t row = kv_row(slot, g, kb + r, seg);
+                if (cc < 16) cp_async16(d, static_cast<const int8_t *>(kv_base(seg, which)) + row * HD + 16 * cc);
+                else cp_async16(d, kv_sbase(seg, which) + row * (HD / 32));
+            } else if (cc == 16) {
+                *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0); // (zero scales: the row contributes nothing)
+            }
+        }
+        pf::cpa_commit();
+    };
+    if constexpr (PIPE) {
+        if (klo < kend) issue_raw(klo);
+        else pf::cpa_wait<0>(); // (no positions: the Q rows' copies still complete)
+    }
+    for (int kb = klo; kb < kend; kb += AT_K) {
+        const int np = min(AT_K, kend - kb);
+        if constexpr (PIPE) {
+            pf::cpa_wait<0>();
+            __syncthreads(); // (the last tile's compute is done with sK / sV)
+            for (int i = tid; i < 2 * AT_K * 32; i += 192) {
+                const int which = i / (AT_K * 32), r = (i >> 5) % AT_K, c = i & 31;
+                const uint8_t * src = sRaw + (which * AT_K + r) * KVQ_ROW;
+                __half2 h[4];
+                q8_to_f16(*reinterpret_cast<const uint2 *>(src + 8 * c), __half2float(reinterpret_cast<const __half *>(src + HD)[c >> 2]), h);
+                *reinterpret_cast<int4 *>((which ? sV : sK) + r * AT_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
+            }
+            __syncthreads();
+            if (kb + AT_K < kend) issue_raw(kb + AT_K); // (streams in during this tile's compute)
+        } else if constexpr (Q8) { // q8 K/V tile -> fp16 in shared memory (all loads issued before the first conversion)
             constexpr int PER = (2 * AT_K * 32 + 191) / 192;
             uint2 q[PER];
             float d[PER];
@@ -542,9 +586,10 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
                 q[k] = make_uint2(0, 0);
                 d[k] = 0.f;
                 if (i < 2 * AT_K * 32 && r < np) {
-                    const size_t row = row0 + kb + r;
-                    q[k] = __ldg(reinterpret_cast<const uint2 *>(static_cast<const int8_t *>(which ? cB.vc : cB.kc) + row * HD) + c);
-                    d[k] = __half2float((which ? cB.vsc : cB.ksc)[row * (HD / 32) + (c >> 2)]);
+                    bool seg;
+                    const size_t row = kv_row(slot, g, kb + r, seg);
+                    q[k] = __ldg(reinterpret_cast<const uint2 *>(static_cast<const int8_t *>(kv_base(seg, which)) + row * HD) + c);
+                    d[k] = __half2float(kv_sbase(seg, which)[row * (HD / 32) + (c >> 2)]);
                 }
             }
             pf::cpa_wait<0>(); // Q rows (first tile)
@@ -560,8 +605,10 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
             for (int i = tid; i < AT_K * 32; i += 192) {
                 const int p = i >> 5, c = i & 31;
                 if (p < np) {
-                    cp_async16(sK + p * AT_LD + 8 * c, Kc + (size_t) (kb + p) * HD + 8 * c);
-                    cp_async16(sV + p * AT_LD + 8 * c, Vc + (size_t) (kb + p) * HD + 8 * c);
+                    bool seg;
+                    const size_t row = kv_row(slot, g, kb + p, seg);
+                    cp_async16(sK + p * AT_LD + 8 * c, static_cast<const __half *>(kv_base(seg, 0)) + row * HD + 8 * c);
+                    cp_async16(sV + p * AT_LD + 8 * c, static_cast<const __half *>(kv_base(seg, 1)) + row * HD + 8 * c);
                 } else {
                     *reinterpret_cast<int4 *>(sK + p * AT_LD + 8 * c) = make_int4(0, 0, 0, 0);
                     *reinterpret_cast<int4 *>(sV + p * AT_LD + 8 * c) = make_int4(0, 0, 0, 0);
@@ -570,16 +617,40 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
             pf::cpa_commit();
             pf::cpa_wait<0>();
         }
-        __syncthreads();
+        if constexpr (!PIPE) __syncthreads();
         float s[AT_K / 8][4];
 #pragma unroll
         for (int ni = 0; ni < AT_K / 8; ni++) s[ni][0] = s[ni][1] = s[ni][2] = s[ni][3] = 0.f;
+        if constexpr (PIPE) { // fragments by ldmatrix: Q (A) rows of matrix lane / 8 (rows + 8, chunk + 1), K (B) 2 k steps
+            const int qrow = warp * AT_Q + (lane & 7) + 8 * ((lane >> 3) & 1);
+            const unsigned qbase = (unsigned) __cvta_generic_to_shared(sQ + qrow * QLD);
+            const unsigned kbase = (unsigned) __cvta_generic_to_shared(sK + (lane & 7) * AT_LD + 8 * (lane >> 3));
+#pragma unroll
+            for (int k2 = 0; k2 < HD / 32; k2++) {
+                unsigned kb_[AT_K / 8][4];
+#pragma unroll
+                for (int ni = 0; ni < AT_K / 8; ni++) // chunks 4 k2 .. 4 k2 + 3 of positions 8 ni .. + 7
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                 : "=r"(kb_[ni][0]), "=r"(kb_[ni][1]), "=r"(kb_[ni][2]), "=r"(kb_[ni][3])
+                                 : "r"(kbase + (unsigned) ((8 * ni * AT_LD + 32 * k2) * 2)));
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int ks = 2 * k2 + h;
+                    unsigned a0, a1, a2, a3;
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                                 : "r"(qbase + (unsigned) (16 * ((2 * ks + (lane >> 4)) ^ (qrow & 7)))));
+#pragma unroll
+                    for (int ni = 0; ni < AT_K / 8; ni++) mma16816(s[ni], a0, a1, a2, a3, kb_[ni][2 * h], kb_[ni][2 * h + 1]);
+                }
+            }
+        } else
 #pragma unroll
         for (int ks = 0; ks < HD / 16; ks++) {
             const unsigned a0 = *reinterpret_cast<const unsigned *>(qa + 16 * ks);
-            const unsigned a1 = *reinterpret_cast<const unsigned *>(qa + 8 * AT_LD + 16 * ks);
+            const unsigned a1 = *reinterpret_cast<const unsigned *>(qa + 8 * QLD + 16 * ks);
             const unsigned a2 = *reinterpret_cast<const unsigned *>(qa + 16 * ks + 8);
-            const unsigned a3 = *reinterpret_cast<const unsigned *>(qa + 8 * AT_LD + 16 * ks + 8);
+            const unsigned a3 = *reinterpret_cast<const unsigned *>(qa + 8 * QLD + 16 * ks + 8);
 #pragma unroll
             for (int ni = 0; ni < AT_K / 8; ni++) {
                 const __half * kp = sK + (8 * ni + g8) * AT_LD + 2 * t4 + 16 * ks;
@@ -627,13 +698,14 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
         l1 = l1 * al1 + ps1;
         m0 = mn0;
         m1 = mn1;
+        if (__any_sync(0xffffffffu, al0 != 1.f || al1 != 1.f)) // (a row's maximum moved: past the first tiles, rare)
 #pragma unroll
-        for (int i = 0; i < 32; i++) {
-            o[i][0] *= al0;
-            o[i][1] *= al0;
-            o[i][2] *= al1;
-            o[i][3] *= al1;
-        }
+            for (int i = 0; i < 32; i++) {
+                o[i][0] *= al0;
+                o[i][1] *= al0;
+                o[i][2] *= al1;
+                o[i][3] *= al1;
+            }
         // O += P V: k = positions (2 steps of 16), n = 32 tiles of 8 dims
 #pragma unroll
         for (int ks = 0; ks < AT_K / 16; ks++) {
@@ -649,10 +721,22 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
                 mma16816(o[2 * dt2 + 1], a0, a1, a2, a3, b2, b3);
             }
         }
-        __syncthreads();
+        if constexpr (!PIPE) __syncthreads(); // (PIPE: the next tile's first barrier)
+    }
+    const int hq = g * 6 + warp;
+    if (gridDim.z > 1) {
+        const size_t r0 = ((size_t) blockIdx.z * T + t0 + g8) * NH + hq, r1 = r0 + (size_t) 8 * NH;
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            const int d = 8 * i + 2 * t4;
+            if (g8 < nq) *reinterpret_cast<float2 *>(po + r0 * HD + d) = make_float2(o[i][0], o[i][1]);
+            if (g8 + 8 < nq) *reinterpret_cast<float2 *>(po + r1 * HD + d) = make_float2(o[i][2], o[i][3]);
+        }
+        if (t4 == 0 && g8 < nq) pml[r0] = make_float2(m0, l0);
+        if (t4 == 0 && g8 + 8 < nq) pml[r1] = make_float2(m1, l1);
+        return;
     }
     const float il0 = l0 > 0.f ? 1.f / l0 : 0.f, il1 = l1 > 0.f ? 1.f / l1 : 0.f;
-    const int hq = g * 6 + warp;
 #pragma unroll
     for (int i = 0; i < 32; i++) {
         const int d = 8 * i + 2 * t4;
@@ -666,6 +750,38 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot) {
             dst[0] = o[i][2] * il1;
             dst[1] = o[i][3] * il1;
         }
+    }
+}
+
+// pk_attn with nz key splits: y2 row t, head h = sum_z O_z e^(m_z - M) / sum_z l_z e^(m_z - M) (z in order)
+__global__ void __launch_bounds__(HD) pk_attn_comb(int T, int nz, const float * po, const float2 * pml) {
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    float M = -INFINITY;
+    for (int z = 0; z < nz; z++) M = fmaxf(M, pml[((size_t) z * T + t) * NH + h].x);
+    float L = 0.f, acc = 0.f;
+    for (int z = 0; z < nz; z++) {
+        const size_t r = ((size_t) z * T + t) * NH + h;
+        const float2 ml = pml[r];
+        const float w = ml.x == -INFINITY ? 0.f : expf(ml.x - M);
+        L += ml.y * w;
+        acc += po[r * HD + d] * w;
+    }
+    cP.y2[(size_t) t * VD + h * HD + d] = L > 0.f ? acc / L : 0.f;
+}
+
+#include "prefill_attn.cuh"
+
+// MK_KV, a slot whose V is stored rotated: the attention output rotated back in place (WHT, its own inverse), before
+// pk_attn_out. One warp per head.
+__global__ void __launch_bounds__(256) pk_attn_vrot() {
+    const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int h = warp; h < NH; h += 8) {
+        float * y = cP.y2 + (size_t) t * VD + h * HD + lane * 8;
+        float v[8];
+        load8(y, v);
+        fwht256(v);
+        *reinterpret_cast<float4 *>(y) = make_float4(v[0], v[1], v[2], v[3]);
+        *reinterpret_cast<float4 *>(y + 4) = make_float4(v[4], v[5], v[6], v[7]);
     }
 }
 

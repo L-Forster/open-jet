@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Speed and accuracy comparison of the current OpenJet engine (origin/master build in ../open-jet-bench)
-# with llamAmpere v0.6.1 and llama.cpp b11982 on this machine.  Run it with nothing else on the GPU:
+# with llama.cpp b11982 on this machine.  Run it with nothing else on the GPU:
 # it refuses to start when the GPU is busy (FORCE=1 overrides).  About 2 hours.
 #
 #   megakernel/bench/run_compare.sh [OUT_DIR]
@@ -9,7 +9,6 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH=/home/louis/open-jet-bench/megakernel
 MODEL=/home/louis/open-jet/models/Qwen3.8-27B-Q4_K_M.gguf
-LLAMAMPERE=/home/louis/bench-engines/llamampere-v0.6.1/build-sm86/bin/llama-server
 LLAMACPP=/home/louis/bench-engines/llama.cpp-b11982/build/bin/llama-server
 LLAMA_REF=/home/louis/open-jet/megakernel/tools/llama_ref
 TOKENIZER=/home/louis/bench-engines/qwen_tok/tokenizer.json
@@ -29,12 +28,9 @@ fi
 # 2. speed: 8 seeds in 4 interleaved rounds, short prompts and a ~98K-token prompt
 MK="python3 $BENCH/server/mk_server.py -m $MODEL --port 8094 -c $CTX --kv q8 -d 4 --lib $BENCH/libqwen38mk.so"
 COMMON="-m $MODEL --host 127.0.0.1 --port 8094 --parallel 1 -ngl 99 -c $CTX --jinja"
-LA="$LLAMAMPERE $COMMON -fa on -b 4096 -ub 1024 --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 5 --spec-draft-p-min 0 -ctk q8_0 -ctv q8_0"
 python3 "$HERE/engine_compare.py" --seeds 8 --rounds 4 -n 1024 --tokenizer "$TOKENIZER" --output "$OUT/speed.json" \
     --engine "openjet-attn8=8094=$MK" \
     --engine "openjet-attn2=8094=env MK_ATTN_S8=0 $MK" \
-    --engine "llamampere-exact=8094=$LA --no-spec-mb-mtp" \
-    --engine "llamampere-mbmtp=8094=$LA" \
     --engine "llama.cpp-b11982=8094=$LLAMACPP $COMMON --flash-attn on -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 2" \
     2>&1 | tee "$OUT/speed.console.txt"
 

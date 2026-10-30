@@ -36,8 +36,8 @@ from .provisioning import LLAMA_CPP_DIR, _download_to_path, _extract_archive, _n
 _BUILD_TAG = ".openjet-build.json"
 _MIXED_BUILD_TAG = ".openjet-build-mixed.json"
 _RELEASE_ASSET_URL = "https://github.com/L-Forster/open-jet/releases/download/v{version}/{asset}"
-_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "prefill.cuh", "prefill_gemm.cuh",
-            "cuda_compat.cuh", "gguf.h", "capi.cpp")
+_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "kv_lowbit.cuh", "kv_spec.h", "prefill.cuh", "prefill_attn.cuh",
+            "prefill_gemm.cuh", "cuda_compat.cuh", "gguf.h", "capi.cpp", "bmm.cuh")
 
 
 def _nvcc_path() -> str | None:

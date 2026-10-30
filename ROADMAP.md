@@ -5,50 +5,23 @@ short series of pull requests. Comment on the matching issue, or open one, befor
 large item, and follow [What A Pull Request Needs](CONTRIBUTING.md#what-a-pull-request-needs):
 engine changes come with before/after benchmarks, and new quants with accuracy numbers.
 
-## 1. Anthropic Messages and OpenAI Responses APIs on the engine server
+## 1. Check the prebuilt engine on a clean machine
 
-`megakernel/server/mk_server.py` serves `/v1/chat/completions`, `/v1/models` and `/v1/health`.
-Claude Code talks to `/v1/messages` (Anthropic Messages); Codex CLI talks to `/v1/responses`
-(OpenAI Responses). Neither can use the engine directly today.
+`openjet setup` downloads the engine prebuilt for the GPU from the GitHub release
+(`.github/workflows/engine.yml` builds it) and compiles from source only when none matches.
 
-- Add `POST /v1/messages`: system prompt, content blocks, `tool_use` / `tool_result`,
-  thinking blocks mapped to `reasoning_content`, streaming as Anthropic SSE events
-  (`message_start`, `content_block_delta`, `message_stop`).
-- Add `POST /v1/responses`: input items, function calls and their outputs, reasoning items,
-  streaming events.
-- Both reuse the existing chat-completions path (template rendering, tool-call parsing,
-  sampling), not a second implementation.
-- Done when: a recipe in `docs/clients/` shows Claude Code and Codex CLI each completing a task
-  with tool calls against the engine, plus tests for the request/response mapping.
-
-## 2. Prebuilt engine binaries (no `nvcc` on the user's machine)
-
-The wheel ships the engine as source and `openjet setup` compiles it, so users need the CUDA
-toolkit. Most only have the NVIDIA driver.
-
-- Build `libqwen38mk.so` (and `libqwen38mk_mixed.so`) in CI as one fat binary for sm_75, sm_86,
-  sm_89 and sm_120, and ship it in the Linux x86_64 wheel or as release assets.
-- The library links `libllama` / `libggml*` (tokenizer, via `capi.cpp`) and cudart / cuBLAS /
-  cuBLASLt. Bundle the llama.cpp libraries, or link them statically. For CUDA, depend on
-  NVIDIA's pip wheels: `nvidia-cuda-runtime` 13.4.92 and `nvidia-cublas` 13.8.2.12 both publish
-  `manylinux` x86_64 wheels.
-- Setup uses the prebuilt library when its architecture matches and falls back to compiling
-  from source otherwise.
-- Done when: on a clean Linux machine with only the driver, `pipx install open-jet && openjet
+- Done when: on a clean Linux machine with only the NVIDIA driver, `pipx install open-jet && openjet
   setup` serves Qwen3.8-27B with the engine, and `pgrep -af mk_server.py` shows it.
 
-## 3. Windows build of the engine
+## 2. Windows engine on real hardware
 
-The engine is Linux-only; Windows users fall back to llama.cpp.
+CI builds the engine for Windows (MSVC + nvcc, loaded as a DLL by `mk_server.py`), but no one has run it
+on a Windows machine yet.
 
-- Build `qwen38_mk.cu`, `capi.cpp` and the server under MSVC + nvcc, and load the DLL from
-  `mk_server.py`.
-- `nvidia-cuda-runtime` 13 has a `win_amd64` wheel; `nvidia-cublas` 13 does not (Linux only),
-  so cuBLAS / cuBLASLt DLLs have to be bundled or taken from the CUDA 12 wheels.
 - Done when: a Windows machine with an RTX 30/40/50 card and 24 GB+ runs `openjet setup` and
   serves with the engine; decode speed reported against the same card under Linux or WSL.
 
-## 4. i-quant support: 16 GB and 12 GB cards
+## 3. i-quant support: 16 GB and 12 GB cards
 
 Every Qwen3.8-27B GGUF under ~15 GiB on Hugging Face is a dynamic mix of many weight types, not one
 (read from the GGUF headers; GiB of layer weights per type):
@@ -78,7 +51,7 @@ Done when, for each file: the loader accepts it, decode and prefill speeds are r
 top-token agreement and KL divergence against llama.cpp on the same file are reported with the
 commands under Correctness in the [engine README](megakernel/README.md).
 
-## 5. Fit the engine on 16 GB cards
+## 4. Fit the engine on 16 GB cards
 
 Done for UD-Q3_K_XL on branch `iq3s-native` (per-model VRAM gate from the GGUF header, measured engine
 overhead ~1.25 GiB); still to do: a run on a real 16 GB card, and the same for UD-IQ4_XS (~25K context).
@@ -88,7 +61,7 @@ Accuracy can be checked there, but the 16 GB cards are Ada (sm_89) or Blackwell 
 different SM counts, L2 sizes and memory bandwidth, so speed and launch shapes have to be measured
 and tuned on the card itself.
 
-Depends on item 4. Once an 11-12 GiB file loads, the remaining VRAM has to cover the KV cache,
+Depends on item 3. Once an 11-12 GiB file loads, the remaining VRAM has to cover the KV cache,
 MTP state, prefill scratch and the CUDA context.
 
 - Measure the engine's VRAM use per component at 8K, 32K and 128K context.
@@ -99,30 +72,7 @@ MTP state, prefill scratch and the CUDA context.
 - Done when: an RTX 4060 Ti 16 GB, 4070 Ti Super, 5070 Ti or 5080 serves the IQ3_S file through
   `openjet setup`, with the context it chose and the decode speed.
 
-## 6. `openjet bench`: a standard benchmark with a results path
-
-Hardware reports today are free-form issues.
-
-- `openjet bench` runs a fixed prompt set against the running server (engine or llama.cpp):
-  reasoning on, the model card's sampling, prompts at 4K, 32K and 100K tokens, a few
-  needle-recall checks. It writes `results.json` with hardware, driver, versions, model file,
-  flags and every request's timings.
-- A results-only pull request path: `bench/results/<date>-<gpu>/` holds the JSON and a short
-  README, and a generated table in `docs/benchmarks/` lists all submitted results.
-- A `[Benchmark]` issue template for runs that can't become a pull request.
-
-## 7. Same-machine comparison harness
-
-`bench/think_bench.py` compares the engine with llama.cpp using llama.cpp's flags. Extend it
-to start any OpenAI-compatible server from a command line (other llama.cpp forks, other
-engines), with the same rendered prompts, seeds and sampling. Report:
-
-- decode at short context and at 100K depth, prompt speed, time to first token
-- which servers sample exactly; flag non-exact draft acceptance, e.g. llamAmpere's `mb-MTP`,
-  and run with it off as well as on
-- KV precision and model file per server, in the output JSON
-
-## 8. Engine limitations
+## 5. Engine limitations
 
 From [Limitations](megakernel/README.md#limitations) in the engine README:
 

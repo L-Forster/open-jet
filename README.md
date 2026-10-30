@@ -10,16 +10,23 @@ RTX 30, 40 and 50-series with 24 GB · works with Claude Code, Codex, OpenCode a
   <a href="https://discord.com/invite/pspKHtExSa"><img src="https://img.shields.io/badge/Discord-join-5865F2" alt="Discord"></a>
 </p>
 
+https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
+
 | RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
 |---|---|---|
-| Reasoning mode (what coding agents use) | 51 tok/s | **78 tok/s** (1.5x) |
+| Reasoning mode, short prompts (what coding agents use) | 60 tok/s | **92 tok/s** (1.5x) |
+| Reasoning mode, 98K tokens in context | 37 tok/s | **79 tok/s** (2.2x) |
+| Reading a 98K-token prompt | 112 s | **82 s** (1.4x) |
 | Greedy, average of 4 prompts | 63 tok/s | **107 tok/s** (1.7x) |
 | Greedy, writing code | 73 tok/s | **140 tok/s** (1.9x) |
 | Reading your prompt, 2-8K tokens | 1050-1140 tok/s | **1530-1600 tok/s** |
 
 Each figure is one conversation on one RTX 3090, not a batch. llama.cpp runs with OpenJet's flags,
-including MTP speculative decoding. OpenJet's output matches llama.cpp's on the same weights: KL
-divergence 0.0009, top-token agreement 99.08% ([results and reproduction scripts](megakernel/README.md#results)).
+including MTP speculative decoding. The first three rows are the current engine against llama.cpp
+b11982, measured with [`megakernel/bench/run_compare.sh`](megakernel/bench/run_compare.sh): thinking on
+at xhigh, temperature 1.0, 5 prompts x 4 seeds, and one 98K-token prompt x 4 seeds. The other rows are
+from an earlier engine build. OpenJet's output matches llama.cpp's on the same weights: KL divergence 0.0009, top-token
+agreement 99.08% ([results and reproduction scripts](megakernel/README.md#results)).
 
 ## Install
 
@@ -66,6 +73,9 @@ For OpenJet's engine:
   matching RTX workstation cards)
 - Linux, and an NVIDIA driver that supports CUDA 12.8 (570 or newer)
 - the Qwen3.8 27B Q4_K_M model, which `openjet setup` downloads
+- context: about 120K tokens with the default q8_0 KV cache, or up to about 234K on a 24 GB card with
+  `openjet setup --long-context`, which stores the cache in 5 bits and keeps the most recent 2K
+  positions at q8_0 ([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv))
 
 `openjet setup` downloads the engine prebuilt for your GPU, so you don't need the CUDA toolkit. If
 no prebuilt engine matches, setup compiles it instead, which needs `nvcc` (CUDA 12+, or 12.8+ for
@@ -90,6 +100,44 @@ serving, run `pgrep -af mk_server.py`: it prints a line when OpenJet's engine is
 the model and GPU match, `llama` always uses llama.cpp, and `megakernel` fails instead of falling
 back. See [the runtime docs](docs/runtimes/llama-cpp.md#openjets-engine-rtx-304050-series) and
 [how the engine works](megakernel/README.md).
+
+## 4 coding agents on one GPU
+
+Same hardware as OpenJet's engine above. Build the engine from a source checkout:
+
+```bash
+git clone https://github.com/l-forster/open-jet.git && cd open-jet
+git clone --depth 1 --branch b10246 https://github.com/ggml-org/llama.cpp.git llama.cpp
+cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
+cmake --build llama.cpp/build --config Release -j 2
+make -C megakernel libqwen38mk.so
+pip install jinja2 rich  # rich: for mk_top.py
+```
+
+Start the server with the Qwen3.8-27B Q4_K_M GGUF (if `openjet setup` downloaded it, its path is
+`llama_model` in your OpenJet `config.yaml`):
+
+```bash
+python3 megakernel/server/mk_server.py -m /path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
+```
+
+Then point up to 4 agents, anything that speaks the OpenAI chat API, at `http://127.0.0.1:18080/v1`.
+They decode in the same pass over the weights, so they share the GPU instead of taking turns:
+
+| RTX 3090, Qwen3.8-27B Q4_K_M | Per agent | Total |
+|---|---|---|
+| 1 agent generating | 117 tok/s | 117 tok/s |
+| 4 agents generating, short context | ~75 tok/s | ~290 tok/s |
+| 4 agents generating, 10K context each | ~40 tok/s | ~160 tok/s |
+| 4 real coding agents (they pause to run tools and tests) | 40-75 tok/s | 150-200 tok/s |
+
+The 4 share one 132K-token KV cache (q8_0), so one agent can use most of it while the others are short.
+A system prompt and tool list they have in common is processed once. To watch them live (tok/s, context
+and task per agent):
+
+```bash
+python3 megakernel/tools/mk_top.py
+```
 
 ## Smaller GPU?
 
@@ -140,9 +188,6 @@ power limit, context window and OpenJet version, which each file records. See
 
 ### OpenJet's terminal agent
 
-<p align="center">
-  <img width="1672" height="941" alt="OpenJet coding agent running in a terminal" src="https://github.com/user-attachments/assets/b06b0b8f-1bbc-443d-920e-bd70bff1479c" />
-</p>
 
 Most coding agents assume a frontier model with a huge context window. OpenJet's agent assumes a
 model that fits on your GPU, whose context is limited and drifts over a long task. So the harness
@@ -207,7 +252,7 @@ control of the model, so OpenJet's hardware tuning and engine don't apply.
 pipx install 'open-jet[cloud]'
 ```
 
-Add a profile to the `config.yaml` that `openjet status` reports, then select it with
+Add a profile to `config.yaml` (`openjet --status` shows where it is), then select it with
 `/model <name>`:
 
 ```yaml
@@ -226,22 +271,17 @@ model_profiles:
 | LM Studio | `http://127.0.0.1:1234/v1` | `openai/<LM Studio model ID>` |
 | llama-server | `http://127.0.0.1:8080/v1` | `openai/local` |
 
-Loopback servers get a placeholder API key automatically.
+That server keeps control of the model, so OpenJet's hardware tuning and its CUDA engine don't apply.
 
 ### Python SDK: embed a local LLM in your application
 
-The same runtime ships inside your software: an in-app assistant, a game NPC, an offline
-classifier. You provision the model at build time for the device you ship to:
+Ship a local model inside your app. Size it for the target device at build time:
 
 ```bash
 pip install open-jet
 cd your-project
 openjet project --use-case dialogue --target handheld --budget 4
 ```
-
-Unlike `openjet setup`, this sizes the model for the target device and the memory your app gives
-it, optimises for first-token latency, and puts the weights in `.openjet/models/` so your build
-bundles them.
 
 ```python
 import asyncio
@@ -261,8 +301,8 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-Nothing downloads at runtime: if the model is missing, the session raises an error rather than
-fetching it on a user's machine. See the [SDK quickstart](docs/sdk/quickstart.md).
+The weights go in `.openjet/models/` for your build to bundle; nothing downloads on a user's machine.
+See the [SDK quickstart](docs/sdk/quickstart.md).
 
 ### FAQ
 
@@ -302,8 +342,7 @@ Everything else runs on llama.cpp.
 - For AI tools and writers: [AGENTS.md](AGENTS.md) · [Install with an agent](docs/agent-install.md) ·
   [AI reference](docs/AI_REFERENCE.md) · [Media kit](docs/MEDIA_KIT.md)
 - Deployment: [Jetson](docs/deployment/jetson.md) ·
-  [Linux x86 + NVIDIA](docs/deployment/linux-x86-nvidia.md) · [CPU-only](docs/deployment/cpu-only.md) ·
-  [Examples](docs/examples/README.md)
+  [Linux x86 + NVIDIA](docs/deployment/linux-x86-nvidia.md) · [CPU-only](docs/deployment/cpu-only.md)
 
 ### Community
 

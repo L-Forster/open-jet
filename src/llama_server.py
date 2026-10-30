@@ -52,6 +52,24 @@ _MEGAKERNEL_MIN_VRAM_MIB = 23000
 _MEGAKERNEL_COMPUTE_CAPS = frozenset({"7.5", "8.6", "8.9", "12.0"})
 # Turing runs only the native Q4_K_M engine; qwen38_mixed.cu needs sm_80+ (cp.async, 99 KB shared memory)
 _MEGAKERNEL_TURING_CAP = "7.5"
+# `openjet setup --long-context` (config megakernel_long_context): the compact KV cache, 5-bit K (Hadamard-rotated) and
+# 5-bit V with the newest 2,048 positions at q8_0 (megakernel/README.md, KV cache presets), for contexts past what the
+# q8_0 cache fits on a 24 GB card. An MK_KV already in the environment wins.
+MEGAKERNEL_LONG_CONTEXT_ENV = {"MK_KV": "K*=5r,V*=5", "MK_KV_WIN": "2048"}
+# It stores 23,936 bytes per position against q8_0's 36,992, plus 114 MiB of q8_0 window rings. With it the engine also
+# keeps less of its own in device memory (memory pool, smaller stack reservation, no copy of the draft head's rows, the
+# prompt checkpoint in host memory: ~0.9 GiB), so it takes 1.2 GiB more than the q8_0 limit's KV budget: 120,000 ->
+# about 234,000 positions on a 24 GB card. Measured on an RTX 3090 with ~1 GiB used by the desktop: 250,000 positions
+# peaked at 23,962 of 24,576 MiB at full decode speed, so 234,000 leaves about 1 GiB.
+_Q8_KV_BYTES, _COMPACT_KV_BYTES, _WINDOW_RING_BYTES = 36992, 23936, 114 * 1024 * 1024
+_LONG_CONTEXT_EXTRA_BYTES = int(1.2 * 1024**3)
+_QWEN38_MAX_CONTEXT = 262144
+
+
+def megakernel_long_context_limit(q8_limit: int, model_max: int) -> int:
+    """The positions the compact cache holds where the q8_0 cache's limit is *q8_limit*."""
+    budget = q8_limit * _Q8_KV_BYTES - _WINDOW_RING_BYTES + _LONG_CONTEXT_EXTRA_BYTES
+    return max(q8_limit, min(model_max or _QWEN38_MAX_CONTEXT, budget // _COMPACT_KV_BYTES))
 
 
 def _megakernel_root() -> Path:
@@ -290,6 +308,16 @@ def _megakernel_gpu_info() -> tuple[str, str] | None:
     return None
 
 
+def megakernel_long_context_reason(model: str) -> str | None:
+    """None when the megakernel's compact KV cache can serve *model* on this GPU (checked before the build), else why not."""
+    if not _megakernel_model_supported(model):
+        return "the megakernel only supports Qwen3.8-27B Q4_K_M and UD-Q4_K_XL"
+    gpu = _megakernel_gpu_info()
+    if gpu is None or gpu[1] == _MEGAKERNEL_TURING_CAP:
+        return f"the compact KV cache needs an RTX 30/40/50-series GPU (sm_86, sm_89 or sm_120) with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB"
+    return None
+
+
 def megakernel_unavailable_reason(model: str) -> str | None:
     """None when the megakernel can serve *model* on this machine, else why not."""
     if not _megakernel_model_supported(model):
@@ -368,6 +396,7 @@ class LlamaServerClient:
         diagnostics_hook: Callable[[str, dict[str, Any]], None] | None = None,
         backend: str = "auto",
         allow_system_tuning: bool = True,
+        megakernel_long_context: bool = False,
     ) -> None:
         self.model = model
         self.binary = str(binary or "").strip() or None
@@ -393,6 +422,7 @@ class LlamaServerClient:
             raise ValueError("llama_backend must be one of: auto, megakernel, llama")
         self.active_backend = "llama.cpp"
         self.allow_system_tuning = allow_system_tuning
+        self.megakernel_long_context = bool(megakernel_long_context)
         self._stderr_task: asyncio.Task[None] | None = None
 
     def set_reasoning_mode(self, mode: str) -> None:
@@ -825,12 +855,15 @@ class LlamaServerClient:
             "-c",
             str(ctx),
         ]
+        if self.megakernel_long_context and not env.get("MK_KV", "").strip():
+            env = {**env, **MEGAKERNEL_LONG_CONTEXT_ENV}
         if not env.get("CUDA_VISIBLE_DEVICES", "").strip():
             gpu = _megakernel_gpu()
             if gpu is not None:
                 # nvidia-smi indexes GPUs in PCI bus order; CUDA does too with this set
                 env = {**env, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": gpu}
-        self._emit_diagnostic("runtime_megakernel_launch_command", command=" ".join(cmd), ctx=ctx)
+        self._emit_diagnostic("runtime_megakernel_launch_command", command=" ".join(cmd), ctx=ctx,
+                              kv_cache=env.get("MK_KV") or "q8_0")
         stderr_lines: deque[str] = deque(maxlen=120)
         # keep draining stderr once ready: the server logs one line per request
         outcome = await self._spawn_until_healthy(

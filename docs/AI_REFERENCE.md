@@ -62,10 +62,15 @@ flags, including MTP speculative decoding, q8_0 KV cache and flash attention):
 
 | Workload | llama.cpp | OpenJet |
 |---|---|---|
-| Reasoning mode (thinking on, temperature 1.0, top_p 0.95, top_k 20; 5 coding prompts x 2 seeds) | 51 tok/s | 78 tok/s (1.53x) |
-| Greedy decode, mean of 4 chat prompts x 512 tokens | 63 tok/s | 107 tok/s (1.69x) |
-| Greedy decode, Python function prompt | 73 tok/s | 140 tok/s (1.93x) |
-| Prompt processing, 1.8K-7.8K token prompts | 1050-1140 tok/s | 1530-1600 tok/s |
+| Reasoning mode, short prompts (thinking on, xhigh, temperature 1.0, top_p 0.95, top_k 20; 5 coding prompts x 4 seeds) | 60 tok/s | 92 tok/s (1.53x) |
+| Reasoning mode, 98K tokens in context (same settings, one 98K-token prompt x 4 seeds) | 37 tok/s | 79 tok/s (2.17x) |
+| Reading a 98K-token prompt, cold | 112 s (876 tok/s) | 82 s (1,198 tok/s) |
+| Greedy decode, mean of 4 chat prompts x 512 tokens (earlier build) | 63 tok/s | 107 tok/s (1.69x) |
+| Greedy decode, Python function prompt (earlier build) | 73 tok/s | 140 tok/s (1.93x) |
+| Prompt processing, 1.8K-7.8K token prompts (earlier build) | 1050-1140 tok/s | 1530-1600 tok/s |
+
+The first three rows are the current engine against llama.cpp b11982, measured with
+`megakernel/bench/run_compare.sh`.
 
 Speed depends on how predictable the text is (draft acceptance) and on other GPU load. Without
 speculation the two decode at about the same speed (40.4 vs 42.9 tok/s), near the memory-bandwidth
