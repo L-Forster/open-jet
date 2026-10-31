@@ -511,7 +511,10 @@ constexpr bool AT_PIPE = !QWEN_MK_SM75;
 constexpr int AT_SMEM = AT_PIPE ? 6 * AT_Q * HD * 2 + 2 * AT_K * AT_LD * 2 + 2 * AT_K * KVQ_ROW // Q, K/V tile, raw q8 tile
                                 : (6 * AT_Q + 2 * AT_K) * AT_LD * 2;                            // Q, K/V tile
 static_assert(!QWEN_MK_SM75 || AT_SMEM <= 65536, "Turing prefill attention shared memory");
-template <bool Q8>
+// LB (MK_KV, the pipelined q8 path: MK_KV is refused on Turing): each raw row staged from where kv_src_row puts it (the
+// q8 ring at positions >= kv_ws(n0 + T), else the slot's format in the paged or contiguous cache) and converted to fp16
+// with its bits (kv_row_to_f16)
+template <bool Q8, bool LB = false>
 __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot, int chunk = 0, float * po = nullptr, float2 * pml = nullptr) {
     constexpr bool PIPE = Q8 && AT_PIPE;
     constexpr int QLD = PIPE ? HD : AT_LD;          // (PIPE: swizzled)
@@ -536,6 +539,7 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot, int chun
     pf::cpa_commit();
     const int qpos0 = n0 + t0, pmax = qpos0 + nq - 1;
     const int klo = gridDim.z > 1 ? blockIdx.z * chunk : 0, kend = gridDim.z > 1 ? min(pmax + 1, klo + chunk) : pmax + 1;
+    const int wsr = LB ? kv_ws(n0 + T) : 0; // (MK_KV_WIN: one window start for the launch, as a decode step's)
     float o[32][4];
 #pragma unroll
     for (int i = 0; i < 32; i++) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
@@ -548,10 +552,19 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot, int chun
             const int which = i / (AT_K * 17), r = (i / 17) % AT_K, cc = i % 17;
             uint8_t * d = sRaw + (which * AT_K + r) * KVQ_ROW + 16 * cc;
             if (r < np) {
-                bool seg;
-                const size_t row = kv_row(slot, g, kb + r, seg);
-                if (cc < 16) cp_async16(d, static_cast<const int8_t *>(kv_base(seg, which)) + row * HD + 16 * cc);
-                else cp_async16(d, kv_sbase(seg, which) + row * (HD / 32));
+                if constexpr (LB) {
+                    const int8_t * q;
+                    const __half * sc;
+                    const int bits = kv_src_row(which, slot, g, kb + r, wsr, q, sc);
+                    if (cc < 16) {
+                        if (cc < 2 * bits) cp_async16(d, q + 16 * cc);
+                    } else cp_async16(d, sc);
+                } else {
+                    bool seg;
+                    const size_t row = kv_row(slot, g, kb + r, seg);
+                    if (cc < 16) cp_async16(d, static_cast<const int8_t *>(kv_base(seg, which)) + row * HD + 16 * cc);
+                    else cp_async16(d, kv_sbase(seg, which) + row * (HD / 32));
+                }
             } else if (cc == 16) {
                 *reinterpret_cast<int4 *>(d) = make_int4(0, 0, 0, 0); // (zero scales: the row contributes nothing)
             }
@@ -571,7 +584,8 @@ __global__ void __launch_bounds__(192) pk_attn(int T, int n0, int slot, int chun
                 const int which = i / (AT_K * 32), r = (i >> 5) % AT_K, c = i & 31;
                 const uint8_t * src = sRaw + (which * AT_K + r) * KVQ_ROW;
                 __half2 h[4];
-                q8_to_f16(*reinterpret_cast<const uint2 *>(src + 8 * c), __half2float(reinterpret_cast<const __half *>(src + HD)[c >> 2]), h);
+                if constexpr (LB) kv_row_to_f16(src, cB.kvrp[which][slot] && kb + r >= wsr ? 8 : cB.kvb[which][slot], c, h);
+                else q8_to_f16(*reinterpret_cast<const uint2 *>(src + 8 * c), __half2float(reinterpret_cast<const __half *>(src + HD)[c >> 2]), h);
                 *reinterpret_cast<int4 *>((which ? sV : sK) + r * AT_LD + 8 * c) = *reinterpret_cast<int4 *>(h);
             }
             __syncthreads();

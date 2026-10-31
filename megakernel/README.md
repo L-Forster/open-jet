@@ -408,6 +408,13 @@ openjet-engine --model /absolute/path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
   draws on as its context grows, 132K positions on a 24 GB RTX 3090 (about 33K per agent with 4).
 - A system message plus tools of 1024 tokens or more is stored once and shared by the
   conversations that start with it (`--no-shared-prefix` turns this off).
+- The low-bit KV formats (`MK_KV`, `MK_KV_WIN`) apply to the slots as well: the pool's pages hold
+  the packed rows (`MK_KV='K*=6,V*=5'`: 0.71 of q8_0's bytes per position, `'K*=5r,V*=5'`: 0.65), so
+  the same memory holds more context. With `MK_KV_WIN` every slot keeps its own 8-bit ring of
+  recent rows (114 MiB at `MK_KV_WIN=2048` for those two) and every shared prefix a copy of the
+  ring it was built with, so conversations attached to it read its last rows at 8 bits too.
+  A lone active conversation decodes through the single-stream kernel as with q8_0; for that the
+  shared prefix is rounded down to a multiple of 32 tokens under `MK_KV`.
 - The active slots decode together: one pass over the weights for all their rows (each slot's
   current token and its MTP / prompt-lookup drafts).
 - A new prompt rides along with those steps: each pass holds the step's rows plus the next chunk

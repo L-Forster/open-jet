@@ -326,6 +326,19 @@ class MegakernelServerParsingTests(unittest.TestCase):
         with self.assertRaises(self.mk.BadRequest):
             self.mk.normalize_messages([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}])
 
+    def test_shared_prefix_ends_on_a_32_token_tile_under_mk_kv(self) -> None:
+        srv = object.__new__(self.mk.Server)
+        srv.shared_text = "shared context"
+        srv.template_args = lambda body, messages, generation_prompt: {}
+        srv.template = mock.Mock(render=lambda **kw: "")
+        prefix = list(range(1108))
+        srv.eng = mock.Mock(tokenize=lambda text: prefix)
+        toks = prefix + [5000, 5001]
+        with mock.patch.dict("os.environ", {"MK_KV": ""}):
+            self.assertEqual(srv.share_len({}, toks), 1100)
+        with mock.patch.dict("os.environ", {"MK_KV": "K*=5r,V*=5"}):
+            self.assertEqual(srv.share_len({}, toks), 1088)
+
 
     def test_oversized_prompt_uses_the_llama_cpp_overflow_wording(self) -> None:
         # Pi compacts and retries only on errors matching its overflow patterns,
