@@ -1,5 +1,7 @@
 <h1 align="center">OpenJet</h1>
 
+<p align="center">English · <a href="README.zh-CN.md">简体中文</a></p>
+
 <p align="center"><b>Run Qwen3.8-27B on your own GPU, 1.5x faster than llama.cpp.</b><br>
 RTX 30, 40 and 50-series with 24 GB · works with Claude Code, Codex, OpenCode and OpenClaw · offline · open source</p>
 
@@ -44,14 +46,11 @@ More: [docs/installation.md](docs/installation.md)
 
 ## What you need
 
-| Your hardware | What runs | Guide |
-|---|---|---|
-| NVIDIA RTX 30, 40 or 50-series with 24 GB, Linux | Qwen3.8-27B on OpenJet's engine | [Engine for your GPU](docs/installation.md#prebuilt-engines) |
-| NVIDIA Turing with 24 GB or more, Linux | OpenJet's engine, experimental | [Turing](megakernel/README.md#turing-rtx-8000) |
-| Windows | llama.cpp; OpenJet's engine on Windows is in progress | [Installation](docs/installation.md) |
-| Any other GPU, or Apple silicon | The best model that fits, on llama.cpp | [Pick by memory](docs/models.md#pick-by-memory) |
-| Jetson | llama.cpp | [Jetson](docs/deployment/jetson.md) |
-| CPU only | llama.cpp | [CPU-only](docs/deployment/cpu-only.md) |
+Linux and an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB (sm_86, sm_89, sm_120), driver 570 or newer.
+`openjet setup` downloads OpenJet's engine prebuilt for your GPU ([which one](docs/installation.md#prebuilt-engines)).
+
+Context on a 24 GB card: about 120K tokens with the default q8_0 KV cache, or up to about 234K with
+`openjet setup --long-context` ([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv)).
 
 More: [docs/installation.md](docs/installation.md#what-you-need)
 

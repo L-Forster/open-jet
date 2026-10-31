@@ -1,5 +1,7 @@
 # Features
 
+English · [简体中文](zh/features.md)
+
 ## Use it with your coding tools
 
 `openjet serve` answers the three APIs coding tools speak, from the same local model:

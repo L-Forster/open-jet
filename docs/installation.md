@@ -1,5 +1,7 @@
 # Installation
 
+English · [简体中文](zh/installation.md)
+
 ## What you need
 
 | Computer | What runs |

@@ -1,5 +1,7 @@
 # Coding tools: Claude Code, Codex, OpenCode and OpenClaw
 
+English · [简体中文](zh/clients.md)
+
 `openjet serve` runs the model `openjet setup` configured, on OpenJet's engine when your GPU and model
 support it and on llama.cpp otherwise, and answers three APIs:
 
