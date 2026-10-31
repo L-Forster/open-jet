@@ -48,3 +48,5 @@ testfile
 .claude/settings.local.json
 MEMORY.md
 llama.cpp/
+*.swp
+config.yaml.bak*
