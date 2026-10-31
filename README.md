@@ -16,7 +16,10 @@ RTX 30, 40 and 50-series with 24 GB · works with Claude Code, Codex, OpenCode a
 
 
 
-https://github.com/user-attachments/assets/edde1104-f416-49f2-a2e2-9fb25d998378
+
+
+https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
+
 
 
 
