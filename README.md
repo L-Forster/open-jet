@@ -14,7 +14,10 @@ RTX 30, 40 and 50-series with 24 GB · works with Claude Code, Codex, OpenCode a
 
 
 
-https://github.com/user-attachments/assets/c9ac0b21-67b1-4f20-af70-21741accc774
+
+
+https://github.com/user-attachments/assets/edde1104-f416-49f2-a2e2-9fb25d998378
+
 
 
 | RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
@@ -56,7 +59,8 @@ More: [docs/installation.md](docs/installation.md#what-you-need)
 
 ## 4 coding agents on one GPU
 
-https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
+
+https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
 Up to 4 agents decode in the same pass over the weights: about 290 tok/s in total on an RTX 3090 at
 short context, 150-200 tok/s with real coding agents.
@@ -87,12 +91,6 @@ A coding agent built for a model that fits on your GPU: bounded context, automat
 approved shell commands, resumable sessions, [skills](docs/usage/skills.md) and [MCP](docs/usage/mcp.md).
 
 More: [docs/features.md](docs/features.md#openjets-terminal-agent)
-
-## Slipstream
-
-A frontier model plans and reviews; your local model reads, edits and tests.
-
-More: [docs/features.md](docs/features.md#slipstream-a-frontier-model-plans-your-local-model-works)
 
 ## Python SDK
 
