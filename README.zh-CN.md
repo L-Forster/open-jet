@@ -33,6 +33,9 @@ https://github.com/user-attachments/assets/c9ac0b21-67b1-4f20-af70-21741accc774
 的输出与 llama.cpp 一致：KL 散度 0.0009，首选 token 一致率 99.08%
 （[结果和复现脚本](megakernel/README.md#results)）。
 
+24 GB 显卡上的上下文：使用默认的 q8_0 KV 缓存时约 **120K token**，使用 `openjet setup --long-context` 时最多约 **234K**
+（[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。
+
 ## 安装
 
 ```bash
@@ -48,9 +51,6 @@ openjet serve      # 或者把模型提供给 Claude Code、Codex、OpenCode 或
 
 Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm_89、sm_120），驱动 570 或更新版本。
 `openjet setup` 会下载为你的 GPU 预编译好的 OpenJet 引擎（[具体是哪一个](docs/zh/installation.md#预编译引擎)）。
-
-24 GB 显卡上的上下文：使用默认的 q8_0 KV 缓存时约 120K token，使用 `openjet setup --long-context` 时最多约 234K
-（[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。
 
 更多：[docs/zh/installation.md](docs/zh/installation.md#硬件要求)
 

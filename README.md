@@ -33,6 +33,9 @@ at xhigh, temperature 1.0, 5 prompts x 4 seeds, and one 98K-token prompt x 4 see
 from an earlier engine build. OpenJet's output matches llama.cpp's on the same weights: KL divergence 0.0009, top-token
 agreement 99.08% ([results and reproduction scripts](megakernel/README.md#results)).
 
+Context on a 24 GB card: about **120K tokens** with the default q8_0 KV cache, or up to about **234K** with
+`openjet setup --long-context` ([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv)).
+
 ## Install
 
 ```bash
@@ -48,9 +51,6 @@ More: [docs/installation.md](docs/installation.md)
 
 Linux and an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB (sm_86, sm_89, sm_120), driver 570 or newer.
 `openjet setup` downloads OpenJet's engine prebuilt for your GPU ([which one](docs/installation.md#prebuilt-engines)).
-
-Context on a 24 GB card: about 120K tokens with the default q8_0 KV cache, or up to about 234K with
-`openjet setup --long-context` ([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv)).
 
 More: [docs/installation.md](docs/installation.md#what-you-need)
 
