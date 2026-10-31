@@ -20,8 +20,7 @@ Each `connect` command prints the exact configuration for your server address an
 
 ## 4 coding agents on one GPU
 
-https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
-
+https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
 Same hardware as OpenJet's engine above. Build the engine from a source checkout:
 
@@ -60,7 +59,6 @@ python3 megakernel/tools/mk_top.py
 ```
 
 ## OpenJet's terminal agent
-
 
 Most coding agents assume a frontier model with a huge context window. OpenJet's agent assumes a
 model that fits on your GPU, whose context is limited and drifts over a long task. So the harness
@@ -161,7 +159,6 @@ import asyncio
 
 from openjet.sdk import create_inference_session
 
-
 async def main() -> None:
     session = await create_inference_session()
     try:
@@ -169,7 +166,6 @@ async def main() -> None:
         print(result.text)
     finally:
         await session.close()
-
 
 asyncio.run(main())
 ```

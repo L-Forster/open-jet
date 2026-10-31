@@ -1,9 +1,15 @@
-<h1 align="center">OpenJet</h1>
+<h1 align="center"><img src="docs/assets/logo.png" width="498" alt="OpenJet"></h1>
 
-<p align="center"><a href="README.md">English</a> · 简体中文</p>
+<p align="center"><b>在你自己的 GPU 上运行 Qwen3.8-27B，速度是 llama.cpp 的 1.5 倍。</b></p>
 
-<p align="center"><b>在你自己的 GPU 上运行 Qwen3.8-27B，速度是 llama.cpp 的 1.5 倍。</b><br>
-24 GB 显存的 RTX 30、40、50 系列 · 支持 Claude Code、Codex、OpenCode 和 OpenClaw · 可离线运行 · 开源</p>
+<p align="center">适用于 24 GB 显存的 NVIDIA RTX 30、40 和 50 系列显卡。可配合 Claude Code、Codex、OpenCode、OpenClaw
+或 OpenJet 自带的智能体使用。可离线运行。</p>
+
+<p align="center">
+  <a href="#速度">速度</a> · <a href="#安装">安装</a> · <a href="#硬件要求">硬件</a> ·
+  <a href="#配合你的编程工具使用">编程工具</a> · <a href="#一块-gpu-上跑-4-个编程智能体">4 个智能体</a> ·
+  <a href="#文档">文档</a>
+</p>
 
 <p align="center">
   <a href="https://github.com/L-Forster/open-jet/stargazers"><img src="https://img.shields.io/github/stars/L-Forster/open-jet" alt="Stars"></a>
@@ -12,28 +18,29 @@
   <a href="https://discord.com/invite/pspKHtExSa"><img src="https://img.shields.io/badge/Discord-join-5865F2" alt="Discord"></a>
 </p>
 
+<p align="center"><a href="README.md">English</a> · 简体中文</p>
 
+https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
-https://github.com/user-attachments/assets/c9ac0b21-67b1-4f20-af70-21741accc774
-
+## 速度
 
 | RTX 3090，Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
 |---|---|---|
-| 思考模式，短提示词（编程智能体的典型用法） | 60 tok/s | **92 tok/s**（1.5 倍） |
-| 思考模式，上下文中有 98K token | 37 tok/s | **79 tok/s**（2.2 倍） |
+| 开启思考，短提示词 | 60 tok/s | **92 tok/s**（1.5 倍） |
+| 开启思考，上下文中有 98K token | 37 tok/s | **79 tok/s**（2.2 倍） |
 | 读取 98K token 的提示词 | 112 秒 | **82 秒**（1.4 倍） |
 | 贪心解码，4 个提示词的平均值 | 63 tok/s | **107 tok/s**（1.7 倍） |
 | 贪心解码，写代码 | 73 tok/s | **140 tok/s**（1.9 倍） |
-| 读取你的提示词，2-8K token | 1050-1140 tok/s | **1530-1600 tok/s** |
+| 读取 2-8K token 的提示词 | 1050-1140 tok/s | **1530-1600 tok/s** |
 
-每个数字都是一块 RTX 3090 上的单个对话，不是批处理。llama.cpp 使用与 OpenJet 相同的参数运行，包括 MTP
-投机解码。前三行是当前引擎与 llama.cpp b11982 的对比，用
-[`megakernel/bench/run_compare.sh`](megakernel/bench/run_compare.sh) 测得：思考模式开启，强度 xhigh，温度
-1.0，5 个提示词 x 4 个随机种子，以及一个 98K token 的提示词 x 4 个随机种子。其余几行来自较早的引擎版本。在相同权重下，OpenJet
-的输出与 llama.cpp 一致：KL 散度 0.0009，首选 token 一致率 99.08%
-（[结果和复现脚本](megakernel/README.md#results)）。
+- 一块 RTX 3090 上的单个对话，不是批处理。
+- llama.cpp b11982 使用相同的参数，包括 MTP 投机解码。
+- 第 1-3 行：当前引擎，思考强度 xhigh，温度 1.0，5 个提示词 x 4 个随机种子，以及一个 98K token 的提示词 x 4 个随机种子
+  （[`run_compare.sh`](megakernel/bench/run_compare.sh)）。其余几行：较早的引擎版本。
+- 在相同权重下与 llama.cpp 输出一致：KL 散度 0.0009，首选 token 一致率 99.08%
+  （[结果](megakernel/README.md#results)）。
 
-24 GB 显卡上的上下文：使用默认的 q8_0 KV 缓存时约 **120K token**，使用 `openjet setup --long-context` 时最多约 **234K**
+24 GB 显卡上的上下文：约 **120K token**，使用 `openjet setup --long-context` 时约 **234K**
 （[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。
 
 ## 安装
@@ -56,7 +63,7 @@ Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm
 
 ## 一块 GPU 上跑 4 个编程智能体
 
-https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
+https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
 最多 4 个智能体在同一次权重遍历中一起解码：在 RTX 3090 上，短上下文时总速度约 290 tok/s，运行真实编程智能体时为
 150-200 tok/s。
@@ -82,12 +89,6 @@ https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
 [skills](docs/usage/skills.md) 和 [MCP](docs/usage/mcp.md)。
 
 更多：[docs/zh/features.md](docs/zh/features.md#openjet-的终端智能体)
-
-## Slipstream
-
-前沿模型负责规划和审查；你的本地模型负责阅读、编辑和测试。
-
-更多：[docs/zh/features.md](docs/zh/features.md#slipstream前沿模型规划本地模型干活)
 
 ## Python SDK
 

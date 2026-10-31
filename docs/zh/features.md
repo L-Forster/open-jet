@@ -19,8 +19,7 @@
 
 ## 一块 GPU 上跑 4 个编程智能体
 
-https://github.com/user-attachments/assets/a7fc5010-110d-45fd-9774-a42afa1f3eb9
-
+https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
 硬件要求与 OpenJet 引擎相同。从源码检出构建引擎：
 
@@ -58,7 +57,6 @@ python3 megakernel/tools/mk_top.py
 ```
 
 ## OpenJet 的终端智能体
-
 
 大多数编程智能体假设使用的是上下文窗口巨大的前沿模型。OpenJet 的智能体假设的是能装进你 GPU 的模型，它的上下文有限，在长任务中容易偏离。所以框架本身承担了更多工作：
 
@@ -140,7 +138,6 @@ import asyncio
 
 from openjet.sdk import create_inference_session
 
-
 async def main() -> None:
     session = await create_inference_session()
     try:
@@ -148,7 +145,6 @@ async def main() -> None:
         print(result.text)
     finally:
         await session.close()
-
 
 asyncio.run(main())
 ```
