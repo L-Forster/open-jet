@@ -110,12 +110,6 @@ def main() -> int:
     copy_pi_theme_assets(destination)
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     (destination / "SHA256").write_text(f"{digest}  {executable}\n", encoding="utf-8")
-    release_dir = ROOT / "release"
-    release_dir.mkdir(exist_ok=True)
-    release_name = f"openjet-tui-{args.target}{'.exe' if executable.endswith('.exe') else ''}"
-    release_target = release_dir / release_name
-    shutil.copy2(target, release_target)
-    (release_dir / f"{release_name}.sha256").write_text(f"{digest}  {release_name}\n", encoding="utf-8")
     print(target)
     return 0
 

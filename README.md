@@ -48,7 +48,7 @@ irm https://github.com/L-Forster/open-jet/releases/latest/download/install.ps1 |
 The installer brings its own Python, so you don't need Python or pipx. Then, in a new terminal:
 
 ```bash
-openjet setup      # finds your GPU, downloads the model and OpenJet's engine
+openjet setup      # finds your GPU, downloads the model and the engine built for it
 openjet            # OpenJet's own coding agent
 ```
 
@@ -85,13 +85,17 @@ Each `connect` command prints the exact configuration for your server address an
 
 ## What you need
 
-OpenJet's engine runs Qwen3.8-27B on an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB, on Linux. The
-model is unsloth's [Qwen3.8-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf),
-which `openjet setup` downloads for you. On any other GPU, Apple silicon or CPU only, OpenJet sets up
-the best model that fits and runs it on llama.cpp; `openjet serve` and `openjet connect` work the same way.
+| Your hardware | What runs | Guide |
+|---|---|---|
+| NVIDIA RTX 30, 40 or 50-series with 24 GB, Linux | Qwen3.8-27B on OpenJet's engine | [Engine for your GPU](docs/installation.md#prebuilt-engines) · [OpenJet's engine](megakernel/README.md) |
+| NVIDIA Turing with 24 GB or more, Linux | OpenJet's engine, experimental | [Engine for your GPU](docs/installation.md#prebuilt-engines) · [Turing](megakernel/README.md#turing-rtx-8000) |
+| Windows | llama.cpp; OpenJet's engine on Windows is in progress | [Windows install](docs/installation.md#one-line-install) |
+| Any other GPU, or Apple silicon | The best model that fits, on llama.cpp | [Pick by memory](docs/models.md#pick-by-memory) |
+| Jetson | llama.cpp | [Jetson](docs/deployment/jetson.md) |
+| CPU only | llama.cpp | [CPU-only](docs/deployment/cpu-only.md) |
 
-[Requirements](docs/installation.md#what-you-need) · [Which model fits your hardware](docs/models.md) ·
-[How the engine works](megakernel/README.md)
+The engine's model is unsloth's [Qwen3.8-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf), which `openjet setup` downloads for
+you. [All requirements](docs/installation.md#what-you-need) · [Every model file](docs/models.md)
 
 ## 4 coding agents on one GPU
 

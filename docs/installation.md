@@ -5,21 +5,44 @@
 | Computer | What runs |
 |---|---|
 | Linux, NVIDIA RTX 30, 40 or 50-series with 24 GB or more (sm_86, sm_89, sm_120, and the matching RTX workstation cards) | Qwen3.8-27B on [OpenJet's engine](../megakernel/README.md) |
-| Windows, the same GPUs | OpenJet's engine, prebuilt only. New and untested on hardware: [report how it runs](https://github.com/L-Forster/open-jet/issues) |
+| Windows | llama.cpp. OpenJet's engine on Windows comes prebuilt only, and its builds are in progress |
 | NVIDIA Turing with 24 GB or more (sm_75, such as the 48 GB Quadro RTX 8000) | OpenJet's engine, experimental ([Turing](../megakernel/README.md#turing-rtx-8000)) |
 | Any other GPU, Apple silicon, or CPU only | The best model that fits, on llama.cpp ([pick by memory](models.md#pick-by-memory), [CPU-only](deployment/cpu-only.md)) |
 | Jetson | llama.cpp ([Jetson setup](deployment/jetson.md)) |
 
 For OpenJet's engine you also need an NVIDIA driver that supports CUDA 12.8 (570 or newer).
-`openjet setup` downloads the engine prebuilt for your GPU, so you don't need the CUDA toolkit. If
-no prebuilt engine matches, setup compiles it, which needs `nvcc` (CUDA 12+, or 12.8+ for RTX 50).
-If the engine can't be installed, setup says why and serves the model with llama.cpp instead.
+`openjet setup` downloads the engine prebuilt for your GPU ([which one](#prebuilt-engines)), so you
+don't need the CUDA toolkit. If no prebuilt engine matches, setup compiles it, which needs `nvcc`
+(CUDA 12+, or 12.8+ for RTX 50). If the engine can't be installed, setup says why and serves the
+model with llama.cpp instead.
 
 Context on a 24 GB card is about 120K tokens with the default q8_0 KV cache, or up to about 234K
 with `openjet setup --long-context`, which stores the cache in 5 bits and keeps the most recent 2K
 positions at q8_0 ([KV cache presets](../megakernel/README.md#kv-cache-presets-mk_kv)).
 
 Which model files run where, with download links: [Choosing a model](models.md).
+
+## Prebuilt engines
+
+Each [GitHub release](https://github.com/L-Forster/open-jet/releases) carries OpenJet's engine built
+for each GPU architecture. `openjet setup` reads your GPU's compute capability and downloads the
+matching archive from the release with the same version as your `open-jet` package, so you don't
+pick one yourself. The links below are for the latest release.
+
+| GPU (24 GB or more) | Architecture | Linux |
+|---|---|---|
+| RTX 5090, RTX PRO Blackwell | sm_120 | [openjet-engine-linux-x64-sm120.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm120.tar.gz) |
+| RTX 4090, RTX 6000 Ada, L40, L4 | sm_89 | [openjet-engine-linux-x64-sm89.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm89.tar.gz) |
+| RTX 3090, 3090 Ti, RTX A5000, A6000 | sm_86 | [openjet-engine-linux-x64-sm86.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm86.tar.gz) |
+| Titan RTX, Quadro RTX 6000 and 8000 (experimental) | sm_75 | [openjet-engine-linux-x64-sm75.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm75.tar.gz) |
+
+Each archive holds the engine for Q4_K_M (`libqwen38mk.so`), the engine for UD-Q4_K_XL
+(`libqwen38mk_mixed.so`, not in sm_75, so Turing serves UD-Q4_K_XL with llama.cpp), and a CPU-only
+`libllama` for the tokenizer. CUDA is linked in, so only the NVIDIA driver is needed. Find your
+GPU's architecture with `nvidia-smi --query-gpu=name,compute_cap --format=csv` (8.6 is sm_86).
+
+Windows archives (`openjet-engine-windows-x64-sm*.zip`) are not in a release yet; until they are,
+OpenJet on Windows serves models with llama.cpp.
 
 ## One-line install
 

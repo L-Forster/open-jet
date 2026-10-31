@@ -60,10 +60,6 @@ jobs:
         with:
           name: wheel-${{ matrix.artifact }}
           path: dist/*.whl
-      - uses: actions/upload-artifact@v4
-        with:
-          name: binary-${{ matrix.artifact }}
-          path: release/*
 
   engine:
     uses: ./.github/workflows/engine.yml
@@ -82,11 +78,6 @@ jobs:
           pattern: wheel-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: binary-*
-          path: release-assets
-          merge-multiple: true
       # prebuilt engine archives that `openjet setup` downloads for this release's version
       - uses: actions/download-artifact@v4
         continue-on-error: true
@@ -99,11 +90,21 @@ jobs:
         with:
           path: source
           sparse-checkout: scripts/installer
-      - run: cp source/scripts/installer/install.sh source/scripts/installer/install.ps1 release-assets/
-      - uses: softprops/action-gh-release@v2
-        if: github.event_name == 'release'
-        with:
-          files: release-assets/*
+      - run: |
+          mkdir -p release-assets
+          cp source/scripts/installer/install.sh source/scripts/installer/install.ps1 release-assets/
+      # attached to the release for this version, from a manual run too (it replaces files of the same name);
+      # a manual run of a version that has no release yet attaches nothing
+      - name: Attach to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('source/pyproject.toml', 'rb'))['project']['version'])")
+          if gh release view "v$version" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "v$version" release-assets/* --clobber --repo "${{ github.repository }}"
+          else
+            echo "::warning::no v$version release; engines and installers not attached"
+          fi
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_TOKEN }}

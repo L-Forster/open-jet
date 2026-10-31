@@ -67,7 +67,8 @@ python -m build --wheel
 `scripts/build_tui.py` regenerates the OpenRouter TypeScript catalog from Python
 before `npm run build`. The native build supports Linux x86_64/aarch64, macOS
 x86_64/arm64, and Windows x86_64. Source installers either build with the available
-toolchain or download and checksum-verify the matching release asset.
+toolchain or take the TUI out of the matching platform wheel on PyPI, checksum-verified
+(`scripts/install_tui_asset.py`).
 
 For frontend development:
 
