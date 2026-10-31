@@ -8,6 +8,14 @@ constexpr bool KV_SLOTS = false; // (no parallel slots: the paged MK_KV branches
 #else
 constexpr bool KV_SLOTS = true;
 #endif
+// the megakernel also decodes a lone parallel slot from its MK_KV pages (the solo route): only libqwen38mk_agents
+// (-DOPENJET_MK_AGENTS). Without it that code stays out of the megakernel, whose register allocation it would move, and
+// a lone slot under MK_KV decodes in the batched path
+#ifdef OPENJET_MK_AGENTS
+constexpr bool KV_SOLO = true;
+#else
+constexpr bool KV_SOLO = false;
+#endif
 // row of own-cache position i (attention slot, kv head g): paged (ptab) or contiguous of stride ctx. (The tables
 // change only between launches: read-only loads, through L1 — plain loads skip it under -dlcm=cg.)
 __device__ __forceinline__ size_t kv_own_row(const int * ptab, int ctx, int slot, int g, int i) {

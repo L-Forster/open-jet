@@ -26,6 +26,16 @@ libqwen38mk.so: qwen38_mk.o capi.cpp qwen38_mk.h
 	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk.o \
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker '$(RPATH)' -o $@
 
+# The engine for --agents / --parallel with MK_KV: the megakernel also decodes a lone conversation from the slots'
+# low-bit pages (KV_SOLO, kv_paged.cuh). libqwen38mk.so leaves that code out of the megakernel, so it doesn't slow the
+# single conversation; mk_server.py loads this one when it is next to it. sm_80+ (Turing refuses MK_KV).
+qwen38_mk_agents.o: qwen38_mk.cu qwen38_mk.h gguf.h kv_paged.cuh kv_lowbit.cuh kv_spec.h prefill.cuh prefill_attn.cuh prefill_gemm.cuh cuda_compat.cuh bmm.cuh
+	$(NVCC) $(NVFLAGS) -DOPENJET_MK_AGENTS=1 -I$(LLAMA)/ggml/include -c qwen38_mk.cu -o $@ 2> ptxas-agents.log || (cat ptxas-agents.log; false)
+
+libqwen38mk_agents.so: qwen38_mk_agents.o capi.cpp qwen38_mk.h
+	$(NVCC) -O3 -std=c++17 -arch=$(ARCH) -shared -Xcompiler -fPIC -I$(LLAMA)/include -I$(LLAMA)/ggml/include capi.cpp qwen38_mk_agents.o \
+		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker '$(RPATH)' -o $@
+
 # Extended quant support is opt-in; neither `all` nor the native library builds it.
 qwen38_mixed.o: qwen38_mixed.cu qwen38_mk.h gguf.h kv_paged.cuh kv_lowbit.cuh kv_spec.h prefill.cuh prefill_attn.cuh prefill_gemm_mixed.cuh
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mixed.cu -o $@ 2> ptxas-mixed.log || (cat ptxas-mixed.log; false)
@@ -55,5 +65,6 @@ tools/llama_ref: tools/llama_ref.cpp logit_stats.h
 		-Wl,-rpath,$(abspath $(LLAMA)/build/bin) -o $@
 
 clean:
-	rm -f qwen38_mk qwen38_mixed libqwen38mk.so libqwen38mk_mixed.so qwen38_mk.o qwen38_mixed.o ptxas.log ptxas-mixed.log \
+	rm -f qwen38_mk qwen38_mixed libqwen38mk.so libqwen38mk_mixed.so libqwen38mk_agents.so qwen38_mk.o qwen38_mixed.o \
+		qwen38_mk_agents.o ptxas.log ptxas-mixed.log ptxas-agents.log \
 		tools/vocab_freq tools/llama_ref bench/turing_check bench/mmq_bench

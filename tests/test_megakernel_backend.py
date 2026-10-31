@@ -339,6 +339,18 @@ class MegakernelServerParsingTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"MK_KV": "K*=5r,V*=5"}):
             self.assertEqual(srv.share_len({}, toks), 1088)
 
+    def test_agents_library_only_for_parallel_slots_under_mk_kv(self) -> None:
+        name = (lambda stem: f"{stem}.dll" if self.mk.os.name == "nt" else f"lib{stem}.so")
+        with mock.patch.object(self.mk.os.path, "isfile", return_value=True):
+            with mock.patch.dict("os.environ", {"MK_KV": "K*=5r,V*=5"}):
+                self.assertTrue(self.mk.default_library(4).endswith(name("qwen38mk_agents")))
+                self.assertTrue(self.mk.default_library(1).endswith(name("qwen38mk")))
+            with mock.patch.dict("os.environ", {"MK_KV": ""}):
+                self.assertTrue(self.mk.default_library(4).endswith(name("qwen38mk")))
+        with mock.patch.object(self.mk.os.path, "isfile", return_value=False), \
+                mock.patch.dict("os.environ", {"MK_KV": "K*=5r,V*=5"}):
+            self.assertTrue(self.mk.default_library(4).endswith(name("qwen38mk")))  # (not built: the batched path)
+
 
     def test_oversized_prompt_uses_the_llama_cpp_overflow_wording(self) -> None:
         # Pi compacts and retries only on errors matching its overflow patterns,

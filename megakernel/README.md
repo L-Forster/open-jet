@@ -297,6 +297,10 @@ make        # qwen38_mk (CLI), libqwen38mk.so (server library), tools/vocab_freq
             -d 4 --draft-vocab draft_vocab_32k.bin --think --temp 1.0 --top-p 0.95 --top-k 20
 ```
 
+For parallel agents with the low-bit KV cache (`MK_KV`), `make -j1 libqwen38mk_agents.so` builds the
+same engine with the code that decodes a lone agent from the slots' low-bit pages; the server uses it
+when it is next to `libqwen38mk.so` (see [Parallel serving](#parallel-serving)).
+
 To build and serve the mixed engine manually:
 
 ```sh
@@ -413,8 +417,12 @@ openjet-engine --model /absolute/path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
   the same memory holds more context. With `MK_KV_WIN` every slot keeps its own 8-bit ring of
   recent rows (114 MiB at `MK_KV_WIN=2048` for those two) and every shared prefix a copy of the
   ring it was built with, so conversations attached to it read its last rows at 8 bits too.
-  A lone active conversation decodes through the single-stream kernel as with q8_0; for that the
-  shared prefix is rounded down to a multiple of 32 tokens under `MK_KV`.
+  With `libqwen38mk_agents.so` (`make -j1 libqwen38mk_agents.so`; the server loads it in place of
+  `libqwen38mk.so` with `--parallel` / `--agents` and `MK_KV` when it is built) a lone active
+  conversation decodes through the single-stream kernel as with q8_0; for that the shared prefix is
+  rounded down to a multiple of 32 tokens under `MK_KV`. `libqwen38mk.so` leaves that code out of
+  the single-stream kernel, so a single conversation keeps its speed; with it a lone conversation
+  decodes in the batched path.
 - The active slots decode together: one pass over the weights for all their rows (each slot's
   current token and its MTP / prompt-lookup drafts).
 - A new prompt rides along with those steps: each pass holds the step's rows plus the next chunk
@@ -463,8 +471,9 @@ host memory. The low-bit KV cache, its recent window and these memory savings ar
 - `MK_KV_WIN=W`: every low-bit layer also keeps its last W to W + 640 positions in a q8_0 ring. The window start
   moves in 640-position steps, like the attention split, so greedy output stays independent of the draft depth. A
   rewind (checkpoint restore, truncate) refills the window rows the abandoned tokens overwrote from the low-bit cache.
-- A non-empty `MK_KV` selects the q8_0 cache in `--kv auto`; `--kv f16` with `MK_KV` is an error, as are `--parallel` /
-  `--agents` (for now), Turing and `MK_ATTN=1`.
+- A non-empty `MK_KV` selects the q8_0 cache in `--kv auto`; `--kv f16` with `MK_KV` is an error, as are Turing and
+  `MK_ATTN=1`. With `--parallel` / `--agents` the slots' pages hold the low-bit rows (see
+  [Parallel serving](#parallel-serving)).
 - The accuracy check is the usual one (see Correctness) with the variables set:
   `MK_KV='K*=5r,V*=5' MK_KV_WIN=2048 ./qwen38_mk -m model.gguf --kld llama.ref --score-path mixed --kv q8`.
 
@@ -575,7 +584,7 @@ and attention paths against references without a model. On multi-GPU machines, p
   re-prompting).
 - `--parallel`: at most 8 conversations (16 rows per step), Q4_K_M engine only. With 4 agents on
   a 24 GB card, each has about 33K tokens of context.
-- `MK_KV` low-bit caches: single conversation, sm_80+ (see [KV cache presets](#kv-cache-presets-mk_kv)).
+- `MK_KV` low-bit caches: sm_80+, Q4_K_M engine for `--parallel` (see [KV cache presets](#kv-cache-presets-mk_kv)).
 
 ## Files
 

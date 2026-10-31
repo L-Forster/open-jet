@@ -1470,7 +1470,7 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     int nch, CS;
     attn_dims(n + T, nch, CS);
     const int rowb = cB.kvq8 ? HD : HD * 2, lines = rowb / 128; // bytes, 128-byte lines per K / V row
-    if (cB.kvlow && cB.ptab) { // MK_KV, a parallel slot's pages (the agents' solo route): row by row
+    if (KV_SOLO && cB.kvlow && cB.ptab) { // MK_KV, a parallel slot's pages (the agents' solo route): row by row
         const int lk = HD * cB.kvb[0][slot] / 8 / 128, lv = HD * cB.kvb[1][slot] / 8 / 128, nl = max(lk, lv);
         for (int item = blockIdx.x; item < NKV * nch; item += gridDim.x) {
             const int g = item / nch, c0 = (item % nch) * CS, c1 = min(n, min(c0 + CS, c0 + 64));
@@ -1959,9 +1959,9 @@ __device__ __forceinline__ void attn_core_q8_t(const LayerW & W, int slot, int n
 #pragma unroll
             for (int k = 0; k < 8; k++) v[k] *= rs * W.kn[lane * 8 + k];
             rope8(v, lane, pp);
-            kv_store_row(0, slot, g, pp, v);
+            kv_store_row<KV_SOLO>(0, slot, g, pp, v);
             load8(cB.vbuf + t * KVD + g * 256 + lane * 8, v);
-            kv_store_row(1, slot, g, pp, v);
+            kv_store_row<KV_SOLO>(1, slot, g, pp, v);
         }
         if (tid < 32) {
             sM(tid) = -INFINITY;
@@ -2243,13 +2243,19 @@ __device__ __noinline__ void attn_core_q8p(const LayerW & W, int slot, int n) {
 // q8 cache: the pipelined kernel when a chunk has more than one tile (L_ctx > ATT_BUCKET), attn_core_t for one-tile
 // chunks (the pipeline fill does not pay there) and with MK_DATTN=0. MK_KV (packed slots): the pipelined kernels at every
 // context, attn_core_q8m for the slots with a low-bit side. Every choice gives the same partials. A slot's paged view
-// (parallel agents, a lone one decoding here) keeps attn_core_t on the q8 cache and runs attn_core_q8p under MK_KV.
+// (parallel agents, a lone one decoding here) keeps attn_core_t on the q8 cache and runs attn_core_q8p under MK_KV
+// (KV_SOLO builds only).
 template <int T>
 __device__ __noinline__ void attn_core(const LayerW & W, int slot, int n, uint8_t * /*sm*/) {
 #if !QWEN_MK_SM75
     if (cB.kvlow) {
-        if (cB.ptab) attn_core_q8p<T>(W, slot, n);
-        else if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_q8m<T>(W, slot, n);
+        if constexpr (KV_SOLO) {
+            if (cB.ptab) {
+                attn_core_q8p<T>(W, slot, n);
+                return;
+            }
+        }
+        if (cB.kvb[0][slot] != 8 || cB.kvb[1][slot] != 8) attn_core_q8m<T>(W, slot, n);
         else attn_core_q8<T>(W, slot, n);
         return;
     }
@@ -5569,9 +5575,10 @@ struct MKEngine::Impl {
         bool all_acc;
     } solo_saved;
     bool solo_on = !getenv("MS_SOLO") || atoi(getenv("MS_SOLO")) != 0;
-    // MK_KV: the megakernel reads a slot's pages a tile (ATP positions) at a time, so its shared segment has to end on a
-    // tile boundary (the server rounds share_len down to one); a slot whose segment does not decodes in the batched path
-    bool solo_fits(int q) const { return !hb.kvlow || !msp[q].seg || msp[q].seg->toks.size() % ATP == 0; }
+    // MK_KV: only a KV_SOLO build (libqwen38mk_agents) decodes a lone slot in the megakernel. It reads the slot's pages a
+    // tile (ATP positions) at a time, so its shared segment has to end on a tile boundary (the server rounds share_len
+    // down to one); a slot whose segment does not decodes in the batched path
+    bool solo_fits(int q) const { return !hb.kvlow || (KV_SOLO && (!msp[q].seg || msp[q].seg->toks.size() % ATP == 0)); }
     std::vector<int> solo_enter(int q) {
         auto & m = msp[q];
         slot_flush(q);

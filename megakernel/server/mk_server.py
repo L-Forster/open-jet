@@ -964,6 +964,17 @@ class SlotScheduler:
         else:
             self.active[slot] = r
 
+def default_library(parallel):
+    """The engine library next to this package: with --parallel and MK_KV, libqwen38mk_agents when it is built (its
+    megakernel also decodes a lone slot from its low-bit pages, code libqwen38mk leaves out so that a single conversation
+    keeps its speed), else libqwen38mk."""
+    def path(stem):
+        return os.path.join(os.path.dirname(HERE), f"{stem}.dll" if os.name == "nt" else f"lib{stem}.so")
+    if parallel > 1 and os.environ.get("MK_KV") and os.path.isfile(path("qwen38mk_agents")):
+        return path("qwen38mk_agents")
+    return path("qwen38mk")
+
+
 class Server:
     def __init__(self, args):
         self.args = args
@@ -1432,7 +1443,9 @@ def main():
                          "at startup and stored once: all agents share that context")
     ap.add_argument("-d", "--draft", type=int, default=4)
     ap.add_argument("--draft-vocab", default=os.path.join(os.path.dirname(HERE), "draft_vocab_32k.bin"))
-    ap.add_argument("--lib", default=os.path.join(os.path.dirname(HERE), "qwen38mk.dll" if os.name == "nt" else "libqwen38mk.so"))
+    ap.add_argument("--lib", default=None,
+                    help="engine library (default: libqwen38mk next to this package; libqwen38mk_agents with --parallel and "
+                         "MK_KV when it is built)")
     ap.add_argument("--parallel", type=int, default=1,
                     help="requests decoded together (slots; each holds its own KV cache of --ctx positions); 1: one at a time")
     ap.add_argument("--agents", type=int, default=0,
@@ -1446,6 +1459,8 @@ def main():
             args.ctx = 0
     if args.ctx is None:
         args.ctx = 32768
+    if args.lib is None:
+        args.lib = default_library(args.parallel)
     srv = Server(args)
     httpd = ThreadingHTTPServer((args.host, args.port), make_handler(srv))
     httpd.daemon_threads = True

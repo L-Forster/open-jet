@@ -4,6 +4,7 @@ qwen38_mk
 qwen38_mixed
 libqwen38mk.so
 libqwen38mk_mixed.so
+libqwen38mk_agents.so
 ptxas*.log
 tools/vocab_freq
 tools/llama_ref

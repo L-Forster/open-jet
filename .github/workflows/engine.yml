@@ -1,7 +1,8 @@
 name: Build prebuilt engine libraries
 
 # One archive per GPU architecture, so `openjet setup` can serve Qwen3.8-27B without the CUDA toolkit.
-# Each archive holds the engine library (and the mixed-quant one, except on Turing) plus a CPU-only
+# Each archive holds the engine library (and, except on Turing, the mixed-quant one and the one for
+# parallel agents with the MK_KV cache) plus a CPU-only
 # libllama for the tokenizer, all resolved next to each other. CUDA's runtime is linked statically, so
 # users only need the NVIDIA driver.
 
@@ -35,9 +36,11 @@ jobs:
       - name: Build the engine for sm_${{ matrix.arch }}
         run: |
           make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
-          # the mixed-quant engine needs sm_80+; its compile uses about 11 GiB of RAM
+          # the mixed-quant engine needs sm_80+; its compile uses about 11 GiB of RAM. The agents engine (MK_KV in the
+          # parallel slots) too: Turing refuses MK_KV
           if [ "${{ matrix.arch }}" != "75" ]; then
             make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_mixed.so
+            make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_agents.so
           fi
       - name: Package and check that the libraries resolve from their own directory
         run: |
@@ -94,8 +97,11 @@ jobs:
           }
           $flags = @("-O3", "-std=c++17", "-arch=sm_${{ matrix.arch }}", "-lineinfo")
           if ("${{ matrix.arch }}" -eq "75") { $flags += "-DQWEN_MK_SM75=1" }
-          $variants = @(@{ src = "qwen38_mk.cu"; dll = "qwen38mk.dll" })
-          if ("${{ matrix.arch }}" -ne "75") { $variants += @{ src = "qwen38_mixed.cu"; dll = "qwen38mk_mixed.dll" } }
+          $variants = @(@{ src = "qwen38_mk.cu"; dll = "qwen38mk.dll"; def = @() })
+          if ("${{ matrix.arch }}" -ne "75") {
+            $variants += @{ src = "qwen38_mixed.cu"; dll = "qwen38mk_mixed.dll"; def = @() }
+            $variants += @{ src = "qwen38_mk.cu"; dll = "qwen38mk_agents.dll"; def = @("-DOPENJET_MK_AGENTS=1") }
+          }
           New-Item -ItemType Directory -Force pkg | Out-Null
           # job logs need a login; annotations don't, so a failure posts its compiler errors as annotations
           function Fail {
@@ -104,7 +110,7 @@ jobs:
             exit $LASTEXITCODE
           }
           foreach ($v in $variants) {
-            nvcc @flags -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/$($v.src)" -o engine.obj 2>&1 |
+            nvcc @flags @($v.def) -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/$($v.src)" -o engine.obj 2>&1 |
               Tee-Object -FilePath build.log -Append | Out-Host
             if ($LASTEXITCODE) { Fail }
             nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/capi.cpp engine.obj @libs -o "pkg/$($v.dll)" 2>&1 |

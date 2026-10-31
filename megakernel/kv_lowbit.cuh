@@ -90,7 +90,9 @@ __device__ __forceinline__ void kv_store_fmt(int8_t * q, __half * sc, const floa
 
 // one K (w = 0) or V (w = 1) row (kv head g, position pos) of attention slot `slot` in its MK_KV format; with a
 // recent-window ring (MK_KV_WIN) the row is also stored q8 in the ring (same rotation: every tile of a slot must share
-// the basis). The engine's own contiguous cache, or a parallel slot's paged one (cB.ptab).
+// the basis). The engine's own contiguous cache, or a parallel slot's paged one (cB.ptab; PG: the code for it, compiled
+// into the megakernel only with KV_SOLO).
+template <bool PG = KV_SLOTS>
 __device__ __forceinline__ void kv_store_row(int w, int slot, int g, int pos, const float (&vin)[8]) {
     float v[8];
 #pragma unroll
@@ -99,7 +101,7 @@ __device__ __forceinline__ void kv_store_row(int w, int slot, int g, int pos, co
     const int bits = cB.kvb[w][slot];
     int8_t * q;
     __half * sc;
-    if (KV_SLOTS && cB.ptab) q = kv_vptr_paged(w, slot, g, pos, sc); // (parallel slots: packed pages, kv_paged.cuh)
+    if (PG && cB.ptab) q = kv_vptr_paged(w, slot, g, pos, sc); // (parallel slots: packed pages, kv_paged.cuh)
     else {
         const size_t row = (size_t) g * cB.ctx + pos;
         q = cB.kvp[w][slot] + row * (HD * bits / 8);
