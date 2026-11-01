@@ -71,6 +71,24 @@ def long_prompt(target_tokens, tokenizer_path):
     return "Here is a codebase:\n" + text + LONG_QUESTION
 
 
+# the edit suite: return a whole source file with one small change, so most of the answer copies the prompt (where
+# prompt-lookup drafting can help); files from a fixed tree (EDIT_ROOT, default this checkout) so the prompts stay the same
+EDIT_ROOT = os.environ.get("EDIT_ROOT", ROOT)
+EDITS = [("src/api_auth.py", "Rename the function `normalize_provider_id` to `canonical_provider_id` everywhere."),
+         ("src/swap_manager.py", "Rename the class `SwapPlan` to `SwapSchedule` everywhere."),
+         ("src/airgap.py", "Add a one-line docstring to every function that has none.")]
+
+
+def edit_prompts():
+    out = []
+    for path, change in EDITS:
+        with open(os.path.join(EDIT_ROOT, path)) as f:
+            src = f.read()
+        out.append(f"{change} Reply with the complete updated file in one code block and nothing else.\n\n"
+                   f"```python\n{src}```")
+    return out
+
+
 def stream_chat(port, prompt, n, seed):
     body = dict(model="bench", messages=[{"role": "user", "content": prompt}], max_tokens=n, seed=seed,
                 stream=True, stream_options={"include_usage": True}, chat_template_kwargs=TEMPLATE_KWARGS,
@@ -199,7 +217,7 @@ def run_engine(name, port, cmd, suites, seeds, n, logdir, save, rnd=0):
 def summarize(samples):
     out = {}
     for e in dict.fromkeys(x["engine"] for x in samples):
-        for suite in ("short", "long"):
+        for suite in ("short", "long", "edit"):
             xs = [x for x in samples if x["engine"] == e and x["suite"] == suite]
             if not xs:
                 continue
@@ -232,6 +250,8 @@ def main():
     suites = []
     if "short" in wanted:
         suites.append(("short", PROMPTS + [file_prompt()]))
+    if "edit" in wanted:
+        suites.append(("edit", edit_prompts()))
     if "long" in wanted:
         lp = long_prompt(args.long_tokens, args.tokenizer)
         with open(os.path.join(logdir, "long_prompt.txt"), "w") as f:

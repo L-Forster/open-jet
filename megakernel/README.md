@@ -592,6 +592,11 @@ and attention paths against references without a model. On multi-GPU machines, p
 - `--parallel`: at most 8 conversations (16 rows per step), Q4_K_M engine only. With 4 agents on
   a 24 GB card, each has about 33K tokens of context.
 - `MK_KV` low-bit caches: sm_80+, Q4_K_M engine for `--parallel` (see [KV cache presets](#kv-cache-presets-mk_kv)).
+- One conversation guesses at most 4 tokens ahead and checks them in one pass (`MAXT = 5`), and only with the model's
+  MTP head. Guessing from earlier text (prompt lookup, which guesses long runs on code edits) works only with
+  `--parallel`. Checking more guesses is cheap: 8 tokens cost about 1.4x one token with the `--parallel` kernels
+  (`bmm.cuh`, RTX 3090), but those kernels run out of registers inside the single-conversation engine. Longer guesses
+  for one conversation need them moved there.
 
 ## Files
 
