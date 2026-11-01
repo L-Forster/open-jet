@@ -15,6 +15,7 @@ import json
 import os
 import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -47,16 +48,109 @@ def _nvcc_path() -> str | None:
     found = _native_tool_path("nvcc")
     if found:
         return found
+    exe = "nvcc.exe" if sys.platform == "win32" else "nvcc"
     for var in ("CUDA_HOME", "CUDA_PATH"):
         base = os.environ.get(var, "").strip()
-        if base and (Path(base) / "bin" / "nvcc").is_file():
-            return str(Path(base) / "bin" / "nvcc")
+        if base and (Path(base) / "bin" / exe).is_file():
+            return str(Path(base) / "bin" / exe)
     default = Path("/usr/local/cuda/bin/nvcc")
     return str(default) if default.is_file() else None
 
 
+# llama.cpp's import libraries, which the engine DLL links against; the CMake build puts each under its
+# own configuration directory, so they are located by name
+_WINDOWS_IMPORT_LIBS = ("llama.lib", "ggml-base.lib")
+
+
+def _windows_import_libs(llama_dir: Path) -> list[str]:
+    """Paths of llama.cpp's import libraries in a Windows build tree, or [] when any of them is missing."""
+    found: list[str] = []
+    for name in _WINDOWS_IMPORT_LIBS:
+        hit = next(iter(sorted((llama_dir / "build").rglob(name))), None)
+        if hit is None:
+            return []
+        found.append(str(hit))
+    return found
+
+
+def _copy_windows_runtime(llama_dir: Path, root: Path) -> None:
+    """Put llama.cpp's DLLs beside the engine.
+
+    Windows has no RPATH, so the loader resolves the engine's dependencies from its own directory; the
+    prebuilt archives ship them adjacent for the same reason.
+    """
+    for dll in sorted((llama_dir / "build" / "bin").rglob("*.dll")):
+        dest = root / dll.name
+        if not dest.is_file() or dest.stat().st_mtime < dll.stat().st_mtime:
+            shutil.copy2(dll, dest)
+
+
 def _llama_cpp_ready(llama_dir: Path) -> bool:
-    return (llama_dir / "include" / "llama.h").is_file() and (llama_dir / "build" / "bin" / "libllama.so").is_file()
+    if not (llama_dir / "include" / "llama.h").is_file():
+        return False
+    if sys.platform == "win32":
+        return bool(_windows_import_libs(llama_dir))
+    return (llama_dir / "build" / "bin" / "libllama.so").is_file()
+
+
+def _vcvars_candidates() -> list[Path]:
+    """vcvars64.bat of every Visual Studio install found, newest first; an install may be incomplete."""
+    roots: list[Path] = []
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if vswhere.is_file():
+        try:
+            out = subprocess.run([str(vswhere), "-products", "*", "-prerelease", "-property", "installationPath"],
+                                 capture_output=True, text=True, timeout=60)
+            roots += [Path(line.strip()) for line in out.stdout.splitlines() if line.strip()]
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")):
+        if base:
+            roots += sorted((Path(base) / "Microsoft Visual Studio").glob("20*/*"), reverse=True)
+    seen: set[str] = set()
+    found: list[Path] = []
+    for root in roots:
+        bat = root / "VC" / "Auxiliary" / "Build" / "vcvars64.bat"
+        key = str(bat).lower()
+        if bat.is_file() and key not in seen:
+            seen.add(key)
+            found.append(bat)
+    return found
+
+
+def _msvc_env() -> dict[str, str] | None:
+    """The environment vcvars64.bat exports, so nvcc finds cl.exe, the CRT headers and the Windows SDK.
+
+    Every install is tried: one can be registered but too incomplete to set up a working toolchain, and
+    another alongside it (Build Tools next to a broken Community, say) still builds.
+    """
+    # an unbalanced quote anywhere in PATH breaks cmd's parser before vcvars even runs
+    start = dict(os.environ)
+    start["PATH"] = os.pathsep.join(
+        entry.replace(chr(34), "") for entry in start.get("PATH", "").split(os.pathsep) if entry.strip()
+    )
+    for bat in _vcvars_candidates():
+        # through a script file: cmd mangles the quoting that `cmd /c call "<path>"` needs for a path
+        # with spaces, and vcvars lives under "Program Files (x86)" whose parentheses it also splits on
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "openjet_vcvars.bat"
+            script.write_bytes(('@echo off\r\ncall "' + str(bat) + '" >nul\r\nset\r\n').encode("mbcs", "replace"))
+            try:
+                out = subprocess.run(["cmd", "/c", str(script)],
+                                     capture_output=True, text=True, timeout=300, env=start)
+            except (OSError, subprocess.SubprocessError):
+                continue
+        if out.returncode != 0:
+            continue
+        env = dict(start)
+        for line in out.stdout.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                env[key] = value
+        if env.get("VCToolsInstallDir") and shutil.which("cl", path=env.get("PATH", "")):
+            return env
+    return None
 
 
 def _arch_for_cap(cap: str) -> str:
@@ -140,6 +234,29 @@ def megakernel_build_command(root: Path, *, nvcc: str, arch: str, llama_dir: Pat
     return ["make", "-B", "-C", str(root), "-j1", f"NVCC={nvcc}", f"ARCH={arch}", f"LLAMA={llama_dir}", _megakernel_library(model)]
 
 
+def megakernel_build_commands(root: Path, *, nvcc: str, arch: str, llama_dir: Path, model: str = "") -> list[list[str]]:
+    """The commands that build the engine library in *root*, to be run in order.
+
+    Windows has no POSIX make and links a DLL against import libraries rather than building an .so, so
+    the two nvcc steps the release workflow runs (compile the engine, then link it with capi.cpp) are
+    issued directly instead of through the Makefile.
+    """
+    if sys.platform != "win32":
+        return [megakernel_build_command(root, nvcc=nvcc, arch=arch, llama_dir=llama_dir, model=model)]
+    mixed = _megakernel_variant(model) == "mixed"
+    source = "qwen38_mixed.cu" if mixed else "qwen38_mk.cu"
+    obj = str(root / ("qwen38_mixed.obj" if mixed else "qwen38_mk.obj"))
+    flags = ["-O3", "-std=c++17", f"-arch={arch}", "-lineinfo"]
+    if arch == "sm_75":
+        flags.append("-DQWEN_MK_SM75=1")
+    ggml_include = str(llama_dir / "ggml" / "include")
+    return [
+        [nvcc, *flags, "-Xptxas", "-dlcm=cg", "-I", ggml_include, "-c", str(root / source), "-o", obj],
+        [nvcc, *flags, "-shared", "-I", str(llama_dir / "include"), "-I", ggml_include,
+         str(root / "capi.cpp"), obj, *_windows_import_libs(llama_dir), "-o", str(root / _megakernel_library(model))],
+    ]
+
+
 async def ensure_megakernel(
     setup_result: dict[str, Any],
     *,
@@ -184,9 +301,6 @@ async def ensure_megakernel(
         if installed and _build_is_current(root, arch, model):
             log.write("[bold bright_white]OpenJet engine installed: OpenJet will serve Qwen3.8-27B with it.[/]")
             return setup_result
-    if sys.platform == "win32":  # Windows builds only come prebuilt
-        log.write(skip.format(f"no prebuilt engine for {arch} in this release"))
-        return setup_result
     nvcc = _nvcc_path()
     if nvcc is None:
         log.write(skip.format("CUDA toolkit not found: install it for nvcc, then rerun `openjet setup`"))
@@ -197,10 +311,20 @@ async def ensure_megakernel(
     if not os.access(root, os.W_OK):
         log.write(skip.format(f"{escape(str(root))} is not writable"))
         return setup_result
+    env = None
+    if sys.platform == "win32":
+        env = _msvc_env()
+        if env is None:
+            log.write(skip.format("no Visual Studio C++ build tools found: nvcc needs cl.exe, then rerun `openjet setup`"))
+            return setup_result
 
     set_status(f"building OpenJet's Qwen3.8-27B {variant} engine for {arch} (a few minutes)")
     log.write(f"[bold bright_white]Building OpenJet's Qwen3.8-27B {variant} engine for {arch} (a few minutes)...[/]")
-    rc, out, err = await _run_exec(*megakernel_build_command(root, nvcc=nvcc, arch=arch, llama_dir=LLAMA_CPP_DIR, model=model))
+    rc, out, err = 0, "", ""
+    for command in megakernel_build_commands(root, nvcc=nvcc, arch=arch, llama_dir=LLAMA_CPP_DIR, model=model):
+        rc, out, err = await _run_exec(*command, **({"env": env} if env else {}))
+        if rc != 0:
+            break
     clear_status()
     if rc != 0 or not (root / library).is_file():
         tail = "\n".join((err or out).strip().splitlines()[-15:])
@@ -208,6 +332,8 @@ async def ensure_megakernel(
         if tail:
             log.write(f"[dim]{escape(tail)}[/]")
         return setup_result
+    if sys.platform == "win32":
+        _copy_windows_runtime(LLAMA_CPP_DIR, root)
     (root / (_BUILD_TAG if variant == "native" else _MIXED_BUILD_TAG)).write_text(json.dumps({"arch": arch}) + "\n")
     log.write("[bold bright_white]OpenJet engine built: OpenJet will serve Qwen3.8-27B with it.[/]")
     return setup_result

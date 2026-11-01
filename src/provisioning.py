@@ -390,11 +390,11 @@ def _configured_llama_server_path(setup_result: Mapping[str, Any]) -> str | None
     return None
 
 
-async def _run_exec(*args: str, cwd: Path | None = None) -> tuple[int, str, str]:
+async def _run_exec(*args: str, cwd: Path | None = None, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *args,
         cwd=str(cwd) if cwd else None,
-        env=_subprocess_env(),
+        env=env or _subprocess_env(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

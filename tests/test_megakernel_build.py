@@ -211,14 +211,62 @@ class PrebuiltMegakernelTests(unittest.TestCase):
         _run({"llama_model": self.model}, _Log())
         self.assertEqual(self.urls, [])
 
-    def test_windows_uses_the_prebuilt_dll_and_never_compiles(self) -> None:
+    def test_windows_prefers_the_prebuilt_dll_then_falls_back_to_compiling(self) -> None:
         self.archive = None
         log = _Log()
         with mock.patch.object(mb.sys, "platform", "win32"), mock.patch.object(mb, "_run_exec") as run:
             _run({"llama_model": self.model}, log)
-        run.assert_not_called()
+        run.assert_not_called()  # this fixture has no nvcc
         self.assertTrue(self.urls[0].endswith("/openjet-engine-windows-x64-sm86.zip"))
-        self.assertIn("no prebuilt engine for sm_86", log.lines[-1])
+        self.assertIn("No prebuilt engine for sm_86 in v0.6.0", log.lines[0])
+        self.assertIn("CUDA toolkit not found", log.lines[-1])
+
+    def _windows_llama_tree(self):
+        """A llama.cpp build tree as it looks on Windows: headers plus the import libraries."""
+        llama = self.root.parent / "llama.cpp"
+        (llama / "include").mkdir(parents=True, exist_ok=True)
+        (llama / "build" / "bin").mkdir(parents=True, exist_ok=True)
+        (llama / "include" / "llama.h").write_text("")
+        for name in ("llama.lib", "ggml-base.lib"):
+            (llama / "build" / name).write_text("")
+        return llama
+
+    def test_windows_compiles_with_nvcc_directly(self) -> None:
+        # no POSIX make on Windows: the engine is compiled and then linked into a DLL by nvcc itself
+        self.archive = None
+        calls: list[list[str]] = []
+
+        async def fake_exec(*args, **_kwargs):
+            calls.append(list(args))
+            (self.root / "qwen38mk.dll").write_text("dll")
+            return 0, "", ""
+
+        log = _Log()
+        with mock.patch.object(mb.sys, "platform", "win32"), \
+                mock.patch.object(mb, "_nvcc_path", return_value="nvcc.exe"), \
+                mock.patch.object(mb, "LLAMA_CPP_DIR", self._windows_llama_tree()), \
+                mock.patch.object(mb, "_msvc_env", return_value={"PATH": ""}), \
+                mock.patch.object(mb, "_copy_windows_runtime"), \
+                mock.patch.object(mb, "_run_exec", side_effect=fake_exec):
+            _run({"llama_model": self.model}, log)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call[0] for call in calls], ["nvcc.exe", "nvcc.exe"])
+        self.assertIn("-c", calls[0])
+        self.assertIn("-shared", calls[1])
+        self.assertEqual(json.loads((self.root / ".openjet-build.json").read_text()), {"arch": "sm_86"})
+        self.assertIn("OpenJet engine built", log.lines[-1])
+
+    def test_windows_without_msvc_skips_the_build(self) -> None:
+        self.archive = None
+        log = _Log()
+        with mock.patch.object(mb.sys, "platform", "win32"), \
+                mock.patch.object(mb, "_nvcc_path", return_value="nvcc.exe"), \
+                mock.patch.object(mb, "LLAMA_CPP_DIR", self._windows_llama_tree()), \
+                mock.patch.object(mb, "_msvc_env", return_value=None), \
+                mock.patch.object(mb, "_run_exec") as run:
+            _run({"llama_model": self.model}, log)
+        run.assert_not_called()
+        self.assertIn("no Visual Studio C++ build tools found", log.lines[-1])
 
 
 class SourceListTests(unittest.TestCase):
