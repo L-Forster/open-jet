@@ -8,6 +8,7 @@ libqwen38mk_agents.so
 ptxas*.log
 tools/vocab_freq
 tools/llama_ref
+tools/iq_repack_check
 # microbenchmark binaries (bench/*.cu) and benchmark scratch output
 bench/ffn_bench
 bench/ffn_bench_h*

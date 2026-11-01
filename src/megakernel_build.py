@@ -26,6 +26,7 @@ from .llama_server import (
     _MEGAKERNEL_TURING_CAP,
     _megakernel_dir,
     _megakernel_gpu_info,
+    _megakernel_min_vram_mib,
     _megakernel_library,
     _megakernel_model_supported,
     _megakernel_root,
@@ -38,6 +39,8 @@ _MIXED_BUILD_TAG = ".openjet-build-mixed.json"
 _RELEASE_ASSET_URL = "https://github.com/L-Forster/open-jet/releases/download/v{version}/{asset}"
 _SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "kv_lowbit.cuh", "kv_spec.h", "prefill.cuh", "prefill_attn.cuh",
             "prefill_gemm.cuh", "cuda_compat.cuh", "gguf.h", "capi.cpp", "bmm.cuh")
+# the mixed build's i-quant codebooks and load-time block layouts
+_MIXED_ONLY_SOURCES = ("iq_tables.cuh", "iq_repack.h")
 
 
 def _nvcc_path() -> str | None:
@@ -77,7 +80,7 @@ def _build_is_current(root: Path, arch: str, model: str = "") -> bool:
     sources = _SOURCES if variant == "native" else tuple(
         {"qwen38_mk.cu": "qwen38_mixed.cu", "prefill_gemm.cuh": "prefill_gemm_mixed.cuh"}.get(name, name)
         for name in _SOURCES
-    )
+    ) + _MIXED_ONLY_SOURCES
     return all(not (root / name).is_file() or (root / name).stat().st_mtime <= built for name in sources)
 
 
@@ -160,7 +163,7 @@ async def ensure_megakernel(
         log.write("[yellow]Skipping OpenJet's Qwen3.8-27B engine: unsupported or unreadable GGUF tensor types; using llama-server.[/]")
         return setup_result
     library = _megakernel_library(model)
-    gpu = _megakernel_gpu_info()
+    gpu = _megakernel_gpu_info(_megakernel_min_vram_mib(model))
     if gpu is None:
         return setup_result
     if variant == "mixed" and gpu[1] == _MEGAKERNEL_TURING_CAP:

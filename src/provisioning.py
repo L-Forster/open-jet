@@ -334,7 +334,7 @@ def recommend_direct_model(
     *,
     cfg: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
-    model_catalog = setup_direct_model_catalog(cfg)
+    model_catalog = tuple(row for row in setup_direct_model_catalog(cfg) if not row.get("manual_only"))
     unified_memory = hardware_info.has_metal or running_on_jetson()
     if not unified_memory:
         model_catalog = tuple(

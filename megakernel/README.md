@@ -127,7 +127,8 @@ Which model file runs on it (details in [The GGUF](#the-gguf)):
 | unsloth's original Qwen3.8-27B `Q4_K_M`, the one the catalog downloads | OpenJet |
 | a Qwen3.8-27B `Q4_K_M` from lmstudio-community, mradermacher, Abiray or KikoCis | OpenJet, semi compatible |
 | unsloth Qwen3.8-27B `UD-Q4_K_XL` | OpenJet's separate mixed-quant build |
-| any other quant (other unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp |
+| unsloth Qwen3.8-27B `UD-Q3_K_XL` (12.4 GiB on the GPU: 16 GB cards, ~48K context) | OpenJet's separate mixed-quant build |
+| any other quant (other unsloth `UD-*`, bartowski, GSQ-RCO, ...) | llama.cpp (the mixed build loads them; untested for accuracy) |
 
 ## How it works
 
@@ -310,9 +311,15 @@ python server/mk_server.py -m /path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf --lib ./libqw
 
 The original CLI remains Q4_K_M-only; use `./qwen38_mixed` or the server with `--lib` for the mixed engine.
 Benchmark scripts accept `--model /path/to/model.gguf --mk-bin ./qwen38_mixed` for this executable.
-`openjet` passes the correct library automatically. The mixed loader accepts Q4_K, Q5_K, Q6_K,
-Q8_0 and IQ4_XS projections, and converts Q3_K / IQ3_S to Q6_K and IQ4_NL to Q8_0.
-Both engines still require Q4_K token embeddings and a Q6_K output head.
+`openjet` passes the correct library automatically. The mixed loader reads Q4_K, Q5_K, Q6_K and Q8_0
+projections, and the i-quants and low-bit k-quants of unsloth's `UD-` files and ISTA-DASLab's GSQ-RCO files:
+IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M, Q3_K and Q2_K. Each is re-laid-out at load
+into blocks the GEMV and the prefill GEMM read with aligned loads (`iq_repack.h`: IQ3_* and Q3_K at 3.5
+bits per weight, IQ2_*, IQ1_* and Q2_K at 3), and the values are unchanged: `make tools/iq_repack_check`
+then `tools/iq_repack_check --synthetic` (or `tools/iq_repack_check model.gguf`) rebuilds every weight
+both ways and compares it with ggml's dequantization. IQ4_NL is converted to Q8_0, exactly. The output
+head may be Q6_K, Q5_K or Q4_K, and `token_embd` any of the types above (Q3_K is converted to
+Q6_K, exactly). The original engine requires Q4_K token embeddings and a Q6_K output head.
 
 CLI flags: `-d` drafts per cycle (0-4; with 4 the depth drops to 3 for a cycle after a rejected
 draft), `-c` KV capacity, `--kv f16|q8|auto` (KV cache format), `--think [xhigh|medium|low]`

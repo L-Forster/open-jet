@@ -38,7 +38,7 @@ keywords = [
     "edge-ai",
 ]
 license = "AGPL-3.0-only"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

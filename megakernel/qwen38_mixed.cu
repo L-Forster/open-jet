@@ -36,6 +36,8 @@
 #include "gguf.h"
 #include "qwen38_mk.h"
 #include "kv_spec.h"
+#include "iq_tables.cuh"
+#include "iq_repack.h"
 
 #define CK(x)                                                                                   \
     do {                                                                                        \
@@ -100,7 +102,18 @@ constexpr int SM_ATTN_MAX = SM_ATTN > SM_ATTN_Q8 ? SM_ATTN : SM_ATTN_Q8;
 constexpr int SM_TOTAL = (SM_MISC + 2048 > SM_ATTN_MAX ? SM_MISC + 2048 : SM_ATTN_MAX);
 static_assert(SM_TOTAL <= 99 * 1024, "shared memory budget");
 
-enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ4X = 23 };
+enum { T_F32 = 0, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_IQ2XXS = 16, T_IQ2XS = 17, T_IQ3XXS = 18, T_IQ3S = 21,
+       T_IQ2S = 22, T_IQ4X = 23, T_Q2K = 10, T_Q3K = 11, T_IQ1S = 19, T_IQ1M = 29 };
+// Kernel template tags of the codebook families: one instantiation each, the type (Mat::type) chosen at run time
+enum { F_IQ3 = 100, F_IQ2 = 101 }; // IQ3_S / IQ3_XXS; IQ2_XXS / XS / S and IQ1_S / M
+// The GEMV phases (gemv_pairs, resid32, rows16) see all of those and Q2_K / Q3_K as one type, F_ANY: fam_rows_any picks
+// the family at run time
+enum { F_ANY = 102 };
+__host__ __device__ constexpr bool blk112(int rt) { return rt == T_IQ3S || rt == T_IQ3XXS || rt == T_Q3K; }
+// the loader stores a repacked type's ggml id as its Mat type (T_IQ4X is IQ4_XS's id, its layout is repack_iq4xs's)
+static_assert(T_IQ3S == gguf::IQ3_S && T_IQ3XXS == gguf::IQ3_XXS && T_IQ2XXS == gguf::IQ2_XXS && T_IQ2XS == gguf::IQ2_XS &&
+              T_IQ2S == gguf::IQ2_S && T_IQ1S == gguf::IQ1_S && T_IQ1M == gguf::IQ1_M && T_Q2K == gguf::Q2_K &&
+              T_Q3K == gguf::Q3_K, "type ids");
 enum { MODE_PREFILL = 0, MODE_DECODE = 1, MODE_BENCH = 2 };
 
 struct Mat {
@@ -129,6 +142,7 @@ struct ModelW {
     const int * draft_ids; // row -> token id for head_d (nullptr: identity)
     const float *enorm, *hnorm, *shnorm, *onorm;
     const uint8_t * embd;
+    int embd_type, embd_rb; // token_embd: its type (see dequant_embd), bytes per row
 };
 
 // Quantised activation vector(s) in the "unit" layout consumed by the GEMV:
@@ -702,23 +716,229 @@ __device__ __forceinline__ void rows_iq4x(const uint8_t * const (&rp)[R], const 
     }
 }
 
+// IQ3_S and IQ3_XXS re-laid-out at load (repack_iq3) into 112-byte blocks.  Unit uu = 2 p + h covers
+// A = elements [64 p + 16 h, +16) (sub-block 2 p) and B = [64 p + 32 + 16 h, +16) (sub-block 2 p + 1):
+//   [8 uu, +8)       grid indices (low 8 bits) of A's four 4-weight groups, then B's
+//   [64 + 4 uu, +4)  sign bits of A's 16 weights (u16), then B's (IQ3_XXS: expanded from ksigns_iq2xs)
+//   [96 + uu]        9th index bits (IQ3_S): A's four in the low nibble, B's in the high nibble
+//   [104, +2) fp16 d | [106 + p] the 4-bit scales s of sub-blocks 2 p (low) and 2 p + 1 (high) | 2 pad
+// A weight is d (1 + 2 s) g (IQ3_S) or d (1 + 2 s) g / 4 (IQ3_XXS), g a signed grid value.
+constexpr int IQ3_BLK = 112;
+__device__ __forceinline__ int iq3_word(const uint32_t * grid, unsigned idx, unsigned sbits) {
+    const int g = (int) __ldg(grid + idx);
+    const int sm = (int) __vcmpne4((sbits * 0x01010101u) & 0x08040201u, 0u);
+    return (int) __vsub4((unsigned) (g ^ sm), (unsigned) sm);
+}
+__device__ __forceinline__ void iq3_scales(const int4 & h, int p, bool xxs, float & fA, float & fB) {
+    const float d = __half2float(__ushort_as_half((unsigned short) (h.z & 0xffff))) * (xxs ? 0.25f : 1.0f);
+    const unsigned sc = (p < 2 ? (unsigned) h.z >> (16 + 8 * p) : (unsigned) h.w >> (8 * (p - 2))) & 0xff;
+    fA = d * (float) (1 + 2 * (int) (sc & 15));
+    fB = d * (float) (1 + 2 * (int) (sc >> 4));
+}
+
+// IQ2_XXS, IQ2_XS and IQ2_S re-laid-out at load (repack_iq2) into 96-byte blocks.  Unit uu = 2 p + h (A and B as
+// for unit_fam's IQ3 layout) holds four 8-weight groups A0 A1 B0 B1:
+//   [8 uu, +4)      grid index bits 0-7 of the four groups   [8 uu + 4, +4)  their sign bytes (IQ2_XXS / XS:
+//                                                                            expanded from ksigns_iq2xs)
+//   [64 + uu]       index bits 8-9 of the four groups, 2 bits each
+//   [72 + i / 2]    4-bit scale s of 16-group i (IQ2_XXS: its 32-group's scale in both halves)
+//   [80, +2) fp16 d | pad
+// A weight is d (1 + 2 s) g / 8, g a signed value of the type's grid (8 values per index).
+// IQ1_S / IQ1_M use the same layout (repack_iq2): a group's sign byte holds its index bits 8-10 and its delta's sign
+// (bit 3), and a weight is d (1 + 2 s) (8 g +/- 1) / 8 with g in {-1, 0, 1} from iq1s_grid.
+constexpr int IQ2_BLK = 96;
+// the two 4-weight words of a group of type rt (uniform across the warp), in one straight-line path for all five types:
+// IQ2: grid value with its sign bit applied; IQ1: 8 g (IQ1S_GRID8) plus the group's delta, +1 or -1
+__device__ __forceinline__ void iq2_words(int rt, unsigned idx, unsigned sgn, int & lo, int & hi) {
+    const bool iq1 = rt == T_IQ1S || rt == T_IQ1M;
+    const uint64_t * grid = iq1 ? IQ1S_GRID8 : rt == T_IQ2XXS ? IQ2XXS_GRID : rt == T_IQ2XS ? IQ2XS_GRID : IQ2S_GRID;
+    const unsigned long long g = __ldg(reinterpret_cast<const unsigned long long *>(grid) + (idx | (iq1 ? (sgn & 7) << 8 : 0u)));
+    const unsigned sb = iq1 ? 0u : sgn;
+    const unsigned delta = iq1 ? ((sgn & 8) ? 0xFFFFFFFFu : 0x01010101u) : 0u; // bytes of -1 / +1 / 0
+    const unsigned m0 = __vcmpne4(((sb & 0xF) * 0x01010101u) & 0x08040201u, 0u);
+    const unsigned m1 = __vcmpne4(((sb >> 4) * 0x01010101u) & 0x08040201u, 0u);
+    lo = (int) __vadd4(__vsub4((unsigned) g ^ m0, m0), delta);
+    hi = (int) __vadd4(__vsub4((unsigned) (g >> 32) ^ m1, m1), delta);
+}
+// grid index of group g: bits 0-7 from byte g of qi, bits 8-9 from bits 2 g of hb
+__device__ __forceinline__ unsigned iq2_idx(unsigned qi, unsigned hb, int g) {
+    return ((qi >> (8 * g)) & 0xff) | (((hb >> (2 * g)) & 3) << 8);
+}
+// the 4-bit scale of 16-group i from the header words z (bytes 72..75) and w (76..79)
+__device__ __forceinline__ float iq2_scale(float d, int z, int w, int i) {
+    const unsigned b = (i < 8 ? (unsigned) z >> (4 * i) : (unsigned) w >> (4 * (i - 8))) & 0xF;
+    return d * (float) (1 + 2 * (int) b);
+}
+
+// Q2_K re-laid-out at load (repack_q2k) into 96-byte blocks: unit uu's A then B values (2 bits each) at 8 uu,
+// scales[16] (4-bit scale | 4-bit min per 16-group, ggml order) at 64, fp16 d and dmin at 80.
+// A weight is d sc q - dmin m.
+constexpr int Q2_BLK = 96;
+
+// Q3_K re-laid-out at load (repack_q3k) into 112-byte blocks: unit uu's A then B low 2-bit values at 8 uu (as
+// Q2_K), their third bits at 64 + 4 uu (u16 each), 6-bit scales at 96 (low nibbles) and 104 (top 2 bits), fp16 d
+// at 108. A weight is d (sc - 32) ((lo | hi << 2) - 4).
+constexpr int Q3_BLK = 112;
+// third bits 4 m .. 4 m + 3 of a 16-bit mask -> bit 2 of bytes 0..3
+__device__ __forceinline__ unsigned q3_hi(unsigned h16, int m) { return ((((h16 >> (4 * m)) & 0xF) * 0x00204081u) & 0x01010101u) << 2; }
+// the 6-bit scale of 16-group i, minus 32, from header words x (bytes 96..99), y (100..103), z (104..107)
+__device__ __forceinline__ int q3_scale(const int4 & hd, int i) {
+    const unsigned lo = ((unsigned) (i < 8 ? hd.x : hd.y) >> (4 * (i & 7))) & 0xF;
+    const unsigned hi = ((unsigned) hd.z >> (2 * i)) & 3;
+    return (int) (lo | (hi << 4)) - 32;
+}
+
+// One unit (A and B halves, 16 weights each) of a row of a codebook family (F_IQ3, F_IQ2) or low-bit k-quant (Q2_K,
+// Q3_K) in its repacked layout: four int8 words per half, their scales fA / fB and (Q2_K) mins gA / gB.
+template <int FAM>
+__device__ __forceinline__ void unit_fam(const uint8_t * row, int u, int rt, int (&A)[4], int (&B)[4], float & fA,
+                                         float & gA, float & fB, float & gB) {
+    const int uu = u & 7, p = uu >> 1, hh = uu & 1;
+    gA = gB = 0.f;
+    if constexpr (FAM == F_IQ3) {
+        const bool xxs = rt == T_IQ3XXS;
+        const uint32_t * grid = xxs ? IQ3XXS_GRID : IQ3S_GRID;
+        const uint8_t * blk = row + (u >> 3) * IQ3_BLK;
+        const int4 h = ldw4(blk + 96);
+        const int2 q = ldw2(blk + 8 * uu);
+        const unsigned sv = (unsigned) ldw1(blk + 64 + 4 * uu);
+        iq3_scales(h, p, xxs, fA, fB);
+        const unsigned qh = (unsigned) (uu < 4 ? h.x : h.y) >> (8 * (uu & 3)); // (IQ3_XXS: 0)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            A[j] = iq3_word(grid, (((unsigned) q.x >> (8 * j)) & 0xff) | (((qh >> j) & 1) << 8), (sv >> (4 * j)) & 0xf);
+            B[j] = iq3_word(grid, (((unsigned) q.y >> (8 * j)) & 0xff) | (((qh >> (4 + j)) & 1) << 8), (sv >> (16 + 4 * j)) & 0xf);
+        }
+    } else if constexpr (FAM == F_IQ2) {
+        const uint8_t * blk = row + (u >> 3) * IQ2_BLK;
+        const int2 q = ldw2(blk + 8 * uu);
+        const int4 h = ldw4(blk + 64);
+        const int dd = ldw1(blk + 80);
+        const float d = __half2float(__ushort_as_half((unsigned short) (dd & 0xffff))) * 0.125f;
+        fA = iq2_scale(d, h.z, h.w, 4 * p + hh);
+        fB = iq2_scale(d, h.z, h.w, 4 * p + 2 + hh);
+        const unsigned hb = (unsigned) (uu < 4 ? h.x : h.y) >> (8 * (uu & 3));
+        const unsigned qi = (unsigned) q.x, sg = (unsigned) q.y;
+        iq2_words(rt, iq2_idx(qi, hb, 0), sg & 0xff, A[0], A[1]);
+        iq2_words(rt, iq2_idx(qi, hb, 1), (sg >> 8) & 0xff, A[2], A[3]);
+        iq2_words(rt, iq2_idx(qi, hb, 2), (sg >> 16) & 0xff, B[0], B[1]);
+        iq2_words(rt, iq2_idx(qi, hb, 3), sg >> 24, B[2], B[3]);
+    } else if constexpr (FAM == T_Q2K) {
+        const uint8_t * blk = row + (u >> 3) * Q2_BLK;
+        const int2 q = ldw2(blk + 8 * uu);
+        const int4 sc = ldw4(blk + 64);
+        const int dm = ldw1(blk + 80);
+        const float2 d = __half22float2(*reinterpret_cast<const __half2 *>(&dm));
+        const int iA = 4 * p + hh, iB = iA + 2; // 16-group i: scale byte i, in word i / 4 of sc
+        const unsigned wA = (unsigned) (iA < 4 ? sc.x : iA < 8 ? sc.y : iA < 12 ? sc.z : sc.w);
+        const unsigned wB = (unsigned) (iB < 4 ? sc.x : iB < 8 ? sc.y : iB < 12 ? sc.z : sc.w);
+        const unsigned bA = (wA >> (8 * (iA & 3))) & 0xff, bB = (wB >> (8 * (iB & 3))) & 0xff;
+        fA = d.x * (float) (bA & 15); gA = d.y * (float) (bA >> 4);
+        fB = d.x * (float) (bB & 15); gB = d.y * (float) (bB >> 4);
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            A[m] = ((unsigned) q.x >> (2 * m)) & 0x03030303u;
+            B[m] = ((unsigned) q.y >> (2 * m)) & 0x03030303u;
+        }
+    } else { // Q3_K
+        const uint8_t * blk = row + (u >> 3) * Q3_BLK;
+        const int2 q = ldw2(blk + 8 * uu);
+        const unsigned hb = (unsigned) ldw1(blk + 64 + 4 * uu);
+        const int4 hd = ldw4(blk + 96);
+        const float d = __half2float(__ushort_as_half((unsigned short) (hd.w & 0xffff)));
+        fA = d * (float) q3_scale(hd, 4 * p + hh);
+        fB = d * (float) q3_scale(hd, 4 * p + 2 + hh);
+#pragma unroll
+        for (int m = 0; m < 4; m++) {
+            A[m] = (int) __vsub4((((unsigned) q.x >> (2 * m)) & 0x03030303u) | q3_hi(hb & 0xffff, m), 0x04040404u);
+            B[m] = (int) __vsub4((((unsigned) q.y >> (2 * m)) & 0x03030303u) | q3_hi(hb >> 16, m), 0x04040404u);
+        }
+    }
+}
+
+template <int T> struct LaneT { float v[T]; };
+template <int R> struct RowPtrs { const uint8_t * p[R]; };
+
+// R rows of a FAM matrix (F_IQ3, F_IQ2, Q2_K or Q3_K, type rt) against the T activation rows of s, which hold 32 nit
+// units each.  One compiled body per (T, R, FAM) with a run-time unit loop: per-K / per-call-site instances of these
+// types would push the mixed build's ptxas step past the memory a 16 GB machine has.
+template <int T, int R, int FAM>
+__device__ __noinline__ LaneT<R * T> fam_rows(const RowPtrs<R> rp, const SX s, int nit, int rt) {
+    const int lane = threadIdx.x & 31, UU = 32 * nit;
+    float acc[R][T];
+    zero_acc<T, R>(acc);
+#pragma unroll 1
+    for (int i = 0; i < nit; i++) {
+        const int u = lane + 32 * i;
+        int A[R][4], B[R][4];
+        float fA[R], gA[R], fB[R], gB[R];
+#pragma unroll
+        for (int k = 0; k < R; k++) unit_fam<FAM>(rp.p[k], u, rt, A[k], B[k], fA[k], gA[k], fB[k], gB[k]);
+#pragma unroll
+        for (int t = 0; t < T; t++) {
+            const int ix = t * UU + u;
+            const int4 va = s.xa[ix], vb = s.xb[ix];
+            const uint2 mm = s.xm[ix];
+            const float2 dx = __half22float2(*reinterpret_cast<const __half2 *>(&mm.x));
+            const int qq = (int) mm.y;
+            const float sqA = dx.x * (float) (short) (qq & 0xffff), sqB = dx.y * (float) (short) (qq >> 16);
+#pragma unroll
+            for (int k = 0; k < R; k++) {
+                int sa = __dp4a(A[k][0], va.x, 0);
+                sa = __dp4a(A[k][1], va.y, sa);
+                sa = __dp4a(A[k][2], va.z, sa);
+                sa = __dp4a(A[k][3], va.w, sa);
+                int sb = __dp4a(B[k][0], vb.x, 0);
+                sb = __dp4a(B[k][1], vb.y, sb);
+                sb = __dp4a(B[k][2], vb.z, sb);
+                sb = __dp4a(B[k][3], vb.w, sb);
+                acc[k][t] += fA[k] * (dx.x * (float) sa) + fB[k] * (dx.y * (float) sb) - gA[k] * sqA - gB[k] * sqB;
+            }
+        }
+    }
+    LaneT<R * T> res;
+#pragma unroll
+    for (int k = 0; k < R; k++)
+#pragma unroll
+        for (int t = 0; t < T; t++) res.v[k * T + t] = acc[k][t];
+    return res;
+}
+
 // rows row0 .. row0+R-1 of m, weight type fixed at compile time
 // u0: first unit of a K-slice (multiple of 32) when the activations in s hold only that slice
 template <int TYPE>
-__device__ __forceinline__ int unit_bytes(int u0) {
-    return TYPE == T_Q4K || TYPE == T_IQ4X ? (u0 >> 3) * 144
-         : TYPE == T_Q5K                  ? (u0 >> 3) * 176
-         : TYPE == T_Q6K                  ? (u0 >> 3) * Q6_BLK
-                                          : 32 * u0;
+__device__ __forceinline__ int unit_bytes(int u0, int rt) {
+    return TYPE == T_Q4K || TYPE == T_IQ4X   ? (u0 >> 3) * 144
+         : TYPE == T_Q5K                    ? (u0 >> 3) * 176
+         : TYPE == T_Q6K                    ? (u0 >> 3) * Q6_BLK
+         : TYPE == F_ANY                    ? (u0 >> 3) * (blk112(rt) ? 112 : 96)
+                                            : 32 * u0;
 }
-// R rows of one weight type given their row pointers (and, for Q8_0, their scale rows)
+// R rows of one weight type given their row pointers (and, for Q8_0, their scale rows); rt: the matrix's type, for
+// the codebook families
 template <int T, int IT, int R, int TYPE>
 __device__ __forceinline__ void rows_t(const uint8_t * const (&rp)[R], const __half * const (&dp)[R], const SX & s,
-                                       float (&acc)[R][T]) {
+                                       float (&acc)[R][T], int rt = 0) {
     if constexpr (TYPE == T_Q4K) rows_q4k<T, IT, R>(rp, s, acc);
     else if constexpr (TYPE == T_Q5K) rows_q5k<T, IT, R>(rp, s, acc);
     else if constexpr (TYPE == T_Q6K) rows_q6k<T, IT, R>(rp, dp, s, acc);
     else if constexpr (TYPE == T_IQ4X) rows_iq4x<T, IT, R>(rp, s, acc);
+    else if constexpr (TYPE == F_ANY) {
+        RowPtrs<R> P;
+#pragma unroll
+        for (int k = 0; k < R; k++) P.p[k] = rp[k];
+        LaneT<R * T> o;
+        switch (rt) {
+            case T_IQ3S: case T_IQ3XXS: o = fam_rows<T, R, F_IQ3>(P, s, IT, rt); break;
+            case T_Q2K: o = fam_rows<T, R, T_Q2K>(P, s, IT, rt); break;
+            case T_Q3K: o = fam_rows<T, R, T_Q3K>(P, s, IT, rt); break;
+            default: o = fam_rows<T, R, F_IQ2>(P, s, IT, rt); break;
+        }
+#pragma unroll
+        for (int k = 0; k < R; k++)
+#pragma unroll
+            for (int t = 0; t < T; t++) acc[k][t] += o.v[k * T + t];
+    }
     else rows_q80<T, IT, R>(rp, dp, s, acc);
 }
 template <int T, int IT, int R, int TYPE>
@@ -727,16 +947,35 @@ __device__ __forceinline__ void mrows(const Mat & m, int row0, const SX & s, flo
     const __half * dp[R];
 #pragma unroll
     for (int k = 0; k < R; k++) {
-        rp[k] = m.w + (size_t) (row0 + k) * m.rb + unit_bytes<TYPE>(u0);
+        rp[k] = m.w + (size_t) (row0 + k) * m.rb + unit_bytes<TYPE>(u0, m.type);
         dp[k] = m.d + (size_t) (row0 + k) * m.nd + (TYPE == T_Q6K ? (u0 >> 3) * (Q6_META / 2) : u0); // Q6_K: meta, Q8_0: d
     }
-    rows_t<T, IT, R, TYPE>(rp, dp, s, acc);
+    rows_t<T, IT, R, TYPE>(rp, dp, s, acc, m.type);
 }
 
-// Row pairs [lo, hi) of a single-matrix item range, distributed over all warps of the grid.
-// out(row0, acc) receives the reduced sums for rows row0, row0 + 1.
-template <int T, int IT, int TYPE, class Out>
-__device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
+// Where gemv_pairs stores the reduced sums of a row pair, times the activations' RMS factors: row r of token t at
+// base[t * stride + r], or (ring >= 0: the delta-net conv ring) at base[((ring + t) % CONV_RING) * QKV + r].  A plain
+// struct, not a functor per call site: each would compile its own copy of the GEMV, for every weight type and K,
+// and the mixed build's ptxas step would need more memory than a 16 GB machine has.
+struct PairOut {
+    float * base;
+    int stride, ring;
+};
+template <int T>
+__device__ __forceinline__ void store_pair(const PairOut & o, int r, const float (&a)[2][T]) {
+    const int lane = threadIdx.x & 31;
+    const float * s_rs = misc(nullptr);
+#pragma unroll
+    for (int t = 0; t < T; t++)
+        if ((lane >> 1) == t) {
+            const size_t row = o.ring >= 0 ? (size_t) ((o.ring + t) % CONV_RING) * QKV : (size_t) t * o.stride;
+            o.base[row + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
+        }
+}
+
+// Row pairs [lo, hi) of a single-matrix item range, distributed over all warps of the grid, stored through o.
+template <int T, int IT, int TYPE>
+__device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, const PairOut o) {
     const SX sx = make_sx(nullptr, 32 * IT); // activations already in shared memory
     const int W = nwarps(), gw = gwarp();
     const int first = lo + (((gw - lo) % W) + W) % W;
@@ -746,19 +985,21 @@ __device__ __noinline__ void gemv_pairs(const Mat m, int lo, int hi, Out out) {
         zero_acc<T, 2>(a);
         mrows<T, IT, 2, TYPE>(m, r, sx, a);
         wsum_acc<T, 2>(a);
-        out(r, a);
+        store_pair<T>(o, r, a);
     }
 }
 
 // Runtime dispatch on a matrix's type (uniform across the grid). Plain switches: a capturing
 // lambda would take the address of the caller's locals and push them to local memory.
-template <int T, int IT, class Out>
-__device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, Out out) {
+template <int T, int IT>
+__device__ __forceinline__ void gemv_pairs_any(const Mat & m, int lo, int hi, const PairOut & out) {
     switch (m.type) {
         case T_Q4K: gemv_pairs<T, IT, T_Q4K>(m, lo, hi, out); break;
         case T_Q5K: gemv_pairs<T, IT, T_Q5K>(m, lo, hi, out); break;
         case T_Q6K: gemv_pairs<T, IT, T_Q6K>(m, lo, hi, out); break;
         case T_Q8_0: gemv_pairs<T, IT, T_Q8_0>(m, lo, hi, out); break;
+        case T_IQ3S: case T_IQ3XXS: case T_IQ2XXS: case T_IQ2XS: case T_IQ2S: case T_IQ1S: case T_IQ1M: case T_Q2K:
+        case T_Q3K: gemv_pairs<T, IT, F_ANY>(m, lo, hi, out); break;
         default: gemv_pairs<T, IT, T_IQ4X>(m, lo, hi, out); break;
     }
 }
@@ -828,13 +1069,65 @@ __device__ __forceinline__ float dequant_q4k(const uint8_t * row, int e) {
     return d * (float) s * (float) qv - dmin * (float) m;
 }
 
-constexpr int EMBD_RB = D / 256 * 144; // bytes of one Q4_K token_embd row
+// GGUF Q6_K row (210-byte blocks: ql[128] | qh[64] | int8 scales[16] | fp16 d), element e
+__device__ __forceinline__ float dequant_q6k(const uint8_t * row, int e) {
+    const int b = e >> 8, w = e & 255, n = w >> 7, qr = (w >> 5) & 3, l = w & 31;
+    const uint8_t * blk = row + b * 210;
+    const float d = __half2float(*reinterpret_cast<const __half *>(blk + 208));
+    const uint8_t ql = blk[64 * n + l + 32 * (qr & 1)];
+    const int lo = qr >= 2 ? ql >> 4 : ql & 0xF;
+    const int hi = (blk[128 + 32 * n + l] >> (2 * qr)) & 3;
+    const int sc = (int8_t) blk[192 + 8 * n + (l >> 4) + 2 * qr];
+    return d * (float) sc * (float) ((lo | (hi << 4)) - 32);
+}
+
+// element e of a row in the repacked layouts of unit_fam: block b, 64-group p, A / B half j,
+// 16-chunk h, position i in the chunk (unit 2 p + h)
+template <int TYPE>
+__device__ __forceinline__ float dequant_rp(const uint8_t * row, int e, int rt) {
+    const int b = e >> 8, w = e & 255, p = w >> 6, j = (w >> 5) & 1, h = (w >> 4) & 1, i = w & 15, uu = 2 * p + h;
+    if constexpr (TYPE == F_IQ3) {
+        const bool xxs = rt == T_IQ3XXS;
+        const uint8_t * blk = row + b * IQ3_BLK;
+        const int jj = i >> 2; // 4-weight group
+        const unsigned qh = blk[96 + uu];
+        const unsigned idx = blk[8 * uu + 4 * j + jj] | (((qh >> (4 * j + jj)) & 1) << 8);
+        const int word = iq3_word(xxs ? IQ3XXS_GRID : IQ3S_GRID, idx, (blk[64 + 4 * uu + 2 * j + (i >> 3)] >> (i & 4)) & 0xF);
+        const float d = __half2float(*reinterpret_cast<const __half *>(blk + 104)) * (xxs ? 0.25f : 1.0f);
+        return d * (float) (1 + 2 * (int) ((blk[106 + p] >> (4 * j)) & 15)) * (float) (int8_t) (word >> (8 * (i & 3)));
+    } else if constexpr (TYPE == F_IQ2) {
+        const uint8_t * blk = row + b * IQ2_BLK;
+        const int g = 2 * j + (i >> 3), si = 4 * p + 2 * j + h; // 8-weight group, 16-group of the scale
+        int lo, hi;
+        iq2_words(rt, blk[8 * uu + g] | (((blk[64 + uu] >> (2 * g)) & 3) << 8), blk[8 * uu + 4 + g], lo, hi);
+        const float d = __half2float(*reinterpret_cast<const __half *>(blk + 80)) * 0.125f;
+        return d * (float) (1 + 2 * (int) ((blk[72 + si / 2] >> (4 * (si & 1))) & 15)) *
+               (float) (int8_t) (((i & 4) ? hi : lo) >> (8 * (i & 3)));
+    } else { // Q2_K
+        const uint8_t * blk = row + b * Q2_BLK;
+        const unsigned wv = *reinterpret_cast<const unsigned *>(blk + 8 * uu + 4 * j);
+        const unsigned sc = blk[64 + 4 * p + 2 * j + h];
+        const float2 dm = __half22float2(*reinterpret_cast<const __half2 *>(blk + 80));
+        return dm.x * (float) (sc & 15) * (float) ((wv >> (8 * (i & 3) + 2 * (i >> 2))) & 3) - dm.y * (float) (sc >> 4);
+    }
+}
+
+// token_embd: Q4_K / Q6_K in GGUF layout, the i-quants and Q2_K repacked (see the loader)
+__device__ __forceinline__ float dequant_embd(const uint8_t * row, int e) {
+    switch (cW.embd_type) {
+        case T_Q6K: return dequant_q6k(row, e);
+        case T_IQ3S: case T_IQ3XXS: return dequant_rp<F_IQ3>(row, e, cW.embd_type);
+        case T_IQ2XXS: case T_IQ2XS: case T_IQ2S: case T_IQ1S: case T_IQ1M: return dequant_rp<F_IQ2>(row, e, cW.embd_type);
+        case T_Q2K: return dequant_rp<T_Q2K>(row, e, T_Q2K);
+        default: return dequant_q4k(row, e);
+    }
+}
 
 // token_embd row -> shared memory in one coalesced read: the table is in mapped host memory, where
-// every dependent access pays a PCIe round trip
+// every dependent access pays a PCIe round trip (8-byte words: Q6_K rows are 4200 bytes)
 __device__ __forceinline__ const uint8_t * stage_embd_row(int tok, uint8_t * dst) {
-    if (threadIdx.x < EMBD_RB / 16)
-        reinterpret_cast<uint4 *>(dst)[threadIdx.x] = reinterpret_cast<const uint4 *>(cW.embd + (size_t) tok * EMBD_RB)[threadIdx.x];
+    const uint2 * src = reinterpret_cast<const uint2 *>(cW.embd + (size_t) tok * cW.embd_rb);
+    for (int i = threadIdx.x; i < cW.embd_rb / 8; i += NT) reinterpret_cast<uint2 *>(dst)[i] = src[i];
     __syncthreads();
     return dst;
 }
@@ -850,7 +1143,7 @@ __device__ __noinline__ void embed_prologue() {
     const float * w0 = cW.L[0].attn_norm;
     for (int j = warp; j < U_D; j += NW) {
         const int e = 32 * j + lane;
-        const float v = dequant_q4k(row, e);
+        const float v = dequant_embd(row, e);
         cB.x[t * D + e] = v;
         q32_store(cB.qn, t, j, v * w0[e], v * v, true);
     }
@@ -949,6 +1242,8 @@ __device__ __forceinline__ void resid_any(const Mat & W, const QBuf & in, float 
         case T_Q5K: resid32<T, IT, T_Q5K>(W, in, x, add, wnext, sm); break;
         case T_Q6K: resid32<T, IT, T_Q6K>(W, in, x, add, wnext, sm); break;
         case T_Q8_0: resid32<T, IT, T_Q8_0>(W, in, x, add, wnext, sm); break;
+        case T_IQ3S: case T_IQ3XXS: case T_IQ2XXS: case T_IQ2XS: case T_IQ2S: case T_IQ1S: case T_IQ1M: case T_Q2K:
+        case T_Q3K: resid32<T, IT, F_ANY>(W, in, x, add, wnext, sm); break;
         default: resid32<T, IT, T_IQ4X>(W, in, x, add, wnext, sm); break;
     }
 }
@@ -1003,8 +1298,6 @@ __device__ __noinline__ void ffn_gu_q4k(const LayerW & W, uint8_t * /*sm*/) {
     }
 }
 
-template <int T> struct LaneT { float v[T]; };
-
 // Rows 16 j .. 16 j + 15 of m against the normed activations in shared memory: lane r gets row
 // 16 j + r (lanes 16-31: 0). As many rows per step as ffn_gu_q4k shares activations across.
 template <int T, int TYPE>
@@ -1039,6 +1332,8 @@ __device__ __forceinline__ LaneT<T> rows16_any(const Mat & m, int j) {
         case T_Q5K: return rows16<T, T_Q5K>(m, j);
         case T_Q6K: return rows16<T, T_Q6K>(m, j);
         case T_Q8_0: return rows16<T, T_Q8_0>(m, j);
+        case T_IQ3S: case T_IQ3XXS: case T_IQ2XXS: case T_IQ2XS: case T_IQ2S: case T_IQ1S: case T_IQ1M: case T_Q2K:
+        case T_Q3K: return rows16<T, F_ANY>(m, j);
         default: return rows16<T, T_IQ4X>(m, j);
     }
 }
@@ -1084,16 +1379,6 @@ __device__ __forceinline__ void store_lane_t(float * base, int stride, int idx, 
         if (lane == t) base[t * stride + idx] = a[t];
 }
 
-// a[k][t] -> base[t * stride + idx + k]
-template <int T>
-__device__ __forceinline__ void store_pair_t(float * base, int stride, int idx, const float (&a)[2][T]) {
-    const int lane = threadIdx.x & 31;
-    const float * s_rs = misc(nullptr);
-#pragma unroll
-    for (int t = 0; t < T; t++)
-        if ((lane >> 1) == t) base[t * stride + idx + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * s_rs[t];
-}
-
 // delta-net input projections: alpha/beta (fp32), qkv -> conv ring, z
 template <int T>
 __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, uint8_t * /*sm*/) {
@@ -1129,15 +1414,8 @@ __device__ __noinline__ void dn_proj(const LayerW & W, int dl, int n, int dn_c, 
         for (int t = 0; t < T; t++) acc[t] = wsum(acc[t]) * s_rs[t];
         store_lane_t<T>(cB.ab + ch * MAXT * 2 * NVH, 2 * NVH, row, acc);
     }
-    gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, [=](int r, const float (&a)[2][T]) {
-        const int lane = threadIdx.x & 31;
-#pragma unroll
-        for (int t = 0; t < T; t++)
-            if ((lane >> 1) == t)
-                conv[((n + t) % CONV_RING) * QKV + r + (lane & 1)] = ((lane & 1) ? a[1][t] : a[0][t]) * misc(nullptr)[t];
-    });
-    gemv_pairs_any<T, 5>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z,
-                         [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.z, VD, r, a); });
+    gemv_pairs_any<T, 5>(W.qkv, n_ab, n_ab + n_qkv, PairOut{conv, 0, n});
+    gemv_pairs_any<T, 5>(W.gate, n_ab + n_qkv, n_ab + n_qkv + n_z, PairOut{cB.z, VD, -1});
     // Warm L2 with what dn_core will read, while the other blocks are still projecting:
     // the head's recurrent state (64 KB), its conv weights, older conv rows and replay entries.
     if (blockIdx.x < NVH) {
@@ -1408,9 +1686,9 @@ __device__ __noinline__ void attn_proj(const LayerW & W, int slot, int n, uint8_
     if (gwarp() < QG / 2) pf_rows(W.q, 2 * gwarp(), 2, 576);
     fill_xs<T>(cB.qn, 0, true, sx, misc(sm));
     const int nq = QG / 2, nk = KVD / 2;
-    gemv_pairs_any<T, 5>(W.q, 0, nq, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.qbuf, QG, r, a); });
-    gemv_pairs_any<T, 5>(W.k, nq, nq + nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.kbuf, KVD, r, a); });
-    gemv_pairs_any<T, 5>(W.v, nq + nk, nq + 2 * nk, [=](int r, const float (&a)[2][T]) { store_pair_t<T>(cB.vbuf, KVD, r, a); });
+    gemv_pairs_any<T, 5>(W.q, 0, nq, PairOut{cB.qbuf, QG, -1});
+    gemv_pairs_any<T, 5>(W.k, nq, nq + nk, PairOut{cB.kbuf, KVD, -1});
+    gemv_pairs_any<T, 5>(W.v, nq + nk, nq + 2 * nk, PairOut{cB.vbuf, KVD, -1});
     // Warm L2 with what attn_core reads first: q/k norm weights, RoPE rows of the new positions,
     // and the first K / V tile of this block's attention item (positions < n).
     pf_block(W.qn, HD * 4);
@@ -2273,6 +2551,44 @@ __device__ __forceinline__ bool topk_insert(float & tv, int & ti, float v, int i
 
 // lm_head over TL rows (qn rows t0..t0+TL-1) with greedy argmax; returns true in the single
 // block that finished last, which holds the reduced argmax in s_tok.  TOPK: additionally keeps the
+// lm_head rows r0, r1 of a Q5_K or Q4_K head: one function per TL (not inlined into every lm_head variant)
+template <int TL>
+__device__ __noinline__ LaneT<2 * TL> head_rows_other(int r0, int r1) {
+    const Mat & H = cW.head;
+    const SX sx = make_sx(nullptr, U_D);
+    const uint8_t * rp[2] = {H.w + (size_t) r0 * H.rb, H.w + (size_t) r1 * H.rb};
+    float a[2][TL];
+    zero_acc<TL, 2>(a);
+    if (H.type == T_Q5K) rows_q5k<TL, 5, 2>(rp, sx, a);
+    else rows_q4k<TL, 5, 2>(rp, sx, a);
+    LaneT<2 * TL> res;
+#pragma unroll
+    for (int t = 0; t < TL; t++) {
+        res.v[t] = a[0][t];
+        res.v[TL + t] = a[1][t];
+    }
+    return res;
+}
+
+// lm_head rows r, r + 1 (rows ids[r], ids[r + 1] for the draft head), added to a; Q6_K (the native head) inline
+template <int TL>
+__device__ __forceinline__ void head_rows(const int * ids, int r, const SX & sx, float (&a)[2][TL]) {
+    const Mat & H = cW.head;
+    const int r0 = ids ? __ldg(ids + r) : r, r1 = ids ? __ldg(ids + r + 1) : r + 1;
+    if (H.type == T_Q6K) {
+        const uint8_t * rp[2] = {H.w + (size_t) r0 * H.rb, H.w + (size_t) r1 * H.rb};
+        const __half * dp[2] = {H.d + (size_t) r0 * H.nd, H.d + (size_t) r1 * H.nd};
+        rows_q6k<TL, 5, 2>(rp, dp, sx, a);
+    } else {
+        const LaneT<2 * TL> o = head_rows_other<TL>(r0, r1);
+#pragma unroll
+        for (int t = 0; t < TL; t++) {
+            a[0][t] += o.v[t];
+            a[1][t] += o.v[TL + t];
+        }
+    }
+}
+
 // TOPK_MAX best logits of each row in cB.cand (for sampling).  FULL: additionally stores every
 // logit of each row in cB.logits (scoring).
 template <int TL, bool TOPK = false, bool FULL = false>
@@ -2305,14 +2621,7 @@ __device__ __noinline__ bool lm_head(int t0, bool draft, uint8_t * /*sm*/, int *
     for (int r = 2 * gwarp(); r < head.N; r += 2 * nwarps()) {
         float a[2][TL];
         zero_acc<TL, 2>(a);
-        if (ids) {
-            const int p0 = __ldg(ids + r), p1 = __ldg(ids + r + 1);
-            const uint8_t * rp[2] = {cW.head.w + (size_t) p0 * cW.head.rb, cW.head.w + (size_t) p1 * cW.head.rb};
-            const __half * dp[2] = {cW.head.d + (size_t) p0 * cW.head.nd, cW.head.d + (size_t) p1 * cW.head.nd};
-            rows_q6k<TL, 5, 2>(rp, dp, sx, a);
-        } else {
-            mrows<TL, 5, 2, T_Q6K>(head, r, sx, a);
-        }
+        head_rows<TL>(ids, r, sx, a);
         wsum_acc<TL, 2>(a);
         if constexpr (FULL) {
             if (lane == 0) {
@@ -2669,7 +2978,7 @@ __device__ __noinline__ void mtp_pass(const Launch & P, int row0, bool draft_row
         const uint8_t * erow = stage_embd_row(tok, reinterpret_cast<uint8_t *>(red + 32));
         float ae = 0.f, ah = 0.f;
         for (int e = tid; e < D; e += NT) {
-            const float v = dequant_q4k(erow, e);
+            const float v = dequant_embd(erow, e);
             const float hv = hsrc ? __ldcg(hsrc + e) : 0.f;
             se[e] = v;
             sh[e] = hv;
@@ -2804,6 +3113,8 @@ __global__ void __launch_bounds__(NT, 1) mk_cycle(Launch P) {
     }
 }
 
+#define PF_EMBD_ROW(tok) (cW.embd + (size_t) (tok) * cW.embd_rb)
+#define PF_EMBD(row, e) dequant_embd(row, e)
 #include "prefill.cuh"
 
 // silu(gate) * up from the fp32 outputs of two GEMMs, written like mmh<.., true>'s epilogue (fp16,
@@ -3063,7 +3374,7 @@ struct MKEngine::Impl {
         return (T *) p;
     }
 
-    // A tensor of the file in a type the kernels read. Q3_K and IQ3_S are re-encoded as Q6_K and
+    // A tensor of the file in a type the kernels read. Q3_K is re-encoded as Q6_K when asked (token_embd) and
     // IQ4_NL as Q8_0, exactly: every weight is a small integer times an fp16 scale in both (checked
     // against ggml's dequantization of the source row; signed zeros compare equal). `to == T_F32` dequantizes
     // (ssm_alpha / ssm_beta, which are folded into fp32 rows).
@@ -3095,7 +3406,7 @@ struct MKEngine::Impl {
         const bool to_f32 = to == T_F32 && t.type != gguf::F32;
         const bool to_q4 = req_q4 && (int) t.type == to &&
                            (t.type == gguf::Q5_K || t.type == gguf::Q6_K || t.type == gguf::Q8_0);
-        const bool to_q6 = !to_f32 && (t.type == gguf::Q3_K || t.type == gguf::IQ3_S);
+        const bool to_q6 = !to_f32 && t.type == gguf::Q3_K && to == T_Q6K;
         const bool to_q8 = !to_f32 && t.type == gguf::IQ4_NL;
         if (!to_f32 && !to_q4 && !to_q6 && !to_q8) return s; // anything the kernels cannot read is refused by up_mat / need()
         const ggml_type from = (ggml_type) t.type;
@@ -3234,6 +3545,16 @@ struct MKEngine::Impl {
             CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
             m.w = dq;
             wbytes += q.size();
+        } else if (const size_t bb = repacked_block_bytes((int) t.type)) { // i-quants, Q2_K, Q3_K: see unit_fam
+            m.type = (int) t.type; // (the T_ constants are the ggml type ids)
+            m.rb = (int) (nb * bb);
+            const size_t srb = gguf::type_row_bytes(t.type, K);
+            std::vector<uint8_t> q((size_t) N * m.rb);
+            parallel_rows(N, [&](int64_t r) { repack_blocks((int) t.type, t.data + (size_t) r * srb, q.data() + (size_t) r * m.rb, nb); });
+            uint8_t * dq = dalloc<uint8_t>(q.size(), false);
+            CK(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice));
+            m.w = dq;
+            wbytes += q.size();
         } else if (t.type == gguf::Q8_0) {
             const int nb32 = K / 32;
             m.rb = K;
@@ -3291,7 +3612,7 @@ struct MKEngine::Impl {
 
         auto blk = [](int i, const char * s) { return "blk." + std::to_string(i) + "." + s; };
         // The kernels take the weight type as a template argument and dispatch on each matrix's
-        // type at run time (gemv_pairs_any, resid_any, ffn_gu), for Q4_K, Q5_K, Q6_K, Q8_0 and IQ4_XS (plus what want()
+        // type at run time (gemv_pairs_any, resid_any, ffn_gu), for Q4_K, Q5_K, Q6_K, Q8_0, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS / XS / S, IQ1_S / M, Q2_K and Q3_K (plus what want()
         // re-encodes into those). Check every role so that an unsupported type is refused at load.
         auto tname = [](int t) -> std::string {
             switch (t) {
@@ -3305,6 +3626,14 @@ struct MKEngine::Impl {
                 case gguf::IQ4_NL: return "IQ4_NL";
                 case gguf::IQ3_S: return "IQ3_S";
                 case gguf::IQ4_XS: return "IQ4_XS";
+                case gguf::IQ3_XXS: return "IQ3_XXS";
+                case gguf::IQ2_XXS: return "IQ2_XXS";
+                case gguf::IQ2_XS: return "IQ2_XS";
+                case gguf::IQ2_S: return "IQ2_S";
+                case gguf::Q2_K: return "Q2_K";
+                case gguf::IQ1_S: return "IQ1_S";
+                case gguf::IQ1_M: return "IQ1_M";
+                case gguf::BF16: return "BF16";
                 default: return "type " + std::to_string(t);
             }
         };
@@ -3316,7 +3645,7 @@ struct MKEngine::Impl {
             throw std::runtime_error(name + " is " + tname(got) + ", the kernel needs " + want +
                                      " (see README: the GGUF)");
         };
-        auto needq = [&](const std::string & name, int got) { need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X}); };
+        auto needq = [&](const std::string & name, int got) { need(name, got, {T_Q4K, T_Q5K, T_Q6K, T_Q8_0, T_IQ4X, T_IQ3S, T_IQ3XXS, T_IQ2XXS, T_IQ2XS, T_IQ2S, T_Q2K, T_Q3K, T_IQ1S, T_IQ1M}); };
         int mtp_q4 = 1;
         if (const char * e = getenv("MK_MTP_Q4")) {
             if (strcmp(e, "0") != 0 && strcmp(e, "1") != 0) throw std::runtime_error("MK_MTP_Q4: 0 or 1");
@@ -3390,7 +3719,7 @@ struct MKEngine::Impl {
         hw.shnorm = up_f32(blk(NL, "nextn.shared_head_norm.weight"), D);
         hw.onorm = up_f32("output_norm.weight", D);
         hw.head = up_mat("output.weight", D, VOCAB);
-        if (hw.head.type != T_Q6K) throw std::runtime_error("output.weight must be Q6_K");
+        need("output.weight", hw.head.type, {T_Q6K, T_Q5K, T_Q4K});
         hw.head_d = hw.head;
         hw.draft_ids = nullptr;
         if (!draft_vocab.empty()) {
@@ -3422,8 +3751,21 @@ struct MKEngine::Impl {
             fprintf(stderr, "[mk] MTP draft head restricted to %d tokens (%s)\n", m.N, draft_vocab.c_str());
         }
         {
-            const auto & t = file.get("token_embd.weight");
-            if (t.type != gguf::Q4_K) throw std::runtime_error("token_embd must be Q4_K");
+            const int et = (int) file.get("token_embd.weight").type;
+            Src t = want("token_embd.weight", et == gguf::Q3_K ? T_Q6K : -1); // (Q3_K: re-encoded as Q6_K)
+            need("token_embd.weight", (int) t.type, {T_Q4K, T_Q6K, T_IQ3S, T_IQ3XXS, T_IQ2XXS, T_IQ2XS, T_IQ2S, T_IQ1S, T_IQ1M, T_Q2K});
+            if (t.ne[0] != D || t.ne[1] != VOCAB) throw std::runtime_error("token_embd.weight bad shape");
+            hw.embd_type = (int) t.type; // (the T_ constants are the ggml type ids)
+            hw.embd_rb = (int) gguf::type_row_bytes(t.type, D);
+            if (const size_t bb = repacked_block_bytes((int) t.type)) { // the layout dequant_rp reads
+                const size_t srb = (size_t) hw.embd_rb;
+                hw.embd_rb = (int) (D / 256 * bb);
+                std::vector<uint8_t> rp((size_t) VOCAB * hw.embd_rb);
+                parallel_rows(VOCAB, [&](int64_t r) { repack_blocks((int) t.type, t.data + r * srb, rp.data() + r * hw.embd_rb, D / 256); });
+                t.own = std::move(rp);
+                t.data = t.own.data();
+                t.nbytes = t.own.size();
+            }
             // mapped pinned host memory: a cycle reads only a few 2.8 KB rows over PCIe, saves 0.7 GB of VRAM
             const char * ed = getenv("MK_EMBD_DEVICE");
             if (!(ed && ed[0] == '1') &&
@@ -3443,7 +3785,7 @@ struct MKEngine::Impl {
         }
         CK(cudaMemcpyToSymbol(cW, &hw, sizeof(ModelW)));
         if (n_conv)
-            fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: Q3_K / IQ3_S -> Q6_K, IQ4_NL -> Q8_0; ssm_alpha / beta -> F32)\n",
+            fprintf(stderr, "[mk] %d tensors re-encoded in %.1f s (exact: token_embd Q3_K -> Q6_K, IQ4_NL -> Q8_0; ssm_alpha / beta -> F32)\n",
                     n_conv, conv_s);
         if (n_req)
             fprintf(stderr, "[mk] MTP layer: %d matrices re-quantized to Q4_K in %.1f s (drafts only; MK_MTP_Q4=0 keeps the stored types)\n",
@@ -3803,6 +4145,10 @@ struct MKEngine::Impl {
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ4K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ4K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TQ5K, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ5K>()));
         CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ4>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ3>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ3>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TIQ2>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TIQ2>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ2K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ2K>()));
+        CK(cudaFuncSetAttribute(pf::mmh<pf::TQ3K>, cudaFuncAttributeMaxDynamicSharedMemorySize, pf::hm_smem<pf::TQ3K>()));
         CK(cudaFuncSetAttribute(pk_attn<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         CK(cudaFuncSetAttribute(pk_attn<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, AT_SMEM));
         pf_attn2_init();
@@ -3821,6 +4167,11 @@ struct MKEngine::Impl {
             case T_Q6K: pf::mmh<pf::TQ6K><<<grid, 256, pf::hm_smem<pf::TQ6K>()>>>(W, X, ntok, O); break;
             case T_Q8_0: pf::mmh<pf::TQ80><<<grid, 256, pf::hm_smem<pf::TQ80>()>>>(W, X, ntok, O); break;
             case T_IQ4X: pf::mmh<pf::TIQ4><<<grid, 256, pf::hm_smem<pf::TIQ4>()>>>(W, X, ntok, O); break;
+            case T_IQ3S: case T_IQ3XXS: pf::mmh<pf::TIQ3><<<grid, 256, pf::hm_smem<pf::TIQ3>()>>>(W, X, ntok, O); break;
+            case T_IQ2XXS: case T_IQ2XS: case T_IQ2S: case T_IQ1S: case T_IQ1M:
+                pf::mmh<pf::TIQ2><<<grid, 256, pf::hm_smem<pf::TIQ2>()>>>(W, X, ntok, O); break;
+            case T_Q2K: pf::mmh<pf::TQ2K><<<grid, 256, pf::hm_smem<pf::TQ2K>()>>>(W, X, ntok, O); break;
+            case T_Q3K: pf::mmh<pf::TQ3K><<<grid, 256, pf::hm_smem<pf::TQ3K>()>>>(W, X, ntok, O); break;
             default: throw std::runtime_error("gemm: unsupported weight type");
         }
     }

@@ -40,6 +40,7 @@ The memory column is the target setup sizes that row for.
 | Qwen3.5 9B | 12 | 5.7 GB | [Qwen3.5-9B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/blob/main/Qwen3.5-9B-Q4_K_M.gguf) |
 | Qwen3.6 27B UD-IQ2_XXS MTP | 12 | 9.4 GB | [Qwen3.6-27B-UD-IQ2_XXS.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/blob/main/Qwen3.6-27B-UD-IQ2_XXS.gguf) |
 | Qwen3.6 27B UD-IQ3_XXS MTP | 16 | 12.0 GB | [Qwen3.6-27B-UD-IQ3_XXS.gguf](https://huggingface.co/unsloth/Qwen3.6-27B-MTP-GGUF/blob/main/Qwen3.6-27B-UD-IQ3_XXS.gguf) |
+| Qwen3.8 27B UD-Q3_K_XL MTP | 16 | 12.2 GB | [Qwen3.8-27B-UD-Q3_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-UD-Q3_K_XL.gguf) |
 | Qwen3.8 27B Q4_K_M MTP | 20 | 16.4 GB | [Qwen3.8-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf) |
 
 **Unified memory only, such as Apple silicon:**

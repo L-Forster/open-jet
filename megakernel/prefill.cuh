@@ -68,10 +68,16 @@ __device__ __forceinline__ float block_sum256(float v, float * red) {
     return wsum(r);
 }
 
+// token_embd rows: Q4_K, or whatever the including engine defines (qwen38_mixed.cu: Q4_K or Q6_K)
+#ifndef PF_EMBD
+#define PF_EMBD_ROW(tok) (cW.embd + (size_t) (tok) * (D / 256 * 144))
+#define PF_EMBD(row, e) dequant_q4k_ldg(row, e)
+#endif
+
 __global__ void pk_embed(int T) {
     const int t = blockIdx.x;
-    const uint8_t * row = cW.embd + (size_t) cP.tok[t] * (D / 256 * 144);
-    for (int e = threadIdx.x; e < D; e += blockDim.x) cP.x[(size_t) t * D + e] = dequant_q4k_ldg(row, e);
+    const uint8_t * row = PF_EMBD_ROW(cP.tok[t]);
+    for (int e = threadIdx.x; e < D; e += blockDim.x) cP.x[(size_t) t * D + e] = PF_EMBD(row, e);
 }
 
 // RMS-norm (weight w) of rows of src [T][D] -> fp16 xh (K = D); rs per token
@@ -834,11 +840,11 @@ __global__ void __launch_bounds__(256) pk_mtp_in() {
     __shared__ float se[D];
     __shared__ float red[8];
     const int t = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    const uint8_t * row = cW.embd + (size_t) cP.tok[t] * (D / 256 * 144);
+    const uint8_t * row = PF_EMBD_ROW(cP.tok[t]);
     const float * hp = cP.h + (size_t) t * D;
     float ae = 0.f, ah = 0.f;
     for (int e = threadIdx.x; e < D; e += 256) {
-        const float v = dequant_q4k_ldg(row, e), hv = __ldg(hp + e);
+        const float v = PF_EMBD(row, e), hv = __ldg(hp + e);
         se[e] = v;
         ae += v * v;
         ah += hv * hv;

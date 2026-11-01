@@ -51,6 +51,9 @@ QWEN38_27B_REPO = "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF"
 QWEN38_27B_FILENAME = "Qwen3.8-27B-Q4_K_M.gguf"
 # pinned: unsloth deleted this file from main (2026-08-19); the last revision that had it still serves it
 QWEN38_27B_URL = f"{QWEN38_27B_REPO}/resolve/566347e99d832d31f6245a577198d10d5bdd389e/{QWEN38_27B_FILENAME}?download=true"
+# unsloth's UD-Q3_K_XL (12.24 GiB): the 16 GB cards' Qwen3.8, served by the engine's mixed build
+QWEN38_27B_Q3_FILENAME = "Qwen3.8-27B-UD-Q3_K_XL.gguf"
+QWEN38_27B_Q3_URL = f"{QWEN38_27B_REPO}/resolve/566347e99d832d31f6245a577198d10d5bdd389e/{QWEN38_27B_Q3_FILENAME}?download=true"
 MANAGED_MODELS_DIR = openjet_install_root() / "models"
 
 
@@ -162,6 +165,22 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "llama_mtp": True,
         "model_size_mb": 12288,
         "kv_bytes_per_token": 34816,
+    },
+    {
+        "max_ram_gb": 16.0,
+        "label": "Qwen3.8 27B UD-Q3_K_XL MTP",
+        # offered in setup's model list where the engine runs (16 GB+ RTX 30/40/50), not picked automatically: the
+        # 16 GB default stays Qwen3.6 UD-IQ3_XXS
+        "manual_only": True,
+        "filename": QWEN38_27B_Q3_FILENAME,
+        "url": QWEN38_27B_Q3_URL,
+        "llama_mtp": True,
+        "model_size_mb": 12537,
+        # the engine's device memory before its KV cache (12,722 MiB of weights, ~1,250 MiB of CUDA context and buffers,
+        # measured on an RTX 3090) plus 512 MiB for the desktop, and its q8_0 KV cache per position
+        "resident_model_size_mb": 14484,
+        "kv_bytes_per_token": 36992,
+        "max_context_tokens": 262144,
     },
     {
         "max_ram_gb": 20.0,

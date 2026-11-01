@@ -47,7 +47,13 @@ def test_native_and_plain_q4_keep_the_original_engine(model):
 
 @pytest.mark.parametrize('overrides', [
     {'blk.0.ffn_gate.weight': 23}, {'blk.0.ffn_down.weight': 11},
-    {'blk.0.ffn_gate.weight': 21}, {'blk.0.ffn_gate.weight': 20},
+    {'blk.0.ffn_gate.weight': 21}, {'blk.0.ffn_gate.weight': 20}, {'blk.0.ffn_gate.weight': 18},
+    {'blk.0.ffn_up.weight': 16}, {'blk.0.ffn_up.weight': 17}, {'blk.0.ffn_down.weight': 22},
+    {'blk.0.attn_q.weight': 10}, {'blk.0.ffn_up.weight': 19}, {'blk.0.ffn_gate.weight': 29},
+    # ISTA-DASLab GSQ-RCO: IQ2_S token_embd, Q4_K lm_head, BF16 ssm_alpha / ssm_beta
+    {'token_embd.weight': 22, 'output.weight': 12, 'blk.0.ssm_alpha.weight': 30, 'blk.0.ssm_beta.weight': 30},
+    # unsloth's small UD files: Q5_K (or Q4_K) lm_head, Q3_K token_embd (re-encoded as Q6_K)
+    {'output.weight': 13, 'token_embd.weight': 11}, {'output.weight': 12},
     # Q8_0 is an existing type, but not supported in this role by the native engine.
     {'blk.0.ssm_out.weight': 8, 'blk.0.ssm_alpha.weight': 8,
      'blk.64.nextn.eh_proj.weight': 14},
@@ -59,10 +65,23 @@ def test_extended_types_and_roles_select_mixed_engine(model, overrides):
 
 
 @pytest.mark.parametrize('overrides', [
-    {'token_embd.weight': 8}, {'output.weight': 12}, {'blk.0.ffn_gate.weight': 2},
+    {'token_embd.weight': 8}, {'output.weight': 10}, {'blk.0.ffn_gate.weight': 2},
+    {'blk.0.ffn_gate.weight': 24},  # I8: not a weight type either engine reads
 ])
 def test_unsupported_types_are_rejected_before_building(model, overrides):
     assert ls._megakernel_variant(model(**overrides)) is None
+
+
+def test_vram_gate_follows_the_model(model, tmp_path):
+    # native engine: a 24 GB card; mixed engine: its copy of the weights plus the measured runtime overhead
+    assert ls._megakernel_min_vram_mib(model()) == ls._MEGAKERNEL_MIN_VRAM_MIB
+    small = ls._megakernel_min_vram_mib(model(**{'blk.0.ffn_gate.weight': 21}))
+    assert small == pytest.approx(ls.megakernel_weight_mib(model(**{'blk.0.ffn_gate.weight': 21})) + ls._MEGAKERNEL_RUNTIME_MIB)
+    # a catalog file not downloaded yet: unsloth UD-Q3_K_XL fits a 16 GB card
+    need = ls._megakernel_min_vram_mib(str(tmp_path / 'Qwen3.8-27B-UD-Q3_K_XL.gguf'))
+    assert 14000 < need < 16000
+    assert ls._megakernel_model_supported('Qwen3.8-27B-UD-Q3_K_XL.gguf')
+    assert not ls._megakernel_model_supported('Qwen3.8-27B-UD-IQ3_XXS.gguf')
 
 
 def test_truncated_header_is_rejected(tmp_path):

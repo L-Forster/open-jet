@@ -225,7 +225,7 @@ class SourceListTests(unittest.TestCase):
     def test_every_engine_dependency_invalidates_the_build(self) -> None:
         makefile = (Path(mb.__file__).resolve().parents[1] / "megakernel" / "Makefile").read_text()
         mixed = {"qwen38_mk.cu": "qwen38_mixed.cu", "prefill_gemm.cuh": "prefill_gemm_mixed.cuh"}
-        for target, sources in (("qwen38_mk.o:", set(mb._SOURCES)), ("qwen38_mixed.o:", {mixed.get(s, s) for s in mb._SOURCES})):
+        for target, sources in (("qwen38_mk.o:", set(mb._SOURCES)), ("qwen38_mixed.o:", {mixed.get(s, s) for s in mb._SOURCES} | set(mb._MIXED_ONLY_SOURCES))):
             line = next(l for l in makefile.splitlines() if l.startswith(target))
             self.assertEqual(sorted(set(line.split(":", 1)[1].split()) - sources), [], target)
 

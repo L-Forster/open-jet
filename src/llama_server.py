@@ -6,6 +6,7 @@ import asyncio
 import ctypes
 import importlib.util
 import logging
+import math
 import os
 import re
 import shutil
@@ -90,10 +91,29 @@ def _megakernel_dir(model: str = "") -> Path | None:
 
 
 def _megakernel_model_supported(model: str) -> bool:
-    # Q4_K_M and unsloth's UD-Q4_K_XL: UD-Q4_K_M, AP-Q4_K_M and the like are untested quant mixes and run
-    # on llama-server
+    # Q4_K_M and unsloth's UD-Q4_K_XL and UD-Q3_K_XL (16 GB cards): UD-Q4_K_M, AP-Q4_K_M and the like are untested
+    # quant mixes and run on llama-server
     name = Path(model).name.lower()
-    return name.endswith(".gguf") and re.search(r"qwen3\.8-27b[-.](q4_k_m|ud-q4_k_xl)", name) is not None
+    return name.endswith(".gguf") and re.search(r"qwen3\.8-27b[-.](q4_k_m|ud-q4_k_xl|ud-q3_k_xl)", name) is not None
+
+
+# Device memory the engine needs besides its weights: ~1.25 GiB of CUDA context and buffers (measured with UD-Q3_K_XL on
+# an RTX 3090: 14,262 MiB in use at 8K positions, 12,722 of them weights and 286 the KV cache), an 8K-position q8_0 KV
+# cache, and 512 MiB for the desktop
+_MEGAKERNEL_RUNTIME_MIB = 1300 + 8192 * 36992 // 2**20 + 512
+# device weights of mixed-engine catalog files (megakernel_weight_mib of their headers), to select them before download
+_MIXED_CATALOG_WEIGHT_MIB = {"ud-q3_k_xl": 12657}
+
+
+def _megakernel_min_vram_mib(model: str) -> float:
+    """GPU memory the engine needs to serve *model*: a 24 GB card for the native engine, else the mixed engine's copy of
+    the weights plus _MEGAKERNEL_RUNTIME_MIB (a 16 GB card for UD-Q3_K_XL)."""
+    name = Path(model).name.lower()
+    if Path(model).is_file():
+        weights = megakernel_weight_mib(model) if _megakernel_variant(model) == "mixed" else 0.0
+    else:
+        weights = next((mib for tag, mib in _MIXED_CATALOG_WEIGHT_MIB.items() if tag in name), 0.0)
+    return weights + _MEGAKERNEL_RUNTIME_MIB if weights else _MEGAKERNEL_MIN_VRAM_MIB
 
 
 # decode speed in the agent's reasoning mode on an RTX 3090, megakernel/README.md
@@ -106,9 +126,9 @@ MEGAKERNEL_MIXED_LABEL = "OpenJet engine, mixed quant"
 _GGUF_SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
 
-def _gguf_tensor_types(path: Path, names: tuple[str, ...] | None = None) -> dict[str, int]:
-    """ggml type ids of the named tensors (all of them when names is None), read from a GGUF header."""
-    found: dict[str, int] = {}
+def _gguf_tensors(path: Path, names: tuple[str, ...] | None = None) -> dict[str, tuple[int, int]]:
+    """(ggml type id, element count) of the named tensors (all of them when names is None), read from a GGUF header."""
+    found: dict[str, tuple[int, int]] = {}
     with open(path, "rb") as f:
         if f.read(4) != b"GGUF":
             return found
@@ -135,18 +155,55 @@ def _gguf_tensor_types(path: Path, names: tuple[str, ...] | None = None) -> dict
             skip_value(struct.unpack("<I", f.read(4))[0])
         for _ in range(n_tensors):
             name = f.read(struct.unpack("<Q", f.read(8))[0]).decode("utf-8", "replace")
-            f.seek(8 * struct.unpack("<I", f.read(4))[0], 1)
+            n_dims = struct.unpack("<I", f.read(4))[0]
+            elements = math.prod(struct.unpack(f"<{n_dims}Q", f.read(8 * n_dims)))
             kind, _offset = struct.unpack("<IQ", f.read(12))
             if names is None or name in names:
-                found[name] = kind
+                found[name] = (kind, elements)
                 if names is not None and len(found) == len(names):
                     break
     return found
 
 
-# ggml types the megakernel loader accepts: F32, Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS, plus Q3_K, IQ3_S
-# (re-encoded as Q6_K) and IQ4_NL (as Q8_0), exactly
-_MEGAKERNEL_TYPES = frozenset({0, 8, 11, 12, 13, 14, 20, 21, 23})
+def _gguf_tensor_types(path: Path, names: tuple[str, ...] | None = None) -> dict[str, int]:
+    """ggml type ids of the named tensors (all of them when names is None), read from a GGUF header."""
+    return {name: kind for name, (kind, _elements) in _gguf_tensors(path, names).items()}
+
+
+# ggml types the megakernel loader accepts: F32, BF16 (ssm_alpha / ssm_beta, converted to F32), Q8_0, Q2_K, Q4_K,
+# Q3_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS / XS / S and IQ1_S / M (a Q3_K token_embd re-encoded as Q6_K), plus
+# IQ4_NL (re-encoded as Q8_0), exactly
+_MEGAKERNEL_TYPES = frozenset({0, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30})
+# token_embd / output types of the mixed build (token_embd Q3_K is re-encoded as Q6_K); the native build
+# needs Q4_K / Q6_K
+_MIXED_EMBD_TYPES = frozenset({10, 11, 12, 14, 16, 17, 18, 19, 21, 22, 29})
+_MIXED_OUTPUT_TYPES = frozenset({12, 13, 14})
+
+
+# Device bytes per weight of each ggml type in the mixed engine (qwen38_mixed.cu's load-time layouts): F32 and BF16 as
+# F32, Q8_0 and IQ4_NL as int8 plus an fp16 scale per 32, Q6_K at 224 B per 256 weights, Q2_K / IQ2 / IQ1 at 96 and
+# Q3_K / IQ3 at 112. token_embd stays in host memory.
+_MIXED_DEVICE_BYTES_PER_WEIGHT = {
+    0: 4.0, 30: 4.0, 8: 34 / 32, 20: 34 / 32, 10: 96 / 256, 11: 112 / 256, 12: 144 / 256, 13: 176 / 256,
+    14: 224 / 256, 16: 96 / 256, 17: 96 / 256, 18: 112 / 256, 19: 96 / 256, 21: 112 / 256, 22: 96 / 256,
+    23: 144 / 256, 29: 96 / 256,
+}
+
+
+def megakernel_weight_mib(model: str) -> float:
+    """MiB of device memory the mixed engine's copy of *model*'s weights takes, from the GGUF header (0: unreadable)."""
+    try:
+        tensors = _gguf_tensors(Path(model))
+    except (OSError, struct.error, KeyError):
+        return 0.0
+    total = 0.0
+    for name, (kind, elements) in tensors.items():
+        if name == "token_embd.weight":
+            continue
+        if kind not in _MIXED_DEVICE_BYTES_PER_WEIGHT:
+            return 0.0
+        total += elements * _MIXED_DEVICE_BYTES_PER_WEIGHT[kind]
+    return total / 2**20
 
 
 def _megakernel_variant(model: str) -> str | None:
@@ -163,7 +220,7 @@ def _megakernel_variant(model: str) -> str | None:
         return None
     if not types or not set(types.values()) <= _MEGAKERNEL_TYPES:
         return None
-    if types.get("token_embd.weight") != 12 or types.get("output.weight") != 14:
+    if types.get("token_embd.weight") not in _MIXED_EMBD_TYPES or types.get("output.weight") not in _MIXED_OUTPUT_TYPES:
         return None
     native_roles = {
         "ssm_out": {12, 13}, "ssm_alpha": {0, 12}, "ssm_beta": {0, 12},
@@ -181,7 +238,7 @@ def _megakernel_variant(model: str) -> str | None:
 
 
 def _megakernel_quant_mix(model: str) -> str | None:
-    """"native" for the quant mixes the megakernel is benchmarked on (unsloth's Q4_K_M and UD-Q4_K_XL),
+    """"native" for the quant mixes the megakernel is benchmarked on (unsloth's Q4_K_M, UD-Q4_K_XL and UD-Q3_K_XL),
     "semi" for any other mix of types it reads (e.g. a plain llama-quantize Q4_K_M), None otherwise."""
     names = ("blk.0.ssm_out.weight", "blk.0.ssm_alpha.weight", "blk.64.nextn.eh_proj.weight")
     try:
@@ -191,7 +248,8 @@ def _megakernel_quant_mix(model: str) -> str | None:
     if not types or not set(types.values()) <= _MEGAKERNEL_TYPES:
         return None
     mix = tuple(types.get(name) for name in names)
-    if mix in ((13, 0, 8), (8, 8, 14)):  # unsloth Q4_K_M: Q5_K, F32, Q8_0; unsloth UD-Q4_K_XL: Q8_0, Q8_0, Q6_K
+    # unsloth Q4_K_M: Q5_K, F32, Q8_0; UD-Q4_K_XL: Q8_0, Q8_0, Q6_K; UD-Q3_K_XL: Q5_K, Q8_0, Q6_K
+    if mix in ((13, 0, 8), (8, 8, 14), (13, 8, 14)):
         return "native"
     return "semi"
 
@@ -200,12 +258,13 @@ def model_runtime_label(model: str) -> str:
     """The runtime OpenJet serves *model* with on this machine, as shown in the setup selectors."""
     if not _megakernel_model_supported(model):
         return "llama.cpp"
-    gpu = _megakernel_gpu_info()
+    gpu = _megakernel_gpu_info(_megakernel_min_vram_mib(model))
     if gpu is None:
         return "llama.cpp"
     downloaded = Path(model).is_file()
     # a catalog model that is not downloaded yet is selected by name; setup selects again after download
-    mixed = _megakernel_variant(model) == "mixed" if downloaded else "ud-q4_k_xl" in Path(model).name.lower()
+    name = Path(model).name.lower()
+    mixed = _megakernel_variant(model) == "mixed" if downloaded else ("ud-q4_k_xl" in name or "ud-q3_k_xl" in name)
     if mixed and gpu[1] == _MEGAKERNEL_TURING_CAP:
         return "llama.cpp"
     if mixed:
@@ -226,7 +285,7 @@ def _megakernel_gpu() -> str | None:
     return gpu[0] if gpu else None
 
 
-def _cuda_megakernel_gpu_info() -> tuple[str, str] | None:
+def _cuda_megakernel_gpu_info(min_vram_mib: float = _MEGAKERNEL_MIN_VRAM_MIB) -> tuple[str, str] | None:
     """Discover through CUDA when NVML is unavailable; CUDA honours device visibility."""
     try:
         driver = ctypes.CDLL("libcuda.so.1")
@@ -266,7 +325,7 @@ def _cuda_megakernel_gpu_info() -> tuple[str, str] | None:
         if not checked("cuDeviceTotalMem_v2", ctypes.byref(memory), device.value):
             return None
         cap = f"{major.value}.{minor.value}"
-        if cap not in _MEGAKERNEL_COMPUTE_CAPS or memory.value < _MEGAKERNEL_MIN_VRAM_MIB * 1024 * 1024:
+        if cap not in _MEGAKERNEL_COMPUTE_CAPS or memory.value < min_vram_mib * 1024 * 1024:
             continue
         if not checked("cuDeviceGetUuid", ctypes.byref(uuid), device.value):
             return None
@@ -275,7 +334,7 @@ def _cuda_megakernel_gpu_info() -> tuple[str, str] | None:
     return None
 
 
-def _megakernel_gpu_info() -> tuple[str, str] | None:
+def _megakernel_gpu_info(min_vram_mib: float = _MEGAKERNEL_MIN_VRAM_MIB) -> tuple[str, str] | None:
     """(GPU selector, compute capability) of a GPU the megakernel can run on, or None.
 
     The megakernel runs on CUDA device 0, so a CUDA_VISIBLE_DEVICES already in the
@@ -288,9 +347,9 @@ def _megakernel_gpu_info() -> tuple[str, str] | None:
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
-        return _cuda_megakernel_gpu_info()
+        return _cuda_megakernel_gpu_info(min_vram_mib)
     if result.returncode != 0:
-        return _cuda_megakernel_gpu_info()
+        return _cuda_megakernel_gpu_info(min_vram_mib)
     out = result.stdout.strip().splitlines()
     pinned = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
     for line in out:
@@ -301,7 +360,7 @@ def _megakernel_gpu_info() -> tuple[str, str] | None:
         if pinned and pinned not in (index, uuid):
             continue
         try:
-            if cap in _MEGAKERNEL_COMPUTE_CAPS and float(mem) >= _MEGAKERNEL_MIN_VRAM_MIB:
+            if cap in _MEGAKERNEL_COMPUTE_CAPS and float(mem) >= min_vram_mib:
                 return index, cap
         except ValueError:
             continue
@@ -321,17 +380,18 @@ def megakernel_long_context_reason(model: str) -> str | None:
 def megakernel_unavailable_reason(model: str) -> str | None:
     """None when the megakernel can serve *model* on this machine, else why not."""
     if not _megakernel_model_supported(model):
-        return "OpenJet's engine only supports Qwen3.8-27B Q4_K_M and UD-Q4_K_XL"
+        return "OpenJet's engine only supports Qwen3.8-27B Q4_K_M, UD-Q4_K_XL and UD-Q3_K_XL"
     if _megakernel_variant(model) is None:
         return "the GGUF tensor types are unsupported or its header is unreadable"
     if _megakernel_dir(model) is None:
         return "OpenJet's engine is not installed (rerun `openjet setup`)"
     if importlib.util.find_spec("jinja2") is None:
         return "OpenJet's engine server needs jinja2"
-    gpu = _megakernel_gpu_info()
+    need = _megakernel_min_vram_mib(model)
+    gpu = _megakernel_gpu_info(need)
     if gpu is None:
         return (f"OpenJet's engine needs a Turing or RTX 30/40/50-series GPU (sm_75, sm_86, sm_89 or sm_120) "
-                f"with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB")
+                f"with >= {need:.0f} MiB for this model")
     if gpu[1] == _MEGAKERNEL_TURING_CAP and _megakernel_variant(model) == "mixed":
         return "OpenJet's mixed-quant engine (UD-Q4_K_XL) does not support Turing GPUs; use Q4_K_M"
     return None

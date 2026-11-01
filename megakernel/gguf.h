@@ -28,7 +28,8 @@
 namespace gguf {
 
 enum GType : uint32_t {
-    F32 = 0, F16 = 1, Q8_0 = 8, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ4_NL = 20, IQ3_S = 21, IQ4_XS = 23
+    F32 = 0, F16 = 1, Q8_0 = 8, Q2_K = 10, Q3_K = 11, Q4_K = 12, Q5_K = 13, Q6_K = 14, IQ2_XXS = 16, IQ2_XS = 17,
+    IQ3_XXS = 18, IQ1_S = 19, IQ4_NL = 20, IQ3_S = 21, IQ2_S = 22, IQ4_XS = 23, IQ1_M = 29, BF16 = 30
 };
 
 struct Tensor {
@@ -50,6 +51,14 @@ inline uint64_t type_row_bytes(uint32_t type, uint64_t n) {
         case Q6_K: return n / 256 * 210;
         case Q3_K: return n / 256 * 110;
         case IQ3_S: return n / 256 * 110;
+        case IQ3_XXS: return n / 256 * 98;
+        case Q2_K: return n / 256 * 84;
+        case IQ2_XXS: return n / 256 * 66;
+        case IQ2_XS: return n / 256 * 74;
+        case IQ2_S: return n / 256 * 82;
+        case IQ1_S: return n / 256 * 50;
+        case IQ1_M: return n / 256 * 56;
+        case BF16: return n * 2;
         case IQ4_XS: return n / 256 * 136;
         case IQ4_NL: return n / 32 * 18;
         default: throw std::runtime_error("unsupported ggml type " + std::to_string(type));

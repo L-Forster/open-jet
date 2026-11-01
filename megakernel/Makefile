@@ -37,7 +37,7 @@ libqwen38mk_agents.so: qwen38_mk_agents.o capi.cpp qwen38_mk.h
 		-L$(LLAMA)/build/bin -lllama -lggml-base -Xlinker -rpath -Xlinker '$(RPATH)' -o $@
 
 # Extended quant support is opt-in; neither `all` nor the native library builds it.
-qwen38_mixed.o: qwen38_mixed.cu qwen38_mk.h gguf.h kv_paged.cuh kv_lowbit.cuh kv_spec.h prefill.cuh prefill_attn.cuh prefill_gemm_mixed.cuh
+qwen38_mixed.o: qwen38_mixed.cu qwen38_mk.h gguf.h iq_tables.cuh iq_repack.h kv_paged.cuh kv_lowbit.cuh kv_spec.h prefill.cuh prefill_attn.cuh prefill_gemm_mixed.cuh
 	$(NVCC) $(NVFLAGS) -I$(LLAMA)/ggml/include -c qwen38_mixed.cu -o $@ 2> ptxas-mixed.log || (cat ptxas-mixed.log; false)
 
 qwen38_mixed: qwen38_mixed.o main.cu logit_stats.h
@@ -59,6 +59,11 @@ tools/vocab_freq: tools/vocab_freq.cpp
 	g++ -O2 -std=c++17 -I$(LLAMA)/include -I$(LLAMA)/ggml/include $< -L$(LLAMA)/build/bin -lllama \
 		-Wl,-rpath,$(abspath $(LLAMA)/build/bin) -o $@
 
+# the i-quant re-layouts of qwen38_mixed.cu (iq_repack.h) against ggml's dequantization: tools/iq_repack_check --synthetic
+tools/iq_repack_check: tools/iq_repack_check.cpp iq_repack.h gguf.h
+	g++ -O2 -std=c++17 -I$(LLAMA)/include -I$(LLAMA)/ggml/include -I$(LLAMA)/ggml/src $< -L$(LLAMA)/build/bin -lggml-base -lggml \
+		-Wl,-rpath,$(abspath $(LLAMA)/build/bin) -o $@
+
 # llama.cpp's next-token distributions for the accuracy check (see "Correctness" in README.md)
 tools/llama_ref: tools/llama_ref.cpp logit_stats.h
 	g++ -O2 -std=c++17 -pthread -I$(LLAMA)/include -I$(LLAMA)/ggml/include $< -L$(LLAMA)/build/bin -lllama \
@@ -67,4 +72,4 @@ tools/llama_ref: tools/llama_ref.cpp logit_stats.h
 clean:
 	rm -f qwen38_mk qwen38_mixed libqwen38mk.so libqwen38mk_mixed.so libqwen38mk_agents.so qwen38_mk.o qwen38_mixed.o \
 		qwen38_mk_agents.o ptxas.log ptxas-mixed.log ptxas-agents.log \
-		tools/vocab_freq tools/llama_ref bench/turing_check bench/mmq_bench
+		tools/vocab_freq tools/llama_ref tools/iq_repack_check bench/turing_check bench/mmq_bench
