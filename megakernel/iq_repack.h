@@ -8,6 +8,14 @@
 
 #include "gguf.h"
 
+// a 7-bit sign index with its parity in bit 7, as ggml's ksigns_iq2xs table has it (no __builtin_popcount: MSVC lacks it)
+inline uint8_t ksign7(uint32_t v) {
+    uint32_t p = v ^ (v >> 4);
+    p ^= p >> 2;
+    p ^= p >> 1;
+    return (uint8_t) (v | ((p & 1) << 7));
+}
+
 // GGUF IQ3_S (110 B: fp16 d | qs[64] | qh[8] | signs[32] | scales[4]) or IQ3_XXS blocks (98 B: fp16 d | qs[64] |
 // per sub-block a u32 of four 7-bit ksigns_iq2xs indices and the 4-bit scale) -> the 112-byte layout rows_iq3 and
 // the prefill GEMM read (see rows_iq3). Lossless: IQ3_XXS's sign bytes get their parity bit, as ksigns_iq2xs does.
@@ -23,7 +31,7 @@ inline void repack_iq3(const uint8_t * src, uint8_t * dst, size_t nblocks, bool 
                 memcpy(&aux, s + 66 + 4 * ib, 4);
                 for (int l = 0; l < 4; l++) {
                     const uint32_t v = (aux >> (7 * l)) & 127;
-                    sg[4 * ib + l] = (uint8_t) (v | ((__builtin_popcount(v) & 1) << 7));
+                    sg[4 * ib + l] = ksign7(v);
                 }
                 sc[ib / 2] |= (uint8_t) ((aux >> 28) << (4 * (ib & 1)));
             }
@@ -140,7 +148,6 @@ inline void repack_blocks(int type, const uint8_t * src, uint8_t * dst, size_t n
 inline void repack_iq2(const uint8_t * src, uint8_t * dst, size_t nblocks, int type) {
     const size_t sbytes = type == gguf::IQ2_XXS ? 66 : type == gguf::IQ2_XS ? 74 : type == gguf::IQ2_S ? 82
                         : type == gguf::IQ1_S ? 50 : 56;
-    auto ksign = [](uint32_t v) { return (uint8_t) (v | ((__builtin_popcount(v) & 1) << 7)); };
     for (size_t i = 0; i < nblocks; i++) {
         const uint8_t * s = src + i * sbytes;
         uint8_t * o = dst + i * 96;
@@ -153,13 +160,13 @@ inline void repack_iq2(const uint8_t * src, uint8_t * dst, size_t nblocks, int t
                     uint32_t aux[2];
                     memcpy(aux, s + 2 + 8 * sb, 8);
                     idx = (aux[0] >> (8 * l)) & 0xff;
-                    sgn = ksign((aux[1] >> (7 * l)) & 127);
+                    sgn = ksign7((aux[1] >> (7 * l)) & 127);
                     sc[0] = sc[1] = (uint8_t) (aux[1] >> 28);
                 } else if (type == gguf::IQ2_XS) {
                     uint16_t q;
                     memcpy(&q, s + 2 + 2 * (4 * sb + l), 2);
                     idx = q & 511;
-                    sgn = ksign(q >> 9);
+                    sgn = ksign7(q >> 9);
                     sc[0] = s[66 + sb] & 0xf;
                     sc[1] = s[66 + sb] >> 4;
                 } else if (type == gguf::IQ1_S) {
