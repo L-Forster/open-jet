@@ -54,6 +54,37 @@ def copy_pi_theme_assets(next_to_binary: Path) -> None:
         shutil.copy2(source / name, destination / name)
 
 
+# The napi platform suffix of each target's native addon packages (@scope/name-win32-x64-msvc and the
+# like). npm installs only the host's platform, so a cross-compile has nothing to embed.
+NAPI_SUFFIXES = {
+    "linux-x64": ("linux-x64-gnu", "linux-x64-musl"),
+    "linux-arm64": ("linux-arm64-gnu", "linux-arm64-musl"),
+    "macos-x64": ("darwin-x64", "darwin-universal"),
+    "macos-arm64": ("darwin-arm64", "darwin-universal"),
+    "windows-x64": ("win32-x64-msvc",),
+}
+
+
+def missing_native_addons(target: str) -> list[str]:
+    """Packages whose native addon is installed for the host but not for *target*.
+
+    Bun embeds a .node only if it is on disk, so without this the cross-compiled binary exits at
+    startup with "Cannot find native binding" instead of failing the build.
+    """
+    modules = UI / "node_modules"
+    host = NAPI_SUFFIXES[target_tag()]
+    wanted = NAPI_SUFFIXES[target]
+    missing = []
+    for installed in sorted(modules.glob("@*/*")) + sorted(modules.glob("[a-z]*")):
+        suffix = next((s for s in host if installed.name.endswith(s)), None)
+        if suffix is None:
+            continue
+        stem = installed.name[: -len(suffix)]
+        if not any((installed.parent / (stem + want)).exists() for want in wanted):
+            missing.append(stem + wanted[0])
+    return sorted(set(missing))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-install", action="store_true")
@@ -88,6 +119,14 @@ def main() -> int:
     bun = shutil.which("bun") or (str(local_bun) if local_bun.is_file() else None)
     if not bun:
         raise SystemExit("Bun 1.3.10 is required to build the standalone TUI (https://bun.sh).")
+    missing = missing_native_addons(args.target)
+    if missing:
+        raise SystemExit(
+            f"Cannot build the {args.target} TUI here: npm installs only this host's native addons, so "
+            f"these are absent and Bun would embed nothing: {', '.join(missing)}. The binary would fail at "
+            f"startup with \"Cannot find native binding\". Build this target on {args.target} (CI does), or "
+            f"install its packages first."
+        )
     bun_target, executable = TARGETS[args.target]
     output = f"./dist/{executable}"
     subprocess.run(
