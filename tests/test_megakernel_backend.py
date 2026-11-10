@@ -362,5 +362,37 @@ class MegakernelServerParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(self.mk.BadRequest, "exceeds the available context size"):
             srv.generate({"messages": []}, lambda kind, text: True)
 
+    def test_a_tool_call_cut_off_by_the_token_limit_is_not_returned(self) -> None:
+        # Issue #32: the cut argument was dropped and the call returned as complete with
+        # finish_reason "tool_calls", so the client could not tell and the model retried it forever.
+        tools = [{"type": "function", "function": {"name": "edit", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}, "edits": {"type": "array"}}}}}]
+        text = ("<tool_call>\n<function=edit>\n<parameter=path>\na.yml\n</parameter>\n<parameter=edits>\n"
+                "[{\"oldText\": \"a\", \"newText\": \"b\"}]\n</parameter>\n</function>\n</tool_call>")
+        pieces = [text[i:i + 4].encode() for i in range(0, len(text), 4)]
+
+        def run(max_tokens):
+            following = iter(range(1, len(pieces) + 1))  # (the token after the last piece ends generation)
+            srv = object.__new__(self.mk.Server)
+            srv.args = SimpleNamespace(ctx=4096)
+            srv.sched = None
+            srv.render = lambda body: ("prompt", False)
+            srv.sampling = lambda body: None
+            srv.load_prompt = lambda toks: (0, 0)
+            srv.eng = SimpleNamespace(tokenize=lambda text: [1, 2, 3], is_eog=lambda t: t == len(pieces),
+                                      piece=lambda t: pieces[t], step=lambda: [next(following)])
+            with mock.patch.object(self.mk, "log"):
+                finish, calls, _, _ = srv.generate({"messages": [], "tools": tools, "max_tokens": max_tokens},
+                                                   lambda kind, text: True)
+            return finish, [json.loads(c["function"]["arguments"]) for c in calls]
+
+        self.assertEqual(run(len(pieces) + 1), ("tool_calls", [{"path": "a.yml", "edits": [{"oldText": "a", "newText": "b"}]}]))
+        self.assertEqual(run(len(pieces) // 2), ("length", []))
+        # one whole call, then one that is cut: the whole one is still returned
+        calls = self.mk.parse_tool_calls(text + "\n" + text[:text.index("</function>")], tools, cut=True)
+        self.assertEqual(len(calls), 1)
+        # the model stopped by itself without closing the call: accepted as before
+        self.assertEqual(len(self.mk.parse_tool_calls(text[:text.index("</function>")], tools)), 1)
+
 if __name__ == "__main__":
     unittest.main()

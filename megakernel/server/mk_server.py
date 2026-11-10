@@ -289,17 +289,20 @@ def normalize_messages(messages):
     return out
 
 
-TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)(?:</function>\s*(?:</tool_call>|$)|$)", re.S)
+TOOL_CALL_RE = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)(?:(</function>)\s*(?:</tool_call>|$)|$)", re.S)
 PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
 
 
-def parse_tool_calls(text, tools):
+def parse_tool_calls(text, tools, cut=False):
+    """cut: generation ran out of tokens, so a call without its </function> is missing arguments and is dropped"""
     schemas = {}
     for t in tools or []:
         fn = t.get("function", t)
         schemas[fn.get("name")] = (fn.get("parameters") or {}).get("properties") or {}
     calls = []
     for m in TOOL_CALL_RE.finditer(text):
+        if cut and m.group(3) is None:
+            continue
         name = m.group(1).strip()
         props = schemas.get(name, {})
         args = {}
@@ -1198,7 +1201,7 @@ class Server:
                         break
         for kind, delta in parser.feed(dec.decode(b"", final=True), final=True):
             emit(kind, delta)
-        calls = parse_tool_calls(parser.tool_text, tools) if parser.tool_text else []
+        calls = parse_tool_calls(parser.tool_text, tools, finish == "length") if parser.tool_text else []
         if calls:
             finish = "tool_calls"
         t2 = time.time()
