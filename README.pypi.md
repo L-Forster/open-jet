@@ -5,6 +5,9 @@
 <p align="center">For NVIDIA RTX 30, 40 and 50-series cards with 24 GB. Use it with Claude Code, Codex, OpenCode,
 OpenClaw or OpenJet's own agent. Runs offline.</p>
 
+<p align="center">No 24 GB card? <a href="https://www.openjet.dev/pricing#deploy">Deploy a cloud RTX 3090</a> with OpenJet and Qwen3.8-27B
+ready to use, about $0.25/hour on Vast.ai.</p>
+
 <p align="center">
   <a href="https://github.com/L-Forster/open-jet#speed">Speed</a> · <a href="https://github.com/L-Forster/open-jet#install">Install</a> · <a href="https://github.com/L-Forster/open-jet#what-you-need">Hardware</a> ·
   <a href="https://github.com/L-Forster/open-jet#use-it-with-your-coding-tools">Coding tools</a> · <a href="https://github.com/L-Forster/open-jet#4-coding-agents-on-one-gpu">4 agents</a> ·
@@ -72,6 +75,7 @@ Or have Claude Code or Codex [install it for you](https://github.com/l-forster/o
 | Your hardware | What runs | Guide |
 |---|---|---|
 | NVIDIA RTX 30, 40 or 50-series with 24 GB, Linux | Qwen3.8-27B on OpenJet's engine | [Engine for your GPU](https://github.com/l-forster/open-jet/blob/master/docs/installation.md#prebuilt-engines) |
+| No 24 GB NVIDIA card | Qwen3.8-27B on OpenJet's engine, on a rented cloud RTX 3090 (about $0.25/hour on Vast.ai) | [Deploy](https://www.openjet.dev/pricing#deploy) |
 | NVIDIA Turing with 24 GB or more, Linux | OpenJet's engine, experimental | [Turing](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#turing-rtx-8000) |
 | Windows | llama.cpp; OpenJet's engine on Windows is in progress | [Installation](https://github.com/l-forster/open-jet/blob/master/docs/installation.md) |
 | Any other GPU, or Apple silicon | The best model that fits, on llama.cpp | [Pick by memory](https://github.com/l-forster/open-jet/blob/master/docs/models.md#pick-by-memory) |

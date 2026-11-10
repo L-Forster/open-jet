@@ -5,6 +5,9 @@
 <p align="center">适用于 24 GB 显存的 NVIDIA RTX 30、40 和 50 系列显卡。可配合 Claude Code、Codex、OpenCode、OpenClaw
 或 OpenJet 自带的智能体使用。可离线运行。</p>
 
+<p align="center">没有 24 GB 显卡？<a href="https://www.openjet.dev/pricing#deploy">部署一台云端 RTX 3090</a>，OpenJet 和 Qwen3.8-27B
+已装好即可使用，在 Vast.ai 上约 $0.25/小时。</p>
+
 <p align="center">
   <a href="#速度">速度</a> · <a href="#安装">安装</a> · <a href="#硬件要求">硬件</a> ·
   <a href="#配合你的编程工具使用">编程工具</a> · <a href="#一块-gpu-上跑-4-个编程智能体">4 个智能体</a> ·
@@ -59,6 +62,8 @@ openjet serve      # 或者把模型提供给 Claude Code、Codex、OpenCode 或
 Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm_89、sm_120），驱动 570 或更新版本。
 `openjet setup` 会下载为你的 GPU 预编译好的 OpenJet 引擎（[具体是哪一个](docs/zh/installation.md#预编译引擎)）。
 
+没有 24 GB 显卡？[部署一台云端 RTX 3090](https://www.openjet.dev/pricing#deploy)，OpenJet 和 Qwen3.8-27B 已装好即可使用，在 Vast.ai 上约 $0.25/小时。
+
 更多：[docs/zh/installation.md](docs/zh/installation.md#硬件要求)
 
 ## 一块 GPU 上跑 4 个编程智能体
@@ -97,6 +102,13 @@ https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 更多：[docs/zh/features.md](docs/zh/features.md#python-sdk在应用中嵌入本地-llm)
 
 另见：[针对硬件调优](docs/zh/features.md#针对硬件调优) · [Ollama、LM Studio 或 llama-server](docs/zh/features.md#使用-ollamalm-studio-或已有的-llama-server) · [常见问题](docs/zh/features.md#常见问题)
+
+## 基于 OpenJet 构建
+
+- [geezuz-qwen3.8-27b-dual-gpu](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu)：把 OpenJet 的引擎拆分到 2 块 GPU 上（张量并行，2 块 RTX 3090 通过 P2P 互联）
+- [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel)：OpenJet 引擎的独立服务器，带 CPU 视觉编码器
+
+你也基于 OpenJet 做了项目？提交 pull request 把它加到这里。
 
 ## 文档
 

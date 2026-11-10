@@ -5,6 +5,9 @@
 <p align="center">For NVIDIA RTX 30, 40 and 50-series cards with 24 GB. Use it with Claude Code, Codex, OpenCode,
 OpenClaw or OpenJet's own agent. Runs offline.</p>
 
+<p align="center">No 24 GB card? <a href="https://www.openjet.dev/pricing#deploy">Deploy a cloud RTX 3090</a> with OpenJet and Qwen3.8-27B
+ready to use, about $0.25/hour on Vast.ai.</p>
+
 <p align="center">
   <a href="#speed">Speed</a> · <a href="#install">Install</a> · <a href="#what-you-need">Hardware</a> ·
   <a href="#use-it-with-your-coding-tools">Coding tools</a> · <a href="#4-coding-agents-on-one-gpu">4 agents</a> ·
@@ -59,6 +62,9 @@ More: [docs/installation.md](docs/installation.md)
 Linux and an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB (sm_86, sm_89, sm_120), driver 570 or newer.
 `openjet setup` downloads OpenJet's engine prebuilt for your GPU ([which one](docs/installation.md#prebuilt-engines)).
 
+No 24 GB card? [Deploy a cloud RTX 3090](https://www.openjet.dev/pricing#deploy) with OpenJet and Qwen3.8-27B ready to use, about
+$0.25/hour on Vast.ai.
+
 More: [docs/installation.md](docs/installation.md#what-you-need)
 
 ## 4 coding agents on one GPU
@@ -102,6 +108,13 @@ Embed a local model in your application.
 More: [docs/features.md](docs/features.md#python-sdk-embed-a-local-llm-in-your-application)
 
 Also: [tuned to the hardware](docs/features.md#tuned-to-the-hardware) · [Ollama, LM Studio or llama-server](docs/features.md#use-ollama-lm-studio-or-an-existing-llama-server) · [FAQ](docs/features.md#faq)
+
+## Built on OpenJet
+
+- [geezuz-qwen3.8-27b-dual-gpu](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu): OpenJet's engine split across 2 GPUs (tensor-parallel, 2x RTX 3090 over P2P)
+- [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel): a standalone server for OpenJet's engine with a CPU vision encoder
+
+Built something on OpenJet? Open a pull request to add it here.
 
 ## Docs
 

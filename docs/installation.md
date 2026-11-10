@@ -7,6 +7,7 @@ English · [简体中文](zh/installation.md)
 | Computer | What runs |
 |---|---|
 | Linux, NVIDIA RTX 30, 40 or 50-series with 24 GB or more (sm_86, sm_89, sm_120, and the matching RTX workstation cards) | Qwen3.8-27B on [OpenJet's engine](../megakernel/README.md) |
+| No 24 GB NVIDIA card | Qwen3.8-27B on OpenJet's engine, on a rented cloud RTX 3090, about $0.25/hour on Vast.ai ([deploy](https://www.openjet.dev/pricing#deploy)) |
 | Windows | llama.cpp. OpenJet's engine on Windows comes prebuilt only, and its builds are in progress |
 | NVIDIA Turing with 24 GB or more (sm_75, such as the 48 GB Quadro RTX 8000) | OpenJet's engine, experimental ([Turing](../megakernel/README.md#turing-rtx-8000)) |
 | Any other GPU, Apple silicon, or CPU only | The best model that fits, on llama.cpp ([pick by memory](models.md#pick-by-memory), [CPU-only](deployment/cpu-only.md)) |

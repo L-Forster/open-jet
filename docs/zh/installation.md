@@ -7,6 +7,7 @@
 | 电脑 | 能运行什么 |
 |---|---|
 | Linux，NVIDIA RTX 30、40 或 50 系列，24 GB 或以上显存（sm_86、sm_89、sm_120，以及对应的 RTX 工作站显卡） | [OpenJet 引擎](../../megakernel/README.md)上的 Qwen3.8-27B |
+| 没有 24 GB 的 NVIDIA 显卡 | 在租用的云端 RTX 3090 上运行 OpenJet 引擎和 Qwen3.8-27B，在 Vast.ai 上约 $0.25/小时（[部署](https://www.openjet.dev/pricing#deploy)） |
 | Windows | llama.cpp。OpenJet 引擎在 Windows 上只提供预编译版本，目前仍在构建中 |
 | NVIDIA Turing，24 GB 或以上显存（sm_75，例如 48 GB 的 Quadro RTX 8000） | OpenJet 引擎，实验性支持（[Turing](../../megakernel/README.md#turing-rtx-8000)） |
 | 其他 GPU、Apple 芯片，或只有 CPU | llama.cpp 上能装下的最好的模型（[按内存选择](../models.md#pick-by-memory)、[纯 CPU](../deployment/cpu-only.md)） |
