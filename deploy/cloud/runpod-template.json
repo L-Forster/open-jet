@@ -1,0 +1,10 @@
+{
+  "name": "OpenJet + Qwen3.8-27B (RTX 3090)",
+  "image": "ghcr.io/l-forster/openjet-cloud:0.5.4-qwen3.8-27b-q4km",
+  "category": "NVIDIA",
+  "disk": 60,
+  "public": true,
+  "serverless": false,
+  "ports": ["8080/http", "22/tcp"],
+  "env": {}
+}

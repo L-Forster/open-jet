@@ -600,6 +600,35 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
         install_prebuilt.assert_not_awaited()
         build_source.assert_not_awaited()
 
+    async def test_provision_setup_artifacts_skips_llama_server_for_engine_only_backend(self) -> None:
+        hardware = HardwareInfo(label="RTX 3090", total_ram_gb=64.0, has_cuda=True, vram_mb=24576.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = Path(tmp) / "llama-server-unavailable"
+            stub.write_text("#!/bin/sh\nexit 1\n")
+            with patch(
+                "src.provisioning.ensure_direct_model",
+                AsyncMock(side_effect=lambda setup_result, **_kwargs: dict(setup_result)),
+            ), patch("src.provisioning.ensure_llama_server", AsyncMock()) as ensure_llama, patch(
+                "src.megakernel_build.ensure_megakernel",
+                AsyncMock(side_effect=lambda setup_result, **_kwargs: setup_result),
+            ):
+                payload = await provision_setup_artifacts(
+                    {
+                        "llama_model": "/models/Qwen3.8-27B-Q4_K_M.gguf",
+                        "llama_backend": "megakernel",
+                        "llama_server_path": str(stub),
+                        "setup_missing_runtime": True,
+                    },
+                    hardware_info=hardware,
+                    log=Mock(),
+                    set_status=Mock(),
+                    clear_status=Mock(),
+                )
+
+        ensure_llama.assert_not_awaited()
+        self.assertFalse(payload["setup_missing_runtime"])
+        self.assertEqual(payload["llama_server_path"], str(stub))
+
     async def test_provision_setup_artifacts_enables_mtp_for_qwen38(self) -> None:
         hardware = HardwareInfo(
             label="RTX 3090",

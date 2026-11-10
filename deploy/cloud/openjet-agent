@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Run OpenJet's own coding agent on this machine. It loads the model itself, so the endpoint stops until the agent exits.
+set -u
+PAUSE_FILE=/run/openjet-engine.pause
+PID_FILE=/run/openjet-engine.pid
+
+touch "$PAUSE_FILE"
+trap 'rm -f "$PAUSE_FILE"' EXIT
+if [ -f "$PID_FILE" ]; then
+    pid="$(cat "$PID_FILE")"
+    kill "$pid" 2>/dev/null
+    while kill -0 "$pid" 2>/dev/null; do sleep 1; done
+fi
+openjet "$@"

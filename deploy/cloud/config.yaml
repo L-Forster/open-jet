@@ -1,0 +1,37 @@
+active_model_profile: Qwen3.8-27B-Q4_K_M
+agent_local_profile: Qwen3.8-27B-Q4_K_M
+agent_mode: local
+airgapped: false
+context_window_tokens: 100000
+device: cuda
+gpu_layers: 99
+hardware_profile: auto
+llama_backend: megakernel
+llama_model: /opt/openjet/model/Qwen3.8-27B-Q4_K_M.gguf
+llama_mtp: true
+llama_server_path: /opt/openjet/llama-server-unavailable
+logging:
+  enabled: false
+model_profiles:
+- context_window_tokens: 100000
+  device: cuda
+  gpu_layers: 99
+  hardware_profile: auto
+  llama_model: /opt/openjet/model/Qwen3.8-27B-Q4_K_M.gguf
+  llama_mtp: true
+  llama_server_path: /opt/openjet/llama-server-unavailable
+  model_source: local
+  name: Qwen3.8-27B-Q4_K_M
+  reasoning: true
+  runtime: llama_cpp
+  setup_complete: true
+  setup_missing_model: false
+model_source: local
+reasoning: true
+runtime: llama_cpp
+setup_complete: true
+setup_missing_model: false
+setup_missing_runtime: false
+telemetry:
+  consent: denied
+  consent_version: 1

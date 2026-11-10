@@ -1,0 +1,10 @@
+OpenJet is licensed under AGPL-3.0-only. Source: https://github.com/L-Forster/open-jet
+This image installs the open-jet package from PyPI and OpenJet's prebuilt engine from the GitHub release of the same version.
+deploy/cloud in that repository holds the files this image is built from, including the token proxy.
+
+Qwen3.8-27B (https://huggingface.co/Qwen/Qwen3.8-27B) is by the Qwen team at Alibaba, under the Apache License 2.0.
+The GGUF file is unsloth's Qwen3.8-27B-Q4_K_M.gguf, revision 566347e99d832d31f6245a577198d10d5bdd389e,
+https://huggingface.co/unsloth/Qwen3.8-27B-GGUF. It is not modified. It is split into parts inside the image and joined
+at startup. The license text is in /opt/openjet/LICENSE-Qwen3.8-27B-Apache-2.0.
+
+Parts of OpenJet's engine use llama.cpp and ggml (MIT). See THIRD_PARTY_NOTICES.md in the source repository.

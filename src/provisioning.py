@@ -1539,13 +1539,18 @@ async def provision_setup_artifacts(
         set_status=set_status,
         clear_status=clear_status,
     )
-    resolved = await ensure_llama_server(
-        resolved,
-        hardware_info=hardware_info,
-        log=log,
-        set_status=set_status,
-        clear_status=clear_status,
-    )
+    engine_only = str(resolved.get("llama_backend") or "").strip().lower() == "megakernel"
+    if engine_only and _configured_llama_server_path(resolved):
+        # llama_backend: megakernel never falls back to llama-server, so there is nothing to build.
+        resolved["setup_missing_runtime"] = False
+    else:
+        resolved = await ensure_llama_server(
+            resolved,
+            hardware_info=hardware_info,
+            log=log,
+            set_status=set_status,
+            clear_status=clear_status,
+        )
     if _setup_uses_mtp_model(resolved):
         resolved["llama_mtp"] = True
     from .megakernel_build import ensure_megakernel  # imports llama_server, which imports this module

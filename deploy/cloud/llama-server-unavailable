@@ -1,0 +1,4 @@
+#!/bin/sh
+# This image serves the model only on OpenJet's engine. The config requires llama_server_path to exist.
+echo "This image has no llama-server: it runs Qwen3.8-27B on OpenJet's engine, on an RTX 3090-class GPU (sm_86)." >&2
+exit 1
