@@ -44,7 +44,7 @@ _SOURCES = ("Makefile", "build.ps1", "qwen38_mk.cu", "qwen38_mk.h", "mk_shared.c
             "loader.cuh", "prefill.cuh", "prefill_attn.cuh", "prefill_gemm.cuh", "wv.cuh", "wv_dev.cuh", "wv_host.cuh",
             "engine.cu", "ck_pool.cu", "loader.cu", "prefill_host.cu", "state_files.cu", "host_store.cu", "lanes.cu",
             "capi.cpp", "compat_win32.cpp", "compat_win32.h")
-# the previous engine (megakernel/legacy): its native build serves Turing, its mixed-quant build UD-Q3_K_XL and cards
+# the legacy engine (megakernel/legacy): its native build serves Turing, its mixed-quant build UD-Q3_K_XL and cards
 # under 24 GB. Both compile in a few minutes and under 12 GiB of RAM.
 _LEGACY_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "kv_lowbit.cuh", "kv_spec.h", "prefill.cuh",
                    "prefill_attn.cuh", "prefill_gemm.cuh", "cuda_compat.cuh", "gguf.h", "capi.cpp", "bmm.cuh")
@@ -252,7 +252,7 @@ def megakernel_build_commands(root: Path, *, nvcc: str, arch: str, llama_dir: Pa
     """The commands that build the engine library for *model* in *root*, to be run in order.
 
     The current engine builds through its Makefile on Linux and through build.ps1 on Windows, which sets up MSVC
-    2022 itself. The previous engine (megakernel/legacy) builds through its Makefile on Linux; Windows has no POSIX
+    2022 itself. The legacy engine (megakernel/legacy) builds through its Makefile on Linux; Windows has no POSIX
     make, so its two nvcc steps (compile the engine, then link it with capi.cpp) are issued directly.
     """
     variant = _megakernel_variant(model)

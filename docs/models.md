@@ -14,8 +14,8 @@ to each model.
 
 | File | In setup | Notes |
 |---|---|---|
-| unsloth [Qwen3.8-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf) | `(OpenJet engine, 1.5x faster)` | The file the speed figures are measured on, and the one setup downloads. unsloth removed it from the repo's main branch; this link is the last revision that has it. |
-| unsloth [Qwen3.8-27B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-Q4_K_XL.gguf) | `(OpenJet engine, 1.5x faster)` | Same engine as Q4_K_M. Not on Turing GPUs. |
+| unsloth [Qwen3.8-27B-Q4_K_M.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/566347e99d832d31f6245a577198d10d5bdd389e/Qwen3.8-27B-Q4_K_M.gguf) | `(OpenJet engine, 2x faster)` | The file the speed figures are measured on, and the one setup downloads. unsloth removed it from the repo's main branch; this link is the last revision that has it. |
+| unsloth [Qwen3.8-27B-UD-Q4_K_XL.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-Q4_K_XL.gguf) | `(OpenJet engine, 2x faster)` | Same engine as Q4_K_M. Not on Turing GPUs. |
 | `Q4_K_M` from [lmstudio-community](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF), [mradermacher](https://huggingface.co/mradermacher/Qwen3.8-27B-GGUF), [Abiray](https://huggingface.co/Abiray/Qwen3.8-27B-Q4_K_M-GGUF) or [KikoCis](https://huggingface.co/KikoCis/Qwen3.8-27B-GGUF) | `(OpenJet engine, semi compatible)` | Same kernels; the loader re-encodes the tensors stored differently ([details](../megakernel/README.md#the-gguf)). Not benchmarked. |
 | Any other quant | `(llama.cpp)` | |
 

@@ -1,6 +1,6 @@
 # OpenJet's Qwen3.8-27B engine
 
-> **This is OpenJet's previous engine.** OpenJet now serves Q4_K_M and UD-Q4_K_XL on 24 GB RTX 30/40/50-series cards
+> **This is OpenJet's legacy engine.** OpenJet now serves Q4_K_M and UD-Q4_K_XL on 24 GB RTX 30/40/50-series cards
 > with the engine in [`megakernel/`](../README.md), and keeps this one for what that engine does not serve: Turing
 > (sm_75), UD-Q3_K_XL and cards under 24 GB. Everything below describes this engine; its files are in this directory
 > (`megakernel/legacy/`) and the Python benchmarks it mentions are in [`../bench/`](../bench/).

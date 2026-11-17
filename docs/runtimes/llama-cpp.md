@@ -19,22 +19,19 @@ The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/b
 
 For one specific setup, Qwen3.8-27B Q4_K_M or UD-Q4_K_XL on an RTX 30, 40 or 50-series GPU with 24 GB+
 (sm_86, sm_89, sm_120), OpenJet ships a specialised CUDA engine in [`megakernel/`](../../megakernel/README.md)
-and serves the model through it instead of `llama-server`. The previous engine, in
+and serves the model through it instead of `llama-server`. The legacy engine, in
 [`megakernel/legacy/`](../../megakernel/legacy/README.md), serves Turing (sm_75, experimental, Q4_K_M only;
-see [Turing (RTX 8000)](../../megakernel/legacy/README.md#turing-rtx-8000)) and UD-Q3_K_XL. Measured with
-the previous engine on an RTX 3090 against `llama-server` with OpenJet's flags:
+see [Turing (RTX 8000)](../../megakernel/legacy/README.md#turing-rtx-8000)) and UD-Q3_K_XL. Measured on an
+RTX 3090 against `llama-server` with OpenJet's flags (MTP speculative decoding, flash attention, q8_0 KV
+cache), Q4_K_M, thinking on, sampled, 106K-token context:
 
-| | llama.cpp | OpenJet, previous engine |
+| | llama.cpp | OpenJet |
 |---|---|---|
-| reasoning mode, OpenJet's thinking preset (decode) | 60 tok/s | 92 tok/s (1.5x) |
-| reasoning mode, 98K tokens in context (decode) | 37 tok/s | 79 tok/s (2.2x) |
-| reading a 98K-token prompt | 112 s | 82 s (1.4x) |
-| greedy decode, chat prompts (mean; earlier build) | 63 tok/s | 107 tok/s (1.7x) |
-| prompt processing, 2-8K tokens | 1050-1140 tok/s | 1530-1600 tok/s (1.3-1.5x) |
-| pasting a 12K-token file into the next turn | 10.5 s | 8.1 s |
+| decode, short prompts | 61 tok/s | 121 tok/s (2.0x) |
+| decode, 98K tokens in context | 37 tok/s | 96 tok/s (2.6x) |
+| reading a 98K-token prompt | 112 s | 76 s (1.5x) |
 
-The current engine decodes 1.36x as fast as the previous one on short prompts and 1.25x with 98K tokens
-in context, thinking on, sampled, on the same RTX 3090 ([results](../../megakernel/README.md#results)).
+Conditions and accuracy: [results](../../megakernel/README.md#results).
 
 `openjet setup` installs it when it selects this model on a supported GPU. An installed wheel
 downloads the engine prebuilt for that GPU's architecture from the matching GitHub release, which
@@ -49,7 +46,7 @@ by hand:
 make -C megakernel -j1 libqwen38mk.so
 ```
 
-The previous engine builds separately (`make -C megakernel/legacy libqwen38mk.so`, or
+The legacy engine builds separately (`make -C megakernel/legacy libqwen38mk.so`, or
 `libqwen38mk_mixed.so` for UD-Q3_K_XL), in a few minutes and under 12 GiB of RAM. Setup picks the
 engine from the GPU and the downloaded GGUF's tensor types, builds only that one, and caches each
 build separately ([build requirements](../../megakernel/README.md#build--run)).

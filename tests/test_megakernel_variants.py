@@ -91,7 +91,7 @@ def test_the_gpu_picks_between_the_engines(model, tmp_path):
     q3 = ud(tmp_path / 'Qwen3.8-27B-UD-Q3_K_XL.gguf', **{'blk.0.ssm_out.weight': 13, 'blk.0.ffn_gate.weight': 11})
     # a 24 GB Ampere or newer GPU: the current engine, except for UD-Q3_K_XL
     assert [ls._megakernel_variant(path) for path in (q4_k_m, xl, q3)] == ['native', 'native', 'mixed']
-    # no 24 GB GPU (a 16 GB card): the previous engine's mixed build takes the UD files
+    # no 24 GB GPU (a 16 GB card): the legacy engine's mixed build takes the UD files
     with mock.patch.object(ls, '_megakernel_gpu_info', side_effect=lambda need=24000: ('0', '8.9') if need < 20000 else None):
         assert ls._megakernel_variant(xl) == 'mixed'
         assert ls._megakernel_variant(q3) == 'mixed'

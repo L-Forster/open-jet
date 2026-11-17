@@ -24,7 +24,7 @@ class MegakernelSelectionTests(unittest.TestCase):
 
     def test_setup_selector_names_the_runtime(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")):
-            self.assertEqual(llama_server.model_runtime_label(MODEL), "OpenJet engine, 1.5x faster")
+            self.assertEqual(llama_server.model_runtime_label(MODEL), "OpenJet engine, 2x faster")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.8-27B-UD-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/Qwen3.5-9B-Q4_K_M.gguf"), "llama.cpp")
             self.assertEqual(llama_server.model_runtime_label("/m/mmproj-Qwen3.8-27B-BF16.gguf"), "llama.cpp")

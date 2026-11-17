@@ -45,7 +45,7 @@ _MTP_SPEC_ARGS: tuple[str, ...] = (
 
 # The Qwen3.8-27B megakernel (<openjet>/megakernel): a specialised CUDA engine for this one model and
 # supported quantisations on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120), with an OpenAI-compatible
-# server in front of it. megakernel/legacy holds the previous engine, which serves what this one does not: Turing
+# server in front of it. megakernel/legacy holds the legacy engine, which serves what this one does not: Turing
 # (sm_75, native Q4_K_M only) and, with its mixed-quant library, UD-Q3_K_XL and cards under 24 GB.
 _MEGAKERNEL_SERVER = Path("server") / "mk_server.py"
 _MEGAKERNEL_FILES = ("libqwen38mk.so", "draft_vocab_32k.bin", str(_MEGAKERNEL_SERVER))
@@ -93,7 +93,7 @@ def _megakernel_library(model: str = "") -> str:
 
 
 def _megakernel_engine_root(model: str = "") -> Path:
-    """Where the engine that serves *model* lives: megakernel/, or megakernel/legacy for the previous engine."""
+    """Where the engine that serves *model* lives: megakernel/, or megakernel/legacy for the legacy engine."""
     root = _megakernel_root()
     return root / _MEGAKERNEL_LEGACY_DIR if _megakernel_variant(model) in ("legacy", "mixed") else root
 
@@ -135,8 +135,8 @@ def _megakernel_min_vram_mib(model: str = "") -> float:
     return weights + _MEGAKERNEL_RUNTIME_MIB if weights else _MEGAKERNEL_MIN_VRAM_MIB
 
 
-# decode speed in the agent's reasoning mode on an RTX 3090, megakernel/README.md
-MEGAKERNEL_RUNTIME_LABEL = "OpenJet engine, 1.5x faster"
+# decode speed in reasoning mode against llama.cpp on an RTX 3090 (2.0x on short prompts), megakernel/README.md
+MEGAKERNEL_RUNTIME_LABEL = "OpenJet engine, 2x faster"
 MEGAKERNEL_TURING_LABEL = "OpenJet engine, experimental Turing"
 MEGAKERNEL_SEMI_LABEL = "OpenJet engine, semi compatible"
 MEGAKERNEL_MIXED_LABEL = "OpenJet engine, mixed quant"
@@ -252,8 +252,8 @@ def _megakernel_variant(model: str) -> str | None:
     """The engine that serves *model* on this machine, from the GGUF header (no tensor data is read):
 
     "native": the current engine, for Q4_K_M and UD-Q4_K_XL on a 24 GB sm_86 / sm_89 / sm_120 GPU;
-    "legacy": the previous engine's native build, for Q4_K_M anywhere else (Turing);
-    "mixed": the previous engine's mixed-quant build, for other quant mixes and for UD-Q4_K_XL under 24 GB;
+    "legacy": the legacy engine's native build, for Q4_K_M anywhere else (Turing);
+    "mixed": the legacy engine's mixed-quant build, for other quant mixes and for UD-Q4_K_XL under 24 GB;
     None: neither reads the file. A missing file is a not-yet-downloaded catalog entry and counts as "native"; setup
     selects again after download.
     """
@@ -958,7 +958,7 @@ class LlamaServerClient:
             "-c",
             str(ctx),
         ]
-        # the previous engine (megakernel/legacy) takes none of the options below and picks its own draft count
+        # the legacy engine (megakernel/legacy) takes none of the options below and picks its own draft count
         legacy = _megakernel_variant(self.model) in ("legacy", "mixed")
         if not legacy:
             base += ["--kv", "q8", "--exact-reuse"]

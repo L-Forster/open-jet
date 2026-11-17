@@ -184,7 +184,7 @@ temperature, top_k (at most 32), top_p, min_p and the presence and frequency pen
 `repetition_penalty` is ignored. OpenJet starts it with the q8_0 KV cache
 ([what it passes](../megakernel/README.md#use-with-openjet)).
 
-The previous engine ([`megakernel/legacy/`](../megakernel/legacy/README.md)) serves what the current one
+The legacy engine ([`megakernel/legacy/`](../megakernel/legacy/README.md)) serves what the current one
 doesn't: Turing (`sm_75`, e.g. Quadro RTX 8000; experimental, Q4_K_M only, so UD-Q4_K_XL uses
 `llama-server` there) and UD-Q3_K_XL. On multi-GPU systems, set `CUDA_VISIBLE_DEVICES` to the GPU's
 UUID for both setup and runtime. See [Turing (RTX 8000)](../megakernel/legacy/README.md#turing-rtx-8000).

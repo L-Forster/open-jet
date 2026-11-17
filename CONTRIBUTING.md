@@ -46,7 +46,7 @@ git clone --depth 1 --branch b10246 https://github.com/ggml-org/llama.cpp.git ll
 cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j 2
 make -C megakernel NVCC="$(command -v nvcc)" -j1 libqwen38mk.so   # up to 30 min; ptxas needs ~21 GiB of RAM
-# the previous engine (CUDA 12+): Turing (sm_75), UD-Q3_K_XL and cards under 24 GB
+# the legacy engine (CUDA 12+): Turing (sm_75), UD-Q3_K_XL and cards under 24 GB
 make -C megakernel/legacy NVCC="$(command -v nvcc)" -j1 libqwen38mk.so         # ~4 min, ~6 GiB RAM
 make -C megakernel/legacy NVCC="$(command -v nvcc)" -j1 libqwen38mk_mixed.so   # ~11 GiB RAM
 ```
@@ -88,7 +88,7 @@ issue titled `Hardware report: <GPU>` and paste this, filled in:
 - OpenJet commit or version (`git rev-parse --short HEAD` or `pip show open-jet`):
 - How installed (`openjet setup`, source build, `openjet-engine`):
 - Model file (repo and filename):
-- Engine serving it (OpenJet's engine, the previous engine in `megakernel/legacy`, or llama.cpp; `pgrep -af mk_server.py`):
+- Engine serving it (OpenJet's engine, the legacy engine in `megakernel/legacy`, or llama.cpp; `pgrep -af mk_server.py`):
 - Server command and flags:
 
 **Result**

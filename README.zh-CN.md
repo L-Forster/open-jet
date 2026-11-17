@@ -1,6 +1,6 @@
 <h1 align="center"><img src="docs/assets/logo.png" width="498" alt="OpenJet"></h1>
 
-<p align="center"><b>在你自己的 GPU 上运行 Qwen3.8-27B，速度是 llama.cpp 的 1.5 倍。</b></p>
+<p align="center"><b>在你自己的 GPU 上运行 Qwen3.8-27B，速度是 llama.cpp 的 2 倍。</b></p>
 
 <p align="center">适用于 24 GB 显存的 NVIDIA RTX 30、40 和 50 系列显卡。可配合 Claude Code、Codex、OpenCode、OpenClaw
 或 OpenJet 自带的智能体使用。可离线运行。</p>
@@ -27,26 +27,18 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 ## 速度
 
-| RTX 3090，Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet 旧引擎 |
+| RTX 3090，Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
 |---|---|---|
-| 开启思考，短提示词 | 60 tok/s | **92 tok/s**（1.5 倍） |
-| 开启思考，上下文中有 98K token | 37 tok/s | **79 tok/s**（2.2 倍） |
-| 读取 98K token 的提示词 | 112 秒 | **82 秒**（1.4 倍） |
-| 贪心解码，4 个提示词的平均值 | 63 tok/s | **107 tok/s**（1.7 倍） |
-| 贪心解码，写代码 | 73 tok/s | **140 tok/s**（1.9 倍） |
-| 读取 2-8K token 的提示词 | 1050-1140 tok/s | **1530-1600 tok/s** |
+| 开启思考，短提示词 | 61 tok/s | **121 tok/s**（2.0 倍） |
+| 开启思考，上下文中有 98K token | 37 tok/s | **96 tok/s**（2.6 倍） |
+| 读取 98K token 的提示词 | 112 秒 | **76 秒**（1.5 倍） |
 
-- 一块 RTX 3090 上的单个对话，不是批处理。
-- llama.cpp b11982 使用相同的参数，包括 MTP 投机解码。
-- 第 1-3 行：思考强度 xhigh，温度 1.0，5 个提示词 x 4 个随机种子，以及一个 98K token 的提示词 x 4 个随机种子
-  （[`run_compare.sh`](megakernel/bench/run_compare.sh)）。其余几行：该引擎较早的版本。
-- 在相同权重下与 llama.cpp 输出一致：KL 散度 0.0009，首选 token 一致率 99.08%
-  （[结果](megakernel/legacy/README.md#results)）。
-
-OpenJet 的引擎现在来自 [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel)，即由 Benjamin Cutler
-继续开发的旧引擎。在同一块 RTX 3090 上，开启思考、采样解码时，它在短提示词上的解码速度是旧引擎的 **1.36 倍**，
-上下文中有 98K token 时为 **1.25 倍**（相同随机种子的中位数，分别为 40 和 8 个请求），与 llama.cpp 相比的准确度与旧引擎相同
-（[结果](megakernel/README.md#results)）。
+- 一块 RTX 3090 上的单个对话，不是批处理。106K token 上下文，q8_0 KV 缓存，开启思考，温度 1.0，top_p 0.95，top_k 20，
+  每次回复 1,024 个 token；5 个提示词和一个 98K token 的提示词（[`engine_compare.py`](megakernel/bench/engine_compare.py)）。
+- llama.cpp b11982 使用 MTP 投机解码（2 个草稿）和 flash attention，2026-10-29 测得；OpenJet 引擎使用 7 个草稿，
+  2026-11-17 测得。测试工具和设置相同；两次运行中 5 个短提示词里有一个、以及 98K 提示词的文本不同。
+- 在相同权重下与 llama.cpp 输出一致：首选 token 一致率 98.74%，KL 散度 0.0016；llama.cpp 自身的批处理模式为 98.25% 和
+  0.0023（[结果](megakernel/README.md#results)）。
 
 24 GB 显卡上的上下文：约 **120K token**，使用 `openjet setup --long-context` 时约 **234K**
 （[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。
@@ -75,8 +67,8 @@ Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm
 
 https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
-最多 4 个智能体在同一次权重遍历中一起解码：在 RTX 3090 上，短上下文时总速度约 290 tok/s，运行真实编程智能体时为
-150-200 tok/s（用旧引擎测得）。
+最多 4 个智能体在同一次权重遍历中一起解码：在 RTX 3090 上，短提示词时总速度约 420 tok/s，每个智能体约有 23K token
+上下文时为 360 tok/s。
 
 更多：[docs/zh/features.md](docs/zh/features.md#一块-gpu-上跑-4-个编程智能体)
 

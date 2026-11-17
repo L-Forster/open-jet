@@ -42,17 +42,15 @@ python3 megakernel/server/mk_server.py -m /path/to/Qwen3.8-27B-Q4_K_M.gguf --age
 ```
 
 然后把最多 4 个智能体（任何支持 OpenAI chat API 的工具）指向 `http://127.0.0.1:18080/v1`。它们在同一次权重遍历中一起解码，所以是共享
-GPU，而不是轮流使用。以下用 OpenJet 旧引擎测得：
+GPU，而不是轮流使用：
 
-| RTX 3090，Qwen3.8-27B Q4_K_M | 每个智能体 | 总计 |
-|---|---|---|
-| 1 个智能体生成 | 117 tok/s | 117 tok/s |
-| 4 个智能体生成，短上下文 | ~75 tok/s | ~290 tok/s |
-| 4 个智能体生成，每个 10K 上下文 | ~40 tok/s | ~160 tok/s |
-| 4 个真实编程智能体（会暂停去运行工具和测试） | 40-75 tok/s | 150-200 tok/s |
+| RTX 3090，Qwen3.8-27B Q4_K_M，4 个智能体 | 总解码速度 |
+|---|---|
+| 短编程提示词 | 424 tok/s |
+| 每个约 23K token 上下文 | 360 tok/s |
 
-Benjamin Cutler 测得当前引擎在 4 个智能体、短编程提示词时总速度为 424 tok/s，每个智能体约 23K token 上下文时为 360 tok/s
-（RTX 3090，他的 release v2026.11.05，`--agents 4 -d 7 --kv q8`；[详情](../../megakernel/docs/BENCHMARKS.md#parallel-agents)）。
+采样解码，`--agents 4 -d 7 --kv q8`，由引擎作者在 release v2026.11.05 上测得
+（[详情](../../megakernel/docs/BENCHMARKS.md#parallel-agents)）。
 
 每个智能体在 KV 缓存中有自己的槽位，长度为 `-c` 个位置（默认为能装下的最大值）。实时查看它们的状态（每个智能体的
 tok/s、上下文和任务）：
@@ -162,7 +160,7 @@ asyncio.run(main())
 Code、Codex、OpenCode、OpenClaw、它自带的终端智能体或你的应用使用。从 PyPI 安装 `open-jet` 包即可。
 
 **它和 Ollama 或 LM Studio 有什么不同？** 它们负责运行和提供模型。OpenJet 也做这些，并且在支持的 NVIDIA GPU 上用自己的引擎运行
-Qwen3.8-27B，速度是 llama.cpp 的 1.5 倍。它还支持 Anthropic Messages API，所以 Claude Code 无需代理就能连接。
+Qwen3.8-27B，速度是 llama.cpp 的 2 倍。它还支持 Anthropic Messages API，所以 Claude Code 无需代理就能连接。
 
 **能离线使用吗？** 能。模型下载到本地后，一切都在本地运行。`airgapped: true` 还会屏蔽云端运行时和远程 MCP 服务器。
 

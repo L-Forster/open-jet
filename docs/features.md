@@ -43,19 +43,15 @@ python3 megakernel/server/mk_server.py -m /path/to/Qwen3.8-27B-Q4_K_M.gguf --age
 ```
 
 Then point up to 4 agents, anything that speaks the OpenAI chat API, at `http://127.0.0.1:18080/v1`.
-They decode in the same pass over the weights, so they share the GPU instead of taking turns.
-Measured with OpenJet's previous engine:
+They decode in the same pass over the weights, so they share the GPU instead of taking turns:
 
-| RTX 3090, Qwen3.8-27B Q4_K_M | Per agent | Total |
-|---|---|---|
-| 1 agent generating | 117 tok/s | 117 tok/s |
-| 4 agents generating, short context | ~75 tok/s | ~290 tok/s |
-| 4 agents generating, 10K context each | ~40 tok/s | ~160 tok/s |
-| 4 real coding agents (they pause to run tools and tests) | 40-75 tok/s | 150-200 tok/s |
+| RTX 3090, Qwen3.8-27B Q4_K_M, 4 agents | Total decode |
+|---|---|
+| Short coding prompts | 424 tok/s |
+| About 23K tokens of context each | 360 tok/s |
 
-Benjamin Cutler measured the current engine at 424 tok/s in total for 4 agents on short coding prompts and
-360 tok/s with about 23K tokens of context each (RTX 3090, his release v2026.11.05, `--agents 4 -d 7 --kv q8`;
-[details](../megakernel/docs/BENCHMARKS.md#parallel-agents)).
+Sampled, `--agents 4 -d 7 --kv q8`, measured by the engine's author on release v2026.11.05
+([details](../megakernel/docs/BENCHMARKS.md#parallel-agents)).
 
 Each agent gets its own slot of the KV cache, `-c` positions long (by default, the most that fit). To watch them
 live (tok/s, context and task per agent):
@@ -187,7 +183,7 @@ OpenClaw, its own terminal agent, or your application. Install the `open-jet` pa
 
 **How is this different from Ollama or LM Studio?** They run and serve models. OpenJet does that
 too, and on supported NVIDIA GPUs serves Qwen3.8-27B with its own engine,
-1.5x faster than llama.cpp. It also speaks the Anthropic Messages API, so Claude Code connects
+2x faster than llama.cpp. It also speaks the Anthropic Messages API, so Claude Code connects
 without a proxy.
 
 **Does it work offline?** Yes. Once the model is on disk, everything runs locally.

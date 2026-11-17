@@ -1,4 +1,4 @@
-"""The previous engine (megakernel/legacy): its server's Anthropic Messages and OpenAI Responses endpoints, over HTTP with a scripted engine."""
+"""The legacy engine (megakernel/legacy): its server's Anthropic Messages and OpenAI Responses endpoints, over HTTP with a scripted engine."""
 import http.client
 import importlib.util
 import json

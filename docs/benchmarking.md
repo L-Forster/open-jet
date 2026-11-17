@@ -108,17 +108,17 @@ and SDK would use.
 
 `openjet benchmark` measures `llama-bench`. OpenJet's engine has its own benchmarks in
 `megakernel/bench/`. `engine_compare.py` runs the same requests against any OpenAI-compatible
-servers (OpenJet's engine, the previous engine, `llama-server`) and produced the engine's published
+servers (OpenJet's engine, the legacy engine, `llama-server`) and produced the engine's published
 results ([megakernel/README.md](../megakernel/README.md#results)). `think_bench.py` (reasoning mode
 with OpenJet's sampling preset), `code_bench.py` (greedy decode, a context-length sweep and
-second-turn prompt time) and `bench.py` were written for the previous engine's command line
+second-turn prompt time) and `bench.py` were written for the legacy engine's command line
 (`megakernel/legacy/qwen38_mk`).
 
 ### Matched reasoning comparison on two GPUs
 
 Run from the repository root with a built megakernel and the original unsloth
 `Qwen3.8-27B-Q4_K_M.gguf` (catalog revision `566347e99d832d31f6245a577198d10d5bdd389e`).
-Turing runs the previous engine: build it with `make -C megakernel/legacy ARCH=sm_75` and pass
+Turing runs the legacy engine: build it with `make -C megakernel/legacy ARCH=sm_75` and pass
 `--megakernel megakernel/legacy/qwen38_mk`; see [Turing (RTX 8000)](../megakernel/legacy/README.md#turing-rtx-8000).
 
 Use full UUIDs from `nvidia-smi -L` rather than assuming CUDA ordinals match NVIDIA indexes:

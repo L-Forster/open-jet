@@ -16,14 +16,14 @@ fuller technical description, see the [AI reference](AI_REFERENCE.md).
 
 **One line**
 
-> OpenJet runs Qwen3.8-27B on your own NVIDIA GPU, 1.5x faster than llama.cpp, and serves it to Claude
+> OpenJet runs Qwen3.8-27B on your own NVIDIA GPU, 2x faster than llama.cpp, and serves it to Claude
 > Code, Codex, OpenCode and OpenClaw.
 
 **About 50 words**
 
 > OpenJet is an open-source tool that sets up a local coding model on your own computer and serves it
 > to the coding tools you already use. On RTX 30, 40 and 50-series GPUs with 24 GB, it runs
-> Qwen3.8-27B with its own CUDA engine, 1.5x faster than llama.cpp in reasoning mode on an RTX 3090.
+> Qwen3.8-27B with its own CUDA engine, 2x faster than llama.cpp in reasoning mode on an RTX 3090.
 
 **About 150 words**
 
@@ -35,29 +35,25 @@ fuller technical description, see the [AI reference](AI_REFERENCE.md).
 >
 > On NVIDIA RTX 30, 40 and 50-series GPUs with 24 GB or more, OpenJet serves Qwen3.8-27B with its own
 > CUDA engine: each decode step runs as one persistent kernel launch that also verifies speculative
-> tokens drafted by the model's own multi-token-prediction head. On an RTX 3090 its previous engine
-> decoded at 92 tokens per second in reasoning mode, against 60 for llama.cpp with the same
-> speculative decoding, and at 79 against 37 with 98K tokens in context; the current engine decodes
-> 1.36x as fast again at short context and 1.25x at 98K, with output matching llama.cpp's as closely.
+> tokens drafted by the model's own multi-token-prediction head. On an RTX 3090 it decodes at 121
+> tokens per second in reasoning mode, against 61 for llama.cpp with the same speculative decoding,
+> and at 96 against 37 with 98K tokens in context, with output matching llama.cpp's.
 > Other models, smaller GPUs, Macs and CPUs run through llama.cpp.
 
 ## Facts you can quote
 
 Keep each figure with its conditions. All speed figures are from one RTX 3090 running one
-conversation, with Qwen3.8-27B Q4_K_M. The llama.cpp comparisons ran with OpenJet's flags (MTP
-speculative decoding, flash attention, q8_0 KV cache) against OpenJet's previous engine.
+conversation, with Qwen3.8-27B Q4_K_M, against llama.cpp with OpenJet's flags (MTP speculative
+decoding, flash attention, q8_0 KV cache).
 
 | Claim | Figure | Condition |
 |---|---|---|
-| Current engine against the previous one | 1.36x short prompts, 1.25x at 98K context | thinking on, sampled, q8_0 KV; same-seed medians of 40 and 8 requests |
-| Reasoning-mode decode | 92 vs 60 tok/s (1.5x) | previous engine; thinking on at xhigh, temperature 1.0, short coding prompts; how coding agents use the model |
-| Reasoning-mode decode, long context | 79 vs 37 tok/s (2.2x) | same, with 98K tokens in context |
-| Reading a long prompt | 82 vs 112 s (1.4x) | previous engine; one 98K-token prompt |
-| Greedy decode | 107 vs 63 tok/s (1.7x) | mean of 4 chat prompts; an earlier build of the previous engine |
-| Greedy code generation | 140 vs 73 tok/s (1.9x) | one prompt: writing a Python function; an earlier build of the previous engine |
-| Prompt processing | 1530-1600 vs 1050-1140 tok/s | 2-8K token prompts; an earlier build of the previous engine |
+| Reasoning-mode decode | 121 vs 61 tok/s (2.0x) | thinking on, temperature 1.0, short prompts; how coding agents use the model |
+| Reasoning-mode decode, long context | 96 vs 37 tok/s (2.6x) | same, with 98K tokens in context |
+| Reading a long prompt | 76 vs 112 s (1.5x) | one 98K-token prompt |
+| 4 agents at once | 424 tok/s in total | short coding prompts, `--agents 4`; measured by the engine's author |
 | Output fidelity | KL divergence 0.0016, top-token agreement 98.74% | current engine against llama.cpp generating one token at a time on the same weights, 13,299 positions; llama.cpp's own batched mode scores 0.0023 and 98.25% |
-| Supported GPUs (engine) | RTX 30, 40, 50-series, 24 GB+ | Linux, NVIDIA driver 580+; Turing experimental, on the previous engine |
+| Supported GPUs (engine) | RTX 30, 40, 50-series, 24 GB+ | Linux, NVIDIA driver 580+; Turing experimental |
 | Supported clients | Claude Code, Codex CLI, OpenCode, OpenClaw | via `openjet serve`; any OpenAI- or Anthropic-compatible tool |
 | License | AGPL-3.0-only | |
 
@@ -68,10 +64,10 @@ Results from other GPUs, sent by users with `openjet bench`, are in the
 
 - **"The fastest way to run Qwen3.8-27B" or "faster than vLLM / SGLang / ExLlama".** OpenJet's
   measurements compare it with llama.cpp only.
-- **"2x faster" without the condition.** Reasoning mode at short context, which is what coding
-  agents see most, is 1.5x; 2.2x is with 98K tokens in context, and 1.9x is one greedy code prompt.
+- **"2.6x faster" without the condition.** Reasoning mode at short context, which is what coding
+  agents see most, is 2.0x; 2.6x is with 98K tokens in context.
 - **"Runs on any GPU" or "runs on 16 GB cards".** The engine is measured on 24 GB RTX 30, 40 and
-  50-series cards. 16 GB cards run only UD-Q3_K_XL, on the previous engine, unmeasured. Other hardware
+  50-series cards. 16 GB cards run only UD-Q3_K_XL, on the legacy engine, unmeasured. Other hardware
   runs llama.cpp, at llama.cpp's speed.
 - **"Works on Windows" for the engine.** Windows builds of the engine are new and untested on
   hardware. The agent and the llama.cpp path run on Windows.
