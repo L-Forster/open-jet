@@ -42,7 +42,7 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
           cmake --build /opt/llama.cpp/build --target llama -j4
       - name: Build the engine for sm_${{ matrix.arch }}
-        run: make -C megakernel -j1 NVCC="$CUDA_PATH/bin/nvcc" ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
+        run: make -C megakernel -j1 NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
       - name: Package and check that the library resolves from its own directory
         run: |
           mkdir -p pkg dist
