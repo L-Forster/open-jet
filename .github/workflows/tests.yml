@@ -32,6 +32,10 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -q
 
+      # the engine server's OpenAI Chat Completions, OpenAI Responses and Anthropic Messages APIs, without a GPU
+      - name: Run the engine server's tests
+        run: python -m pytest megakernel/tests -q
+
   tui:
     runs-on: ubuntu-latest
     steps:

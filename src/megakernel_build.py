@@ -24,6 +24,7 @@ from typing import Any, Callable
 from rich.markup import escape
 
 from .llama_server import (
+    _MEGAKERNEL_LEGACY_DIR,
     _MEGAKERNEL_TURING_CAP,
     _megakernel_dir,
     _megakernel_gpu_info,
@@ -34,14 +35,24 @@ from .llama_server import (
     _megakernel_variant,
 )
 from .provisioning import LLAMA_CPP_DIR, _download_to_path, _extract_archive, _native_tool_path, _run_exec
+from .runtime_limits import read_memory_snapshot
 
 _BUILD_TAG = ".openjet-build.json"
 _MIXED_BUILD_TAG = ".openjet-build-mixed.json"
 _RELEASE_ASSET_URL = "https://github.com/L-Forster/open-jet/releases/download/v{version}/{asset}"
-_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "kv_lowbit.cuh", "kv_spec.h", "prefill.cuh", "prefill_attn.cuh",
-            "prefill_gemm.cuh", "cuda_compat.cuh", "gguf.h", "capi.cpp", "bmm.cuh")
+_SOURCES = ("Makefile", "build.ps1", "qwen38_mk.cu", "qwen38_mk.h", "mk_shared.cuh", "mk_launch.h", "engine_impl.h", "gguf.h",
+            "loader.cuh", "prefill.cuh", "prefill_attn.cuh", "prefill_gemm.cuh", "wv.cuh", "wv_dev.cuh", "wv_host.cuh",
+            "engine.cu", "ck_pool.cu", "loader.cu", "prefill_host.cu", "state_files.cu", "host_store.cu", "lanes.cu",
+            "capi.cpp", "compat_win32.cpp", "compat_win32.h")
+# the previous engine (megakernel/legacy): its native build serves Turing, its mixed-quant build UD-Q3_K_XL and cards
+# under 24 GB. Both compile in a few minutes and under 12 GiB of RAM.
+_LEGACY_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "kv_lowbit.cuh", "kv_spec.h", "prefill.cuh",
+                   "prefill_attn.cuh", "prefill_gemm.cuh", "cuda_compat.cuh", "gguf.h", "capi.cpp", "bmm.cuh")
 # the mixed build's i-quant codebooks and load-time block layouts
 _MIXED_ONLY_SOURCES = ("iq_tables.cuh", "iq_repack.h")
+# ptxas peaks at about 21 GiB compiling the megakernel (megakernel/Makefile); a machine with less RAM than this would
+# run out of memory, so it gets the prebuilt engine or stays on llama-server
+_BUILD_MIN_RAM_MIB = 24 * 1024
 
 
 def _nvcc_path() -> str | None:
@@ -157,25 +168,30 @@ def _arch_for_cap(cap: str) -> str:
     return "sm_" + cap.replace(".", "")
 
 
+def _sources(variant: str | None) -> tuple[str, ...]:
+    if variant == "legacy":
+        return _LEGACY_SOURCES
+    if variant == "mixed":
+        return tuple({"qwen38_mk.cu": "qwen38_mixed.cu", "prefill_gemm.cuh": "prefill_gemm_mixed.cuh"}.get(name, name)
+                     for name in _LEGACY_SOURCES) + _MIXED_ONLY_SOURCES
+    return _SOURCES
+
+
 def _build_is_current(root: Path, arch: str, model: str = "") -> bool:
-    library = _megakernel_library(model)
+    """Whether the engine for *model* in *root* (megakernel/, or megakernel/legacy) is built for *arch* from this source."""
     variant = _megakernel_variant(model)
     if _megakernel_dir(model) is None:
         return False
     try:
-        tag = json.loads((root / (_BUILD_TAG if variant == "native" else _MIXED_BUILD_TAG)).read_text())
+        tag = json.loads((root / (_MIXED_BUILD_TAG if variant == "mixed" else _BUILD_TAG)).read_text())
     except (OSError, ValueError):
         return False
     if tag.get("arch") != arch:
         return False
     if "prebuilt" in tag:
         return tag["prebuilt"] == _openjet_version()
-    built = (root / library).stat().st_mtime
-    sources = _SOURCES if variant == "native" else tuple(
-        {"qwen38_mk.cu": "qwen38_mixed.cu", "prefill_gemm.cuh": "prefill_gemm_mixed.cuh"}.get(name, name)
-        for name in _SOURCES
-    ) + _MIXED_ONLY_SOURCES
-    return all(not (root / name).is_file() or (root / name).stat().st_mtime <= built for name in sources)
+    built = (root / _megakernel_library(model)).stat().st_mtime
+    return all(not (root / name).is_file() or (root / name).stat().st_mtime <= built for name in _sources(variant))
 
 
 def _openjet_version() -> str | None:
@@ -185,26 +201,29 @@ def _openjet_version() -> str | None:
         return None
 
 
-def prebuilt_asset_name(arch: str) -> str | None:
-    """Release asset holding the engine for *arch* (sm_86) on this OS, or None when none is published."""
+def prebuilt_asset_name(arch: str, *, legacy: bool = False) -> str | None:
+    """Release asset holding the engine (or the previous one, *legacy*) for *arch* (sm_86) on this OS, or None when
+    none is published."""
     if platform.machine().lower() not in {"x86_64", "amd64"}:
         return None
     sm = arch.replace("_", "")
+    stem = "openjet-engine-legacy" if legacy else "openjet-engine"
     if sys.platform.startswith("linux"):
-        return f"openjet-engine-linux-x64-{sm}.tar.gz"
+        return f"{stem}-linux-x64-{sm}.tar.gz"
     if sys.platform == "win32":
-        return f"openjet-engine-windows-x64-{sm}.zip"
+        return f"{stem}-windows-x64-{sm}.zip"
     return None
 
 
 def _is_source_checkout(root: Path) -> bool:
     # a git checkout compiles its own (possibly edited) engine source
-    return (root.parent / ".git").exists()
+    return (_megakernel_root().parent / ".git").exists()
 
 
-async def install_prebuilt_megakernel(root: Path, arch: str, *, log: Any, set_status: Callable[[str], None]) -> bool:
+async def install_prebuilt_megakernel(root: Path, arch: str, *, log: Any, set_status: Callable[[str], None],
+                                      legacy: bool = False) -> bool:
     """Download this release's engine for *arch* into *root*; False when there is none or it fails."""
-    version, asset = _openjet_version(), prebuilt_asset_name(arch)
+    version, asset = _openjet_version(), prebuilt_asset_name(arch, legacy=legacy)
     if version is None or asset is None:
         return False
     url = _RELEASE_ASSET_URL.format(version=version, asset=asset)
@@ -229,23 +248,23 @@ async def install_prebuilt_megakernel(root: Path, arch: str, *, log: Any, set_st
     return True
 
 
-def megakernel_build_command(root: Path, *, nvcc: str, arch: str, llama_dir: Path, model: str = "") -> list[str]:
-    # -B: the object file may be from another GPU architecture or an older source.
-    return ["make", "-B", "-C", str(root), "-j1", f"NVCC={nvcc}", f"ARCH={arch}", f"LLAMA={llama_dir}", _megakernel_library(model)]
-
-
 def megakernel_build_commands(root: Path, *, nvcc: str, arch: str, llama_dir: Path, model: str = "") -> list[list[str]]:
-    """The commands that build the engine library in *root*, to be run in order.
+    """The commands that build the engine library for *model* in *root*, to be run in order.
 
-    Windows has no POSIX make and links a DLL against import libraries rather than building an .so, so
-    the two nvcc steps the release workflow runs (compile the engine, then link it with capi.cpp) are
-    issued directly instead of through the Makefile.
+    The current engine builds through its Makefile on Linux and through build.ps1 on Windows, which sets up MSVC
+    2022 itself. The previous engine (megakernel/legacy) builds through its Makefile on Linux; Windows has no POSIX
+    make, so its two nvcc steps (compile the engine, then link it with capi.cpp) are issued directly.
     """
+    variant = _megakernel_variant(model)
+    library = _megakernel_library(model)
     if sys.platform != "win32":
-        return [megakernel_build_command(root, nvcc=nvcc, arch=arch, llama_dir=llama_dir, model=model)]
-    mixed = _megakernel_variant(model) == "mixed"
-    source = "qwen38_mixed.cu" if mixed else "qwen38_mk.cu"
-    obj = str(root / ("qwen38_mixed.obj" if mixed else "qwen38_mk.obj"))
+        # -B: the object files may be from another GPU architecture or an older source.
+        return [["make", "-B", "-C", str(root), "-j1", f"NVCC={nvcc}", f"ARCH={arch}", f"LLAMA={llama_dir}", library]]
+    if variant not in ("legacy", "mixed"):
+        return [["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(root / "build.ps1"),
+                 "-Targets", "engine", "-Arch", arch, "-Llama", str(llama_dir), "-Cuda", str(Path(nvcc).parent.parent)]]
+    source = "qwen38_mixed.cu" if variant == "mixed" else "qwen38_mk.cu"
+    obj = str(root / ("qwen38_mixed.obj" if variant == "mixed" else "qwen38_mk.obj"))
     flags = ["-O3", "-std=c++17", f"-arch={arch}", "-lineinfo"]
     if arch == "sm_75":
         flags.append("-DQWEN_MK_SM75=1")
@@ -253,7 +272,7 @@ def megakernel_build_commands(root: Path, *, nvcc: str, arch: str, llama_dir: Pa
     return [
         [nvcc, *flags, "-Xptxas", "-dlcm=cg", "-I", ggml_include, "-c", str(root / source), "-o", obj],
         [nvcc, *flags, "-shared", "-I", str(llama_dir / "include"), "-I", ggml_include,
-         str(root / "capi.cpp"), obj, *_windows_import_libs(llama_dir), "-o", str(root / _megakernel_library(model))],
+         str(root / "capi.cpp"), obj, *_windows_import_libs(llama_dir), "-o", str(root / library)],
     ]
 
 
@@ -276,6 +295,7 @@ async def ensure_megakernel(
         log.write("[yellow]Skipping OpenJet's Qwen3.8-27B engine: download the model first.[/]")
         return setup_result
     variant = _megakernel_variant(model)
+    legacy = variant in ("legacy", "mixed")
     if variant is None:
         log.write("[yellow]Skipping OpenJet's Qwen3.8-27B engine: unsupported or unreadable GGUF tensor types; using llama-server.[/]")
         return setup_result
@@ -287,7 +307,7 @@ async def ensure_megakernel(
         log.write("[yellow]Skipping OpenJet's Qwen3.8-27B engine: its mixed-quant build does not support Turing GPUs; "
                   "using llama-server.[/]")
         return setup_result
-    root = _megakernel_root()
+    root = _megakernel_root() / _MEGAKERNEL_LEGACY_DIR if legacy else _megakernel_root()
     if not (root / "Makefile").is_file():
         return setup_result
     arch = _arch_for_cap(gpu[1])
@@ -296,7 +316,7 @@ async def ensure_megakernel(
 
     skip = "[yellow]Skipping OpenJet's Qwen3.8-27B engine ({}); using llama-server.[/]"
     if not _is_source_checkout(root) and os.access(root, os.W_OK):
-        installed = await install_prebuilt_megakernel(root, arch, log=log, set_status=set_status)
+        installed = await install_prebuilt_megakernel(root, arch, log=log, set_status=set_status, legacy=legacy)
         clear_status()
         if installed and _build_is_current(root, arch, model):
             log.write("[bold bright_white]OpenJet engine installed: OpenJet will serve Qwen3.8-27B with it.[/]")
@@ -312,14 +332,20 @@ async def ensure_megakernel(
         log.write(skip.format(f"{escape(str(root))} is not writable"))
         return setup_result
     env = None
-    if sys.platform == "win32":
+    if not legacy:
+        memory = read_memory_snapshot()
+        if memory is not None and memory.total_mb < _BUILD_MIN_RAM_MIB:
+            log.write(skip.format(f"compiling it needs about 22 GiB of RAM and this machine has {memory.total_mb / 1024:.0f} GiB"))
+            return setup_result
+    elif sys.platform == "win32":
         env = _msvc_env()
         if env is None:
             log.write(skip.format("no Visual Studio C++ build tools found: nvcc needs cl.exe, then rerun `openjet setup`"))
             return setup_result
 
-    set_status(f"building OpenJet's Qwen3.8-27B {variant} engine for {arch} (a few minutes)")
-    log.write(f"[bold bright_white]Building OpenJet's Qwen3.8-27B {variant} engine for {arch} (a few minutes)...[/]")
+    what, wait = (f"{variant} engine", "a few minutes") if legacy else ("engine", "about 15 minutes")
+    set_status(f"building OpenJet's Qwen3.8-27B {what} for {arch} ({wait})")
+    log.write(f"[bold bright_white]Building OpenJet's Qwen3.8-27B {what} for {arch} ({wait})...[/]")
     rc, out, err = 0, "", ""
     for command in megakernel_build_commands(root, nvcc=nvcc, arch=arch, llama_dir=LLAMA_CPP_DIR, model=model):
         rc, out, err = await _run_exec(*command, **({"env": env} if env else {}))
@@ -334,6 +360,6 @@ async def ensure_megakernel(
         return setup_result
     if sys.platform == "win32":
         _copy_windows_runtime(LLAMA_CPP_DIR, root)
-    (root / (_BUILD_TAG if variant == "native" else _MIXED_BUILD_TAG)).write_text(json.dumps({"arch": arch}) + "\n")
+    (root / (_MIXED_BUILD_TAG if variant == "mixed" else _BUILD_TAG)).write_text(json.dumps({"arch": arch}) + "\n")
     log.write("[bold bright_white]OpenJet engine built: OpenJet will serve Qwen3.8-27B with it.[/]")
     return setup_result

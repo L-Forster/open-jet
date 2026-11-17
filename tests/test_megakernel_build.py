@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from src import llama_server
 from src import megakernel_build as mb
 
 MODEL = "/models/Qwen3.8-27B-Q4_K_M.gguf"
@@ -47,9 +48,11 @@ class EnsureMegakernelTests(unittest.TestCase):
             mock.patch.object(mb.sys, "platform", "linux"),
             mock.patch.object(mb, "_megakernel_root", return_value=self.root),
             mock.patch.object(mb, "_megakernel_gpu_info", return_value=("0", "8.9")),
+            mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.9")),
             mock.patch.object(mb, "_nvcc_path", return_value="/usr/local/cuda/bin/nvcc"),
             mock.patch.object(mb, "LLAMA_CPP_DIR", self.llama),
             mock.patch.object(mb, "install_prebuilt_megakernel", mock.AsyncMock(return_value=False)),
+            mock.patch.object(mb, "read_memory_snapshot", return_value=mock.Mock(total_mb=65536.0)),
         ]
         for patch in self.patches:
             patch.start()
@@ -83,13 +86,6 @@ class EnsureMegakernelTests(unittest.TestCase):
                 _run({"llama_model": self.model}, _Log())
         run.assert_not_called()
 
-    def test_builds_for_a_pinned_rtx_8000(self) -> None:
-        with self._fake_make() as run, \
-                mock.patch.object(mb, "_megakernel_gpu_info", return_value=("3", "7.5")):
-            _run({"llama_model": self.model}, _Log())
-        self.assertIn("ARCH=sm_75", run.call_args.args)
-        self.assertEqual(json.loads((self.root / ".openjet-build.json").read_text()), {"arch": "sm_75"})
-
     def test_missing_nvcc_or_llama_cpp_is_reported_not_raised(self) -> None:
         log = _Log()
         with self._fake_make() as run, mock.patch.object(mb, "_nvcc_path", return_value=None):
@@ -120,10 +116,10 @@ class EnsureMegakernelTests(unittest.TestCase):
             self.assertEqual(run.call_count, 2)
             self.assertIn("ARCH=sm_120", run.call_args.args)
 
-    def test_turing_compatibility_header_change_invalidates_the_build(self) -> None:
+    def test_a_shared_header_change_invalidates_the_build(self) -> None:
         with self._fake_make(), mock.patch.object(mb, "_megakernel_dir", return_value=self.root):
             _run({"llama_model": self.model}, _Log())
-            header = self.root / "cuda_compat.cuh"
+            header = self.root / "mk_shared.cuh"
             header.write_text("")
             changed = (self.root / "libqwen38mk.so").stat().st_mtime + 1
             os.utime(header, (changed, changed))
@@ -150,7 +146,7 @@ class PrebuiltMegakernelTests(unittest.TestCase):
         self.archive = base / "engine.tar.gz"
         staged = base / "staged"
         staged.mkdir()
-        for name in ("libqwen38mk.so", "libqwen38mk_mixed.so", "libllama.so.0.0.1"):
+        for name in ("libqwen38mk.so", "libqwen38vision.so", "libllama.so.0.0.1"):
             (staged / name).write_text(name)
         os.symlink("libllama.so.0.0.1", staged / "libllama.so.0")
         with tarfile.open(self.archive, "w:gz") as tf:
@@ -164,6 +160,7 @@ class PrebuiltMegakernelTests(unittest.TestCase):
             mock.patch.object(mb, "_megakernel_root", return_value=self.root),
             mock.patch("src.llama_server._megakernel_root", return_value=self.root),
             mock.patch.object(mb, "_megakernel_gpu_info", return_value=("0", "8.6")),
+            mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")),
             mock.patch.object(mb, "_nvcc_path", return_value=None),
             mock.patch.object(mb, "_download_to_path", side_effect=self._download),
         ]
@@ -190,8 +187,7 @@ class PrebuiltMegakernelTests(unittest.TestCase):
                                      "openjet-engine-linux-x64-sm86.tar.gz"])
         self.assertTrue((self.root / "libqwen38mk.so").is_file())
         self.assertEqual(os.readlink(self.root / "libllama.so.0"), "libllama.so.0.0.1")
-        for tag in (".openjet-build.json", ".openjet-build-mixed.json"):
-            self.assertEqual(json.loads((self.root / tag).read_text()), {"arch": "sm_86", "prebuilt": "0.6.0"})
+        self.assertEqual(json.loads((self.root / ".openjet-build.json").read_text()), {"arch": "sm_86", "prebuilt": "0.6.0"})
         self.assertIn("OpenJet engine installed", log.lines[-1])
         # current until the next release, whatever the source mtimes
         self.assertTrue(mb._build_is_current(self.root, "sm_86", self.model))
@@ -221,6 +217,54 @@ class PrebuiltMegakernelTests(unittest.TestCase):
         self.assertIn("No prebuilt engine for sm_86 in v0.6.0", log.lines[0])
         self.assertIn("CUDA toolkit not found", log.lines[-1])
 
+    def _turing(self):
+        legacy = self.root / "legacy"
+        (legacy / "server").mkdir(parents=True)
+        for name in ("Makefile", "draft_vocab_32k.bin", "server/mk_server.py"):
+            (legacy / name).write_text("")
+        return legacy, mock.patch.object(mb, "_megakernel_gpu_info", return_value=("0", "7.5")), \
+            mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "7.5"))
+
+    def test_turing_downloads_the_previous_engine_into_its_own_directory(self) -> None:
+        legacy, gpu, runtime_gpu = self._turing()
+        log = _Log()
+        with gpu, runtime_gpu, mock.patch.object(mb, "_run_exec") as run:
+            _run({"llama_model": self.model}, log)
+            self.assertTrue(mb._build_is_current(legacy, "sm_75", self.model))
+        run.assert_not_called()
+        self.assertTrue(self.urls[0].endswith("/v0.6.0/openjet-engine-legacy-linux-x64-sm75.tar.gz"))
+        self.assertTrue((legacy / "libqwen38mk.so").is_file())
+        self.assertFalse((self.root / "libqwen38mk.so").exists())
+        self.assertEqual(json.loads((legacy / ".openjet-build.json").read_text()), {"arch": "sm_75", "prebuilt": "0.6.0"})
+        self.assertIn("OpenJet engine installed", log.lines[-1])
+
+    def test_windows_compiles_the_previous_engine_with_nvcc(self) -> None:
+        self.archive = None
+        legacy, gpu, runtime_gpu = self._turing()
+        calls: list[list[str]] = []
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(list(args))
+            self.assertEqual(kwargs["env"], {"VCToolsInstallDir": "vc"})
+            (legacy / "qwen38mk.dll").write_text("dll")
+            return 0, "", ""
+
+        llama = self._windows_llama_tree()
+        with gpu, runtime_gpu, mock.patch.object(mb.sys, "platform", "win32"), \
+                mock.patch("src.llama_server.sys.platform", "win32"), \
+                mock.patch.object(mb, "_nvcc_path", return_value="nvcc.exe"), \
+                mock.patch.object(mb, "LLAMA_CPP_DIR", llama), \
+                mock.patch.object(mb, "_msvc_env", return_value={"VCToolsInstallDir": "vc"}), \
+                mock.patch.object(mb, "_copy_windows_runtime") as copy_runtime, \
+                mock.patch.object(mb, "_run_exec", side_effect=fake_exec):
+            _run({"llama_model": self.model}, _Log())
+        compile_step, link_step = calls
+        self.assertIn(str(legacy / "qwen38_mk.cu"), compile_step)
+        self.assertIn("-DQWEN_MK_SM75=1", compile_step)
+        self.assertEqual(link_step[-1], str(legacy / "qwen38mk.dll"))
+        copy_runtime.assert_called_once_with(llama, legacy)
+        self.assertEqual(json.loads((legacy / ".openjet-build.json").read_text()), {"arch": "sm_75"})
+
     def _windows_llama_tree(self):
         """A llama.cpp build tree as it looks on Windows: headers plus the import libraries."""
         llama = self.root.parent / "llama.cpp"
@@ -231,8 +275,8 @@ class PrebuiltMegakernelTests(unittest.TestCase):
             (llama / "build" / name).write_text("")
         return llama
 
-    def test_windows_compiles_with_nvcc_directly(self) -> None:
-        # no POSIX make on Windows: the engine is compiled and then linked into a DLL by nvcc itself
+    def test_windows_compiles_through_build_ps1(self) -> None:
+        # no POSIX make on Windows: megakernel/build.ps1 sets up MSVC and runs the Makefile's steps
         self.archive = None
         calls: list[list[str]] = []
 
@@ -242,40 +286,34 @@ class PrebuiltMegakernelTests(unittest.TestCase):
             return 0, "", ""
 
         log = _Log()
+        llama = self._windows_llama_tree()
         with mock.patch.object(mb.sys, "platform", "win32"), \
-                mock.patch.object(mb, "_nvcc_path", return_value="nvcc.exe"), \
-                mock.patch.object(mb, "LLAMA_CPP_DIR", self._windows_llama_tree()), \
-                mock.patch.object(mb, "_msvc_env", return_value={"PATH": ""}), \
+                mock.patch("src.llama_server.sys.platform", "win32"), \
+                mock.patch.object(mb, "_nvcc_path", return_value=str(Path("cuda") / "bin" / "nvcc.exe")), \
+                mock.patch.object(mb, "LLAMA_CPP_DIR", llama), \
+                mock.patch.object(mb, "read_memory_snapshot", return_value=mock.Mock(total_mb=65536.0)), \
                 mock.patch.object(mb, "_copy_windows_runtime"), \
                 mock.patch.object(mb, "_run_exec", side_effect=fake_exec):
             _run({"llama_model": self.model}, log)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual([call[0] for call in calls], ["nvcc.exe", "nvcc.exe"])
-        self.assertIn("-c", calls[0])
-        self.assertIn("-shared", calls[1])
+        (call,) = calls
+        self.assertEqual(call[0], "powershell")
+        self.assertEqual(call[call.index("-File") + 1], str(self.root / "build.ps1"))
+        self.assertEqual(call[call.index("-Targets") + 1], "engine")
+        self.assertEqual(call[call.index("-Arch") + 1], "sm_86")
+        self.assertEqual(call[call.index("-Llama") + 1], str(llama))
+        self.assertEqual(call[call.index("-Cuda") + 1], "cuda")
         self.assertEqual(json.loads((self.root / ".openjet-build.json").read_text()), {"arch": "sm_86"})
         self.assertIn("OpenJet engine built", log.lines[-1])
-
-    def test_windows_without_msvc_skips_the_build(self) -> None:
-        self.archive = None
-        log = _Log()
-        with mock.patch.object(mb.sys, "platform", "win32"), \
-                mock.patch.object(mb, "_nvcc_path", return_value="nvcc.exe"), \
-                mock.patch.object(mb, "LLAMA_CPP_DIR", self._windows_llama_tree()), \
-                mock.patch.object(mb, "_msvc_env", return_value=None), \
-                mock.patch.object(mb, "_run_exec") as run:
-            _run({"llama_model": self.model}, log)
-        run.assert_not_called()
-        self.assertIn("no Visual Studio C++ build tools found", log.lines[-1])
 
 
 class SourceListTests(unittest.TestCase):
     def test_every_engine_dependency_invalidates_the_build(self) -> None:
-        makefile = (Path(mb.__file__).resolve().parents[1] / "megakernel" / "Makefile").read_text()
-        mixed = {"qwen38_mk.cu": "qwen38_mixed.cu", "prefill_gemm.cuh": "prefill_gemm_mixed.cuh"}
-        for target, sources in (("qwen38_mk.o:", set(mb._SOURCES)), ("qwen38_mixed.o:", {mixed.get(s, s) for s in mb._SOURCES} | set(mb._MIXED_ONLY_SOURCES))):
-            line = next(l for l in makefile.splitlines() if l.startswith(target))
-            self.assertEqual(sorted(set(line.split(":", 1)[1].split()) - sources), [], target)
+        makefile = (Path(mb.__file__).resolve().parents[1] / "megakernel" / "Makefile").read_text().replace("\\\n", " ")
+        named: set[str] = set()
+        for start in ("qwen38_mk.o:", "HOST_SRC =", "HOST_HDR ="):
+            line = next(l for l in makefile.splitlines() if l.startswith(start))
+            named |= set(line[len(start):].split())
+        self.assertEqual(sorted(named - set(mb._SOURCES) - {"build/nvflags"}), [])
 
 
 if __name__ == "__main__":

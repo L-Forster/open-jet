@@ -23,6 +23,7 @@ import httpx
 from .airgap import apply_airgap_env, assert_endpoint_allowed
 from .app_paths import openjet_install_root
 from .provisioning import _binary_is_vulkan_only, _model_path_looks_mtp
+from .runtime_limits import read_memory_snapshot
 from .runtime_protocol import StreamChunk, stream_openai_chat
 from .setup_memory import _kv_bytes_per_token_from_gguf, _max_context_tokens_from_gguf, _vulkan_max_alloc_ctx
 
@@ -43,16 +44,23 @@ _MTP_SPEC_ARGS: tuple[str, ...] = (
 
 
 # The Qwen3.8-27B megakernel (<openjet>/megakernel): a specialised CUDA engine for this one model and
-# supported quantisations on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120), plus experimental Turing
-# (sm_75, native Q4_K_M engine only), with an OpenAI-compatible
-# server in front of it.
+# supported quantisations on RTX 30/40/50-series GPUs with 24 GB (sm_86, sm_89, sm_120), with an OpenAI-compatible
+# server in front of it. megakernel/legacy holds the previous engine, which serves what this one does not: Turing
+# (sm_75, native Q4_K_M only) and, with its mixed-quant library, UD-Q3_K_XL and cards under 24 GB.
 _MEGAKERNEL_SERVER = Path("server") / "mk_server.py"
 _MEGAKERNEL_FILES = ("libqwen38mk.so", "draft_vocab_32k.bin", str(_MEGAKERNEL_SERVER))
 _MEGAKERNEL_MIN_VRAM_MIB = 23000
 # Turing (RTX 6000/8000), Ampere, Ada and Blackwell.
 _MEGAKERNEL_COMPUTE_CAPS = frozenset({"7.5", "8.6", "8.9", "12.0"})
-# Turing runs only the native Q4_K_M engine; qwen38_mixed.cu needs sm_80+ (cp.async, 99 KB shared memory)
+# Turing runs only the legacy native Q4_K_M engine; the current engine and legacy/qwen38_mixed.cu need sm_80+
 _MEGAKERNEL_TURING_CAP = "7.5"
+_MEGAKERNEL_LEGACY_DIR = "legacy"
+# Drafts per decode cycle. More than 4 need a GPU with at least 80 SMs (megakernel/loader.cu checks at load), so a
+# smaller GPU is started again at 4.
+_MEGAKERNEL_DRAFTS, _MEGAKERNEL_FEW_SM_DRAFTS = 7, 4
+# The engine parks other conversations in page-locked host memory (8 GiB by default); off on machines with less RAM
+# than this, where pinning that much next to the model file's page cache runs the machine out of memory.
+_MEGAKERNEL_PARK_MIN_RAM_MIB = 32 * 1024
 # `openjet setup --long-context` (config megakernel_long_context): the compact KV cache, 5-bit K (Hadamard-rotated) and
 # 5-bit V with the newest 2,048 positions at q8_0 (megakernel/README.md, KV cache presets), for contexts past what the
 # q8_0 cache fits on a 24 GB card. An MK_KV already in the environment wins.
@@ -84,8 +92,14 @@ def _megakernel_library(model: str = "") -> str:
     return f"{stem}.dll" if sys.platform == "win32" else f"lib{stem}.so"
 
 
-def _megakernel_dir(model: str = "") -> Path | None:
+def _megakernel_engine_root(model: str = "") -> Path:
+    """Where the engine that serves *model* lives: megakernel/, or megakernel/legacy for the previous engine."""
     root = _megakernel_root()
+    return root / _MEGAKERNEL_LEGACY_DIR if _megakernel_variant(model) in ("legacy", "mixed") else root
+
+
+def _megakernel_dir(model: str = "") -> Path | None:
+    root = _megakernel_engine_root(model)
     files = (_megakernel_library(model), *_MEGAKERNEL_FILES[1:])
     return root if all((root / name).is_file() for name in files) else None
 
@@ -97,19 +111,24 @@ def _megakernel_model_supported(model: str) -> bool:
     return name.endswith(".gguf") and re.search(r"qwen3\.8-27b[-.](q4_k_m|ud-q4_k_xl|ud-q3_k_xl)", name) is not None
 
 
-# Device memory the engine needs besides its weights: ~1.25 GiB of CUDA context and buffers (measured with UD-Q3_K_XL on
-# an RTX 3090: 14,262 MiB in use at 8K positions, 12,722 of them weights and 286 the KV cache), an 8K-position q8_0 KV
-# cache, and 512 MiB for the desktop
+def _megakernel_current_engine_model(model: str) -> bool:
+    # what the current engine is measured on; UD-Q3_K_XL stays on the legacy mixed-quant engine
+    return re.search(r"qwen3\.8-27b[-.](q4_k_m|ud-q4_k_xl)", Path(model).name.lower()) is not None
+
+
+# Device memory the legacy mixed engine needs besides its weights: ~1.25 GiB of CUDA context and buffers (measured with
+# UD-Q3_K_XL on an RTX 3090: 14,262 MiB in use at 8K positions, 12,722 of them weights and 286 the KV cache), an
+# 8K-position q8_0 KV cache, and 512 MiB for the desktop
 _MEGAKERNEL_RUNTIME_MIB = 1300 + 8192 * 36992 // 2**20 + 512
 # device weights of mixed-engine catalog files (megakernel_weight_mib of their headers), to select them before download
 _MIXED_CATALOG_WEIGHT_MIB = {"ud-q3_k_xl": 12657}
 
 
-def _megakernel_min_vram_mib(model: str) -> float:
-    """GPU memory the engine needs to serve *model*: a 24 GB card for the native engine, else the mixed engine's copy of
-    the weights plus _MEGAKERNEL_RUNTIME_MIB (a 16 GB card for UD-Q3_K_XL)."""
+def _megakernel_min_vram_mib(model: str = "") -> float:
+    """GPU memory the engine needs to serve *model*: a 24 GB card, or for the legacy mixed engine its copy of the
+    weights plus _MEGAKERNEL_RUNTIME_MIB (a 16 GB card for UD-Q3_K_XL)."""
     name = Path(model).name.lower()
-    if Path(model).is_file():
+    if model and Path(model).is_file():
         weights = megakernel_weight_mib(model) if _megakernel_variant(model) == "mixed" else 0.0
     else:
         weights = next((mib for tag, mib in _MIXED_CATALOG_WEIGHT_MIB.items() if tag in name), 0.0)
@@ -119,8 +138,6 @@ def _megakernel_min_vram_mib(model: str) -> float:
 # decode speed in the agent's reasoning mode on an RTX 3090, megakernel/README.md
 MEGAKERNEL_RUNTIME_LABEL = "OpenJet engine, 1.5x faster"
 MEGAKERNEL_TURING_LABEL = "OpenJet engine, experimental Turing"
-
-
 MEGAKERNEL_SEMI_LABEL = "OpenJet engine, semi compatible"
 MEGAKERNEL_MIXED_LABEL = "OpenJet engine, mixed quant"
 _GGUF_SCALAR_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
@@ -170,19 +187,22 @@ def _gguf_tensor_types(path: Path, names: tuple[str, ...] | None = None) -> dict
     return {name: kind for name, (kind, _elements) in _gguf_tensors(path, names).items()}
 
 
-# ggml types the megakernel loader accepts: F32, BF16 (ssm_alpha / ssm_beta, converted to F32), Q8_0, Q2_K, Q4_K,
+# ggml types the engine's GGUF reader knows (megakernel/gguf.h): F32, F16, Q4_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL,
+# IQ3_S and IQ4_XS. The loader checks each tensor's type for its role and names what it refuses.
+_MEGAKERNEL_TYPES = frozenset({0, 1, 2, 8, 11, 12, 13, 14, 20, 21, 23})
+# ggml types the legacy loaders accept: F32, BF16 (ssm_alpha / ssm_beta, converted to F32), Q8_0, Q2_K, Q4_K,
 # Q3_K, Q5_K, Q6_K, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_XXS / XS / S and IQ1_S / M (a Q3_K token_embd re-encoded as Q6_K), plus
 # IQ4_NL (re-encoded as Q8_0), exactly
-_MEGAKERNEL_TYPES = frozenset({0, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30})
-# token_embd / output types of the mixed build (token_embd Q3_K is re-encoded as Q6_K); the native build
+_LEGACY_TYPES = frozenset({0, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30})
+# token_embd / output types of the legacy mixed build (token_embd Q3_K is re-encoded as Q6_K); its native build
 # needs Q4_K / Q6_K
 _MIXED_EMBD_TYPES = frozenset({10, 11, 12, 14, 16, 17, 18, 19, 21, 22, 29})
 _MIXED_OUTPUT_TYPES = frozenset({12, 13, 14})
 
 
-# Device bytes per weight of each ggml type in the mixed engine (qwen38_mixed.cu's load-time layouts): F32 and BF16 as
-# F32, Q8_0 and IQ4_NL as int8 plus an fp16 scale per 32, Q6_K at 224 B per 256 weights, Q2_K / IQ2 / IQ1 at 96 and
-# Q3_K / IQ3 at 112. token_embd stays in host memory.
+# Device bytes per weight of each ggml type in the legacy mixed engine (legacy/qwen38_mixed.cu's load-time layouts):
+# F32 and BF16 as F32, Q8_0 and IQ4_NL as int8 plus an fp16 scale per 32, Q6_K at 224 B per 256 weights, Q2_K / IQ2 /
+# IQ1 at 96 and Q3_K / IQ3 at 112. token_embd stays in host memory.
 _MIXED_DEVICE_BYTES_PER_WEIGHT = {
     0: 4.0, 30: 4.0, 8: 34 / 32, 20: 34 / 32, 10: 96 / 256, 11: 112 / 256, 12: 144 / 256, 13: 176 / 256,
     14: 224 / 256, 16: 96 / 256, 17: 96 / 256, 18: 112 / 256, 19: 96 / 256, 21: 112 / 256, 22: 96 / 256,
@@ -191,7 +211,7 @@ _MIXED_DEVICE_BYTES_PER_WEIGHT = {
 
 
 def megakernel_weight_mib(model: str) -> float:
-    """MiB of device memory the mixed engine's copy of *model*'s weights takes, from the GGUF header (0: unreadable)."""
+    """MiB of device memory the legacy mixed engine's copy of *model*'s weights takes, from the GGUF header (0: unreadable)."""
     try:
         tensors = _gguf_tensors(Path(model))
     except (OSError, struct.error, KeyError):
@@ -206,19 +226,10 @@ def megakernel_weight_mib(model: str) -> float:
     return total / 2**20
 
 
-def _megakernel_variant(model: str) -> str | None:
-    """Select by tensor roles/types, without reading tensor data or loading the model.
-
-    The native loader also accepts plain Q4_K_M, re-encoding four roles at load.
-    A missing file is a not-yet-downloaded catalog entry; setup selects again after download.
-    """
-    if not model or not Path(model).is_file():
-        return "native"
-    try:
-        types = _gguf_tensor_types(Path(model))
-    except (OSError, struct.error, KeyError):
-        return None
-    if not types or not set(types.values()) <= _MEGAKERNEL_TYPES:
+def _legacy_variant(types: dict[str, int]) -> str | None:
+    """The legacy engine for these tensor roles/types: "legacy" (its native Q4_K_M build, which also accepts plain
+    Q4_K_M, re-encoding four roles at load), "mixed", or None."""
+    if not set(types.values()) <= _LEGACY_TYPES:
         return None
     if types.get("token_embd.weight") not in _MIXED_EMBD_TYPES or types.get("output.weight") not in _MIXED_OUTPUT_TYPES:
         return None
@@ -234,7 +245,35 @@ def _megakernel_variant(model: str) -> str | None:
         role = re.sub(r"^blk\.\d+\.", "", name).removesuffix(".weight")
         if kind not in native_roles.get(role, {0}):
             return "mixed"
-    return "native"
+    return "legacy"
+
+
+def _megakernel_variant(model: str) -> str | None:
+    """The engine that serves *model* on this machine, from the GGUF header (no tensor data is read):
+
+    "native": the current engine, for Q4_K_M and UD-Q4_K_XL on a 24 GB sm_86 / sm_89 / sm_120 GPU;
+    "legacy": the previous engine's native build, for Q4_K_M anywhere else (Turing);
+    "mixed": the previous engine's mixed-quant build, for other quant mixes and for UD-Q4_K_XL under 24 GB;
+    None: neither reads the file. A missing file is a not-yet-downloaded catalog entry and counts as "native"; setup
+    selects again after download.
+    """
+    if not model or not Path(model).is_file():
+        return "native"
+    try:
+        types = _gguf_tensor_types(Path(model))
+    except (OSError, struct.error, KeyError):
+        return None
+    if not types:
+        return None
+    legacy = _legacy_variant(types)
+    if set(types.values()) <= _MEGAKERNEL_TYPES and _megakernel_current_engine_model(model):
+        gpu = _megakernel_gpu_info()
+        if gpu is not None and gpu[1] != _MEGAKERNEL_TURING_CAP:
+            return "native"
+        if legacy is None and gpu is None:
+            # no qualifying GPU to choose by; the GPU checks that follow report it
+            return "native"
+    return legacy
 
 
 def _megakernel_quant_mix(model: str) -> str | None:
@@ -245,7 +284,7 @@ def _megakernel_quant_mix(model: str) -> str | None:
         types = _gguf_tensor_types(Path(model))
     except (OSError, struct.error, KeyError):
         return None
-    if not types or not set(types.values()) <= _MEGAKERNEL_TYPES:
+    if not types or not set(types.values()) <= _MEGAKERNEL_TYPES | _LEGACY_TYPES:
         return None
     mix = tuple(types.get(name) for name in names)
     # unsloth Q4_K_M: Q5_K, F32, Q8_0; UD-Q4_K_XL: Q8_0, Q8_0, Q6_K; UD-Q3_K_XL: Q5_K, Q8_0, Q6_K
@@ -261,16 +300,20 @@ def model_runtime_label(model: str) -> str:
     gpu = _megakernel_gpu_info(_megakernel_min_vram_mib(model))
     if gpu is None:
         return "llama.cpp"
+    turing = gpu[1] == _MEGAKERNEL_TURING_CAP
     downloaded = Path(model).is_file()
-    # a catalog model that is not downloaded yet is selected by name; setup selects again after download
-    name = Path(model).name.lower()
-    mixed = _megakernel_variant(model) == "mixed" if downloaded else ("ud-q4_k_xl" in name or "ud-q3_k_xl" in name)
-    if mixed and gpu[1] == _MEGAKERNEL_TURING_CAP:
-        return "llama.cpp"
-    if mixed:
-        label = MEGAKERNEL_MIXED_LABEL
+    if downloaded:
+        variant = _megakernel_variant(model)
     else:
-        label = MEGAKERNEL_TURING_LABEL if gpu[1] == _MEGAKERNEL_TURING_CAP else MEGAKERNEL_RUNTIME_LABEL
+        # a catalog model that is not downloaded yet is selected by name; setup selects again after download
+        name = Path(model).name.lower()
+        if "ud-q3_k_xl" in name or ("ud-q4_k_xl" in name and (turing or _megakernel_gpu_info() is None)):
+            variant = "mixed"
+        else:
+            variant = "legacy" if turing else "native"
+    if variant == "mixed" and turing:
+        return "llama.cpp"
+    label = {"mixed": MEGAKERNEL_MIXED_LABEL, "legacy": MEGAKERNEL_TURING_LABEL}.get(variant or "", MEGAKERNEL_RUNTIME_LABEL)
     if not downloaded:
         return label
     mix = _megakernel_quant_mix(model)
@@ -370,7 +413,7 @@ def _megakernel_gpu_info(min_vram_mib: float = _MEGAKERNEL_MIN_VRAM_MIB) -> tupl
 def megakernel_long_context_reason(model: str) -> str | None:
     """None when the megakernel's compact KV cache can serve *model* on this GPU (checked before the build), else why not."""
     if not _megakernel_model_supported(model):
-        return "the megakernel only supports Qwen3.8-27B Q4_K_M and UD-Q4_K_XL"
+        return "the megakernel only supports Qwen3.8-27B Q4_K_M, UD-Q4_K_XL and UD-Q3_K_XL"
     gpu = _megakernel_gpu_info()
     if gpu is None or gpu[1] == _MEGAKERNEL_TURING_CAP:
         return f"the compact KV cache needs an RTX 30/40/50-series GPU (sm_86, sm_89 or sm_120) with >= {_MEGAKERNEL_MIN_VRAM_MIB} MiB"
@@ -393,7 +436,7 @@ def megakernel_unavailable_reason(model: str) -> str | None:
         return (f"OpenJet's engine needs a Turing or RTX 30/40/50-series GPU (sm_75, sm_86, sm_89 or sm_120) "
                 f"with >= {need:.0f} MiB for this model")
     if gpu[1] == _MEGAKERNEL_TURING_CAP and _megakernel_variant(model) == "mixed":
-        return "OpenJet's mixed-quant engine (UD-Q4_K_XL) does not support Turing GPUs; use Q4_K_M"
+        return "OpenJet's mixed-quant engine (UD-Q4_K_XL, UD-Q3_K_XL) does not support Turing GPUs; use Q4_K_M"
     return None
 
 
@@ -901,7 +944,7 @@ class LlamaServerClient:
     async def _start_megakernel(self, *, env: dict[str, str], ctx: int) -> None:
         root = _megakernel_dir(self.model)
         assert root is not None
-        cmd = [
+        base = [
             sys.executable,
             str(root / _MEGAKERNEL_SERVER),
             "--lib",
@@ -915,29 +958,43 @@ class LlamaServerClient:
             "-c",
             str(ctx),
         ]
+        # the previous engine (megakernel/legacy) takes none of the options below and picks its own draft count
+        legacy = _megakernel_variant(self.model) in ("legacy", "mixed")
+        if not legacy:
+            base += ["--kv", "q8", "--exact-reuse"]
+            memory = read_memory_snapshot()
+            if memory is None or memory.total_mb < _MEGAKERNEL_PARK_MIN_RAM_MIB:
+                base += ["--park-mib", "0"]
         if self.megakernel_long_context and not env.get("MK_KV", "").strip():
             env = {**env, **MEGAKERNEL_LONG_CONTEXT_ENV}
+        if not legacy and ctx > 96000 and not env.get("MK_PF_CAP", "").strip():
+            # 1024-token prefill chunks: 0.34 GB less device memory, as the engine's own launchers do at this size
+            env = {**env, "MK_PF_CAP": "1024"}
         if not env.get("CUDA_VISIBLE_DEVICES", "").strip():
             gpu = _megakernel_gpu()
             if gpu is not None:
                 # nvidia-smi indexes GPUs in PCI bus order; CUDA does too with this set
                 env = {**env, "CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": gpu}
-        self._emit_diagnostic("runtime_megakernel_launch_command", command=" ".join(cmd), ctx=ctx,
-                              kv_cache=env.get("MK_KV") or "q8_0")
-        stderr_lines: deque[str] = deque(maxlen=120)
-        # keep draining stderr once ready: the server logs one line per request
-        outcome = await self._spawn_until_healthy(
-            cmd, env=env, timeout=180.0, stderr_lines=stderr_lines, keep_reading_stderr=True,
-        )
-        if outcome == "exited":
-            detail = _stderr_detail(stderr_lines)
-            self._proc = None
-            raise RuntimeError(f"OpenJet engine server exited: {detail}")
-        if outcome == "ready":
-            self._emit_diagnostic("runtime_megakernel_start_ready", pid=self._proc.pid, ctx=ctx)
-            return
-        await self._stop_server()
-        raise TimeoutError("OpenJet engine server did not become ready")
+        for drafts in (0,) if legacy else (_MEGAKERNEL_DRAFTS, _MEGAKERNEL_FEW_SM_DRAFTS):
+            cmd = [*base, "-d", str(drafts)] if drafts else base
+            self._emit_diagnostic("runtime_megakernel_launch_command", command=" ".join(cmd), ctx=ctx,
+                                  kv_cache=env.get("MK_KV") or "q8_0")
+            stderr_lines: deque[str] = deque(maxlen=120)
+            # keep draining stderr once ready: the server logs one line per request
+            outcome = await self._spawn_until_healthy(
+                cmd, env=env, timeout=180.0, stderr_lines=stderr_lines, keep_reading_stderr=True,
+            )
+            if outcome == "exited":
+                detail = _stderr_detail(stderr_lines)
+                self._proc = None
+                if drafts > _MEGAKERNEL_FEW_SM_DRAFTS and "SMs; the megakernel runs one block per SM" in detail:
+                    continue
+                raise RuntimeError(f"OpenJet engine server exited: {detail}")
+            if outcome == "ready":
+                self._emit_diagnostic("runtime_megakernel_start_ready", pid=self._proc.pid, ctx=ctx, drafts=drafts)
+                return
+            await self._stop_server()
+            raise TimeoutError("OpenJet engine server did not become ready")
 
     async def _spawn_until_healthy(
         self,

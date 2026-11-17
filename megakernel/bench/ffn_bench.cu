@@ -66,7 +66,7 @@ __device__ void setup(SX & s, uint8_t * sm, int T) {
     for (int i = threadIdx.x; i < T * U; i += NT) { s.xa[i] = make_int4(0x01020304, 0x05060708, 0x01010101, 0x7f7f7f7f); s.xb[i] = s.xa[i]; s.xd[i] = make_float2(0.01f, 0.02f); s.xq[i] = 0x00050003; }
     __syncthreads();
 }
-// variant A: current megakernel ffn_gu (16-row warp items, 2 gate + 2 up rows per step)
+// variant A: ffn_gu with 16-row warp items, 2 gate + 2 up rows per step
 template <int T, int RG>
 __global__ void __launch_bounds__(NT, 1) ffn_a(const uint8_t * Wg, const uint8_t * Wu, float * out, int layer_stride) {
     extern __shared__ __align__(16) uint8_t sm[]; SX s; setup(s, sm, T);

@@ -94,7 +94,7 @@ Discord = "https://discord.gg/pspKHtExSa"
 [project.scripts]
 open-jet = "src.cli:main"
 openjet = "src.cli:main"
-openjet-engine = "megakernel.server.mk_server:main"
+openjet-engine = "megakernel.__main__:main"
 
 [build-system]
 requires = ["setuptools>=77,<81", "wheel"]
@@ -104,10 +104,12 @@ build-backend = "setuptools.build_meta"
 include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*", "megakernel", "megakernel.server", "megakernel.tools"]
+include = ["src", "src.*", "open_jet", "open_jet.*", "openjet", "openjet.*", "megakernel"]
 
 [tool.setuptools.package-data]
 src = ["data/*.json", "tui_bin/**/*"]
 # megakernel source, compiled on the user's machine by `openjet setup` (src/megakernel_build.py)
-megakernel = ["Makefile", "README.md", "*.cu", "*.cuh", "*.h", "*.cpp", "draft_vocab_32k.bin"]
-"megakernel.tools" = ["*.cpp"]
+megakernel = ["Makefile", "build.ps1", "README.md", "THIRD_PARTY_NOTICES.md", "*.cu", "*.cuh", "*.h", "*.cpp",
+              "draft_vocab_32k.bin", "server/*.py", "tools/*.cpp", "vision/*.cpp", "vision/*.h",
+              "legacy/Makefile", "legacy/README.md", "legacy/*.cu", "legacy/*.cuh", "legacy/*.h", "legacy/*.cpp",
+              "legacy/draft_vocab_32k.bin", "legacy/server/*.py", "legacy/tools/*.cpp", "legacy/bench/*.cu"]

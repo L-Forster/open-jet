@@ -1,0 +1,2 @@
+# server/mk_server.py (the chat template is rendered with jinja2); pytest only for tests/
+jinja2>=3.1

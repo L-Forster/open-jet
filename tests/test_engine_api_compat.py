@@ -1,4 +1,4 @@
-"""The engine server's Anthropic Messages and OpenAI Responses endpoints, over HTTP with a scripted engine."""
+"""The previous engine (megakernel/legacy): its server's Anthropic Messages and OpenAI Responses endpoints, over HTTP with a scripted engine."""
 import http.client
 import importlib.util
 import json
@@ -25,7 +25,7 @@ PATCH_REPLY = ("</think>\n\n<tool_call>\n<function=apply_patch>\n<parameter=inpu
 
 
 def _load_mk_server():
-    path = ROOT / "megakernel" / "server" / "mk_server.py"
+    path = ROOT / "megakernel" / "legacy" / "server" / "mk_server.py"
     spec = importlib.util.spec_from_file_location("mk_server_api_under_test", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

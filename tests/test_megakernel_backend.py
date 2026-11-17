@@ -16,15 +16,6 @@ ROOT = Path(__file__).resolve().parent.parent
 MODEL = "/models/Qwen3.8-27B-Q4_K_M.gguf"
 
 
-def _load_mk_server():
-    path = ROOT / "megakernel" / "server" / "mk_server.py"
-    spec = importlib.util.spec_from_file_location("mk_server_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 class MegakernelSelectionTests(unittest.TestCase):
     def test_other_models_are_not_served_by_the_megakernel(self) -> None:
         for model in ("/m/Qwen3.6-27B-UD-IQ3_XXS.gguf", "/m/Qwen3.8-27B-Q6_K.gguf", "/m/qwen3.8-27b-q4_k_m.bin",
@@ -40,12 +31,14 @@ class MegakernelSelectionTests(unittest.TestCase):
         with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=None):
             self.assertEqual(llama_server.model_runtime_label(MODEL), "llama.cpp")
 
-    def test_turing_selector_does_not_claim_ampere_benchmark_speed(self) -> None:
-        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("3", "7.5")):
+    def test_turing_and_ud_q3_k_xl_run_on_the_previous_engine(self) -> None:
+        with _nvidia_smi("3, GPU-turing, 7.5, 49152"), mock.patch.dict(llama_server.os.environ, {}, clear=True), \
+                mock.patch.object(llama_server, "_cuda_megakernel_gpu_info", return_value=None):
             self.assertEqual(llama_server.model_runtime_label(MODEL), llama_server.MEGAKERNEL_TURING_LABEL)
-            with mock.patch.object(llama_server.Path, "is_file", return_value=True), \
-                    mock.patch.object(llama_server, "_megakernel_quant_mix", return_value="native"):
-                self.assertEqual(llama_server.model_runtime_label(MODEL), llama_server.MEGAKERNEL_TURING_LABEL)
+            self.assertEqual(llama_server.model_runtime_label("/models/Qwen3.8-27B-UD-Q3_K_XL.gguf"), "llama.cpp")
+        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")):
+            self.assertEqual(llama_server.model_runtime_label("/models/Qwen3.8-27B-UD-Q3_K_XL.gguf"),
+                             llama_server.MEGAKERNEL_MIXED_LABEL)
 
     def test_missing_build_is_reported(self) -> None:
         with mock.patch.object(llama_server, "_megakernel_dir", return_value=None):
@@ -74,7 +67,7 @@ class MegakernelSelectionTests(unittest.TestCase):
         with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")):
             self.assertIsNone(llama_server.megakernel_long_context_reason(MODEL))
             self.assertIn("only supports", llama_server.megakernel_long_context_reason("/m/Qwen3.5-9B-Q4_K_M.gguf"))
-        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "7.5")):
+        with mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=None):
             self.assertIn("RTX 30/40/50", llama_server.megakernel_long_context_reason(MODEL))
 
     def test_registry_passes_the_backend_setting(self) -> None:
@@ -115,18 +108,18 @@ class MegakernelGpuDetectionTests(unittest.TestCase):
                     mock.patch.dict(llama_server.os.environ, {}, clear=True):
                 self.assertEqual(llama_server._megakernel_gpu(), "0")
 
-    def test_rtx_8000_can_be_pinned_without_selecting_another_gpu(self) -> None:
-        lines = ("2, GPU-baseline, 8.6, 24576", "3, GPU-turing, 7.5, 49152")
-        for visible in ("3", "GPU-turing"):
+    def test_a_gpu_can_be_pinned_without_selecting_another_gpu(self) -> None:
+        lines = ("2, GPU-baseline, 8.6, 24576", "3, GPU-ada, 8.9, 49152")
+        for visible in ("3", "GPU-ada"):
             with _nvidia_smi(*lines), \
                     mock.patch.dict(llama_server.os.environ, {"CUDA_VISIBLE_DEVICES": visible}, clear=True):
-                self.assertEqual(llama_server._megakernel_gpu_info(), ("3", "7.5"))
+                self.assertEqual(llama_server._megakernel_gpu_info(), ("3", "8.9"))
 
     def test_nvml_failure_uses_cuda_instead_of_disabling_the_megakernel(self) -> None:
         failed = subprocess.CompletedProcess([], 18, stdout="", stderr="Driver/library version mismatch")
         with mock.patch.object(llama_server.subprocess, "run", return_value=failed), \
-                mock.patch.object(llama_server, "_cuda_megakernel_gpu_info", return_value=("GPU-turing", "7.5")):
-            self.assertEqual(llama_server._megakernel_gpu_info(), ("GPU-turing", "7.5"))
+                mock.patch.object(llama_server, "_cuda_megakernel_gpu_info", return_value=("GPU-ada", "8.9")):
+            self.assertEqual(llama_server._megakernel_gpu_info(), ("GPU-ada", "8.9"))
 
     def test_cuda_fallback_uses_visible_device_uuid_and_respects_first_device(self) -> None:
         driver = mock.Mock()
@@ -141,8 +134,8 @@ class MegakernelGpuDetectionTests(unittest.TestCase):
             return 0
 
         def capability(major, minor, device):
-            major._obj.value = 7 if device == 0 else 8
-            minor._obj.value = 5 if device == 0 else 6
+            major._obj.value = 8
+            minor._obj.value = 9 if device == 0 else 6
             return 0
 
         def memory(out, device):
@@ -161,7 +154,7 @@ class MegakernelGpuDetectionTests(unittest.TestCase):
         with mock.patch.object(llama_server.ctypes, "CDLL", return_value=driver), \
                 mock.patch.dict(llama_server.os.environ, {"CUDA_VISIBLE_DEVICES": "3,2"}, clear=True):
             self.assertEqual(llama_server._cuda_megakernel_gpu_info(),
-                             ("GPU-00000000-0000-0000-0000-000000000003", "7.5"))
+                             ("GPU-00000000-0000-0000-0000-000000000003", "8.9"))
             driver.cuDeviceGet.assert_called_once()
             driver.cuDeviceTotalMem_v2.side_effect = lambda out, device: (
                 setattr(out._obj, "value", 8192 * 1024 * 1024) or 0)
@@ -233,12 +226,12 @@ class MegakernelStartTests(unittest.TestCase):
 
         self._run(scenario())
 
-    def test_megakernel_launch_preserves_the_pinned_rtx_8000(self) -> None:
+    def test_megakernel_launch_preserves_the_pinned_gpu(self) -> None:
         async def scenario() -> None:
             client = self._client("megakernel")
             client._proc = mock.Mock(pid=123)
             client._spawn_until_healthy = mock.AsyncMock(return_value="ready")
-            env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "GPU-turing"}
+            env = {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "GPU-pinned"}
             with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
                     mock.patch.object(llama_server, "_megakernel_gpu") as choose_gpu:
                 await client._start_megakernel(env=env, ctx=4096)
@@ -247,6 +240,53 @@ class MegakernelStartTests(unittest.TestCase):
             await client._http.aclose()
 
         self._run(scenario())
+
+
+class MegakernelLaunchCommandTests(unittest.TestCase):
+    def _launch(self, outcomes, *, ram_mb: float = 65536.0, ctx: int = 32768, stderr: str = ""):
+        async def scenario():
+            client = LlamaServerClient(model=MODEL, binary="/opt/llama-server", backend="megakernel")
+            async def spawn(cmd, *, env, timeout, stderr_lines, keep_reading_stderr=False):
+                client._proc = mock.Mock(pid=123)
+                stderr_lines.append(stderr)
+                return outcomes.pop(0)
+
+            client._spawn_until_healthy = mock.AsyncMock(side_effect=spawn)
+            snapshot = SimpleNamespace(total_mb=ram_mb)
+            with mock.patch.object(llama_server, "_megakernel_dir", return_value=ROOT), \
+                    mock.patch.object(llama_server, "_megakernel_gpu", return_value=None), \
+                    mock.patch.object(llama_server, "read_memory_snapshot", return_value=snapshot):
+                try:
+                    await client._start_megakernel(env={}, ctx=ctx)
+                finally:
+                    await client._http.aclose()
+            return [(call.args[0], call.kwargs["env"]) for call in client._spawn_until_healthy.call_args_list]
+        return asyncio.run(scenario())
+
+    def test_launch_uses_the_q8_cache_exact_reuse_and_seven_drafts(self) -> None:
+        (cmd, env), = self._launch(["ready"])
+        self.assertEqual(cmd[-2:], ["-d", "7"])
+        self.assertIn("--exact-reuse", cmd)
+        self.assertEqual(cmd[cmd.index("--kv") + 1], "q8")
+        self.assertNotIn("--park-mib", cmd)
+        self.assertNotIn("MK_PF_CAP", env)
+
+    def test_a_gpu_with_too_few_sms_is_started_again_at_four_drafts(self) -> None:
+        message = "RTX A5000 has 64 SMs; the megakernel runs one block per SM and needs at least 80"
+        calls = self._launch(["exited", "ready"], stderr=message)
+        self.assertEqual([cmd[-1] for cmd, _env in calls], ["7", "4"])
+
+    def test_another_startup_failure_is_not_retried(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            self._launch(["exited"], stderr="CUDA error: out of memory")
+
+    def test_parking_is_off_on_a_machine_with_little_ram(self) -> None:
+        (cmd, _env), = self._launch(["ready"], ram_mb=15955.0)
+        self.assertEqual(cmd[cmd.index("--park-mib") + 1], "0")
+
+    def test_long_prompts_get_smaller_prefill_chunks(self) -> None:
+        (_cmd, env), = self._launch(["ready"], ctx=120000)
+        self.assertEqual(env["MK_PF_CAP"], "1024")
 
 
 class MegakernelLongContextLaunchTests(unittest.TestCase):
@@ -274,125 +314,6 @@ class MegakernelLongContextLaunchTests(unittest.TestCase):
     def test_an_explicit_mk_kv_wins(self) -> None:
         self.assertEqual(self._launch_env(True, {"MK_KV": "K*=6,V*=5"})["MK_KV"], "K*=6,V*=5")
 
-
-class MegakernelServerParsingTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.mk = _load_mk_server()
-
-    def _feed_all(self, parser, chunks):
-        out = []
-        for c in chunks:
-            out += parser.feed(c)
-        out += parser.feed("", final=True)
-        merged = {"reasoning": "", "content": ""}
-        for kind, text in out:
-            merged[kind] += text
-        return merged
-
-    def test_reasoning_and_content_are_split_across_chunk_boundaries(self) -> None:
-        parser = self.mk.OutputParser(thinking=True, tools=[])
-        text = "Think about it.\n</think>\n\nThe answer is 4."
-        merged = self._feed_all(parser, [text[i:i + 3] for i in range(0, len(text), 3)])
-        self.assertEqual(merged["reasoning"], "Think about it.\n")
-        self.assertEqual(merged["content"], "The answer is 4.")
-
-    def test_tool_call_markup_is_held_back_and_parsed(self) -> None:
-        tools = [{"type": "function", "function": {"name": "read_file", "parameters": {
-            "type": "object", "properties": {"path": {"type": "string"}, "max_lines": {"type": "integer"}}}}}]
-        parser = self.mk.OutputParser(thinking=False, tools=tools)
-        text = ("Let me look.\n\n<tool_call>\n<function=read_file>\n<parameter=path>\n/etc/hostname\n</parameter>\n"
-                "<parameter=max_lines>\n10\n</parameter>\n</function>\n</tool_call>")
-        merged = self._feed_all(parser, [text[i:i + 5] for i in range(0, len(text), 5)])
-        self.assertEqual(merged["content"], "Let me look.")
-        calls = self.mk.parse_tool_calls(parser.tool_text, tools)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["function"]["name"], "read_file")
-        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"path": "/etc/hostname", "max_lines": 10})
-
-    def test_string_parameters_are_not_json_decoded(self) -> None:
-        tools = [{"type": "function", "function": {"name": "run", "parameters": {
-            "type": "object", "properties": {"cmd": {"type": "string"}}}}}]
-        calls = self.mk.parse_tool_calls("<tool_call>\n<function=run>\n<parameter=cmd>\n123\n</parameter>\n</function>\n</tool_call>", tools)
-        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"cmd": "123"})
-
-    def test_assistant_tool_call_arguments_are_decoded_for_the_template(self) -> None:
-        msgs = self.mk.normalize_messages([{"role": "assistant", "content": None, "tool_calls": [
-            {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{\"a\": 1}"}}]}])
-        self.assertEqual(msgs[0]["content"], "")
-        self.assertEqual(msgs[0]["tool_calls"][0]["function"]["arguments"], {"a": 1})
-
-    def test_images_are_rejected(self) -> None:
-        with self.assertRaises(self.mk.BadRequest):
-            self.mk.normalize_messages([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}])
-
-    def test_shared_prefix_ends_on_a_32_token_tile_under_mk_kv(self) -> None:
-        srv = object.__new__(self.mk.Server)
-        srv.shared_text = "shared context"
-        srv.template_args = lambda body, messages, generation_prompt: {}
-        srv.template = mock.Mock(render=lambda **kw: "")
-        prefix = list(range(1108))
-        srv.eng = mock.Mock(tokenize=lambda text: prefix)
-        toks = prefix + [5000, 5001]
-        with mock.patch.dict("os.environ", {"MK_KV": ""}):
-            self.assertEqual(srv.share_len({}, toks), 1100)
-        with mock.patch.dict("os.environ", {"MK_KV": "K*=5r,V*=5"}):
-            self.assertEqual(srv.share_len({}, toks), 1088)
-
-    def test_agents_library_only_for_parallel_slots_under_mk_kv(self) -> None:
-        name = (lambda stem: f"{stem}.dll" if self.mk.os.name == "nt" else f"lib{stem}.so")
-        with mock.patch.object(self.mk.os.path, "isfile", return_value=True):
-            with mock.patch.dict("os.environ", {"MK_KV": "K*=5r,V*=5"}):
-                self.assertTrue(self.mk.default_library(4).endswith(name("qwen38mk_agents")))
-                self.assertTrue(self.mk.default_library(1).endswith(name("qwen38mk")))
-            with mock.patch.dict("os.environ", {"MK_KV": ""}):
-                self.assertTrue(self.mk.default_library(4).endswith(name("qwen38mk")))
-        with mock.patch.object(self.mk.os.path, "isfile", return_value=False), \
-                mock.patch.dict("os.environ", {"MK_KV": "K*=5r,V*=5"}):
-            self.assertTrue(self.mk.default_library(4).endswith(name("qwen38mk")))  # (not built: the batched path)
-
-
-    def test_oversized_prompt_uses_the_llama_cpp_overflow_wording(self) -> None:
-        # Pi compacts and retries only on errors matching its overflow patterns,
-        # which include llama-server's "exceeds the available context size".
-        srv = object.__new__(self.mk.Server)
-        srv.args = SimpleNamespace(ctx=100)
-        srv.render = lambda body: ("prompt", False)
-        srv.eng = SimpleNamespace(tokenize=lambda text: list(range(120)))
-        with self.assertRaisesRegex(self.mk.BadRequest, "exceeds the available context size"):
-            srv.generate({"messages": []}, lambda kind, text: True)
-
-    def test_a_tool_call_cut_off_by_the_token_limit_is_not_returned(self) -> None:
-        # Issue #32: the cut argument was dropped and the call returned as complete with
-        # finish_reason "tool_calls", so the client could not tell and the model retried it forever.
-        tools = [{"type": "function", "function": {"name": "edit", "parameters": {
-            "type": "object", "properties": {"path": {"type": "string"}, "edits": {"type": "array"}}}}}]
-        text = ("<tool_call>\n<function=edit>\n<parameter=path>\na.yml\n</parameter>\n<parameter=edits>\n"
-                "[{\"oldText\": \"a\", \"newText\": \"b\"}]\n</parameter>\n</function>\n</tool_call>")
-        pieces = [text[i:i + 4].encode() for i in range(0, len(text), 4)]
-
-        def run(max_tokens):
-            following = iter(range(1, len(pieces) + 1))  # (the token after the last piece ends generation)
-            srv = object.__new__(self.mk.Server)
-            srv.args = SimpleNamespace(ctx=4096)
-            srv.sched = None
-            srv.render = lambda body: ("prompt", False)
-            srv.sampling = lambda body: None
-            srv.load_prompt = lambda toks: (0, 0)
-            srv.eng = SimpleNamespace(tokenize=lambda text: [1, 2, 3], is_eog=lambda t: t == len(pieces),
-                                      piece=lambda t: pieces[t], step=lambda: [next(following)])
-            with mock.patch.object(self.mk, "log"):
-                finish, calls, _, _ = srv.generate({"messages": [], "tools": tools, "max_tokens": max_tokens},
-                                                   lambda kind, text: True)
-            return finish, [json.loads(c["function"]["arguments"]) for c in calls]
-
-        self.assertEqual(run(len(pieces) + 1), ("tool_calls", [{"path": "a.yml", "edits": [{"oldText": "a", "newText": "b"}]}]))
-        self.assertEqual(run(len(pieces) // 2), ("length", []))
-        # one whole call, then one that is cut: the whole one is still returned
-        calls = self.mk.parse_tool_calls(text + "\n" + text[:text.index("</function>")], tools, cut=True)
-        self.assertEqual(len(calls), 1)
-        # the model stopped by itself without closing the call: accepted as before
-        self.assertEqual(len(self.mk.parse_tool_calls(text[:text.index("</function>")], tools)), 1)
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,3 +50,4 @@ MEMORY.md
 llama.cpp/
 *.swp
 config.yaml.bak*
+bench_data/

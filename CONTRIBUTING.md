@@ -45,8 +45,10 @@ llama.cpp build for tokenization:
 git clone --depth 1 --branch b10246 https://github.com/ggml-org/llama.cpp.git llama.cpp
 cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j 2
-make -C megakernel NVCC="$(command -v nvcc)"     # qwen38_mk CLI, libqwen38mk.so, tools; ~2 min
-make -C megakernel NVCC="$(command -v nvcc)" -j1 libqwen38mk_mixed.so   # UD-Q4_K_XL only; ~11 GiB RAM
+make -C megakernel NVCC="$(command -v nvcc)" -j1 libqwen38mk.so   # ~15 min; ptxas needs ~21 GiB of RAM
+# the previous engine: Turing (sm_75), UD-Q3_K_XL and cards under 24 GB
+make -C megakernel/legacy NVCC="$(command -v nvcc)" -j1 libqwen38mk.so         # ~4 min, ~6 GiB RAM
+make -C megakernel/legacy NVCC="$(command -v nvcc)" -j1 libqwen38mk_mixed.so   # ~11 GiB RAM
 ```
 
 `make` builds for the installed GPU; `make ARCH=sm_89` overrides it. Serving, benchmarks and

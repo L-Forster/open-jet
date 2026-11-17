@@ -47,17 +47,24 @@ from think_bench import PROMPTS, file_prompt  # noqa: E402
 SAMPLING = dict(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0)
 TEMPLATE_KWARGS = dict(enable_thinking=True, reasoning_effort="xhigh")
 LONG_SOURCES = ["megakernel/qwen38_mk.cu", "megakernel/prefill.cuh", "megakernel/prefill_gemm.cuh",
-                "megakernel/qwen38_mixed.cu", "megakernel/main.cu", "megakernel/capi.cpp",
+                "megakernel/engine.cu", "megakernel/loader.cu", "megakernel/main.cu", "megakernel/capi.cpp",
                 "megakernel/server/mk_server.py", "megakernel/README.md", "src/llama_server.py",
                 "src/hybrid.py", "src/runtime_protocol.py", "README.md"]
 LONG_QUESTION = ("\n\nAbove is source code from one project. Explain how the decode path verifies drafted tokens, "
                  "naming the functions involved, and point out one place where a bug could hide.")
 
 
+# the long suite's sources come from a fixed tree when LONG_ROOT is set (default this checkout), so runs of different
+# checkouts read the same prompt; files the tree does not have are skipped
+LONG_ROOT = os.environ.get("LONG_ROOT", ROOT)
+
+
 def long_prompt(target_tokens, tokenizer_path):
     text = ""
     for rel in LONG_SOURCES:
-        with open(os.path.join(ROOT, rel), errors="replace") as f:
+        if not os.path.isfile(os.path.join(LONG_ROOT, rel)):
+            continue
+        with open(os.path.join(LONG_ROOT, rel), errors="replace") as f:
             text += f"\n\n===== {rel} =====\n\n" + f.read()
     if tokenizer_path:
         from tokenizers import Tokenizer

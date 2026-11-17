@@ -1,10 +1,11 @@
 name: Build prebuilt engine libraries
 
 # One archive per GPU architecture, so `openjet setup` can serve Qwen3.8-27B without the CUDA toolkit.
-# Each archive holds the engine library (and, except on Turing, the mixed-quant one and the one for
-# parallel agents with the MK_KV cache) plus a CPU-only
-# libllama for the tokenizer, all resolved next to each other. CUDA's runtime is linked statically, so
-# users only need the NVIDIA driver.
+# Each archive holds the engine library plus a CPU-only libllama for the tokenizer, resolved next to each
+# other. CUDA's runtime is linked statically, so users only need an NVIDIA driver with CUDA 13.2 support.
+# ptxas takes about 21 GiB of RAM on the megakernel, more than a standard runner has, so the Linux job adds swap.
+# The openjet-engine-legacy-* archives hold the previous engine the same way, for the GPUs and files the current one
+# does not serve (src/llama_server.py, _megakernel_variant).
 
 on:
   workflow_call:
@@ -12,6 +13,100 @@ on:
 
 jobs:
   linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["86", "89", "120"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.2.2"
+          method: network
+      - name: Add swap for ptxas
+        run: |
+          sudo fallocate -l 24G /mnt/engine-swap
+          sudo chmod 600 /mnt/engine-swap
+          sudo mkswap /mnt/engine-swap
+          sudo swapon /mnt/engine-swap
+          free -g
+      - name: Build llama.cpp's tokenizer libraries (CPU only)
+        run: |
+          ref=$(python3 -c "import re; print(re.search(r'LLAMA_CPP_MTP_REF = .(\w+)', open('src/provisioning.py').read()).group(1))")
+          git clone --depth 1 --branch "$ref" https://github.com/ggml-org/llama.cpp /opt/llama.cpp
+          cmake -S /opt/llama.cpp -B /opt/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          cmake --build /opt/llama.cpp/build --target llama -j4
+      - name: Build the engine for sm_${{ matrix.arch }}
+        run: make -C megakernel -j1 NVCC="$CUDA_PATH/bin/nvcc" ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
+      - name: Package and check that the library resolves from its own directory
+        run: |
+          mkdir -p pkg dist
+          cp megakernel/libqwen38mk.so pkg/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* pkg/
+          readelf -d pkg/libqwen38mk.so | grep -q 'R.*PATH.*\$ORIGIN'
+          if env -u LD_LIBRARY_PATH ldd pkg/libqwen38mk.so | grep 'not found'; then exit 1; fi
+          tar -czf dist/openjet-engine-linux-x64-sm${{ matrix.arch }}.tar.gz -C pkg .
+          ls -l pkg dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-linux-sm${{ matrix.arch }}
+          path: dist/*
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["86", "89", "120"]
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      # A CUDA 13 runtime needs NVIDIA driver 580 or newer.
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.2.2"
+          method: network
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: Build llama.cpp's tokenizer libraries (CPU only)
+        run: |
+          $ref = python -c "import re; print(re.search(r'LLAMA_CPP_MTP_REF = .(\w+)', open('src/provisioning.py').read()).group(1))"
+          git clone --depth 1 --branch $ref https://github.com/ggml-org/llama.cpp C:/llama.cpp
+          # Ninja: megakernel/build.ps1 looks for the import libraries where a single-configuration build puts them
+          cmake -S C:/llama.cpp -B C:/llama.cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON `
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF
+          cmake --build C:/llama.cpp/build --target llama -j 4
+      - name: Build the engine for sm_${{ matrix.arch }}
+        run: ./megakernel/build.ps1 -Targets engine -Arch sm_${{ matrix.arch }} -Llama C:/llama.cpp -Cuda $env:CUDA_PATH
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force pkg, dist | Out-Null
+          Copy-Item megakernel/qwen38mk.dll pkg/
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName pkg/
+          # the C++ runtime, for machines without the Visual C++ redistributable (Python ships vcruntime140 only)
+          foreach ($name in "msvcp140.dll", "vcruntime140_1.dll") {
+            $crt = Get-ChildItem "$env:VCToolsRedistDir/x64" -Recurse -Filter $name |
+              Where-Object { $_.FullName -notmatch "onecore|debug" } | Select-Object -First 1
+            Copy-Item $crt.FullName pkg/
+          }
+          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('pkg')); ctypes.CDLL(os.path.abspath('pkg/qwen38mk.dll')).mk_last_error"
+          Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-windows-x64-sm${{ matrix.arch }}.zip
+          Get-ChildItem pkg, dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-windows-sm${{ matrix.arch }}
+          path: dist/*
+
+  # The previous engine (megakernel/legacy), which serves Turing and, with its mixed-quant library, UD-Q3_K_XL and
+  # cards under 24 GB. It builds in a standard runner's memory with CUDA 12.8 (13.2 for sm_120 on Windows).
+  legacy-linux:
     strategy:
       fail-fast: false
       matrix:
@@ -33,32 +128,32 @@ jobs:
             -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
           cmake --build /opt/llama.cpp/build --target llama -j4
-      - name: Build the engine for sm_${{ matrix.arch }}
+      - name: Build the previous engine for sm_${{ matrix.arch }}
         run: |
-          make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
+          make -C megakernel/legacy -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
           # the mixed-quant engine needs sm_80+; its compile uses about 11 GiB of RAM. The agents engine (MK_KV in the
           # parallel slots) too: Turing refuses MK_KV
           if [ "${{ matrix.arch }}" != "75" ]; then
-            make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_mixed.so
-            make -C megakernel -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_agents.so
+            make -C megakernel/legacy -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_mixed.so
+            make -C megakernel/legacy -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_agents.so
           fi
       - name: Package and check that the libraries resolve from their own directory
         run: |
           mkdir -p pkg dist
-          cp megakernel/libqwen38mk*.so pkg/
+          cp megakernel/legacy/libqwen38mk*.so pkg/
           cp -a /opt/llama.cpp/build/bin/lib*.so* pkg/
           for lib in pkg/libqwen38mk*.so; do
             readelf -d "$lib" | grep -q 'R.*PATH.*\$ORIGIN'
             if env -u LD_LIBRARY_PATH ldd "$lib" | grep 'not found'; then exit 1; fi
           done
-          tar -czf dist/openjet-engine-linux-x64-sm${{ matrix.arch }}.tar.gz -C pkg .
+          tar -czf dist/openjet-engine-legacy-linux-x64-sm${{ matrix.arch }}.tar.gz -C pkg .
           ls -l pkg dist
       - uses: actions/upload-artifact@v4
         with:
-          name: engine-linux-sm${{ matrix.arch }}
+          name: engine-legacy-linux-sm${{ matrix.arch }}
           path: dist/*
 
-  windows:
+  legacy-windows:
     strategy:
       fail-fast: false
       matrix:
@@ -90,7 +185,7 @@ jobs:
             -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF `
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF
           cmake --build C:/llama.cpp/build --config Release --target llama -j 4
-      - name: Build the engine for sm_${{ matrix.arch }}
+      - name: Build the previous engine for sm_${{ matrix.arch }}
         run: |
           $libs = @("llama.lib", "ggml-base.lib") | ForEach-Object {
             (Get-ChildItem C:/llama.cpp/build -Recurse -Filter $_ | Select-Object -First 1).FullName
@@ -110,10 +205,10 @@ jobs:
             exit $LASTEXITCODE
           }
           foreach ($v in $variants) {
-            nvcc @flags @($v.def) -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/$($v.src)" -o engine.obj 2>&1 |
+            nvcc @flags @($v.def) -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/legacy/$($v.src)" -o engine.obj 2>&1 |
               Tee-Object -FilePath build.log -Append | Out-Host
             if ($LASTEXITCODE) { Fail }
-            nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/capi.cpp engine.obj @libs -o "pkg/$($v.dll)" 2>&1 |
+            nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/legacy/capi.cpp engine.obj @libs -o "pkg/$($v.dll)" 2>&1 |
               Tee-Object -FilePath build.log -Append | Out-Host
             if ($LASTEXITCODE) { Fail }
           }
@@ -130,9 +225,9 @@ jobs:
           Remove-Item pkg/*.lib, pkg/*.exp
           python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('pkg')); [ctypes.CDLL(os.path.abspath('pkg/' + n)).mk_last_error for n in os.listdir('pkg') if n.startswith('qwen38mk') and n.endswith('.dll')]"
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-windows-x64-sm${{ matrix.arch }}.zip
+          Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-legacy-windows-x64-sm${{ matrix.arch }}.zip
           Get-ChildItem pkg, dist
       - uses: actions/upload-artifact@v4
         with:
-          name: engine-windows-sm${{ matrix.arch }}
+          name: engine-legacy-windows-sm${{ matrix.arch }}
           path: dist/*

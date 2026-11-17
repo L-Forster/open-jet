@@ -23,6 +23,7 @@ namespace ls {
 
 constexpr int REF_K = 256;
 constexpr char MAGIC[8] = "MKREF01";
+constexpr int MAX_SEQS = 1 << 20, MAX_LEN = 1 << 24; // (a reference file's header beyond these is corrupt)
 
 struct Seq {
     std::vector<int> tok;
@@ -131,15 +132,26 @@ class Session {
             get(hdr, sizeof(hdr));
             if (memcmp(magic, MAGIC, 8) || hdr[1] != REF_K) throw std::runtime_error(kld_path + ": not a reference file");
             if (hdr[0] != nv_) throw std::runtime_error(kld_path + ": vocabulary size differs");
+            if (hdr[2] < 0 || hdr[2] > MAX_SEQS) throw std::runtime_error(kld_path + ": bad sequence count " + std::to_string(hdr[2]));
             seqs_.resize(hdr[2]);
             for (Seq & s : seqs_) {
                 int nf[2];
                 get(nf, sizeof(nf));
+                if (nf[0] < 1 || nf[0] > MAX_LEN || nf[1] < 0 || nf[1] > nf[0])
+                    throw std::runtime_error(kld_path + ": bad sequence length / first scored position " + std::to_string(nf[0]) +
+                                             " / " + std::to_string(nf[1]));
                 s.tok.resize(nf[0]);
                 s.first = nf[1];
                 get(s.tok.data(), s.tok.size() * sizeof(int));
             }
         }
+        // every token id indexes a logits row and the embedding table
+        for (size_t s = 0; s < seqs_.size(); s++)
+            for (size_t i = 0; i < seqs_[s].tok.size(); i++)
+                if (seqs_[s].tok[i] < 0 || seqs_[s].tok[i] >= nv_)
+                    throw std::runtime_error((kld_path.empty() ? std::string("sequence") : kld_path) + ": token id " +
+                                             std::to_string(seqs_[s].tok[i]) + " out of range (sequence " + std::to_string(s) +
+                                             ", position " + std::to_string(i) + ", vocabulary " + std::to_string(nv_) + ")");
         if (!out_path.empty()) {
             out_ = fopen(out_path.c_str(), "wb");
             if (!out_) throw std::runtime_error("cannot write " + out_path);
@@ -169,6 +181,11 @@ class Session {
         std::vector<Rec> ref(in_ ? m : 0), own(out_ ? m : 0);
         std::vector<Cmp> cmp(in_ ? m : 0);
         if (in_) get(ref.data(), m * sizeof(Rec));
+        for (int r = 0; r < (int) ref.size(); r++)
+            for (int k = 0; k < REF_K; k++)
+                if (ref[r].id[k] < 0 || ref[r].id[k] >= nv_)
+                    throw std::runtime_error("reference file: token id " + std::to_string(ref[r].id[k]) + " out of range (sequence " +
+                                             std::to_string(s) + ", position " + std::to_string(lo + r) + ")");
         par_rows(m, [&](int r) {
             const float * l = logits + (size_t) (lo - i0 + r) * nv_;
             const int next = q.tok[lo + r + 1];

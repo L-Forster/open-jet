@@ -1,26 +1,65 @@
-# build outputs
+# build outputs (build/: out-of-tree variant builds)
+build/
 *.o
+*.o.d
 qwen38_mk
-qwen38_mixed
 libqwen38mk.so
-libqwen38mk_mixed.so
-libqwen38mk_agents.so
+libqwen38vision.so
+vision/*.o
+tools/vit_check
 ptxas*.log
 tools/vocab_freq
 tools/llama_ref
-tools/iq_repack_check
+tools/mkv_cli
+tools/vision_ref
+tests/gguf_fuzz
 # microbenchmark binaries (bench/*.cu) and benchmark scratch output
 bench/ffn_bench
 bench/ffn_bench_h*
 bench/gemv_bench
 bench/mmq_bench
-bench/mma_bench
-bench/turing_check
 bench/mmq_e*
 bench/resid_bench
+bench/wvgemm_bench
+bench/dattn_bench
+bench/attn_bench
+bench/wv_ref.cuh.tmp
 bench/*_tmp/
+# benchmark suite downloads (bench/suite/fetch.py)
+bench/suite/data/
 # experimental draft vocabulary (the engine uses draft_vocab_32k.bin)
 draft_vocab_48k.bin
+# python
+__pycache__/
+.pytest_cache/
+# Windows build outputs (build.ps1)
+build_win/
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+*.pdb
+# release packages (scripts/package_release.*)
+dist/
+# scripts/exactness.py's default output
+exactness-out/
+# scripts/gate.sh's default output
+gate-out/
+# prebuilt engine archives ship their llama.cpp libraries next to the engine
+lib*.so.*
+libllama.so
+libggml*.so
+libmtmd.so
 # written by openjet setup (src/megakernel_build.py)
 .openjet-build.json
 .openjet-build-mixed.json
+# the previous engine's build outputs (legacy/Makefile)
+legacy/qwen38_mixed
+legacy/libqwen38mk_mixed.so
+legacy/libqwen38mk_agents.so
+legacy/tools/iq_repack_check
+legacy/bench/turing_check
+legacy/bench/mmq_bench
+legacy/tools/vocab_freq
+legacy/tools/llama_ref

@@ -55,7 +55,7 @@ __device__ __forceinline__ void iq4_words_reg(unsigned w, int & a, int & b) {
     b = (int) (iq4nl((w >> 4) & 15) | iq4nl((w >> 12) & 15) << 8 | iq4nl((w >> 20) & 15) << 16 | iq4nl(w >> 28) << 24);
 }
 
-// ---------------- V0: current (uint2 xf, 1 row per row_dot, rows in pairs) ----------------
+// ---------------- V0: uint2 xf, 1 row per row_dot, rows in pairs ----------------
 template <int T>
 __device__ __forceinline__ void acc_unit0(const int4 * xa, const int4 * xb, const uint2 * xf, int u, const int (&a)[4], const int (&b)[4],
                                           float fA, float gA, float fB, float gB, float (&acc)[T]) {
@@ -186,7 +186,7 @@ template <int KK, int TYPE, int T, int R, int UF = KK / 1024>
 __global__ void __launch_bounds__(NT, 1) gemv_v2(const uint8_t * W, const __half * Dq, int N, float * out) {
     constexpr int UU = KK / 32, IT = UU / 32, NBB = KK / 256;
     // TYPE 23: IQ4_XS decoded through a 2 KB shared-memory table, 24: IQ4_XS decoded in registers (faster).
-    // A 256 KB global table (two index bytes -> four weights, 8 gathers per unit) ran at a third of Q4_K's speed.
+    // A 256 KB global table (two index bytes -> four weights, 8 gathers per unit) runs at a third of Q4_K's speed.
     constexpr bool IQ4 = TYPE == 23 || TYPE == 24;
     constexpr int RBB = TYPE == 12 || IQ4 ? NBB * 144 : (TYPE == 18 ? NBB * 224 : NBB * 208);
     extern __shared__ __align__(16) uint8_t sm[];

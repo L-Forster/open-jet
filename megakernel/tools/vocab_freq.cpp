@@ -18,10 +18,18 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const int N = atoi(argv[2]);
+    if (N < 1) {
+        fprintf(stderr, "N must be at least 1\n");
+        return 1;
+    }
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     llama_model * m = llama_model_load_from_file(argv[1], mp);
+    if (!m) {
+        fprintf(stderr, "failed to load %s\n", argv[1]);
+        return 1;
+    }
     const llama_vocab * v = llama_model_get_vocab(m);
     const int nv = llama_vocab_n_tokens(v);
     std::vector<long> cnt(nv, 0);
@@ -78,8 +86,10 @@ int main(int argc, char ** argv) {
     long covered = 0;
     for (int id : out) covered += cnt[id];
     FILE * fo = fopen(argv[3], "wb");
-    fwrite(out.data(), sizeof(int), out.size(), fo);
-    fclose(fo);
+    if (!fo || fwrite(out.data(), sizeof(int), out.size(), fo) != out.size() || fclose(fo) != 0) {
+        fprintf(stderr, "cannot write %s\n", argv[3]);
+        return 1;
+    }
     fprintf(stderr, "%ld files, %ld tokens, %zu ids written, coverage %.3f%%\n", files, total, out.size(),
             100.0 * covered / std::max(1L, total));
     llama_model_free(m);

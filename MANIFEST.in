@@ -3,8 +3,10 @@ recursive-include ui *.json *.ts *.md NOTICE
 prune ui/node_modules
 prune ui/dist
 recursive-include src/tui_bin *
-include megakernel/Makefile megakernel/README.md megakernel/draft_vocab_32k.bin
+include megakernel/Makefile megakernel/build.ps1 megakernel/README.md megakernel/THIRD_PARTY_NOTICES.md megakernel/draft_vocab_32k.bin
 recursive-include megakernel *.cu *.cuh *.h *.cpp
 include megakernel/pyproject.toml megakernel/LICENSE
 include megakernel/__init__.py megakernel/__main__.py
-include megakernel/server/__init__.py megakernel/server/mk_server.py
+recursive-include megakernel/server *.py
+include megakernel/legacy/Makefile megakernel/legacy/README.md megakernel/legacy/draft_vocab_32k.bin
+recursive-include megakernel/legacy/server *.py

@@ -37,7 +37,14 @@ int main(int argc, char ** argv) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { if (i + 1 >= argc) usage(); return argv[++i]; };
         if (a == "-m") model = next();
-        else if (a == "-f") { std::ifstream f(next(), std::ios::binary); std::stringstream ss; ss << f.rdbuf(); text += ss.str(); }
+        else if (a == "-f") {
+            const std::string p = next();
+            std::ifstream f(p, std::ios::binary);
+            if (!f) { fprintf(stderr, "cannot read %s\n", p.c_str()); return 1; }
+            std::stringstream ss;
+            ss << f.rdbuf();
+            text += ss.str();
+        }
         else if (a == "--kld") kld_file = next();
         else if (a == "--ref-out") ref_out = next();
         else if (a == "--chunk") chunk = atoi(next().c_str());
@@ -50,6 +57,10 @@ int main(int argc, char ** argv) {
         else usage();
     }
     if (model.empty() || (kld_file.empty() && (text.empty() || ref_out.empty()))) usage();
+    if (chunk < 1 || nb < 1 || first < 0 || max_chunks < 0) {
+        fprintf(stderr, "--chunk and -b must be at least 1, --score-from and --max-chunks at least 0\n");
+        return 1;
+    }
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
