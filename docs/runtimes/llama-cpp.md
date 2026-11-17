@@ -34,8 +34,7 @@ the previous engine on an RTX 3090 against `llama-server` with OpenJet's flags:
 | pasting a 12K-token file into the next turn | 10.5 s | 8.1 s |
 
 The current engine decodes 1.36x as fast as the previous one on short prompts and 1.25x with 98K tokens
-in context, thinking on, sampled, on the same RTX 3090 ([results](../../megakernel/README.md#results)); the
-table above hasn't been rerun with it yet.
+in context, thinking on, sampled, on the same RTX 3090 ([results](../../megakernel/README.md#results)).
 
 `openjet setup` installs it when it selects this model on a supported GPU. An installed wheel
 downloads the engine prebuilt for that GPU's architecture from the matching GitHub release, which

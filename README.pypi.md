@@ -46,8 +46,7 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 OpenJet's engine is now [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel), the previous
 engine developed further by Benjamin Cutler. On the same RTX 3090, thinking on, sampled, it decodes **1.36x** as fast
 as the previous engine on short prompts and **1.25x** with 98K tokens in context (same-seed medians, 40 and 8 requests),
-with the same accuracy against llama.cpp ([results](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#results)). The llama.cpp comparison above has
-not been rerun with it yet.
+with the same accuracy against llama.cpp ([results](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#results)).
 
 Context on a 24 GB card: about **120K tokens**, or about **234K** with `openjet setup --long-context`
 ([KV cache presets](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#kv-cache-presets-mk_kv)).

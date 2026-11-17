@@ -55,7 +55,7 @@ Measured with OpenJet's previous engine:
 
 Benjamin Cutler measured the current engine at 424 tok/s in total for 4 agents on short coding prompts and
 360 tok/s with about 23K tokens of context each (RTX 3090, his release v2026.11.05, `--agents 4 -d 7 --kv q8`;
-[details](../megakernel/docs/BENCHMARKS.md#parallel-agents)); OpenJet hasn't rerun its own table above with it yet.
+[details](../megakernel/docs/BENCHMARKS.md#parallel-agents)).
 
 Each agent gets its own slot of the KV cache, `-c` positions long (by default, the most that fit). To watch them
 live (tok/s, context and task per agent):

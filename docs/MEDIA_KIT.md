@@ -45,8 +45,7 @@ fuller technical description, see the [AI reference](AI_REFERENCE.md).
 
 Keep each figure with its conditions. All speed figures are from one RTX 3090 running one
 conversation, with Qwen3.8-27B Q4_K_M. The llama.cpp comparisons ran with OpenJet's flags (MTP
-speculative decoding, flash attention, q8_0 KV cache) against OpenJet's previous engine, and haven't
-been rerun with the current one yet.
+speculative decoding, flash attention, q8_0 KV cache) against OpenJet's previous engine.
 
 | Claim | Figure | Condition |
 |---|---|---|

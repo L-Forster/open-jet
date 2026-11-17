@@ -46,7 +46,7 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 OpenJet 的引擎现在来自 [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel)，即由 Benjamin Cutler
 继续开发的旧引擎。在同一块 RTX 3090 上，开启思考、采样解码时，它在短提示词上的解码速度是旧引擎的 **1.36 倍**，
 上下文中有 98K token 时为 **1.25 倍**（相同随机种子的中位数，分别为 40 和 8 个请求），与 llama.cpp 相比的准确度与旧引擎相同
-（[结果](megakernel/README.md#results)）。上表与 llama.cpp 的对比尚未用新引擎重新测量。
+（[结果](megakernel/README.md#results)）。
 
 24 GB 显卡上的上下文：约 **120K token**，使用 `openjet setup --long-context` 时约 **234K**
 （[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。

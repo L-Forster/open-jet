@@ -73,7 +73,7 @@ flags, including MTP speculative decoding, q8_0 KV cache and flash attention):
 | Prompt processing, 1.8K-7.8K token prompts (earlier build) | 1050-1140 tok/s | 1530-1600 tok/s |
 
 The first three rows are the previous engine against llama.cpp b11982, measured with
-`megakernel/bench/run_compare.sh`; the comparison has not been rerun with the current engine yet.
+`megakernel/bench/run_compare.sh`.
 Against the previous engine on the same RTX 3090 (thinking on, sampled, q8_0 KV, 8 seeds), the current
 engine decodes 1.36x as fast on short prompts (121 vs 90 tok/s) and 1.25x with 98K tokens in context
 (96 vs 75 tok/s), same-seed medians; its 98K-token prompt read took 72-83 s against 80-98 s.

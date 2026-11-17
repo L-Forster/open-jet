@@ -52,8 +52,7 @@ GPU，而不是轮流使用。以下用 OpenJet 旧引擎测得：
 | 4 个真实编程智能体（会暂停去运行工具和测试） | 40-75 tok/s | 150-200 tok/s |
 
 Benjamin Cutler 测得当前引擎在 4 个智能体、短编程提示词时总速度为 424 tok/s，每个智能体约 23K token 上下文时为 360 tok/s
-（RTX 3090，他的 release v2026.11.05，`--agents 4 -d 7 --kv q8`；[详情](../../megakernel/docs/BENCHMARKS.md#parallel-agents)）；
-OpenJet 尚未用新引擎重新测量上表。
+（RTX 3090，他的 release v2026.11.05，`--agents 4 -d 7 --kv q8`；[详情](../../megakernel/docs/BENCHMARKS.md#parallel-agents)）。
 
 每个智能体在 KV 缓存中有自己的槽位，长度为 `-c` 个位置（默认为能装下的最大值）。实时查看它们的状态（每个智能体的
 tok/s、上下文和任务）：
