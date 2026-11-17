@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 ## 速度
 
-| RTX 3090，Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
+| RTX 3090，Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet 旧引擎 |
 |---|---|---|
 | 开启思考，短提示词 | 60 tok/s | **92 tok/s**（1.5 倍） |
 | 开启思考，上下文中有 98K token | 37 tok/s | **79 tok/s**（2.2 倍） |
@@ -38,10 +38,15 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 - 一块 RTX 3090 上的单个对话，不是批处理。
 - llama.cpp b11982 使用相同的参数，包括 MTP 投机解码。
-- 第 1-3 行：当前引擎，思考强度 xhigh，温度 1.0，5 个提示词 x 4 个随机种子，以及一个 98K token 的提示词 x 4 个随机种子
-  （[`run_compare.sh`](megakernel/bench/run_compare.sh)）。其余几行：较早的引擎版本。
+- 第 1-3 行：思考强度 xhigh，温度 1.0，5 个提示词 x 4 个随机种子，以及一个 98K token 的提示词 x 4 个随机种子
+  （[`run_compare.sh`](megakernel/bench/run_compare.sh)）。其余几行：该引擎较早的版本。
 - 在相同权重下与 llama.cpp 输出一致：KL 散度 0.0009，首选 token 一致率 99.08%
-  （[结果](megakernel/README.md#results)）。
+  （[结果](megakernel/legacy/README.md#results)）。
+
+OpenJet 的引擎现在来自 [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel)，即由 Benjamin Cutler
+继续开发的旧引擎。在同一块 RTX 3090 上，开启思考、采样解码时，它在短提示词上的解码速度是旧引擎的 **1.36 倍**，
+上下文中有 98K token 时为 **1.25 倍**（相同随机种子的中位数，分别为 40 和 8 个请求），与 llama.cpp 相比的准确度与旧引擎相同
+（[结果](megakernel/README.md#results)）。上表与 llama.cpp 的对比尚未用新引擎重新测量。
 
 24 GB 显卡上的上下文：约 **120K token**，使用 `openjet setup --long-context` 时约 **234K**
 （[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。
@@ -59,7 +64,7 @@ openjet serve      # 或者把模型提供给 Claude Code、Codex、OpenCode 或
 
 ## 硬件要求
 
-Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm_89、sm_120），驱动 570 或更新版本。
+Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm_89、sm_120），驱动 580 或更新版本。
 `openjet setup` 会下载为你的 GPU 预编译好的 OpenJet 引擎（[具体是哪一个](docs/zh/installation.md#预编译引擎)）。
 
 没有 24 GB 显卡？[部署一台云端 RTX 3090](https://www.openjet.dev/pricing#deploy)，OpenJet 和 Qwen3.8-27B 已装好即可使用，在 Vast.ai 上约 $0.25/小时。
@@ -71,7 +76,7 @@ Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm
 https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
 最多 4 个智能体在同一次权重遍历中一起解码：在 RTX 3090 上，短上下文时总速度约 290 tok/s，运行真实编程智能体时为
-150-200 tok/s。
+150-200 tok/s（用旧引擎测得）。
 
 更多：[docs/zh/features.md](docs/zh/features.md#一块-gpu-上跑-4-个编程智能体)
 
@@ -106,7 +111,7 @@ https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 ## 基于 OpenJet 构建
 
 - [geezuz-qwen3.8-27b-dual-gpu](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu)：把 OpenJet 的引擎拆分到 2 块 GPU 上（张量并行，2 块 RTX 3090 通过 P2P 互联）
-- [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel)：OpenJet 引擎的独立服务器，带 CPU 视觉编码器
+- [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel)：作为独立服务器继续开发的 OpenJet 引擎，带 CPU 视觉编码器；OpenJet 的引擎现在来自它
 
 你也基于 OpenJet 做了项目？提交 pull request 把它加到这里。
 

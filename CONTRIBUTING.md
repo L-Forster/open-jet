@@ -38,15 +38,15 @@ npm ci --ignore-scripts --legacy-peer-deps
 npm run build && npm test
 ```
 
-The engine (Linux, NVIDIA GPU, CUDA 12+, or 12.8+ for RTX 50). It needs the repo's
-llama.cpp build for tokenization:
+The engine (Linux, an Ampere or newer NVIDIA GPU, CUDA 13.2, about 22 GiB of RAM to compile). It needs the
+repo's llama.cpp build for tokenization:
 
 ```bash
 git clone --depth 1 --branch b10246 https://github.com/ggml-org/llama.cpp.git llama.cpp
 cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j 2
-make -C megakernel NVCC="$(command -v nvcc)" -j1 libqwen38mk.so   # ~15 min; ptxas needs ~21 GiB of RAM
-# the previous engine: Turing (sm_75), UD-Q3_K_XL and cards under 24 GB
+make -C megakernel NVCC="$(command -v nvcc)" -j1 libqwen38mk.so   # up to 30 min; ptxas needs ~21 GiB of RAM
+# the previous engine (CUDA 12+): Turing (sm_75), UD-Q3_K_XL and cards under 24 GB
 make -C megakernel/legacy NVCC="$(command -v nvcc)" -j1 libqwen38mk.so         # ~4 min, ~6 GiB RAM
 make -C megakernel/legacy NVCC="$(command -v nvcc)" -j1 libqwen38mk_mixed.so   # ~11 GiB RAM
 ```
@@ -88,7 +88,7 @@ issue titled `Hardware report: <GPU>` and paste this, filled in:
 - OpenJet commit or version (`git rev-parse --short HEAD` or `pip show open-jet`):
 - How installed (`openjet setup`, source build, `openjet-engine`):
 - Model file (repo and filename):
-- Engine serving it (megakernel, mixed megakernel, llama.cpp; `pgrep -af mk_server.py`):
+- Engine serving it (OpenJet's engine, the previous engine in `megakernel/legacy`, or llama.cpp; `pgrep -af mk_server.py`):
 - Server command and flags:
 
 **Result**
@@ -103,8 +103,10 @@ issue titled `Hardware report: <GPU>` and paste this, filled in:
 For engine development numbers beyond `openjet bench`, run from `megakernel/`:
 
 ```bash
-python3 bench/bench.py mk --draft 4 -n 512 --draft-vocab draft_vocab_32k.bin   # one conversation
-python3 bench/code_bench.py                                                      # also runs llama.cpp
+# one conversation, the same requests against each server (here the engine before and after a change)
+python3 bench/engine_compare.py --seeds 8 --rounds 4 -n 1024 --suite short,long --output compare.json \
+    --engine "before=8094=python3 server/mk_server.py --lib /path/to/before/libqwen38mk.so -m MODEL -c 106496 --kv q8 --exact-reuse -d 7 --port 8094" \
+    --engine "after=8094=python3 server/mk_server.py --lib libqwen38mk.so -m MODEL -c 106496 --kv q8 --exact-reuse -d 7 --port 8094"
 python3 bench/parallel_bench.py http://127.0.0.1:18080 --n 4                     # several agents, any OpenAI-compatible server
 ```
 
@@ -128,7 +130,7 @@ long one covering several untested ones.
 
 ### Fix the installation docs
 
-Follow [README setup](README.md#setup), [Installation](docs/installation.md), or the
+Follow [README install](README.md#install), [Installation](docs/installation.md), or the
 [engine's standalone installation](megakernel/README.md#standalone-installation) on a machine
 that has not had OpenJet installed. Stop at the first step that fails or is unclear, then open a
 pull request that fixes that instruction. Include the machine, the command you ran, and the
@@ -137,19 +139,13 @@ exact error output. A single corrected step is a complete contribution.
 ### Tune or extend the engine
 
 The engine ([megakernel/](megakernel/README.md)) is tuned on an RTX 3090 (sm_86); OpenJet
-enables it on sm_86, sm_89 and sm_120 cards with 24 GB+, and experimentally on sm_75. It serves
-Qwen3.8-27B in two builds:
-
-- `libqwen38mk.so`: unsloth's Q4_K_M mix, plus plain `llama-quantize` Q4_K_M files, which the
-  loader re-encodes to that mix. Parallel serving (`--parallel` / `--agents`) runs on this
-  build only.
-- `libqwen38mk_mixed.so`: UD-Q4_K_XL and other supported mixed tensor recipes.
-
-Other quants fall back to llama.cpp. The [quick guide](megakernel/README.md#quick-guide) and
+enables it on sm_86, sm_89 and sm_120 cards with 24 GB+ for Q4_K_M and UD-Q4_K_XL. The previous
+engine ([megakernel/legacy/](megakernel/legacy/README.md)) serves Turing (sm_75, experimental) and,
+with its mixed-quant build, UD-Q3_K_XL. Other quants fall back to llama.cpp. The [quick guide](megakernel/README.md#quick-guide) and
 [The GGUF](megakernel/README.md#the-gguf) list which files run where. Especially welcome:
 
 - tunes for specific hardware (RTX 4090, 5090 and other 24 GB+ cards)
-- support for further quantisations of Qwen3.8-27B
+- support for further quantisations of Qwen3.8-27B, and for Turing, in the current engine
 - the gaps under Limitations in the engine README
 
 For a large change, open an issue describing the approach before writing it, and split the
@@ -170,7 +166,8 @@ change:
 - the GPU, driver and CUDA version
 - decode speed with the commands above; `parallel_bench.py` too if it touches parallel serving
 - for a change to the kernels or a new quant, accuracy against llama.cpp: top token agreement
-  and KL divergence, with the commands under "Correctness" in the engine README
+  and KL divergence, with the commands under "Checking a build" in
+  [megakernel/docs/BUILDING.md](megakernel/docs/BUILDING.md#checking-a-build)
 - for a new quant, the repo and filename of the GGUF you tested
 
 Review checks those numbers against the existing RTX 3090 path. A change must not slow down

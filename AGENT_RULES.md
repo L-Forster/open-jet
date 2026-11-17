@@ -18,7 +18,7 @@ Each rule comes from a mistake an agent made here.
 - The KV cache floor is q8_0. Do not propose q4 KV.
 - Prove it: a refactor gives byte-identical greedy output and an identical `--kld` report; a kernel change reports top-token
   agreement and KL divergence against llama.cpp generating token by token, next to llama.cpp's own batched noise floor
-  (commands under Correctness in [megakernel/README.md](megakernel/README.md)).
+  (commands under Checking a build in [megakernel/docs/BUILDING.md](megakernel/docs/BUILDING.md#checking-a-build)).
 - Sampled runs use the model card's settings. Never run Qwen3.8 with thinking on at temperature 0: it loops.
 
 ## Claims and measurements

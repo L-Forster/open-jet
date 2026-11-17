@@ -44,23 +44,26 @@ that runs the main model, verifies speculative tokens on the GPU and drafts the 
 model's own MTP (multi-token prediction) head. Prompts go through batched tensor-core kernels.
 Speculative verification is exact: greedy output is the model's greedy choice, and sampled output
 has the same distribution as without drafts. It uses llama.cpp's tokenizer; its kernels are its own.
+Since November 2026 it is [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel), the
+engine developed further by Benjamin Cutler, at up to 7 drafts per pass; the previous engine stays in
+`megakernel/legacy/` for Turing and UD-Q3_K_XL.
 
 **Requirements:** an NVIDIA GPU with 24 GB or more, compute capability sm_86 (RTX 30), sm_89 (RTX 40)
 or sm_120 (RTX 50), including the matching RTX workstation cards; Linux; an NVIDIA driver that
-supports CUDA 12.8 (570 or newer). `openjet setup` downloads a prebuilt engine for the GPU; if none
-matches, it compiles one, which needs the CUDA toolkit (`nvcc`). Turing (sm_75, e.g. Quadro RTX 8000)
-is experimental.
+supports CUDA 13.2 (580 or newer). `openjet setup` downloads a prebuilt engine for the GPU; if none
+matches, it compiles one, which needs the CUDA toolkit (`nvcc`) and about 22 GiB of RAM. Turing (sm_75,
+e.g. Quadro RTX 8000) runs the previous engine, experimentally.
 
 **Model files it runs:** unsloth's Qwen3.8-27B `Q4_K_M` (the one setup downloads); `Q4_K_M` files
-from lmstudio-community, mradermacher, Abiray and KikoCis; unsloth `UD-Q4_K_XL` (mixed-quant build).
-Other quantisations run on llama.cpp. `llama_backend` in `config.yaml` picks: `auto` (default; the
+from lmstudio-community, mradermacher, Abiray and KikoCis; unsloth `UD-Q4_K_XL`; unsloth
+`UD-Q3_K_XL` on the previous engine's mixed-quant build. Other quantisations run on llama.cpp. `llama_backend` in `config.yaml` picks: `auto` (default; the
 engine when model and GPU match), `llama` (always llama.cpp), `megakernel` (fail instead of falling
 back). `megakernel` is the engine's name in code, file names and settings, not a separate product.
 
 **Speed** (RTX 3090, Qwen3.8-27B Q4_K_M, one conversation, not batched; llama.cpp with OpenJet's
 flags, including MTP speculative decoding, q8_0 KV cache and flash attention):
 
-| Workload | llama.cpp | OpenJet |
+| Workload | llama.cpp | OpenJet, previous engine |
 |---|---|---|
 | Reasoning mode, short prompts (thinking on, xhigh, temperature 1.0, top_p 0.95, top_k 20; 5 coding prompts x 4 seeds) | 60 tok/s | 92 tok/s (1.53x) |
 | Reasoning mode, 98K tokens in context (same settings, one 98K-token prompt x 4 seeds) | 37 tok/s | 79 tok/s (2.17x) |
@@ -69,22 +72,26 @@ flags, including MTP speculative decoding, q8_0 KV cache and flash attention):
 | Greedy decode, Python function prompt (earlier build) | 73 tok/s | 140 tok/s (1.93x) |
 | Prompt processing, 1.8K-7.8K token prompts (earlier build) | 1050-1140 tok/s | 1530-1600 tok/s |
 
-The first three rows are the current engine against llama.cpp b11982, measured with
-`megakernel/bench/run_compare.sh`.
+The first three rows are the previous engine against llama.cpp b11982, measured with
+`megakernel/bench/run_compare.sh`; the comparison has not been rerun with the current engine yet.
+Against the previous engine on the same RTX 3090 (thinking on, sampled, q8_0 KV, 8 seeds), the current
+engine decodes 1.36x as fast on short prompts (121 vs 90 tok/s) and 1.25x with 98K tokens in context
+(96 vs 75 tok/s), same-seed medians; its 98K-token prompt read took 72-83 s against 80-98 s.
 
 Speed depends on how predictable the text is (draft acceptance) and on other GPU load. Without
-speculation the two decode at about the same speed (40.4 vs 42.9 tok/s), near the memory-bandwidth
-limit; OpenJet's lead comes from verifying 4-5 drafted tokens per pass. The project's own
+speculation the previous engine and llama.cpp decode at about the same speed (40.4 vs 42.9 tok/s),
+near the memory-bandwidth limit; OpenJet's lead comes from verifying several drafted tokens per pass. The project's own
 measurements are on an RTX 3090, plus an experimental Turing run on a Quadro RTX 8000 (54 vs 33 tok/s
 reasoning decode). Results from other cards are collected in the
 [community table](../README.md#results-on-your-gpu).
 
-**Accuracy** against a llama.cpp reference on the same weights: top-token agreement 99.08%, KL
-divergence 0.0009 (q8_0 KV). For comparison, llama.cpp's own batched configuration scores 98.68% and
-0.0019 against the same reference. At 96K context: 99.60% and 0.0008.
+**Accuracy** against llama.cpp generating one token at a time on the same weights (q8_0 KV), over
+13,299 positions of code and prose: top-token agreement 98.74%, mean KL divergence 0.00162, against
+98.66% / 0.00161 for the previous engine and 98.25% / 0.00225 for llama.cpp's own batched mode. After a
+94K-token prompt: 99.70% / 0.00093 (previous engine 99.70% / 0.00092, llama.cpp batched 99.49% / 0.00111).
 [Full results and reproduction](../megakernel/README.md#results).
 
-**Limits:** Qwen3.8-27B only; text only; one request at a time and one cached conversation; top_k up to 32; no presence, frequency or repetition penalties.
+**Limits:** Qwen3.8-27B only; sm_80 or newer (Turing runs the previous engine); more than 4 drafts needs a GPU with 80 SMs or more; top_k up to 32; `repetition_penalty` ignored. Up to 4 requests at once with `--agents`, text only.
 
 ## Commands
 

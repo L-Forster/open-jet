@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 ## Speed
 
-| RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
+| RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet's previous engine |
 |---|---|---|
 | Thinking on, short prompts | 60 tok/s | **92 tok/s** (1.5x) |
 | Thinking on, 98K tokens in context | 37 tok/s | **79 tok/s** (2.2x) |
@@ -38,10 +38,16 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 - One conversation on one RTX 3090, not a batch.
 - llama.cpp b11982 runs with the same flags, including MTP speculative decoding.
-- Rows 1-3: current engine, thinking at xhigh, temperature 1.0, 5 prompts x 4 seeds and one 98K-token prompt x 4 seeds
-  ([`run_compare.sh`](https://github.com/l-forster/open-jet/blob/master/megakernel/bench/run_compare.sh)). Other rows: an earlier engine build.
+- Rows 1-3: thinking at xhigh, temperature 1.0, 5 prompts x 4 seeds and one 98K-token prompt x 4 seeds
+  ([`run_compare.sh`](https://github.com/l-forster/open-jet/blob/master/megakernel/bench/run_compare.sh)). Other rows: an earlier build of that engine.
 - Same output as llama.cpp on the same weights: KL divergence 0.0009, top-token agreement 99.08%
-  ([results](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#results)).
+  ([results](https://github.com/l-forster/open-jet/blob/master/megakernel/legacy/README.md#results)).
+
+OpenJet's engine is now [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel), the previous
+engine developed further by Benjamin Cutler. On the same RTX 3090, thinking on, sampled, it decodes **1.36x** as fast
+as the previous engine on short prompts and **1.25x** with 98K tokens in context (same-seed medians, 40 and 8 requests),
+with the same accuracy against llama.cpp ([results](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#results)). The llama.cpp comparison above has
+not been rerun with it yet.
 
 Context on a 24 GB card: about **120K tokens**, or about **234K** with `openjet setup --long-context`
 ([KV cache presets](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#kv-cache-presets-mk_kv)).
@@ -76,7 +82,7 @@ Or have Claude Code or Codex [install it for you](https://github.com/l-forster/o
 |---|---|---|
 | NVIDIA RTX 30, 40 or 50-series with 24 GB, Linux | Qwen3.8-27B on OpenJet's engine | [Engine for your GPU](https://github.com/l-forster/open-jet/blob/master/docs/installation.md#prebuilt-engines) |
 | No 24 GB NVIDIA card | Qwen3.8-27B on OpenJet's engine, on a rented cloud RTX 3090 (about $0.25/hour on Vast.ai) | [Deploy](https://www.openjet.dev/pricing#deploy) |
-| NVIDIA Turing with 24 GB or more, Linux | OpenJet's engine, experimental | [Turing](https://github.com/l-forster/open-jet/blob/master/megakernel/README.md#turing-rtx-8000) |
+| NVIDIA Turing with 24 GB or more, Linux | OpenJet's previous engine, experimental | [Turing](https://github.com/l-forster/open-jet/blob/master/megakernel/legacy/README.md#turing-rtx-8000) |
 | Windows | llama.cpp; OpenJet's engine on Windows is in progress | [Installation](https://github.com/l-forster/open-jet/blob/master/docs/installation.md) |
 | Any other GPU, or Apple silicon | The best model that fits, on llama.cpp | [Pick by memory](https://github.com/l-forster/open-jet/blob/master/docs/models.md#pick-by-memory) |
 | Jetson | llama.cpp | [Jetson](https://github.com/l-forster/open-jet/blob/master/docs/deployment/jetson.md) |
@@ -87,7 +93,7 @@ Or have Claude Code or Codex [install it for you](https://github.com/l-forster/o
 https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
 Up to 4 agents decode in the same pass over the weights: about 290 tok/s in total on an RTX 3090 at
-short context, 150-200 tok/s with real coding agents.
+short context, 150-200 tok/s with real coding agents (measured with the previous engine).
 
 ## [Results on your GPU](https://github.com/l-forster/open-jet/blob/master/benchmarks/community/README.md)
 

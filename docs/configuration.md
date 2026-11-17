@@ -175,23 +175,23 @@ memory_guard:
 llama_backend: auto   # auto | megakernel | llama
 ```
 
-With the `llama_cpp` runtime, `auto` (the default) serves Qwen3.8-27B Q4_K_M through the
-megakernel (a CUDA engine specialised for that model on experimental Turing sm_75 and
-RTX 30/40/50-series sm_86, sm_89 and sm_120 GPUs) when it is built (`make` in `megakernel/`), the GPU
-has at least 23,000 MiB of VRAM and `jinja2` is installed; otherwise, or if it fails to start, OpenJet runs
-`llama-server` as before. `megakernel` requires it (startup fails instead of falling back), `llama`
-never uses it. The megakernel samples with temperature, top_k (at most 32), top_p and min_p; it
-ignores presence and repetition penalties, so the non-thinking Qwen3.8 preset (presence penalty 1.5)
-runs without its penalty. Its KV cache is fp16, or q8_0 when the configured context would not fit
-in fp16 (about 80K tokens on a 24 GB card).
+With the `llama_cpp` runtime, `auto` (the default) serves Qwen3.8-27B Q4_K_M and UD-Q4_K_XL through
+OpenJet's engine (a CUDA engine specialised for that model) on RTX 30/40/50-series GPUs (sm_86, sm_89,
+sm_120) with at least 23,000 MiB of VRAM, when `openjet setup` has installed it and `jinja2` is
+installed; otherwise, or if it fails to start, OpenJet runs `llama-server` as before. `megakernel`
+requires it (startup fails instead of falling back), `llama` never uses it. The engine samples with
+temperature, top_k (at most 32), top_p, min_p and the presence and frequency penalties;
+`repetition_penalty` is ignored. OpenJet starts it with the q8_0 KV cache
+([what it passes](../megakernel/README.md#use-with-openjet)).
 
-Turing (`sm_75`, e.g. Quadro RTX 8000) is experimental and runs only the original Q4_K_M engine;
-UD-Q4_K_XL uses `llama-server` there. On multi-GPU systems, set `CUDA_VISIBLE_DEVICES` to the GPU's
-UUID for both setup and runtime. See [Turing (RTX 8000)](../megakernel/README.md#turing-rtx-8000).
+The previous engine ([`megakernel/legacy/`](../megakernel/legacy/README.md)) serves what the current one
+doesn't: Turing (`sm_75`, e.g. Quadro RTX 8000; experimental, Q4_K_M only, so UD-Q4_K_XL uses
+`llama-server` there) and UD-Q3_K_XL. On multi-GPU systems, set `CUDA_VISIBLE_DEVICES` to the GPU's
+UUID for both setup and runtime. See [Turing (RTX 8000)](../megakernel/legacy/README.md#turing-rtx-8000).
 
 `megakernel_long_context: true` (set by `openjet setup --long-context`) starts the megakernel with its compact KV cache
-(5-bit K and V, K Hadamard-rotated, the newest 2,048 positions at 8 bits), and keeps the prompt checkpoint in host
-memory: where the q8_0 cache's limit is 120,000 tokens (a 24 GB card), setup offers about 234,000. The interactive setup
+(5-bit K and V, K Hadamard-rotated, the newest 2,048 positions at 8 bits): where the q8_0 cache's limit is
+120,000 tokens (a 24 GB card), setup offers about 234,000. The interactive setup
 lists it as a context window option when the model and GPU support it. Without it the default cache and context limit
 stay as they are. See
 [KV cache presets](../megakernel/README.md#kv-cache-presets-mk_kv).

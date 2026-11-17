@@ -34,13 +34,15 @@ Every Qwen3.8-27B GGUF under ~15 GiB on Hugging Face is a dynamic mix of many we
 | ISTA-DASLab `GSQ-RCO-IQ3_S-mtp` | 11.29 GiB | IQ3_S 3.39, IQ4_XS 2.81, IQ3_XXS 1.93, Q4_K 0.81, IQ2_S 0.37, Q2_K 0.22, IQ2_XS 0.21, IQ2_XXS, IQ1_M | Q4_K / IQ2_S |
 | unsloth `UD-IQ3_XXS` | 10.18 GiB | IQ3_XXS 2.78, IQ3_S 2.42, IQ4_XS 1.34, IQ2_S 0.78, IQ2_XXS 0.44, IQ1_S 0.13, IQ1_M 0.05, ... | Q4_K / Q2_K |
 
-The mixed build (`qwen38_mixed.cu`) reads IQ4_XS natively and, on branch `iq3s-native`, IQ3_S, IQ3_XXS,
+The previous engine's mixed build (`megakernel/legacy/qwen38_mixed.cu`) reads IQ4_XS natively and, on branch `iq3s-native`, IQ3_S, IQ3_XXS,
 IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M, Q3_K and Q2_K (repacked at load into GEMV-friendly blocks: IQ3 and
 Q3_K at 3.5 bpw, IQ2, IQ1 and Q2_K at 3 bpw; `tools/iq_repack_check` verifies every layout bit-exact
 against ggml), a Q5_K / Q4_K / Q8_0 lm_head and a token_embd of any of those types. Every tensor of all
 five files above is then of a supported type. On UD-Q3_K_XL, KL divergence against llama.cpp token by token is
 0.00136 (decode) / 0.00139 (prefill), at llama.cpp's own batched noise floor (0.00145); setup offers it on 16 GB
-cards (per-model VRAM gate, ~48K context). Remaining:
+cards (per-model VRAM gate, ~48K context). OpenJet's current engine reads IQ4_XS, IQ3_S and Q3_K but not
+IQ3_XXS, the IQ2 and IQ1 types or Q2_K, so these files run on the previous engine; bringing them to the current
+one is open. Remaining:
 
 1. **Faster codebook lookups**: the i-quant kernels read their grids through L1 (`__ldg`); a
    shared-memory copy may be faster. Measure decode and prefill against IQ4_XS first.
@@ -49,7 +51,7 @@ cards (per-model VRAM gate, ~48K context). Remaining:
 
 Done when, for each file: the loader accepts it, decode and prefill speeds are reported, and
 top-token agreement and KL divergence against llama.cpp on the same file are reported with the
-commands under Correctness in the [engine README](megakernel/README.md).
+commands under [Checking a build](megakernel/docs/BUILDING.md#checking-a-build).
 
 ## 4. Fit the engine on 16 GB cards
 
@@ -76,7 +78,7 @@ MTP state, prefill scratch and the CUDA context.
 
 From [Limitations](megakernel/README.md#limitations) in the engine README:
 
-- presence and repetition penalties (OpenJet's non-thinking preset uses a presence penalty of 1.5)
 - top-k above 32
-- slot save / restore, so context compaction doesn't re-prefill the whole conversation
-- image input
+- slot save / restore, for the low-memory shell swap
+- image input through OpenJet: the engine reads images with `--mmproj`, but OpenJet doesn't start it with one
+- Turing (sm_75) and more than 4 drafts on GPUs with fewer than 80 SMs

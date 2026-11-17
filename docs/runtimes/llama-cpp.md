@@ -17,14 +17,14 @@ The `llama-server` binary can be added to `PATH` or left in `~/llama.cpp/build/b
 
 ## OpenJet's engine (RTX 30/40/50 series)
 
-For one specific setup, Qwen3.8-27B Q4_K_M on an RTX 30, 40 or 50-series GPU with 24 GB+ (sm_86, sm_89,
-sm_120), OpenJet ships a
-specialised CUDA engine in [`megakernel/`](../../megakernel/README.md) and serves the model through it
-instead of `llama-server`. Turing (sm_75) is supported experimentally for Q4_K_M only; see
-[Turing (RTX 8000)](../../megakernel/README.md#turing-rtx-8000). Measured on an RTX 3090 against
-`llama-server` with OpenJet's flags:
+For one specific setup, Qwen3.8-27B Q4_K_M or UD-Q4_K_XL on an RTX 30, 40 or 50-series GPU with 24 GB+
+(sm_86, sm_89, sm_120), OpenJet ships a specialised CUDA engine in [`megakernel/`](../../megakernel/README.md)
+and serves the model through it instead of `llama-server`. The previous engine, in
+[`megakernel/legacy/`](../../megakernel/legacy/README.md), serves Turing (sm_75, experimental, Q4_K_M only;
+see [Turing (RTX 8000)](../../megakernel/legacy/README.md#turing-rtx-8000)) and UD-Q3_K_XL. Measured with
+the previous engine on an RTX 3090 against `llama-server` with OpenJet's flags:
 
-| | llama.cpp | OpenJet |
+| | llama.cpp | OpenJet, previous engine |
 |---|---|---|
 | reasoning mode, OpenJet's thinking preset (decode) | 60 tok/s | 92 tok/s (1.5x) |
 | reasoning mode, 98K tokens in context (decode) | 37 tok/s | 79 tok/s (2.2x) |
@@ -33,27 +33,31 @@ instead of `llama-server`. Turing (sm_75) is supported experimentally for Q4_K_M
 | prompt processing, 2-8K tokens | 1050-1140 tok/s | 1530-1600 tok/s (1.3-1.5x) |
 | pasting a 12K-token file into the next turn | 10.5 s | 8.1 s |
 
+The current engine decodes 1.36x as fast as the previous one on short prompts and 1.25x with 98K tokens
+in context, thinking on, sampled, on the same RTX 3090 ([results](../../megakernel/README.md#results)); the
+table above hasn't been rerun with it yet.
+
 `openjet setup` installs it when it selects this model on a supported GPU. An installed wheel
 downloads the engine prebuilt for that GPU's architecture from the matching GitHub release, which
 needs only the NVIDIA driver. A source checkout, or a release without a matching archive, compiles
 the engine source for that architecture against the CUDA `llama.cpp` build setup makes (for its
-tokenizer). That needs the CUDA toolkit (`nvcc`) and takes about 2 minutes; without it, setup says
-so and OpenJet uses `llama-server`. On Windows the engine only comes prebuilt. In a source checkout
-you can also build by hand:
+tokenizer). That needs the CUDA toolkit (`nvcc`, CUDA 13.2), about 21 GiB of RAM and up to half an
+hour; on a machine with less than 24 GiB of RAM, or without `nvcc`, setup says so and OpenJet uses
+`llama-server`. On Windows the engine only comes prebuilt. In a source checkout you can also build
+by hand:
 
 ```bash
-cd megakernel && make
+make -C megakernel -j1 libqwen38mk.so
 ```
 
-Unsloth's Qwen3.8-27B UD-Q4_K_XL uses a separate mixed-quant library. Setup selects and builds
-only the required library by inspecting the downloaded GGUF's tensor roles and types. Existing
-Q4_K_M users keep the original engine and its smaller compilation. Both builds are cached
-independently. The mixed engine's compilation needs substantially more system RAM; see
-[build requirements](../../megakernel/README.md#build--run). The performance figures above are for Q4_K_M.
+The previous engine builds separately (`make -C megakernel/legacy libqwen38mk.so`, or
+`libqwen38mk_mixed.so` for UD-Q3_K_XL), in a few minutes and under 12 GiB of RAM. Setup picks the
+engine from the GPU and the downloaded GGUF's tensor types, builds only that one, and caches each
+build separately ([build requirements](../../megakernel/README.md#build--run)).
 
-With `llama_backend: auto` (the default) OpenJet then starts `megakernel/server/mk_server.py`
-whenever the configured model is Qwen3.8-27B Q4_K_M or UD-Q4_K_XL, its selected megakernel library is built, the GPU is sm_86, sm_89 or
-sm_120 with at least 23 GB and `jinja2` is installed; in every other case, or if the megakernel fails to start,
+With `llama_backend: auto` (the default) OpenJet then starts the engine's `server/mk_server.py`
+whenever the configured model is Qwen3.8-27B Q4_K_M, UD-Q4_K_XL or UD-Q3_K_XL, the engine it needs is
+installed, the GPU is one that engine supports and `jinja2` is installed; in every other case, or if the megakernel fails to start,
 it starts `llama-server` as usual. `llama_backend: llama` turns it off, `llama_backend: megakernel`
 makes it required. `OPENJET_MEGAKERNEL_DIR` points at a megakernel build elsewhere.
 
@@ -63,12 +67,12 @@ the model's own chat template, reasoning as `reasoning_content`, tool calls as s
 `tool_calls`, and reuse of the processed conversation between turns. Differences from
 `llama-server`:
 
-- sampling supports temperature, top_k (at most 32), top_p and min_p; presence and repetition
-  penalties are ignored (OpenJet's non-thinking Qwen3.8 preset uses a presence penalty of 1.5)
-- the KV cache is fp16, or q8_0 when the configured context does not fit in fp16 (above about 80K
-  tokens on a 24 GB card; ~1-2% slower)
+- sampling supports temperature, top_k (at most 32), top_p, min_p and the presence and frequency
+  penalties; `repetition_penalty` is ignored
+- OpenJet starts it with the q8_0 KV cache
 - no slot save / restore: the low-memory shell swap below falls back to re-prompting
-- editing an earlier part of a conversation (e.g. context compaction) re-processes it (~1500 tok/s)
+- editing an earlier part of a conversation (e.g. context compaction) resumes from the nearest saved
+  checkpoint before the edit and re-processes the rest
 
 ## What setup automates
 

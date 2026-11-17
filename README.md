@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 ## Speed
 
-| RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
+| RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet's previous engine |
 |---|---|---|
 | Thinking on, short prompts | 60 tok/s | **92 tok/s** (1.5x) |
 | Thinking on, 98K tokens in context | 37 tok/s | **79 tok/s** (2.2x) |
@@ -38,10 +38,16 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 - One conversation on one RTX 3090, not a batch.
 - llama.cpp b11982 runs with the same flags, including MTP speculative decoding.
-- Rows 1-3: current engine, thinking at xhigh, temperature 1.0, 5 prompts x 4 seeds and one 98K-token prompt x 4 seeds
-  ([`run_compare.sh`](megakernel/bench/run_compare.sh)). Other rows: an earlier engine build.
+- Rows 1-3: thinking at xhigh, temperature 1.0, 5 prompts x 4 seeds and one 98K-token prompt x 4 seeds
+  ([`run_compare.sh`](megakernel/bench/run_compare.sh)). Other rows: an earlier build of that engine.
 - Same output as llama.cpp on the same weights: KL divergence 0.0009, top-token agreement 99.08%
-  ([results](megakernel/README.md#results)).
+  ([results](megakernel/legacy/README.md#results)).
+
+OpenJet's engine is now [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel), the previous
+engine developed further by Benjamin Cutler. On the same RTX 3090, thinking on, sampled, it decodes **1.36x** as fast
+as the previous engine on short prompts and **1.25x** with 98K tokens in context (same-seed medians, 40 and 8 requests),
+with the same accuracy against llama.cpp ([results](megakernel/README.md#results)). The llama.cpp comparison above has
+not been rerun with it yet.
 
 Context on a 24 GB card: about **120K tokens**, or about **234K** with `openjet setup --long-context`
 ([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv)).
@@ -59,7 +65,7 @@ More: [docs/installation.md](docs/installation.md)
 
 ## What you need
 
-Linux and an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB (sm_86, sm_89, sm_120), driver 570 or newer.
+Linux and an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB (sm_86, sm_89, sm_120), driver 580 or newer.
 `openjet setup` downloads OpenJet's engine prebuilt for your GPU ([which one](docs/installation.md#prebuilt-engines)).
 
 No 24 GB card? [Deploy a cloud RTX 3090](https://www.openjet.dev/pricing#deploy) with OpenJet and Qwen3.8-27B ready to use, about
@@ -72,7 +78,7 @@ More: [docs/installation.md](docs/installation.md#what-you-need)
 https://github.com/user-attachments/assets/0df36ad0-b484-463e-a4f7-530e5a768cd9
 
 Up to 4 agents decode in the same pass over the weights: about 290 tok/s in total on an RTX 3090 at
-short context, 150-200 tok/s with real coding agents.
+short context, 150-200 tok/s with real coding agents (measured with the previous engine).
 
 More: [docs/features.md](docs/features.md#4-coding-agents-on-one-gpu)
 
@@ -112,7 +118,7 @@ Also: [tuned to the hardware](docs/features.md#tuned-to-the-hardware) · [Ollama
 ## Built on OpenJet
 
 - [geezuz-qwen3.8-27b-dual-gpu](https://github.com/ohgeebtw/geezuz-qwen3.8-27b-dual-gpu): OpenJet's engine split across 2 GPUs (tensor-parallel, 2x RTX 3090 over P2P)
-- [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel): a standalone server for OpenJet's engine with a CPU vision encoder
+- [qwen38-megakernel](https://github.com/cutlerbenjamin1-cmd/qwen38-megakernel): OpenJet's engine developed further as a standalone server, with a CPU vision encoder; OpenJet's engine now comes from it
 
 Built something on OpenJet? Open a pull request to add it here.
 

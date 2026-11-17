@@ -28,19 +28,21 @@ git clone https://github.com/l-forster/open-jet.git && cd open-jet
 git clone --depth 1 --branch b10246 https://github.com/ggml-org/llama.cpp.git llama.cpp
 cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j 2
-make -C megakernel libqwen38mk.so
+make -C megakernel -j1 libqwen38mk.so   # 约需 21 GiB 内存，最长半小时
 pip install jinja2 rich  # rich：mk_top.py 需要
 ```
+
+也可以把适合你 GPU 的 release 压缩包解压到 `megakernel/`（[预编译引擎](installation.md#预编译引擎)）。
 
 用 Qwen3.8-27B Q4_K_M 的 GGUF 启动服务器（如果是 `openjet setup` 下载的，它的路径就是 OpenJet `config.yaml` 中的
 `llama_model`）：
 
 ```bash
-python3 megakernel/server/mk_server.py -m /path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
+python3 megakernel/server/mk_server.py -m /path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4 -d 7 --kv q8
 ```
 
 然后把最多 4 个智能体（任何支持 OpenAI chat API 的工具）指向 `http://127.0.0.1:18080/v1`。它们在同一次权重遍历中一起解码，所以是共享
-GPU，而不是轮流使用：
+GPU，而不是轮流使用。以下用 OpenJet 旧引擎测得：
 
 | RTX 3090，Qwen3.8-27B Q4_K_M | 每个智能体 | 总计 |
 |---|---|---|
@@ -49,7 +51,11 @@ GPU，而不是轮流使用：
 | 4 个智能体生成，每个 10K 上下文 | ~40 tok/s | ~160 tok/s |
 | 4 个真实编程智能体（会暂停去运行工具和测试） | 40-75 tok/s | 150-200 tok/s |
 
-4 个智能体共享一个 132K token 的 KV 缓存（q8_0），所以当其他智能体的上下文较短时，一个智能体可以用掉其中大部分。它们共有的系统提示词和工具列表只处理一次。实时查看它们的状态（每个智能体的
+Benjamin Cutler 测得当前引擎在 4 个智能体、短编程提示词时总速度为 424 tok/s，每个智能体约 23K token 上下文时为 360 tok/s
+（RTX 3090，他的 release v2026.11.05，`--agents 4 -d 7 --kv q8`；[详情](../../megakernel/docs/BENCHMARKS.md#parallel-agents)）；
+OpenJet 尚未用新引擎重新测量上表。
+
+每个智能体在 KV 缓存中有自己的槽位，长度为 `-c` 个位置（默认为能装下的最大值）。实时查看它们的状态（每个智能体的
 tok/s、上下文和任务）：
 
 ```bash

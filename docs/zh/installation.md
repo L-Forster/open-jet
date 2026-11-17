@@ -9,14 +9,14 @@
 | Linux，NVIDIA RTX 30、40 或 50 系列，24 GB 或以上显存（sm_86、sm_89、sm_120，以及对应的 RTX 工作站显卡） | [OpenJet 引擎](../../megakernel/README.md)上的 Qwen3.8-27B |
 | 没有 24 GB 的 NVIDIA 显卡 | 在租用的云端 RTX 3090 上运行 OpenJet 引擎和 Qwen3.8-27B，在 Vast.ai 上约 $0.25/小时（[部署](https://www.openjet.dev/pricing#deploy)） |
 | Windows | llama.cpp。OpenJet 引擎在 Windows 上只提供预编译版本，目前仍在构建中 |
-| NVIDIA Turing，24 GB 或以上显存（sm_75，例如 48 GB 的 Quadro RTX 8000） | OpenJet 引擎，实验性支持（[Turing](../../megakernel/README.md#turing-rtx-8000)） |
+| NVIDIA Turing，24 GB 或以上显存（sm_75，例如 48 GB 的 Quadro RTX 8000） | OpenJet 旧引擎，实验性支持（[Turing](../../megakernel/legacy/README.md#turing-rtx-8000)） |
 | 其他 GPU、Apple 芯片，或只有 CPU | llama.cpp 上能装下的最好的模型（[按内存选择](../models.md#pick-by-memory)、[纯 CPU](../deployment/cpu-only.md)） |
 | Jetson | llama.cpp（[Jetson 设置](../deployment/jetson.md)） |
 
-使用 OpenJet 引擎还需要支持 CUDA 12.8 的 NVIDIA 驱动（570 或更新版本）。`openjet setup`
-会下载为你的 GPU 预编译好的引擎（[具体是哪一个](#预编译引擎)），所以不需要安装 CUDA 工具包。如果没有匹配的预编译引擎，setup
-会自行编译，这需要 `nvcc`（CUDA 12 以上，RTX 50 系列需要 12.8 以上）。如果引擎无法安装，setup 会说明原因，并改用 llama.cpp
-运行模型。
+使用 OpenJet 引擎还需要支持 CUDA 13.2 的 NVIDIA 驱动（580 或更新版本）；服务 Turing 的旧引擎需要 CUDA 12.8（570 或更新版本）。
+`openjet setup` 会下载为你的 GPU 预编译好的引擎（[具体是哪一个](#预编译引擎)），所以不需要安装 CUDA 工具包。如果没有匹配的预编译引擎，
+setup 会自行编译，这需要 `nvcc`（CUDA 13.2）和约 22 GiB 内存；内存少于 24 GiB 的机器上 setup 不会尝试编译。如果引擎无法安装，
+setup 会说明原因，并改用 llama.cpp 运行模型。
 
 在 24 GB 显卡上，使用默认的 q8_0 KV 缓存时上下文约为 120K token；使用 `openjet setup --long-context`
 时最多约 234K，此时缓存以 5 bit 存储，最近的 2K 个位置保持 q8_0
@@ -40,11 +40,11 @@ release。
 | RTX 5090、RTX PRO Blackwell | sm_120 | [openjet-engine-linux-x64-sm120.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm120.tar.gz) |
 | RTX 4090、RTX 6000 Ada、L40、L4 | sm_89 | [openjet-engine-linux-x64-sm89.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm89.tar.gz) |
 | RTX 3090、3090 Ti、RTX A5000、A6000 | sm_86 | [openjet-engine-linux-x64-sm86.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm86.tar.gz) |
-| Titan RTX、Quadro RTX 6000 和 8000（实验性） | sm_75 | [openjet-engine-linux-x64-sm75.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm75.tar.gz) |
+| Titan RTX、Quadro RTX 6000 和 8000（实验性，旧引擎） | sm_75 | [openjet-engine-legacy-linux-x64-sm75.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-legacy-linux-x64-sm75.tar.gz) |
 
-每个压缩包包含 Q4_K_M 的引擎（`libqwen38mk.so`）、UD-Q4_K_XL 的引擎（`libqwen38mk_mixed.so`，sm_75 中没有，所以 Turing
-用 llama.cpp 运行 UD-Q4_K_XL），以及一个只用于分词器的 CPU 版 `libllama`。CUDA 已静态链接，所以只需要 NVIDIA
-驱动。用 `nvidia-smi --query-gpu=name,compute_cap --format=csv` 查看 GPU 的架构（8.6 即 sm_86）。
+每个 `openjet-engine` 压缩包包含引擎（`libqwen38mk.so`，用于 Q4_K_M 和 UD-Q4_K_XL）以及一个只用于分词器的 CPU 版
+`libllama`。`openjet-engine-legacy` 压缩包包含旧引擎，setup 只在当前引擎不支持时安装它：Turing（仅 Q4_K_M）和
+UD-Q3_K_XL（`libqwen38mk_mixed.so`，sm_75 中没有）。CUDA 已静态链接，所以只需要 NVIDIA 驱动。用 `nvidia-smi --query-gpu=name,compute_cap --format=csv` 查看 GPU 的架构（8.6 即 sm_86）。
 
 Windows 压缩包（`openjet-engine-windows-x64-sm*.zip`）还没有发布；在那之前，Windows 上的 OpenJet 使用 llama.cpp
 运行模型。

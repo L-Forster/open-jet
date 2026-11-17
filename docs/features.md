@@ -29,19 +29,22 @@ git clone https://github.com/l-forster/open-jet.git && cd open-jet
 git clone --depth 1 --branch b10246 https://github.com/ggml-org/llama.cpp.git llama.cpp
 cmake -S llama.cpp -B llama.cpp/build -DGGML_CUDA=ON -DLLAMA_CURL=OFF
 cmake --build llama.cpp/build --config Release -j 2
-make -C megakernel libqwen38mk.so
+make -C megakernel -j1 libqwen38mk.so   # about 21 GiB of RAM, up to half an hour
 pip install jinja2 rich  # rich: for mk_top.py
 ```
+
+Or unpack the release archive for your GPU into `megakernel/` ([prebuilt engines](installation.md#prebuilt-engines)).
 
 Start the server with the Qwen3.8-27B Q4_K_M GGUF (if `openjet setup` downloaded it, its path is
 `llama_model` in your OpenJet `config.yaml`):
 
 ```bash
-python3 megakernel/server/mk_server.py -m /path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4
+python3 megakernel/server/mk_server.py -m /path/to/Qwen3.8-27B-Q4_K_M.gguf --agents 4 -d 7 --kv q8
 ```
 
 Then point up to 4 agents, anything that speaks the OpenAI chat API, at `http://127.0.0.1:18080/v1`.
-They decode in the same pass over the weights, so they share the GPU instead of taking turns:
+They decode in the same pass over the weights, so they share the GPU instead of taking turns.
+Measured with OpenJet's previous engine:
 
 | RTX 3090, Qwen3.8-27B Q4_K_M | Per agent | Total |
 |---|---|---|
@@ -50,9 +53,12 @@ They decode in the same pass over the weights, so they share the GPU instead of 
 | 4 agents generating, 10K context each | ~40 tok/s | ~160 tok/s |
 | 4 real coding agents (they pause to run tools and tests) | 40-75 tok/s | 150-200 tok/s |
 
-The 4 share one 132K-token KV cache (q8_0), so one agent can use most of it while the others are short.
-A system prompt and tool list they have in common is processed once. To watch them live (tok/s, context
-and task per agent):
+Benjamin Cutler measured the current engine at 424 tok/s in total for 4 agents on short coding prompts and
+360 tok/s with about 23K tokens of context each (RTX 3090, his release v2026.11.05, `--agents 4 -d 7 --kv q8`;
+[details](../megakernel/docs/BENCHMARKS.md#parallel-agents)); OpenJet hasn't rerun its own table above with it yet.
+
+Each agent gets its own slot of the KV cache, `-c` positions long (by default, the most that fit). To watch them
+live (tok/s, context and task per agent):
 
 ```bash
 python3 megakernel/tools/mk_top.py

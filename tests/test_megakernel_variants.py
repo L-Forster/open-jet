@@ -233,6 +233,7 @@ def test_setup_builds_the_engine_once(tmp_path, model):
          mock.patch.object(mb, '_megakernel_gpu_info', return_value=('0', '8.6')), \
          mock.patch.object(mb, '_nvcc_path', return_value='nvcc'), \
          mock.patch.object(mb, '_llama_cpp_ready', return_value=True), \
+         mock.patch.object(mb, 'install_prebuilt_megakernel', new_callable=mock.AsyncMock, return_value=False), \
          mock.patch.object(mb, 'read_memory_snapshot', return_value=mock.Mock(total_mb=65536.0)), \
          mock.patch.object(mb.sys, 'platform', 'linux'), \
          mock.patch.object(mb, '_run_exec', side_effect=run):
