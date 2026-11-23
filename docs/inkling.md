@@ -44,7 +44,7 @@ Useful environment variables:
 Measured on an RTX 3090 + Ryzen 7 5800X (DDR4, 15 GB RAM under WSL2), 256 greedy tokens from a short prompt after the page cache warmed. Smaller cards are simulated by capping `IK_VRAM_MIB`. The llama.cpp column is `19bc41d` on the same machine (`UD-Q4_K_XL`, 1,024- and 1,536-token outputs).
 
 | Setup | `UD-IQ4_XS` (OpenJet) | `UD-Q4_K_XL` (OpenJet) | `llama.cpp` (`UD-Q4_K_XL`, best placement) |
-|---|---:|---:|---:|
+|:---:|:---:|:---:|:---:|
 | Full VRAM (no MTP) | 82.0 tok/s | 81-91 tok/s | 41.6-48.9 tok/s |
 | Full VRAM + DSpark MTP (`mtp.safetensors`) | 75-140 tok/s* | - | - |
 | 12 GB card (`9000 MiB` expert cache) | 65.0-67.1 tok/s | 57.1-65.6 tok/s | 23.0-24.7 tok/s |

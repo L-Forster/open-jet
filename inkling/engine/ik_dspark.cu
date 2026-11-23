@@ -25,6 +25,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+inline int mk_open(const char * path, int flags) { return open(path, flags); }
 #endif
 
 namespace ik {
@@ -51,26 +52,17 @@ struct SafetensorsFile {
     size_t size = 0;
     size_t data_base = 0;
     std::unordered_map<std::string, STEntry> tensors;
-#ifdef _WIN32
-    mk_win_mmap_t wmap_{};
-#endif
 
     explicit SafetensorsFile(const std::string & path) {
-#ifdef _WIN32
-        if (mk_win_mmap(path.c_str(), &wmap_) != 0) throw std::runtime_error("cannot open " + path);
-        base = wmap_.base;
-        size = wmap_.size;
-#else
-        int fd = open(path.c_str(), O_RDONLY);
+        int fd = mk_open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path);
         struct stat st{};
         if (fstat(fd, &st) != 0 || st.st_size < 16) { close(fd); throw std::runtime_error("invalid safetensors " + path); }
         size = (size_t) st.st_size;
-        void * p = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        void * p = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
         close(fd);
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed: " + path);
         base = (uint8_t *) p;
-#endif
         uint64_t hlen = 0;
         memcpy(&hlen, base, 8);
         if (hlen == 0 || 8 + hlen > size) throw std::runtime_error("corrupt safetensors header: " + path);
@@ -79,12 +71,7 @@ struct SafetensorsFile {
     }
 
     ~SafetensorsFile() {
-        if (!base) return;
-#ifdef _WIN32
-        mk_win_munmap(&wmap_);
-#else
-        munmap(base, size);
-#endif
+        if (base) munmap(base, size);
     }
 
     const uint8_t * data(const std::string & name, const STEntry ** out_e = nullptr) const {

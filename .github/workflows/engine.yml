@@ -26,10 +26,14 @@ jobs:
           method: network
       - name: Add swap for ptxas
         run: |
-          sudo fallocate -l 24G /mnt/engine-swap
+          df -h /mnt /
+          avail_g=$(df -BG --output=avail /mnt | tail -n 1 | tr -dc '0-9')
+          swap_g=$(( avail_g >= 30 ? 28 : 24 ))
+          sudo fallocate -l "${swap_g}G" /mnt/engine-swap
           sudo chmod 600 /mnt/engine-swap
           sudo mkswap /mnt/engine-swap
           sudo swapon /mnt/engine-swap
+          sudo sysctl -w vm.swappiness=100
           free -g
       - name: Build llama.cpp's tokenizer libraries (CPU only)
         run: |
@@ -42,7 +46,9 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
           cmake --build /opt/llama.cpp/build --target llama -j4
       - name: Build the engine for sm_${{ matrix.arch }}
-        run: make -C megakernel -j1 NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
+        run: |
+          sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+          make -C megakernel -j1 NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
       - name: Verify and stage sm_${{ matrix.arch }} slice
         run: |
           mkdir -p check stage/sm${{ matrix.arch }} stage/llama parts
@@ -253,10 +259,8 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends git cmake make g++ ca-certificates python3 binutils
       - name: Build llama.cpp's tokenizer libraries (CPU only, inkling2_loop)
         run: |
-          git init /opt/llama.cpp
-          git -C /opt/llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
-          git -C /opt/llama.cpp fetch --depth 1 origin 19bc41d
-          git -C /opt/llama.cpp checkout FETCH_HEAD
+          ref=$(python3 -c "import re; print(re.search(r'INKLING_LLAMA_CPP_REF = .(\w+)', open('src/config.py').read()).group(1))")
+          git clone --depth 1 --branch "$ref" https://github.com/ggml-org/llama.cpp /opt/llama.cpp
           cmake -S /opt/llama.cpp -B /opt/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF \
             -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
@@ -330,16 +334,23 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1.13.0
       - name: Build llama.cpp's tokenizer libraries (CPU only, inkling2_loop)
         run: |
-          git init C:/llama.cpp
-          git -C C:/llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
-          git -C C:/llama.cpp fetch --depth 1 origin 19bc41d
-          git -C C:/llama.cpp checkout FETCH_HEAD
+          $ref = python -c "import re; print(re.search(r'INKLING_LLAMA_CPP_REF = .(\w+)', open('src/config.py').read()).group(1))"
+          git clone --depth 1 --branch $ref https://github.com/ggml-org/llama.cpp C:/llama.cpp
           cmake -S C:/llama.cpp -B C:/llama.cpp/build -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF `
             -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF `
             -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF
           cmake --build C:/llama.cpp/build --config Release --target llama -j 4
       - name: Build the Inkling engine for sm_${{ matrix.arch }}
-        run: ./inkling/engine/build.ps1 -Arch sm_${{ matrix.arch }} -Llama C:/llama.cpp -Cuda $env:CUDA_PATH
+        run: |
+          try {
+            ./inkling/engine/build.ps1 -Arch sm_${{ matrix.arch }} -Llama C:/llama.cpp -Cuda $env:CUDA_PATH 2>&1 |
+              Tee-Object -FilePath inkling-build.log | Out-Host
+          } catch {
+            Select-String -Path inkling-build.log -Pattern " error|fatal|catastrophic|out of memory|LNK[0-9]" -ErrorAction SilentlyContinue |
+              Select-Object -First 15 | ForEach-Object { Write-Host "::error::$($_.Line)" }
+            Write-Host "::error::$($_.Exception.Message)"
+            exit 1
+          }
       - name: Verify and stage sm_${{ matrix.arch }} Inkling slice
         run: |
           New-Item -ItemType Directory -Force check, "stage/sm${{ matrix.arch }}/inkling", stage/inkling-llama, stage/inkling-profiles | Out-Null

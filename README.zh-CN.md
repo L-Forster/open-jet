@@ -73,7 +73,7 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 ### Inkling 2 Mini（8–24 GB 显卡）
 
 | RTX 3090 + Ryzen 7 5800X，`UD-IQ4_XS`（256 贪心 token） | llama.cpp（`UD-Q4_K_XL`） | OpenJet |
-|---|---:|---:|
+|:---:|:---:|:---:|
 | 8 GB 显卡预算（`6000 MiB` 专家缓存） | 17.7–19.6 tok/s | **47.8–51.1 tok/s**（2.6 倍） |
 | 12 GB 显卡预算（`9000 MiB` 专家缓存） | 23.0–24.7 tok/s | **65.0–67.1 tok/s**（2.7 倍） |
 | 全显存（无 MTP） | 41.6–48.9 tok/s | **82.0 tok/s**（1.8 倍） |

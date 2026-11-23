@@ -73,7 +73,7 @@ Not sure what fits? [Choose a model for your computer](https://github.com/l-fors
 ### Inkling 2 Mini (8-24 GB GPU)
 
 | RTX 3090 + Ryzen 7 5800X, `UD-IQ4_XS` (256 greedy tok) | llama.cpp (`UD-Q4_K_XL`) | OpenJet |
-|---|---:|---:|
+|:---:|:---:|:---:|
 | 8 GB card budget (`6000 MiB` expert cache) | 17.7-19.6 tok/s | **47.8-51.1 tok/s** (2.6x) |
 | 12 GB card budget (`9000 MiB` expert cache) | 23.0-24.7 tok/s | **65.0-67.1 tok/s** (2.7x) |
 | Full VRAM (no MTP) | 41.6-48.9 tok/s | **82.0 tok/s** (1.8x) |
