@@ -153,6 +153,8 @@ def _run_tool(name: str, args: list[str]) -> subprocess.CompletedProcess | None:
 
 
 def _run_tool_via_login_shell(name: str, args: list[str]) -> subprocess.CompletedProcess | None:
+    if sys.platform == "win32":
+        return _run_tool(name, args)
     shell = os.environ.get("SHELL") or "/bin/bash"
     command = " ".join([shutil.which(name) or name, *args])
     try:

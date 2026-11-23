@@ -143,12 +143,29 @@ class PrebuiltMegakernelTests(unittest.TestCase):
         (self.root / "server").mkdir(parents=True)
         for name in ("Makefile", "draft_vocab_32k.bin", "server/mk_server.py"):
             (self.root / name).write_text("")
-        self.archive = base / "engine.tar.gz"
+        self.inkling_root = base / "site-packages" / "inkling"
+        (self.inkling_root / "engine").mkdir(parents=True)
+        (self.inkling_root / "engine" / "Makefile").write_text("")
+        self.archive = base / "openjet-engine-linux-x64.tar.gz"
         staged = base / "staged"
-        staged.mkdir()
-        for name in ("libqwen38mk.so", "libqwen38vision.so", "libllama.so.0.0.1"):
-            (staged / name).write_text(name)
-        os.symlink("libllama.so.0.0.1", staged / "libllama.so.0")
+        for rel, content in (
+            ("sm86/libqwen38mk.so", "qwen-sm86"),
+            ("sm86/legacy/libqwen38mk.so", "legacy-sm86"),
+            ("sm86/legacy/libqwen38mk_mixed.so", "mixed-sm86"),
+            ("sm86/inkling/libinkling.so", "inkling-sm86"),
+            ("sm89/libqwen38mk.so", "qwen-sm89"),
+            ("sm75/legacy/libqwen38mk.so", "legacy-sm75"),
+            ("llama/libllama.so.0.0.1", "llama"),
+            ("legacy-llama/libllama.so.0.0.1", "legacy-llama"),
+            ("inkling-llama/libllama.so.1.0.0", "inkling-llama"),
+            ("inkling-profiles/default.f32", "profile-bytes"),
+        ):
+            p = staged / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        os.symlink("libllama.so.0.0.1", staged / "llama" / "libllama.so.0")
+        os.symlink("libllama.so.0.0.1", staged / "legacy-llama" / "libllama.so.0")
+        os.symlink("libllama.so.1.0.0", staged / "inkling-llama" / "libllama.so.1")
         with tarfile.open(self.archive, "w:gz") as tf:
             for entry in staged.iterdir():
                 tf.add(entry, arcname=entry.name)
@@ -159,6 +176,7 @@ class PrebuiltMegakernelTests(unittest.TestCase):
             mock.patch.object(mb, "_openjet_version", return_value="0.6.0"),
             mock.patch.object(mb, "_megakernel_root", return_value=self.root),
             mock.patch("src.llama_server._megakernel_root", return_value=self.root),
+            mock.patch.object(mb, "_inkling_root", return_value=self.inkling_root),
             mock.patch.object(mb, "_megakernel_gpu_info", return_value=("0", "8.6")),
             mock.patch.object(llama_server, "_megakernel_gpu_info", return_value=("0", "8.6")),
             mock.patch.object(mb, "_nvcc_path", return_value=None),
@@ -184,10 +202,15 @@ class PrebuiltMegakernelTests(unittest.TestCase):
             _run({"llama_model": self.model}, log)
         run.assert_not_called()
         self.assertEqual(self.urls, ["https://github.com/L-Forster/open-jet/releases/download/v0.6.0/"
-                                     "openjet-engine-linux-x64-sm86.tar.gz"])
-        self.assertTrue((self.root / "libqwen38mk.so").is_file())
+                                     "openjet-engine-linux-x64.tar.gz"])
+        self.assertEqual((self.root / "libqwen38mk.so").read_text(), "qwen-sm86")
         self.assertEqual(os.readlink(self.root / "libllama.so.0"), "libllama.so.0.0.1")
         self.assertEqual(json.loads((self.root / ".openjet-build.json").read_text()), {"arch": "sm_86", "prebuilt": "0.6.0"})
+        # same bundle download also populates Inkling for this GPU
+        self.assertEqual((self.inkling_root / "engine" / "libinkling.so").read_text(), "inkling-sm86")
+        self.assertEqual(os.readlink(self.inkling_root / "engine" / "lib" / "libllama.so.1"), "libllama.so.1.0.0")
+        self.assertEqual((self.inkling_root / "engine" / "profiles" / "default.f32").read_text(), "profile-bytes")
+        self.assertTrue(mb._inkling_build_is_current(self.inkling_root / "engine", "sm_86"))
         self.assertIn("OpenJet engine installed", log.lines[-1])
         # current until the next release, whatever the source mtimes
         self.assertTrue(mb._build_is_current(self.root, "sm_86", self.model))
@@ -213,7 +236,7 @@ class PrebuiltMegakernelTests(unittest.TestCase):
         with mock.patch.object(mb.sys, "platform", "win32"), mock.patch.object(mb, "_run_exec") as run:
             _run({"llama_model": self.model}, log)
         run.assert_not_called()  # this fixture has no nvcc
-        self.assertTrue(self.urls[0].endswith("/openjet-engine-windows-x64-sm86.zip"))
+        self.assertTrue(self.urls[0].endswith("/openjet-engine-windows-x64.zip"))
         self.assertIn("No prebuilt engine for sm_86 in v0.6.0", log.lines[0])
         self.assertIn("CUDA toolkit not found", log.lines[-1])
 
@@ -232,8 +255,8 @@ class PrebuiltMegakernelTests(unittest.TestCase):
             _run({"llama_model": self.model}, log)
             self.assertTrue(mb._build_is_current(legacy, "sm_75", self.model))
         run.assert_not_called()
-        self.assertTrue(self.urls[0].endswith("/v0.6.0/openjet-engine-legacy-linux-x64-sm75.tar.gz"))
-        self.assertTrue((legacy / "libqwen38mk.so").is_file())
+        self.assertTrue(self.urls[0].endswith("/v0.6.0/openjet-engine-linux-x64.tar.gz"))
+        self.assertEqual((legacy / "libqwen38mk.so").read_text(), "legacy-sm75")
         self.assertFalse((self.root / "libqwen38mk.so").exists())
         self.assertEqual(json.loads((legacy / ".openjet-build.json").read_text()), {"arch": "sm_75", "prebuilt": "0.6.0"})
         self.assertIn("OpenJet engine installed", log.lines[-1])
@@ -314,6 +337,101 @@ class SourceListTests(unittest.TestCase):
             line = next(l for l in makefile.splitlines() if l.startswith(start))
             named |= set(line[len(start):].split())
         self.assertEqual(sorted(named - set(mb._SOURCES) - {"build/nvflags"}), [])
+
+    def test_every_inkling_dependency_invalidates_the_build(self) -> None:
+        makefile = (Path(mb.__file__).resolve().parents[1] / "inkling" / "engine" / "Makefile").read_text().replace("\\\n", " ")
+        line = next(l for l in makefile.splitlines() if l.startswith("libinkling.so:"))
+        named = set(line.split(":", 1)[1].split())
+        self.assertEqual(sorted(named - set(mb._INKLING_SOURCES)), [])
+
+
+class InklingBuildTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.model = str(base / "Inkling-2-Mini-UD-IQ4_XS-mainline.gguf")
+        key = b"general.architecture"
+        val = b"inkling2_loop"
+        with open(self.model, "wb") as f:
+            f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, 1))
+            f.write(struct.pack("<Q", len(key)) + key + struct.pack("<IQ", 8, len(val)) + val)
+        self.root = base / "site-packages" / "inkling"
+        self.engine = self.root / "engine"
+        self.engine.mkdir(parents=True)
+        (self.engine / "Makefile").write_text("")
+        self.llama = base / "llama.cpp"
+        (self.llama / "include").mkdir(parents=True)
+        (self.llama / "build" / "bin").mkdir(parents=True)
+        (self.llama / "include" / "llama.h").write_text("")
+        (self.llama / "build" / "bin" / "libllama.so").write_text("")
+        self.archive = base / "openjet-engine-linux-x64.tar.gz"
+        staged = base / "staged"
+        for rel, content in (
+            ("sm86/inkling/libinkling.so", "inkling-sm86"),
+            ("sm89/inkling/libinkling.so", "inkling-sm89"),
+            ("inkling-llama/libllama.so.1.0.0", "llama"),
+        ):
+            p = staged / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+        os.symlink("libllama.so.1.0.0", staged / "inkling-llama" / "libllama.so.1")
+        with tarfile.open(self.archive, "w:gz") as tf:
+            for entry in staged.iterdir():
+                tf.add(entry, arcname=entry.name)
+        self.urls: list[str] = []
+        self.patches = [
+            mock.patch.object(mb.sys, "platform", "linux"),
+            mock.patch.object(mb.platform, "machine", return_value="x86_64"),
+            mock.patch.object(mb, "_openjet_version", return_value="0.6.0"),
+            mock.patch.object(mb, "_megakernel_root", return_value=base / "site-packages" / "megakernel"),
+            mock.patch.object(mb, "_inkling_root", return_value=self.root),
+            mock.patch.object(mb, "_inkling_gpu_info", return_value=("0", "8.6", 12000.0)),
+            mock.patch.object(mb, "LLAMA_CPP_DIR", self.llama),
+            mock.patch.object(mb, "_download_to_path", side_effect=self._download),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self) -> None:
+        for patch in reversed(self.patches):
+            patch.stop()
+        self.tmp.cleanup()
+
+    async def _download(self, url, target, **_kwargs):
+        self.urls.append(url)
+        if self.archive is None:
+            raise RuntimeError("Client error '404 Not Found'")
+        target.write_bytes(self.archive.read_bytes())
+
+    def test_downloads_prebuilt_inkling_engine_without_nvcc(self) -> None:
+        log = _Log()
+        with mock.patch.object(mb, "_nvcc_path", return_value=None), mock.patch.object(mb, "_run_exec") as run:
+            _run({"llama_model": self.model}, log)
+        run.assert_not_called()
+        self.assertEqual(self.urls, ["https://github.com/L-Forster/open-jet/releases/download/v0.6.0/"
+                                     "openjet-engine-linux-x64.tar.gz"])
+        self.assertEqual((self.engine / "libinkling.so").read_text(), "inkling-sm86")
+        self.assertEqual(os.readlink(self.engine / "lib" / "libllama.so.1"), "libllama.so.1.0.0")
+        self.assertEqual(json.loads((self.engine / ".openjet-build.json").read_text()), {"arch": "sm_86", "prebuilt": "0.6.0"})
+        self.assertTrue(mb._inkling_build_is_current(self.engine, "sm_86"))
+        self.assertIn("Inkling engine installed", log.lines[-1])
+
+    def test_falls_back_to_compiling_when_prebuilt_missing(self) -> None:
+        self.archive = None
+        log = _Log()
+
+        async def fake_make(*args, **_kwargs):
+            (self.engine / "libinkling.so").write_text("so")
+            return 0, "", ""
+
+        with mock.patch.object(mb, "_nvcc_path", return_value="/usr/local/cuda/bin/nvcc"), \
+                mock.patch.object(mb, "_run_exec", side_effect=fake_make) as run:
+            _run({"llama_model": self.model}, log)
+        self.assertEqual(run.call_args.args[:4], ("make", "-B", "-C", str(self.engine)))
+        self.assertIn("ARCH=sm_86", run.call_args.args)
+        self.assertIn("libinkling.so", run.call_args.args)
+        self.assertEqual(json.loads((self.engine / ".openjet-build.json").read_text()), {"arch": "sm_86"})
+        self.assertIn("Inkling engine built", log.lines[-1])
 
 
 if __name__ == "__main__":

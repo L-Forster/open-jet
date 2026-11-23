@@ -49,6 +49,10 @@ def _detect_rocm() -> bool:
 def _detect_vulkan() -> bool:
     if shutil.which("vulkaninfo"):
         return True
+    if sys.platform == "win32":
+        system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+        if (Path(system_root) / "System32" / "vulkan-1.dll").is_file():
+            return True
     for candidate in ("/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d"):
         p = Path(candidate)
         if p.is_dir() and any(p.iterdir()):
@@ -220,36 +224,120 @@ def _parse_vulkaninfo_text_total_vram_mb(text: str) -> float:
     return total
 
 
+_WIN_IGPU_PATTERNS = (
+    "radeon(tm) graphics",
+    "radeon graphics",
+    "radeon 660m",
+    "radeon 680m",
+    "radeon 740m",
+    "radeon 760m",
+    "radeon 780m",
+    "radeon 860m",
+    "radeon 880m",
+    "radeon 890m",
+    "radeon(tm) 740m",
+    "radeon(tm) 760m",
+    "radeon(tm) 780m",
+    "radeon(tm) 860m",
+    "radeon(tm) 880m",
+    "radeon(tm) 890m",
+    "vega",
+    "iris",
+    "uhd graphics",
+    "hd graphics",
+    "intel(r) graphics",
+    "arc(tm) graphics",
+)
+
+
+def _is_windows_igpu_name(name: str) -> bool:
+    lowered = name.strip().lower()
+    return any(pat in lowered for pat in _WIN_IGPU_PATTERNS)
+
+
+def _read_windows_vulkan_vram_mb() -> float:
+    """Estimate usable Vulkan GPU memory on Windows (including WDDM 50% shared heap for iGPUs)."""
+    mem = read_memory_snapshot()
+    total_ram_mb = float(mem.total_mb) if mem else 0.0
+    ps_cmd = (
+        "Get-ItemProperty "
+        "'HKLM:\\SYSTEM\\ControlSet001\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}\\0*' "
+        "-ErrorAction SilentlyContinue "
+        "| Select-Object DriverDesc, @{N='Mem';E={$_.'HardwareInformation.qwMemorySize'}} "
+        "| ConvertTo-Json -Compress"
+    )
+    best_mb = 0.0
+    saw_igpu = False
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            payload = json.loads(proc.stdout)
+            rows = payload if isinstance(payload, list) else [payload]
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                name = str(row.get("DriverDesc") or "").strip()
+                if not name or "microsoft basic" in name.lower():
+                    continue
+                raw_mem = row.get("Mem")
+                mem_mb = 0.0
+                if isinstance(raw_mem, (int, float)) and raw_mem > 0:
+                    mem_mb = float(raw_mem) / (1024.0 * 1024.0)
+                if _is_windows_igpu_name(name) or (0 < mem_mb <= 2048.0 and total_ram_mb >= 8192.0):
+                    saw_igpu = True
+                if mem_mb > best_mb:
+                    best_mb = mem_mb
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
+        pass
+
+    if saw_igpu and total_ram_mb > 0:
+        # Windows WDDM grants Vulkan iGPUs up to 50% of system RAM as shared GPU memory.
+        return max(best_mb, total_ram_mb * 0.5)
+    if best_mb > 0:
+        return best_mb
+    if total_ram_mb > 0:
+        return total_ram_mb * 0.5
+    return 0.0
+
+
 def _read_vulkan_vram_mb() -> float:
-    """Total device-local VRAM via vulkaninfo JSON or text output."""
+    """Total device-local VRAM via vulkaninfo JSON or text output (or Windows WDDM registry)."""
     tool = shutil.which("vulkaninfo")
-    if not tool:
-        return 0.0
-    shell = os.environ.get("SHELL") or "/bin/bash"
-    for args in (["--json"], ["--summary"], []):
-        try:
-            proc = subprocess.run(
-                [shell, "-lc", " ".join([tool, *args])],
-                capture_output=True,
-                text=True,
-                timeout=8,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
-        if "--json" in args:
+    if tool:
+        shell = os.environ.get("SHELL") or "/bin/bash"
+        for args in (["--json"], ["--summary"], []):
             try:
-                payload = json.loads(output)
-            except json.JSONDecodeError:
-                payload = None
-            if payload is not None:
-                total = _collect_vulkan_device_local_heap_mb(payload)
-                if total > 0:
-                    return total
-        total = _parse_vulkaninfo_text_total_vram_mb(output)
-        if total > 0:
-            return total
+                cmd = [tool, *args] if sys.platform == "win32" else [shell, "-lc", " ".join([tool, *args])]
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            output = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
+            if "--json" in args:
+                try:
+                    payload = json.loads(output)
+                except json.JSONDecodeError:
+                    payload = None
+                if payload is not None:
+                    total = _collect_vulkan_device_local_heap_mb(payload)
+                    if total > 0:
+                        return total
+            total = _parse_vulkaninfo_text_total_vram_mb(output)
+            if total > 0:
+                return total
+    if sys.platform == "win32":
+        return _read_windows_vulkan_vram_mb()
     return 0.0
 
 

@@ -130,5 +130,36 @@
     "decode_context_tokens": 8192,
     "source_urls": ["https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF"],
     "aliases": ["qwen3.6 35b", "qwen3.6 35b mtp", "qwen3.6-35b-a3b-ud-q4_k_m.gguf", "qwen3.6:35b-a3b"]
+  },
+  {
+    "key": "inkling2_mini_ud_iq4_xs",
+    "label": "Inkling 2 Mini UD-IQ4_XS",
+    "filename": "Inkling-2-Mini-UD-IQ4_XS-mainline.gguf",
+    "parameter_count_billion": 3.2,
+    "model_size_mb": 5120.0,
+    "kv_bytes_per_token": 17408.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://huggingface.co/unsloth/Inkling-2-Mini-GGUF"],
+    "aliases": [
+      "inkling 2 mini",
+      "inkling 2 mini ud-iq4_xs",
+      "inkling-2-mini-ud-iq4_xs-mainline.gguf",
+      "inkling-2-mini-ud-iq4_xs.gguf"
+    ]
+  },
+  {
+    "key": "inkling2_mini_ud_iq3_xxs",
+    "label": "Inkling 2 Mini UD-IQ3_XXS",
+    "filename": "Inkling-2-Mini-UD-IQ3_XXS-mainline.gguf",
+    "parameter_count_billion": 3.2,
+    "model_size_mb": 2900.0,
+    "kv_bytes_per_token": 17408.0,
+    "decode_context_tokens": 8192,
+    "source_urls": ["https://huggingface.co/unsloth/Inkling-2-Mini-GGUF"],
+    "aliases": [
+      "inkling 2 mini ud-iq3_xxs",
+      "inkling-2-mini-ud-iq3_xxs-mainline.gguf",
+      "inkling-2-mini-ud-iq3_xxs.gguf"
+    ]
   }
 ]

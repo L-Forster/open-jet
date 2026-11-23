@@ -515,14 +515,18 @@ def _direct_catalog_payload(row: Mapping[str, object]) -> dict[str, object]:
         "active_model_size_mb",
         "max_context_tokens",
         "llama_mtp",
+        "llama_cpp_ref",
         "setup_update_model",
     ):
         if row.get(key) is not None:
             payload[key] = row[key]
     if "unified_memory_only" in row:
         payload["unified_memory_only"] = bool(row.get("unified_memory_only"))
-    if bool(row.get("unified_memory_only")) and row.get("active_model_size_mb") is not None:
-        payload["llama_cpu_moe"] = bool(row.get("llama_cpu_moe", True))
+    if "llama_cpu_moe" in row:
+        payload["llama_cpu_moe"] = bool(row.get("llama_cpu_moe"))
+    elif bool(row.get("unified_memory_only")) and row.get("active_model_size_mb") is not None:
+        payload["llama_cpu_moe"] = True
+    if "llama_n_cpu_moe" in row or (bool(row.get("unified_memory_only")) and row.get("active_model_size_mb") is not None):
         payload["llama_n_cpu_moe"] = int(row.get("llama_n_cpu_moe", 0) or 0)
     return payload
 
@@ -627,6 +631,7 @@ def build_recommended_payload(
             "unified_memory_only",
             "llama_cpu_moe",
             "llama_n_cpu_moe",
+            "llama_cpp_ref",
             "llama_mtp",
             "setup_update_model",
         ):

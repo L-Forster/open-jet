@@ -279,11 +279,46 @@ def _select_direct_model(
         vram_or_ram_budget_mb = (vram_mb if has_gpu and vram_mb > 0 else total_ram_mb) * 0.9
         combined_budget_mb = (total_ram_mb + (vram_mb if has_gpu and not hardware_info.has_metal else 0.0)) * 0.9
 
-    dense_rows = [row for row in model_catalog if not _is_moe_catalog_row(row)]
-    moe_rows = [row for row in model_catalog if _is_moe_catalog_row(row)]
+    inkling_rows = [row for row in model_catalog if bool(row.get("inkling_engine"))]
+    inkling_vk_rows = [row for row in model_catalog if bool(row.get("inkling_vulkan"))]
+    regular_rows = [
+        row for row in model_catalog
+        if not bool(row.get("inkling_engine")) and not bool(row.get("inkling_vulkan"))
+    ]
+    dense_rows = [row for row in regular_rows if not _is_moe_catalog_row(row)]
+    moe_rows = [row for row in regular_rows if _is_moe_catalog_row(row)]
 
     def largest(rows: list[dict[str, object]]) -> dict[str, object] | None:
         return max(rows, key=lambda row: (bool(row.get("llama_cpu_moe")), _catalog_float(row, "model_size_mb"), _catalog_float(row, "max_ram_gb"))) if rows else None
+
+    # 6-12 GB discrete NVIDIA GPUs: OpenJet's Inkling engine runs Inkling 2 Mini with a VRAM expert cache + CPU
+    # offload. 6 GB cards (and 8 GB laptops with <=16 GB RAM) pick UD-IQ3_XXS (11.66 GB, 94.7% top-1) so CPU-side
+    # experts fit in RAM without SSD paging; 8 GB + 32 GB RAM and 10-12 GB cards keep UD-IQ4_XS (15.0 GiB, 97.7%).
+    if (
+        (inkling_rows or inkling_vk_rows)
+        and hardware_info.has_cuda
+        and not unified_memory
+        and 5500.0 <= vram_mb < 16000.0
+        and hardware_info.total_ram_gb >= 12.0
+    ):
+        tight_nvidia = vram_mb < 7500.0 or (vram_mb < 10000.0 and hardware_info.total_ram_gb <= 16.5)
+        if tight_nvidia and inkling_vk_rows:
+            return inkling_vk_rows[0]
+        if inkling_rows:
+            return inkling_rows[0]
+        return inkling_vk_rows[0]
+
+    # 16 GB+ AMD/Intel Vulkan laptops & 6-10 GB non-CUDA Vulkan GPUs: Inkling 2 Mini UD-IQ3_XXS (11.66 GB, 94.7%
+    # top-1, ~2.8 GB active/tok) with --cpu-moe keeps dense layers + KV inside the 8 GB Vulkan heap (~2x faster than 9B)
+    if (
+        inkling_vk_rows
+        and (hardware_info.has_vulkan or hardware_info.has_rocm)
+        and not hardware_info.has_cuda
+        and not unified_memory
+        and 5500.0 <= vram_mb < 10500.0
+        and hardware_info.total_ram_gb >= 15.0
+    ):
+        return inkling_vk_rows[0]
 
     if hardware_info.has_metal:
         metal_moe = largest([
@@ -338,7 +373,8 @@ def recommend_direct_model(
     unified_memory = hardware_info.has_metal or running_on_jetson()
     if not unified_memory:
         model_catalog = tuple(
-            row for row in model_catalog if not _is_moe_catalog_row(row)
+            row for row in model_catalog
+            if not _is_moe_catalog_row(row) or bool(row.get("inkling_vulkan"))
         )
     selected = _select_direct_model(model_catalog, hardware_info, unified_memory=unified_memory)
     filename = str(selected["filename"])
@@ -351,6 +387,7 @@ def recommend_direct_model(
         "url": str(selected["url"]),
         "target_path": str(MODELS_DIR / filename),
         "model_size_mb": model_size_mb,
+        "resident_model_size_mb": _catalog_float(selected, "resident_model_size_mb"),
         "active_model_size_mb": _active_model_size_mb(selected) if _is_moe_catalog_row(selected) else 0.0,
         "kv_bytes_per_token": kv_bytes_per_token,
         "max_context_tokens": int(selected.get("max_context_tokens") or 0),
@@ -1001,21 +1038,25 @@ def _installed_llama_server_tag() -> str | None:
         return None
 
 
-async def _fetch_latest_release_tag_and_assets() -> tuple[str, list[dict[str, Any]]]:
+async def _fetch_latest_release_tag_and_assets(target_ref: str | None = None) -> tuple[str, list[dict[str, Any]]]:
+    url = LLAMA_CPP_RELEASES_API
+    ref = _normalized_llama_cpp_ref(target_ref)
+    if ref and re.fullmatch(r"b\d+", ref):
+        url = f"https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{ref}"
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
         headers = {"Accept": "application/vnd.github+json"}
         token = os.environ.get("GITHUB_TOKEN", "").strip()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        response = await client.get(LLAMA_CPP_RELEASES_API, headers=headers)
+        response = await client.get(url, headers=headers)
         response.raise_for_status()
         payload = response.json()
     tag = str(payload.get("tag_name") or "").strip()
     if not tag:
-        raise RuntimeError("llama.cpp latest release is missing tag_name.")
+        raise RuntimeError("llama.cpp release is missing tag_name.")
     assets = payload.get("assets") or []
     if not isinstance(assets, list):
-        raise RuntimeError("llama.cpp latest release returned malformed assets.")
+        raise RuntimeError("llama.cpp release returned malformed assets.")
     return tag, assets
 
 
@@ -1113,6 +1154,7 @@ def _install_from_archive(archive_path: Path) -> Path:
 async def _install_prebuilt_llama_server(
     hardware_info: HardwareInfo,
     *,
+    target_ref: str | None = None,
     log: Any,
     set_status: Callable[[str], None],
 ) -> tuple[Path, str, str | None] | None:
@@ -1120,7 +1162,7 @@ async def _install_prebuilt_llama_server(
     if not candidates:
         return None
     try:
-        tag, assets = await _fetch_latest_release_tag_and_assets()
+        tag, assets = await _fetch_latest_release_tag_and_assets(target_ref=target_ref)
     except Exception as exc:
         log.write(f"  [dim]Could not reach llama.cpp releases API ({exc}).[/]")
         return None
@@ -1379,6 +1421,7 @@ async def _ensure_llama_server(
     if not skip_prebuilt:
         prebuilt = await _install_prebuilt_llama_server(
             hardware_info,
+            target_ref=required_ref,
             log=log,
             set_status=set_status,
         )

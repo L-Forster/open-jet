@@ -54,6 +54,20 @@ QWEN38_27B_URL = f"{QWEN38_27B_REPO}/resolve/566347e99d832d31f6245a577198d10d5bd
 # unsloth's UD-Q3_K_XL (12.24 GiB): the 16 GB cards' Qwen3.8, served by the engine's mixed build
 QWEN38_27B_Q3_FILENAME = "Qwen3.8-27B-UD-Q3_K_XL.gguf"
 QWEN38_27B_Q3_URL = f"{QWEN38_27B_REPO}/resolve/566347e99d832d31f6245a577198d10d5bdd389e/{QWEN38_27B_Q3_FILENAME}?download=true"
+# Inkling 2 Mini mainline UD-IQ4_XS (15.0 GiB): served by OpenJet's Inkling engine on 6-12 GB NVIDIA cards
+INKLING_2_MINI_REPO = "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF"
+INKLING_2_MINI_FILENAME = "Inkling-2-Mini-UD-IQ4_XS-mainline.gguf"
+INKLING_2_MINI_URL = (
+    f"{INKLING_2_MINI_REPO}/resolve/main/Mainline_Support/"
+    "Inkling-2-Mini-UD-IQ4_XS.gguf_file?download=true"
+)
+# Inkling 2 Mini mainline UD-IQ3_XXS (11.66 GB, 94.7% top-1): Vulkan + --cpu-moe for 16 GB AMD/Intel Vulkan laptops
+INKLING_2_MINI_IQ3_FILENAME = "Inkling-2-Mini-UD-IQ3_XXS-mainline.gguf"
+INKLING_2_MINI_IQ3_URL = (
+    f"{INKLING_2_MINI_REPO}/resolve/main/Mainline_Support/"
+    "Inkling-2-Mini-UD-IQ3_XXS.gguf_file?download=true"
+)
+INKLING_LLAMA_CPP_REF = "b12651"
 MANAGED_MODELS_DIR = openjet_install_root() / "models"
 
 
@@ -147,6 +161,31 @@ DEFAULT_DIRECT_MODEL_CATALOG: tuple[dict[str, object], ...] = (
         "url": "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q4_K_M.gguf?download=true",
         "model_size_mb": 5816,
         "kv_bytes_per_token": 17408,
+    },
+    {
+        "max_ram_gb": 12.0,
+        "label": "Inkling 2 Mini UD-IQ4_XS",
+        "filename": INKLING_2_MINI_FILENAME,
+        "url": INKLING_2_MINI_URL,
+        "inkling_engine": True,
+        "model_size_mb": 15005,
+        "resident_model_size_mb": 2300,
+        "kv_bytes_per_token": 17408,
+        "max_context_tokens": 131072,
+    },
+    {
+        "max_ram_gb": 16.0,
+        "label": "Inkling 2 Mini UD-IQ3_XXS",
+        "filename": INKLING_2_MINI_IQ3_FILENAME,
+        "url": INKLING_2_MINI_IQ3_URL,
+        "inkling_vulkan": True,
+        "llama_cpu_moe": True,
+        "llama_n_cpu_moe": 0,
+        "llama_cpp_ref": INKLING_LLAMA_CPP_REF,
+        "model_size_mb": 11123,
+        "resident_model_size_mb": 2300,
+        "kv_bytes_per_token": 17408,
+        "max_context_tokens": 131072,
     },
     {
         "max_ram_gb": 12.0,

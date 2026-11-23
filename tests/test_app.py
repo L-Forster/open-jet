@@ -1571,7 +1571,20 @@ class ProvisioningTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        self.assertEqual(recommended["label"], "Qwen3.6 27B UD-IQ2_XXS MTP")
+        self.assertEqual(recommended["label"], "Inkling 2 Mini UD-IQ4_XS")
+
+    def test_recommend_direct_model_uses_inkling_on_8gb_cuda_gpu(self) -> None:
+        recommended = recommend_direct_model(
+            HardwareInfo(
+                label="RTX 4060 8GB",
+                total_ram_gb=16.0,
+                has_cuda=True,
+                vram_mb=8192.0,
+            )
+        )
+
+        self.assertEqual(recommended["label"], "Inkling 2 Mini UD-IQ3_XXS")
+        self.assertEqual(recommended["filename"], "Inkling-2-Mini-UD-IQ3_XXS-mainline.gguf")
 
     def test_recommend_direct_model_prioritizes_large_dense_before_moe(self) -> None:
         recommended = recommend_direct_model(

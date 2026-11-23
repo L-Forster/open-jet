@@ -18,7 +18,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.config import DEFAULT_DIRECT_MODEL_CATALOG, QWEN38_27B_REPO, QWEN38_27B_URL  # noqa: E402
+from src.config import (  # noqa: E402
+    DEFAULT_DIRECT_MODEL_CATALOG,
+    INKLING_2_MINI_IQ3_URL,
+    INKLING_2_MINI_URL,
+    QWEN38_27B_REPO,
+    QWEN38_27B_URL,
+)
 from src.embed_catalog import (  # noqa: E402
     EMBED_MODEL_CATALOG,
     EMBED_USE_CASES,
@@ -112,29 +118,28 @@ files with links, for when you want to choose or download one yourself. Already 
 
 ## OpenJet's engine
 
-On an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB ([requirements](installation.md#what-you-need)),
-these Qwen3.8-27B files run on OpenJet's engine. `openjet setup` shows the engine in brackets next
-to each model.
+On NVIDIA RTX 30, 40 and 50-series GPUs ([requirements](installation.md#what-you-need)), these files run on OpenJet's engines. `openjet setup` shows the engine in brackets next to each model.
 
-| File | In setup | Notes |
-|---|---|---|
-| unsloth {_file_link(QWEN38_27B_URL)} | `(OpenJet engine, 2x faster)` | The file the speed figures are measured on, and the one setup downloads. unsloth removed it from the repo's main branch; this link is the last revision that has it. |
-| unsloth [Qwen3.8-27B-UD-Q4_K_XL.gguf]({QWEN38_27B_REPO}/blob/main/Qwen3.8-27B-UD-Q4_K_XL.gguf) | `(OpenJet engine, 2x faster)` | Same engine as Q4_K_M. Not on Turing GPUs. |
-| `Q4_K_M` from [lmstudio-community](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF), [mradermacher](https://huggingface.co/mradermacher/Qwen3.8-27B-GGUF), [Abiray](https://huggingface.co/Abiray/Qwen3.8-27B-Q4_K_M-GGUF) or [KikoCis](https://huggingface.co/KikoCis/Qwen3.8-27B-GGUF) | `(OpenJet engine, semi compatible)` | Same kernels; the loader re-encodes the tensors stored differently ([details](../megakernel/README.md#the-gguf)). Not benchmarked. |
-| Any other quant | `(llama.cpp)` | |
+| File | GPU VRAM | In setup | Notes |
+|---|---|---|---|
+| unsloth {_file_link(QWEN38_27B_URL)} | 24 GB+ | `(OpenJet engine, 2x faster)` | Measured default for 24 GB cards. unsloth removed it from `main`; this link points to the last revision that has it. |
+| unsloth [Qwen3.8-27B-UD-Q4_K_XL.gguf]({QWEN38_27B_REPO}/blob/main/Qwen3.8-27B-UD-Q4_K_XL.gguf) | 24 GB+ | `(OpenJet engine, 2x faster)` | Same engine as `Q4_K_M`. Not on Turing GPUs. |
+| `Q4_K_M` from [lmstudio-community](https://huggingface.co/lmstudio-community/Qwen3.8-27B-GGUF), [mradermacher](https://huggingface.co/mradermacher/Qwen3.8-27B-GGUF), [Abiray](https://huggingface.co/Abiray/Qwen3.8-27B-Q4_K_M-GGUF) or [KikoCis](https://huggingface.co/KikoCis/Qwen3.8-27B-GGUF) | 24 GB+ | `(OpenJet engine, semi compatible)` | Same kernels; loader re-encodes differently packed tensors ([details](../megakernel/README.md#the-gguf)). Not benchmarked. |
+| unsloth {_file_link(INKLING_2_MINI_URL)} | 8-24 GB | `(OpenJet Inkling engine)` | Default for 10-12 GB NVIDIA and 8 GB NVIDIA + 32 GB RAM. Rename `.gguf_file` to `.gguf` if downloading manually ([Inkling guide](inkling.md)). |
+| unsloth {_file_link(INKLING_2_MINI_IQ3_URL)} | 6-8 GB | `(OpenJet Inkling engine)` | Default for 6 GB NVIDIA, 8 GB NVIDIA + 16 GB RAM, and 16 GB AMD/Intel Vulkan laptops (`llama.cpp` Vulkan + `--cpu-moe`). |
+| Any other quant | Any | `(llama.cpp)` | |
 
-Setup recognises the file by its name, so keep `Qwen3.8-27B` and `Q4_K_M` or `UD-Q4_K_XL` in it.
-While OpenJet's engine is serving, `pgrep -af mk_server.py` prints a line. `llama_backend` in
-`config.yaml` chooses: `auto` (the default) uses the engine whenever the model and GPU match,
-`llama` always uses llama.cpp, and `megakernel` fails instead of falling back
-([runtime docs](runtimes/llama-cpp.md#openjets-engine-rtx-304050-series)).
+Setup matches local files by name, so keep `Qwen3.8-27B` / `Inkling-2-Mini` and the quant name intact. `llama_backend` in `config.yaml` controls runtime choice: `auto` (default) picks OpenJet's engine when the model and GPU match, `llama` forces llama.cpp, and `megakernel` fails instead of falling back ([runtime docs](runtimes/llama-cpp.md#openjets-engine-rtx-304050-series)).
 
 ## Pick by memory
 
-`openjet setup` measures VRAM and RAM and picks the strongest coding model that fits, so
-an aggressive quant of a large model beats a small model here. Everything in these tables
-runs on llama.cpp, except the Qwen3.8 27B file on a GPU that OpenJet's engine supports.
-The memory column is the target setup sizes that row for.
+`openjet setup` reads your VRAM and RAM and picks the strongest coding model that fits:
+
+- **24 GB+ NVIDIA:** `Qwen3.8 27B Q4_K_M MTP` on OpenJet's engine.
+- **10-12 GB NVIDIA (or 8 GB NVIDIA + 32 GB RAM):** `Inkling 2 Mini UD-IQ4_XS` on OpenJet's Inkling engine.
+- **6 GB NVIDIA (or 8 GB NVIDIA + 16 GB RAM):** `Inkling 2 Mini UD-IQ3_XXS` on OpenJet's Inkling engine.
+- **16 GB AMD / Intel Vulkan laptop (6-10 GB Vulkan heap):** `Inkling 2 Mini UD-IQ3_XXS` on `llama.cpp` (`b12651`) Vulkan + `--cpu-moe`.
+- **12 GB discrete Vulkan / Apple silicon / CPU-only:** largest fitting row below on `llama.cpp`.
 
 **GPU, CPU only, or unified memory:**
 
@@ -148,10 +153,7 @@ Any GGUF that llama.cpp loads also works.
 
 ## Embedded in your application
 
-`openjet project` provisions a model for an application that embeds the SDK. The target
-device is declared rather than detected — the machine you build on is not the machine
-you ship to — and the budget is the slice your application concedes to the model, not
-the whole device.
+`openjet project` provisions a model for an application that embeds the SDK. You declare the target device instead of detecting the build machine, and set the memory budget your app can spare for the model.
 
 ```bash
 openjet project --use-case dialogue --target handheld --budget 4
@@ -161,13 +163,9 @@ openjet project --use-case dialogue --target handheld --budget 4
 
 {use_case_table()}
 
-The latency target is enforced during selection: a generous budget will not buy a model
-that misses the first-token deadline for that use case.
+Latency targets are enforced during selection: a larger budget will not pick a model that misses the first-token target for that use case.
 
-Each use case also carries a quant floor. Damage from aggressive quantization shows up
-far faster on a small model than on a 27B, and schema adherence degrades before prose
-does — so `extract` and `classify` will not take a quant that `chat` and `summarize`
-tolerate. A larger model at a quant below the floor loses to a smaller one above it.
+Each use case also has a quant floor. Aggressive quantization breaks structured output and classification sooner than open chat, so `extract` and `classify` reject quants that `chat` and `summarize` allow.
 
 ### Target devices
 
@@ -177,54 +175,37 @@ tolerate. A larger model at a quant below the floor loses to a smaller one above
 
 {embed_table()}
 
-Throughput and first-token figures are planning estimates scaled off active parameter
-count, not measured numbers. Run `openjet benchmark` on real target hardware before
-committing to a latency budget.
+Throughput and first-token numbers are estimates scaled from active parameters, not hardware measurements. Run `openjet benchmark` on your target device before locking in a budget.
 
 ### How a model is picked
 
-The catalog is ordered weakest to strongest, and selection walks it from the strongest
-end, taking the first row that clears every constraint at once:
+The catalog is ordered weakest to strongest, and selection checks from strongest to weakest until a row clears all four constraints:
 
-1. the row supports the use case
-2. its quant is at or above that use case's floor
-3. weights plus KV cache at your context window fit inside the budget
-4. its estimated first token lands inside the use case's latency target
+1. supports the use case
+2. meets the use case's quant floor
+3. weights plus KV cache fit inside the budget
+4. estimated first-token latency fits the target
 
-If nothing clears all four, provisioning fails and prints why each candidate was
-rejected. It never silently downgrades — a model that misses the latency target for a
-game NPC is not a smaller win, it is a broken feature. Raise the budget, shorten the
-context, or pick a use case with a looser deadline.
+If nothing passes, provisioning fails and prints why each row was rejected instead of silently downgrading.
 
 ## Sizing the context window
 
-The KV cache is charged against your budget alongside the weights, and it grows linearly
-with the context window. A model that fits at 4k may not fit at 32k. `openjet project`
-prompts for the context window and accounts for it during selection.
+The KV cache shares your memory budget with the weights and grows linearly with context length. A model that fits at 4k may not fit at 32k. `openjet project` prompts for context length and accounts for it up front.
 
-Two consequences worth planning around:
-
-- `summarize` and RAG workloads spend most of their budget on cache rather than weights,
-  so a long context often means a smaller model, not a bigger budget.
-- The budget is what your application concedes, not what the device has. On a 16GB
-  handheld with a 4GB budget, the other 12GB is your game, not headroom.
+- `summarize` and RAG workloads spend most of their budget on KV cache, so longer context often means a smaller model.
+- The budget is what your app concedes, not total device RAM. On a 16 GB handheld with a 4 GB budget, the other 12 GB belongs to your app.
 
 ## Optional cloud: OpenRouter
 
-Local GGUF catalogs above are the default. The Pi TUI can also use hosted OpenRouter
-models via `/login` (or `/connect openrouter`) and `/cloud`. Curated picker entries —
-including free Ox Alpha (`openrouter/stealth/ox-alpha`) — are defined in
-`src/openrouter_catalog.py` and documented under [Configuration](configuration.md#openrouter-and-other-api-keys).
-OpenRouter can run alone (`/mode openrouter`) or as the Slipstream orchestrator; see
-[Slipstream](usage/slipstream.md).
+Local GGUFs are the default. The TUI can also use OpenRouter models via `/login` (or `/connect openrouter`) and `/cloud`. Curated entries (including free Ox Alpha, `openrouter/stealth/ox-alpha`) live in `src/openrouter_catalog.py`; see [Configuration](configuration.md#openrouter-and-other-api-keys). OpenRouter works standalone (`/mode openrouter`) or as the Slipstream orchestrator ([Slipstream](usage/slipstream.md)).
 
 ## Related
 
-- [SDK quickstart](sdk/quickstart.md) — provision, embed, and ship an on-device model
-- [CLI usage](usage/cli.md#start-commands) — every `openjet project` flag
-- [Project configuration](configuration.md#project-configuration-openjetconfigyaml) — the `.openjet/` overlay
-- [Slipstream](usage/slipstream.md) — Codex or OpenRouter + local
-- [Benchmarking](benchmarking.md) — replace these estimates with measurements
+- [SDK quickstart](sdk/quickstart.md): provision, embed, and ship an on-device model
+- [CLI usage](usage/cli.md#start-commands): every `openjet project` flag
+- [Project configuration](configuration.md#project-configuration-openjetconfigyaml): the `.openjet/` overlay
+- [Slipstream](usage/slipstream.md): Codex or OpenRouter + local
+- [Benchmarking](benchmarking.md): replace estimates with measurements
 """
 
 

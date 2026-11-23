@@ -167,5 +167,4 @@ Qwen3.8-27B，速度是 llama.cpp 的 2 倍。它还支持 Anthropic Messages AP
 **能用云端模型吗？** 只有你主动选择时才会。在 OpenJet 的智能体中，`/mode` 可以在 Local、Codex、OpenRouter 和 Slipstream
 之间切换；默认是 Local。
 
-**引擎能用于其他 GPU 或模型吗？** 它支持在 24 GB 或以上显存的 RTX 30、40、50 系列 GPU（sm_86、sm_89、sm_120）上运行
-Qwen3.8-27B 的 Q4_K_M 和 UD-Q4_K_XL。它是在 RTX 3090 上调优的。其他情况都用 llama.cpp 运行。
+**引擎能用于其他 GPU 或模型吗？** OpenJet 引擎支持在 24 GB+ 显存的 RTX 30、40、50 系列 GPU 上运行 Qwen3.8-27B（`Q4_K_M` 和 `UD-Q4_K_XL`），以及在 6–24 GB 显存的 RTX 30、40、50 系列 GPU（`sm_86`、`sm_89`、`sm_120`）上运行 Inkling 2 Mini（`UD-IQ4_XS`、`UD-IQ3_XXS`、`UD-Q4_K_XL`）。其他情况都用 `llama.cpp` 运行。

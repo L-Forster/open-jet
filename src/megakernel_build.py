@@ -26,6 +26,8 @@ from rich.markup import escape
 from .llama_server import (
     _MEGAKERNEL_LEGACY_DIR,
     _MEGAKERNEL_TURING_CAP,
+    _inkling_gpu_info,
+    _inkling_root,
     _megakernel_dir,
     _megakernel_gpu_info,
     _megakernel_min_vram_mib,
@@ -33,6 +35,7 @@ from .llama_server import (
     _megakernel_model_supported,
     _megakernel_root,
     _megakernel_variant,
+    inkling_model,
 )
 from .provisioning import LLAMA_CPP_DIR, _download_to_path, _extract_archive, _native_tool_path, _run_exec
 from .runtime_limits import read_memory_snapshot
@@ -50,6 +53,11 @@ _LEGACY_SOURCES = ("Makefile", "qwen38_mk.cu", "qwen38_mk.h", "kv_paged.cuh", "k
                    "prefill_attn.cuh", "prefill_gemm.cuh", "cuda_compat.cuh", "gguf.h", "capi.cpp", "bmm.cuh")
 # the mixed build's i-quant codebooks and load-time block layouts
 _MIXED_ONLY_SOURCES = ("iq_tables.cuh", "iq_repack.h")
+# OpenJet's Inkling 2 Mini engine (inkling/engine): compiles in ~6 GiB RAM
+_INKLING_SOURCES = ("Makefile", "build.ps1", "ik_engine.cu", "ik_kernels.cu", "ik_prefill.cu", "ik_prefill_tc.cu",
+                    "ik_dspark.cu", "expert_kernels.cu", "gguf_kernels.cu", "cpu_experts.cpp", "capi.cpp",
+                    "compat_win32.cpp", "compat_win32.h", "ik_kernels.cuh", "ik_prefill.cuh", "ik_dspark.cuh",
+                    "gguf.h", "iq_tables.h")
 # ptxas peaks at about 21 GiB compiling the megakernel (megakernel/Makefile); a machine with less RAM than this would
 # run out of memory, so it gets the prebuilt engine or stays on llama-server
 _BUILD_MIN_RAM_MIB = 24 * 1024
@@ -201,17 +209,15 @@ def _openjet_version() -> str | None:
         return None
 
 
-def prebuilt_asset_name(arch: str, *, legacy: bool = False) -> str | None:
-    """Release asset holding the engine (or the previous one, *legacy*) for *arch* (sm_86) on this OS, or None when
-    none is published."""
+def prebuilt_asset_name(arch: str = "", *, legacy: bool = False, inkling: bool = False) -> str | None:
+    """Release asset holding every prebuilt engine for this OS (one archive per OS; per-arch slices inside),
+    or None when none is published."""
     if platform.machine().lower() not in {"x86_64", "amd64"}:
         return None
-    sm = arch.replace("_", "")
-    stem = "openjet-engine-legacy" if legacy else "openjet-engine"
     if sys.platform.startswith("linux"):
-        return f"{stem}-linux-x64-{sm}.tar.gz"
+        return "openjet-engine-linux-x64.tar.gz"
     if sys.platform == "win32":
-        return f"{stem}-windows-x64-{sm}.zip"
+        return "openjet-engine-windows-x64.zip"
     return None
 
 
@@ -220,9 +226,171 @@ def _is_source_checkout(root: Path) -> bool:
     return (_megakernel_root().parent / ".git").exists()
 
 
+def _copy_entries(src_dir: Path, dst_dir: Path, *, files_only: bool = False) -> None:
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for entry in src_dir.iterdir():
+        if files_only and entry.is_dir() and not entry.is_symlink():
+            continue
+        dest = dst_dir / entry.name
+        if dest.is_symlink() or dest.exists():
+            dest.unlink()
+        shutil.copy2(entry, dest, follow_symlinks=False)
+
+
+def _inkling_build_is_current(engine_dir: Path, arch: str) -> bool:
+    """Whether the Inkling library in *engine_dir* is built for *arch* from this source or release."""
+    lib = engine_dir / ("inkling.dll" if sys.platform == "win32" else "libinkling.so")
+    if not lib.is_file():
+        return False
+    try:
+        tag = json.loads((engine_dir / _BUILD_TAG).read_text())
+    except (OSError, ValueError):
+        return False
+    if tag.get("arch") != arch:
+        return False
+    if "prebuilt" in tag:
+        return tag["prebuilt"] == _openjet_version()
+    built = lib.stat().st_mtime
+    return all(not (engine_dir / name).is_file() or (engine_dir / name).stat().st_mtime <= built
+               for name in _INKLING_SOURCES)
+
+
+def _install_bundle_slices(unpacked: Path, arch: str, version: str, *, qwen_root: Path | None = None,
+                           legacy_root: Path | None = None, inkling_engine_dir: Path | None = None) -> set[str]:
+    """Install every engine slice matching *arch* from *unpacked* into its writable target directory.
+    Returns the subset of {"qwen", "legacy", "inkling"} that landed."""
+    sm = arch.replace("_", "")
+    arch_dir = unpacked / sm
+    if not arch_dir.is_dir():
+        return set()
+    tag = json.dumps({"arch": arch, "prebuilt": version}) + "\n"
+    installed: set[str] = set()
+
+    if qwen_root is not None and qwen_root.is_dir() and os.access(qwen_root, os.W_OK):
+        if (arch_dir / "libqwen38mk.so").is_file() or (arch_dir / "qwen38mk.dll").is_file():
+            _copy_entries(arch_dir, qwen_root, files_only=True)
+            if (unpacked / "llama").is_dir():
+                _copy_entries(unpacked / "llama", qwen_root, files_only=True)
+            (qwen_root / _BUILD_TAG).write_text(tag)
+            installed.add("qwen")
+
+    leg_src = arch_dir / "legacy"
+    if legacy_root is not None and leg_src.is_dir() and legacy_root.is_dir() and os.access(legacy_root, os.W_OK):
+        _copy_entries(leg_src, legacy_root, files_only=True)
+        if (unpacked / "legacy-llama").is_dir():
+            _copy_entries(unpacked / "legacy-llama", legacy_root, files_only=True)
+        for stem, tag_name in (("qwen38mk", _BUILD_TAG), ("qwen38mk_mixed", _MIXED_BUILD_TAG)):
+            if (legacy_root / f"lib{stem}.so").is_file() or (legacy_root / f"{stem}.dll").is_file():
+                (legacy_root / tag_name).write_text(tag)
+        if (legacy_root / _BUILD_TAG).is_file() or (legacy_root / _MIXED_BUILD_TAG).is_file():
+            installed.add("legacy")
+
+    ik_src = arch_dir / "inkling"
+    if (inkling_engine_dir is not None and ik_src.is_dir()
+            and inkling_engine_dir.is_dir() and os.access(inkling_engine_dir, os.W_OK)):
+        _copy_entries(ik_src, inkling_engine_dir, files_only=True)
+        if (unpacked / "inkling-llama").is_dir():
+            ik_llama_dst = inkling_engine_dir if sys.platform == "win32" else inkling_engine_dir / "lib"
+            _copy_entries(unpacked / "inkling-llama", ik_llama_dst, files_only=True)
+        if (unpacked / "inkling-profiles").is_dir():
+            _copy_entries(unpacked / "inkling-profiles", inkling_engine_dir / "profiles", files_only=True)
+        if (inkling_engine_dir / "libinkling.so").is_file() or (inkling_engine_dir / "inkling.dll").is_file():
+            (inkling_engine_dir / _BUILD_TAG).write_text(tag)
+            installed.add("inkling")
+
+    return installed
+
+
+async def install_prebuilt_inkling(engine_dir: Path, arch: str, *, log: Any,
+                                   set_status: Callable[[str], None]) -> bool:
+    """Download this release's OS engine bundle and extract the *arch* Inkling slice (plus Qwen if present)."""
+    version, asset = _openjet_version(), prebuilt_asset_name(arch, inkling=True)
+    if version is None or asset is None:
+        return False
+    url = _RELEASE_ASSET_URL.format(version=version, asset=asset)
+    with tempfile.TemporaryDirectory() as tmp:
+        archive = Path(tmp) / asset
+        try:
+            await _download_to_path(url, archive, label=f"OpenJet's prebuilt engines ({arch})", log=log, set_status=set_status)
+            unpacked = Path(tmp) / "engine"
+            _extract_archive(archive, unpacked)
+        except Exception as exc:  # network, HTTP 404 for a release without engines, a bad archive
+            log.write(f"  [dim]No prebuilt Inkling engine for {arch} in v{version} "
+                      f"({escape((str(exc) or type(exc).__name__).splitlines()[0])}).[/]")
+            return False
+        mk_root = _megakernel_root()
+        installed = _install_bundle_slices(
+            unpacked, arch, version,
+            qwen_root=mk_root,
+            legacy_root=mk_root / _MEGAKERNEL_LEGACY_DIR,
+            inkling_engine_dir=engine_dir,
+        )
+    return "inkling" in installed
+
+
+async def _ensure_inkling(
+    setup_result: dict[str, Any],
+    *,
+    log: Any,
+    set_status: Callable[[str], None],
+    clear_status: Callable[[], None],
+) -> dict[str, Any]:
+    """Install or compile OpenJet's Inkling 2 Mini engine on Linux or Windows when this setup can use it."""
+    if not (sys.platform.startswith("linux") or sys.platform == "win32"):
+        return setup_result
+    gpu = _inkling_gpu_info()
+    if gpu is None:
+        return setup_result
+    root = _inkling_root()
+    engine_dir = root / "engine"
+    if not (engine_dir / "Makefile").is_file():
+        return setup_result
+    arch = _arch_for_cap(gpu[1])
+    if _inkling_build_is_current(engine_dir, arch):
+        return setup_result
+
+    skip = "[yellow]Skipping OpenJet's Inkling engine ({}); using llama-server.[/]"
+    if not (root.parent / ".git").exists() and os.access(engine_dir, os.W_OK):
+        installed = await install_prebuilt_inkling(engine_dir, arch, log=log, set_status=set_status)
+        clear_status()
+        if installed and _inkling_build_is_current(engine_dir, arch):
+            log.write("[bold bright_white]OpenJet Inkling engine installed: OpenJet will serve Inkling 2 Mini with it.[/]")
+            return setup_result
+    nvcc = _nvcc_path()
+    if nvcc is None:
+        log.write(skip.format("CUDA toolkit not found: install it for nvcc, then rerun `openjet setup`"))
+        return setup_result
+    if not _llama_cpp_ready(LLAMA_CPP_DIR):
+        log.write(skip.format(f"no llama.cpp source build in {escape(str(LLAMA_CPP_DIR))}"))
+        return setup_result
+    if not os.access(engine_dir, os.W_OK):
+        log.write(skip.format(f"{escape(str(engine_dir))} is not writable"))
+        return setup_result
+    set_status(f"building OpenJet's Inkling engine for {arch} (about 1 minute)")
+    log.write(f"[bold bright_white]Building OpenJet's Inkling engine for {arch}...[/]")
+    lib_name = "inkling.dll" if sys.platform == "win32" else "libinkling.so"
+    if sys.platform == "win32":
+        cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(engine_dir / "build.ps1"),
+               "-Arch", arch, "-Llama", str(LLAMA_CPP_DIR), "-Cuda", str(Path(nvcc).parent.parent)]
+    else:
+        cmd = ["make", "-B", "-C", str(engine_dir), "-j1",
+               f"NVCC={nvcc}", f"ARCH={arch}", f"LLAMA={LLAMA_CPP_DIR}", lib_name]
+    rc, out, err = await _run_exec(*cmd)
+    clear_status()
+    if rc != 0 or not (engine_dir / lib_name).is_file():
+        tail = "\n".join((err or out).strip().splitlines()[-15:])
+        log.write(skip.format("build failed"))
+        if tail:
+            log.write(f"[dim]{escape(tail)}[/]")
+        return setup_result
+    (engine_dir / _BUILD_TAG).write_text(json.dumps({"arch": arch}) + "\n")
+    log.write("[bold bright_white]OpenJet Inkling engine built: OpenJet will serve Inkling 2 Mini with it.[/]")
+    return setup_result
+
+
 async def install_prebuilt_megakernel(root: Path, arch: str, *, log: Any, set_status: Callable[[str], None],
                                       legacy: bool = False) -> bool:
-    """Download this release's engine for *arch* into *root*; False when there is none or it fails."""
+    """Download this release's OS engine bundle and extract the *arch* slice(s) for this GPU."""
     version, asset = _openjet_version(), prebuilt_asset_name(arch, legacy=legacy)
     if version is None or asset is None:
         return False
@@ -230,22 +398,21 @@ async def install_prebuilt_megakernel(root: Path, arch: str, *, log: Any, set_st
     with tempfile.TemporaryDirectory() as tmp:
         archive = Path(tmp) / asset
         try:
-            await _download_to_path(url, archive, label=f"the OpenJet engine for {arch}", log=log, set_status=set_status)
+            await _download_to_path(url, archive, label=f"OpenJet's prebuilt engines ({arch})", log=log, set_status=set_status)
             unpacked = Path(tmp) / "engine"
             _extract_archive(archive, unpacked)
         except Exception as exc:  # network, HTTP 404 for a release without engines, a bad archive
             log.write(f"  [dim]No prebuilt engine for {arch} in v{version} ({escape((str(exc) or type(exc).__name__).splitlines()[0])}).[/]")
             return False
-        for entry in unpacked.iterdir():
-            dest = root / entry.name
-            if dest.is_symlink() or dest.exists():
-                dest.unlink()
-            shutil.copy2(entry, dest, follow_symlinks=False)
-    tag = json.dumps({"arch": arch, "prebuilt": version}) + "\n"
-    for stem, tag_name in (("qwen38mk", _BUILD_TAG), ("qwen38mk_mixed", _MIXED_BUILD_TAG)):
-        if (root / f"lib{stem}.so").is_file() or (root / f"{stem}.dll").is_file():
-            (root / tag_name).write_text(tag)
-    return True
+        qwen_root = root.parent if legacy else root
+        legacy_root = root if legacy else root / _MEGAKERNEL_LEGACY_DIR
+        installed = _install_bundle_slices(
+            unpacked, arch, version,
+            qwen_root=qwen_root,
+            legacy_root=legacy_root,
+            inkling_engine_dir=_inkling_root() / "engine",
+        )
+    return ("legacy" if legacy else "qwen") in installed
 
 
 def megakernel_build_commands(root: Path, *, nvcc: str, arch: str, llama_dir: Path, model: str = "") -> list[list[str]]:
@@ -288,9 +455,11 @@ async def ensure_megakernel(
         return setup_result
     if str(setup_result.get("llama_backend") or "auto").strip().lower() == "llama":
         return setup_result
-    if not _megakernel_model_supported(str(setup_result.get("llama_model") or "")):
-        return setup_result
     model = str(setup_result.get("llama_model") or "")
+    if inkling_model(model):
+        return await _ensure_inkling(setup_result, log=log, set_status=set_status, clear_status=clear_status)
+    if not _megakernel_model_supported(model):
+        return setup_result
     if not Path(model).is_file():
         log.write("[yellow]Skipping OpenJet's Qwen3.8-27B engine: download the model first.[/]")
         return setup_result

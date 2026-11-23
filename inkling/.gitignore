@@ -1,0 +1,22 @@
+# build outputs (inkling/engine/Makefile, build.ps1)
+engine/*.o
+engine/*.so
+engine/*.so.*
+engine/lib/
+engine/build_win/
+engine/*.dll
+engine/*.lib
+engine/*.exp
+engine/*.pdb
+# prebuilt engine archives and openjet setup (src/megakernel_build.py)
+engine/libllama.so
+engine/libggml*.so
+engine/.openjet-build.json
+# large reference logit dumps, logs and binary traces
+engine/tests/results/
+reference/results/
+routing/results/
+*.log
+# python
+__pycache__/
+.pytest_cache/

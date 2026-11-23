@@ -64,10 +64,10 @@ class SDKRecommendationTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(low_vram_gpu.model.label, "Qwen3.5 9B")
+        self.assertEqual(low_vram_gpu.model.label, "Inkling 2 Mini UD-IQ4_XS")
         self.assertEqual(high_vram_gpu.model.label, "Qwen3.8 27B Q4_K_M MTP")
         self.assertEqual(cpu_only.model.label, "Qwen3.8 27B Q4_K_M MTP")
-        self.assertEqual(low_vram_gpu.llama.context_window_tokens, 128807)
+        self.assertEqual(low_vram_gpu.llama.context_window_tokens, 131072)
         self.assertEqual(high_vram_gpu.llama.context_window_tokens, 208173)
         self.assertEqual(cpu_only.llama.context_window_tokens, 8192)
         self.assertEqual(low_vram_gpu.llama.device, "cuda")
@@ -155,7 +155,7 @@ class SDKRecommendationTests(unittest.TestCase):
             hardware_key="rtx_4060_8gb",
         )
 
-        self.assertEqual(len(estimates), 10)
+        self.assertEqual(len(estimates), 12)
         self.assertEqual(estimates[0].hardware_key, "rtx_4060_8gb")
         self.assertTrue(any(item.fits_in_memory for item in estimates))
         self.assertTrue(any(not item.fits_in_memory for item in estimates))

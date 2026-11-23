@@ -1,0 +1,119 @@
+diff --git a/tools/server/route-trace.h b/tools/server/route-trace.h
+new file mode 100644
+index 0000000..c97d4bf
+--- /dev/null
++++ b/tools/server/route-trace.h
+@@ -0,0 +1,95 @@
++// Routing trace for MoE models: when LLAMA_ROUTE_TRACE=<path> is set, every computed
++// "ffn_moe_topk-<slot>" (selected expert ids) and "ffn_moe_weights-<slot>" (their gate weights)
++// tensor is appended to <path>.
++//
++// Record layout (little-endian int32 header, then data):
++//   int32 slot, int32 kind (0 = expert ids as int32, 1 = gate weights as float32),
++//   int32 n_used, int32 n_tokens, then n_tokens * n_used values (token-major).
++#pragma once
++
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++struct route_trace_state {
++    FILE * f = nullptr;
++    std::vector<uint8_t> raw;
++    std::vector<uint8_t> out;
++};
++
++static bool route_trace_name(const char * name, int & kind, int & slot) {
++    static const char * prefixes[2] = {"ffn_moe_topk-", "ffn_moe_weights-"};
++    for (int k = 0; k < 2; ++k) {
++        const size_t n = strlen(prefixes[k]);
++        if (strncmp(name, prefixes[k], n) == 0) {
++            char * end = nullptr;
++            const long v = strtol(name + n, &end, 10);
++            if (end != name + n && *end == '\0') {
++                kind = k;
++                slot = (int) v;
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++static bool route_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto * st = (route_trace_state *) user_data;
++    int kind = 0;
++    int slot = 0;
++    if (!route_trace_name(t->name, kind, slot)) {
++        return false;
++    }
++    if (ask) {
++        return true;
++    }
++
++    // ids: [n_used, n_tokens]; weights: [1, n_used, n_tokens]
++    const bool w3 = t->ne[0] == 1 && ggml_n_dims(t) >= 2 && t->ne[1] > 1;
++    const int64_t n_used = w3 ? t->ne[1] : t->ne[0];
++    const int64_t n_tok  = w3 ? t->ne[2] : t->ne[1];
++    const size_t  es     = w3 ? t->nb[1] : t->nb[0];
++    const size_t  rs     = w3 ? t->nb[2] : t->nb[1];
++    const size_t  vsize  = ggml_type_size(t->type);
++
++    const size_t span = rs * (size_t) (n_tok - 1) + es * (size_t) (n_used - 1) + vsize;
++    st->raw.resize(span);
++    ggml_backend_tensor_get(t, st->raw.data(), 0, span);
++
++    st->out.resize((size_t) (n_used * n_tok) * 4);
++    for (int64_t i = 0; i < n_tok; ++i) {
++        for (int64_t j = 0; j < n_used; ++j) {
++            memcpy(st->out.data() + (size_t) (i * n_used + j) * 4, st->raw.data() + rs * i + es * j, 4);
++        }
++    }
++
++    const int32_t hdr[4] = {slot, kind, (int32_t) n_used, (int32_t) n_tok};
++    fwrite(hdr, sizeof(hdr), 1, st->f);
++    fwrite(st->out.data(), 1, st->out.size(), st->f);
++    fflush(st->f);
++    return true;
++}
++
++// installs the callback on params when LLAMA_ROUTE_TRACE is set
++template <typename P>
++static void route_trace_install(P & params) {
++    const char * path = getenv("LLAMA_ROUTE_TRACE");
++    if (!path || !*path) {
++        return;
++    }
++    static route_trace_state st;
++    st.f = fopen(path, "ab");
++    if (!st.f) {
++        fprintf(stderr, "route-trace: cannot open %s\n", path);
++        return;
++    }
++    params.cb_eval           = route_trace_cb;
++    params.cb_eval_user_data = &st;
++    fprintf(stderr, "route-trace: writing expert routing to %s\n", path);
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e37661a..e91c5c9 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,5 @@
+ #include "server-context.h"
++#include "route-trace.h"
+ #include <atomic>
+ #include <thread>
+ #include "base64.hpp"
+@@ -1323,6 +1324,7 @@ private:
+             params_base.load_progress_callback_user_data = &load_progress_text;
+         }
+ 
++        route_trace_install(params_base);
+         llama_init = common_init_from_params(params_base);
+ 
+         model_tgt = llama_init->model();

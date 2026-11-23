@@ -1,11 +1,11 @@
 name: Build prebuilt engine libraries
 
-# One archive per GPU architecture, so `openjet setup` can serve Qwen3.8-27B without the CUDA toolkit.
-# Each archive holds the engine library plus a CPU-only libllama for the tokenizer, resolved next to each
-# other. CUDA's runtime is linked statically, so users only need an NVIDIA driver with CUDA 13.2 support.
-# ptxas takes about 21 GiB of RAM on the megakernel, more than a standard runner has, so the Linux job adds swap.
-# The openjet-engine-legacy-* archives hold the previous engine the same way, for the GPUs and files the current one
-# does not serve (src/llama_server.py, _megakernel_variant).
+# Two release archives total — openjet-engine-linux-x64.tar.gz and openjet-engine-windows-x64.zip — so `openjet setup`
+# can serve Qwen3.8-27B (current and legacy/mixed) and Inkling 2 Mini without the CUDA toolkit or release-asset bloat.
+# Each bundle stores per-arch slices (sm75/, sm86/, sm89/, sm120/) alongside shared CPU-only libllama tokenizers;
+# `openjet setup` detects the GPU's compute capability and extracts only the matching slice.
+# CUDA's runtime is linked statically, so users only need an NVIDIA driver (CUDA 13.2 for current Qwen, 12.8 for
+# legacy/Inkling). ptxas takes ~21 GiB RAM on the current Qwen megakernel, so the Linux job adds swap.
 
 on:
   workflow_call:
@@ -43,19 +43,21 @@ jobs:
           cmake --build /opt/llama.cpp/build --target llama -j4
       - name: Build the engine for sm_${{ matrix.arch }}
         run: make -C megakernel -j1 NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
-      - name: Package and check that the library resolves from its own directory
+      - name: Verify and stage sm_${{ matrix.arch }} slice
         run: |
-          mkdir -p pkg dist
-          cp megakernel/libqwen38mk.so pkg/
-          cp -a /opt/llama.cpp/build/bin/lib*.so* pkg/
-          readelf -d pkg/libqwen38mk.so | grep -q 'R.*PATH.*\$ORIGIN'
-          if env -u LD_LIBRARY_PATH ldd pkg/libqwen38mk.so | grep 'not found'; then exit 1; fi
-          tar -czf dist/openjet-engine-linux-x64-sm${{ matrix.arch }}.tar.gz -C pkg .
-          ls -l pkg dist
+          mkdir -p check stage/sm${{ matrix.arch }} stage/llama parts
+          cp megakernel/libqwen38mk.so check/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* check/
+          readelf -d check/libqwen38mk.so | grep -q 'R.*PATH.*\$ORIGIN'
+          if env -u LD_LIBRARY_PATH ldd check/libqwen38mk.so | grep 'not found'; then exit 1; fi
+          cp megakernel/libqwen38mk.so stage/sm${{ matrix.arch }}/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* stage/llama/
+          tar -cf parts/linux-sm${{ matrix.arch }}.tar -C stage .
+          ls -lh parts
       - uses: actions/upload-artifact@v4
         with:
-          name: engine-linux-sm${{ matrix.arch }}
-          path: dist/*
+          name: build-engine-linux-sm${{ matrix.arch }}
+          path: parts/*.tar
 
   windows:
     strategy:
@@ -85,24 +87,26 @@ jobs:
           cmake --build C:/llama.cpp/build --target llama -j 4
       - name: Build the engine for sm_${{ matrix.arch }}
         run: ./megakernel/build.ps1 -Targets engine -Arch sm_${{ matrix.arch }} -Llama C:/llama.cpp -Cuda $env:CUDA_PATH
-      - name: Package
+      - name: Verify and stage sm_${{ matrix.arch }} slice
         run: |
-          New-Item -ItemType Directory -Force pkg, dist | Out-Null
-          Copy-Item megakernel/qwen38mk.dll pkg/
-          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName pkg/
+          New-Item -ItemType Directory -Force check, "stage/sm${{ matrix.arch }}", stage/llama | Out-Null
+          Copy-Item megakernel/qwen38mk.dll check/
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName check/
           # the C++ runtime, for machines without the Visual C++ redistributable (Python ships vcruntime140 only)
           foreach ($name in "msvcp140.dll", "vcruntime140_1.dll") {
             $crt = Get-ChildItem "$env:VCToolsRedistDir/x64" -Recurse -Filter $name |
               Where-Object { $_.FullName -notmatch "onecore|debug" } | Select-Object -First 1
-            Copy-Item $crt.FullName pkg/
+            Copy-Item $crt.FullName check/
+            Copy-Item $crt.FullName stage/llama/
           }
-          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('pkg')); ctypes.CDLL(os.path.abspath('pkg/qwen38mk.dll')).mk_last_error"
-          Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-windows-x64-sm${{ matrix.arch }}.zip
-          Get-ChildItem pkg, dist
+          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('check')); ctypes.CDLL(os.path.abspath('check/qwen38mk.dll')).mk_last_error"
+          Copy-Item megakernel/qwen38mk.dll "stage/sm${{ matrix.arch }}/"
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName stage/llama/
+          Get-ChildItem -Recurse stage
       - uses: actions/upload-artifact@v4
         with:
-          name: engine-windows-sm${{ matrix.arch }}
-          path: dist/*
+          name: build-engine-windows-sm${{ matrix.arch }}
+          path: stage/
 
   # The previous engine (megakernel/legacy), which serves Turing and, with its mixed-quant library, UD-Q3_K_XL and
   # cards under 24 GB. It builds in a standard runner's memory with CUDA 12.8 (13.2 for sm_120 on Windows).
@@ -137,21 +141,23 @@ jobs:
             make -C megakernel/legacy -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_mixed.so
             make -C megakernel/legacy -j1 NVCC=nvcc ARCH=${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk_agents.so
           fi
-      - name: Package and check that the libraries resolve from their own directory
+      - name: Verify and stage sm_${{ matrix.arch }} legacy slice
         run: |
-          mkdir -p pkg dist
-          cp megakernel/legacy/libqwen38mk*.so pkg/
-          cp -a /opt/llama.cpp/build/bin/lib*.so* pkg/
-          for lib in pkg/libqwen38mk*.so; do
+          mkdir -p check stage/sm${{ matrix.arch }}/legacy stage/legacy-llama parts
+          cp megakernel/legacy/libqwen38mk*.so check/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* check/
+          for lib in check/libqwen38mk*.so; do
             readelf -d "$lib" | grep -q 'R.*PATH.*\$ORIGIN'
             if env -u LD_LIBRARY_PATH ldd "$lib" | grep 'not found'; then exit 1; fi
           done
-          tar -czf dist/openjet-engine-legacy-linux-x64-sm${{ matrix.arch }}.tar.gz -C pkg .
-          ls -l pkg dist
+          cp megakernel/legacy/libqwen38mk*.so stage/sm${{ matrix.arch }}/legacy/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* stage/legacy-llama/
+          tar -cf parts/legacy-linux-sm${{ matrix.arch }}.tar -C stage .
+          ls -lh parts
       - uses: actions/upload-artifact@v4
         with:
-          name: engine-legacy-linux-sm${{ matrix.arch }}
-          path: dist/*
+          name: build-engine-legacy-linux-sm${{ matrix.arch }}
+          path: parts/*.tar
 
   legacy-windows:
     strategy:
@@ -197,7 +203,7 @@ jobs:
             $variants += @{ src = "qwen38_mixed.cu"; dll = "qwen38mk_mixed.dll"; def = @() }
             $variants += @{ src = "qwen38_mk.cu"; dll = "qwen38mk_agents.dll"; def = @("-DOPENJET_MK_AGENTS=1") }
           }
-          New-Item -ItemType Directory -Force pkg | Out-Null
+          New-Item -ItemType Directory -Force check | Out-Null
           # job logs need a login; annotations don't, so a failure posts its compiler errors as annotations
           function Fail {
             Select-String -Path build.log -Pattern " error|fatal|catastrophic|out of memory|LNK[0-9]" |
@@ -208,26 +214,174 @@ jobs:
             nvcc @flags @($v.def) -Xptxas -dlcm=cg -I C:/llama.cpp/ggml/include -c "megakernel/legacy/$($v.src)" -o engine.obj 2>&1 |
               Tee-Object -FilePath build.log -Append | Out-Host
             if ($LASTEXITCODE) { Fail }
-            nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/legacy/capi.cpp engine.obj @libs -o "pkg/$($v.dll)" 2>&1 |
+            nvcc @flags -shared -I C:/llama.cpp/include -I C:/llama.cpp/ggml/include megakernel/legacy/capi.cpp engine.obj @libs -o "check/$($v.dll)" 2>&1 |
               Tee-Object -FilePath build.log -Append | Out-Host
             if ($LASTEXITCODE) { Fail }
           }
-      - name: Package
+      - name: Verify and stage sm_${{ matrix.arch }} legacy slice
         run: |
-          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName pkg/
-          # the C++ runtime, for machines without the Visual C++ redistributable (Python ships vcruntime140 only)
+          New-Item -ItemType Directory -Force "stage/sm${{ matrix.arch }}/legacy", stage/legacy-llama | Out-Null
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName check/
           foreach ($name in "msvcp140.dll", "vcruntime140_1.dll") {
             $crt = Get-ChildItem "$env:VCToolsRedistDir/x64" -Recurse -Filter $name |
               Where-Object { $_.FullName -notmatch "onecore|debug" } | Select-Object -First 1
-            Copy-Item $crt.FullName pkg/
+            Copy-Item $crt.FullName check/
+            Copy-Item $crt.FullName stage/legacy-llama/
           }
           # nvcc -shared also writes the import library and exports file; only the DLLs are loaded
-          Remove-Item pkg/*.lib, pkg/*.exp
-          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('pkg')); [ctypes.CDLL(os.path.abspath('pkg/' + n)).mk_last_error for n in os.listdir('pkg') if n.startswith('qwen38mk') and n.endswith('.dll')]"
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-legacy-windows-x64-sm${{ matrix.arch }}.zip
-          Get-ChildItem pkg, dist
+          Remove-Item check/*.lib, check/*.exp
+          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('check')); [ctypes.CDLL(os.path.abspath('check/' + n)).mk_last_error for n in os.listdir('check') if n.startswith('qwen38mk') and n.endswith('.dll')]"
+          Copy-Item check/qwen38mk*.dll "stage/sm${{ matrix.arch }}/legacy/"
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName stage/legacy-llama/
+          Get-ChildItem -Recurse stage
       - uses: actions/upload-artifact@v4
         with:
-          name: engine-legacy-windows-sm${{ matrix.arch }}
+          name: build-engine-legacy-windows-sm${{ matrix.arch }}
+          path: stage/
+
+  # OpenJet's Inkling 2 Mini engine (inkling/engine): builds in ~6 GiB RAM with CUDA 12.8 and glibc 2.35 baseline.
+  inkling-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["86", "89", "120"]
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: apt-get update && apt-get install -y --no-install-recommends git cmake make g++ ca-certificates python3 binutils
+      - name: Build llama.cpp's tokenizer libraries (CPU only, inkling2_loop)
+        run: |
+          git init /opt/llama.cpp
+          git -C /opt/llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
+          git -C /opt/llama.cpp fetch --depth 1 origin 19bc41d
+          git -C /opt/llama.cpp checkout FETCH_HEAD
+          cmake -S /opt/llama.cpp -B /opt/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_INSTALL_RPATH='$ORIGIN'
+          cmake --build /opt/llama.cpp/build --target llama -j4
+      - name: Build the Inkling engine for sm_${{ matrix.arch }}
+        run: make -C inkling/engine -j1 NVCC=nvcc ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN/lib' libinkling.so
+      - name: Verify and stage sm_${{ matrix.arch }} Inkling slice
+        run: |
+          mkdir -p check/lib stage/sm${{ matrix.arch }}/inkling stage/inkling-llama stage/inkling-profiles parts
+          cp inkling/engine/libinkling.so check/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* check/lib/
+          readelf -d check/libinkling.so | grep -q 'R.*PATH.*\$ORIGIN/lib'
+          if env -u LD_LIBRARY_PATH ldd check/libinkling.so | grep 'not found'; then exit 1; fi
+          cp inkling/engine/libinkling.so stage/sm${{ matrix.arch }}/inkling/
+          cp -a /opt/llama.cpp/build/bin/lib*.so* stage/inkling-llama/
+          cp inkling/engine/profiles/default.f32 stage/inkling-profiles/
+          tar -cf parts/inkling-linux-sm${{ matrix.arch }}.tar -C stage .
+          ls -lh parts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-engine-inkling-linux-sm${{ matrix.arch }}
+          path: parts/*.tar
+
+  # Combine every Linux engine slice into a single release archive (openjet-engine-linux-x64.tar.gz).
+  bundle-linux:
+    needs: [linux, legacy-linux, inkling-linux]
+    if: ${{ !cancelled() && (needs.linux.result == 'success' || needs.legacy-linux.result == 'success' || needs.inkling-linux.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-engine-*linux-*
+          path: parts
+          merge-multiple: true
+      - name: Pack openjet-engine-linux-x64.tar.gz
+        run: |
+          mkdir -p pkg dist
+          for f in parts/*.tar; do
+            tar -xf "$f" -C pkg
+          done
+          tar -czf dist/openjet-engine-linux-x64.tar.gz -C pkg .
+          ls -lh dist && find pkg -maxdepth 3 | sort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-linux-x64
+          path: dist/*
+
+  # OpenJet's Inkling 2 Mini engine on Windows (inkling.dll): CUDA 12.8 for sm_86/89, 13.2 for sm_120.
+  inkling-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ["86", "89", "120"]
+        include:
+          - cuda: "12.8.1"
+          - arch: "120"
+            cuda: "13.2.2"
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: ${{ matrix.cuda == '12.8.1' && '["nvcc", "cudart", "visual_studio_integration"]' || '[]' }}
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+      - name: Build llama.cpp's tokenizer libraries (CPU only, inkling2_loop)
+        run: |
+          git init C:/llama.cpp
+          git -C C:/llama.cpp remote add origin https://github.com/ggml-org/llama.cpp
+          git -C C:/llama.cpp fetch --depth 1 origin 19bc41d
+          git -C C:/llama.cpp checkout FETCH_HEAD
+          cmake -S C:/llama.cpp -B C:/llama.cpp/build -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF `
+            -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF
+          cmake --build C:/llama.cpp/build --config Release --target llama -j 4
+      - name: Build the Inkling engine for sm_${{ matrix.arch }}
+        run: ./inkling/engine/build.ps1 -Arch sm_${{ matrix.arch }} -Llama C:/llama.cpp -Cuda $env:CUDA_PATH
+      - name: Verify and stage sm_${{ matrix.arch }} Inkling slice
+        run: |
+          New-Item -ItemType Directory -Force check, "stage/sm${{ matrix.arch }}/inkling", stage/inkling-llama, stage/inkling-profiles | Out-Null
+          Copy-Item inkling/engine/inkling.dll check/
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName check/
+          foreach ($name in "msvcp140.dll", "vcruntime140_1.dll") {
+            $crt = Get-ChildItem "$env:VCToolsRedistDir/x64" -Recurse -Filter $name |
+              Where-Object { $_.FullName -notmatch "onecore|debug" } | Select-Object -First 1
+            Copy-Item $crt.FullName check/
+            Copy-Item $crt.FullName stage/inkling-llama/
+          }
+          python -c "import ctypes, os; os.add_dll_directory(os.path.abspath('check')); ctypes.CDLL(os.path.abspath('check/inkling.dll')).mk_last_error"
+          Copy-Item inkling/engine/inkling.dll "stage/sm${{ matrix.arch }}/inkling/"
+          Copy-Item (Get-ChildItem C:/llama.cpp/build/bin -Recurse -Filter *.dll).FullName stage/inkling-llama/
+          Copy-Item inkling/engine/profiles/default.f32 stage/inkling-profiles/
+          Get-ChildItem -Recurse stage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-engine-inkling-windows-sm${{ matrix.arch }}
+          path: stage/
+
+  # Combine every Windows engine slice into a single release archive (openjet-engine-windows-x64.zip).
+  bundle-windows:
+    needs: [windows, legacy-windows, inkling-windows]
+    if: ${{ !cancelled() && (needs.windows.result == 'success' || needs.legacy-windows.result == 'success' || needs.inkling-windows.result == 'success') }}
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-engine-*windows-*
+          path: pkg
+          merge-multiple: true
+      - name: Pack openjet-engine-windows-x64.zip
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path pkg/* -DestinationPath dist/openjet-engine-windows-x64.zip
+          Get-ChildItem dist
+          Get-ChildItem -Recurse pkg | Select-Object FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-windows-x64
           path: dist/*

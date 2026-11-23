@@ -293,8 +293,15 @@ def _megakernel_quant_mix(model: str) -> str | None:
     return "semi"
 
 
+INKLING_RUNTIME_LABEL = "OpenJet Inkling engine"
+
+
 def model_runtime_label(model: str) -> str:
     """The runtime OpenJet serves *model* with on this machine, as shown in the setup selectors."""
+    if inkling_model(model):
+        return INKLING_RUNTIME_LABEL if inkling_unavailable_reason(model) is None else "llama.cpp"
+    if not Path(model).is_file() and "inkling-2-mini" in Path(model).name.lower():
+        return INKLING_RUNTIME_LABEL if _inkling_gpu() is not None else "llama.cpp"
     if not _megakernel_model_supported(model):
         return "llama.cpp"
     gpu = _megakernel_gpu_info(_megakernel_min_vram_mib(model))
@@ -437,6 +444,146 @@ def megakernel_unavailable_reason(model: str) -> str | None:
                 f"with >= {need:.0f} MiB for this model")
     if gpu[1] == _MEGAKERNEL_TURING_CAP and _megakernel_variant(model) == "mixed":
         return "OpenJet's mixed-quant engine (UD-Q4_K_XL, UD-Q3_K_XL) does not support Turing GPUs; use Q4_K_M"
+    return None
+
+
+# ---------------------------------------------------------------- OpenJet's Inkling 2 Mini engine (inkling/)
+# Decodes Inkling 2 Mini with every expert in VRAM when they fit, otherwise with a VRAM expert cache and the CPU
+# computing the rest (inkling/DESIGN.md); served by inkling/server/ik_server.py, which runs megakernel/server unchanged.
+_INKLING_ARCH = "inkling2_loop"
+_INKLING_SERVER = Path("server") / "ik_server.py"
+_INKLING_LIB = Path("engine") / "libinkling.so"
+_INKLING_COMPUTE_CAPS = frozenset({"8.6", "8.9", "12.0"})
+
+
+def _inkling_lib_path(root: Path) -> Path:
+    return root / "engine" / ("inkling.dll" if sys.platform == "win32" else "libinkling.so")
+# device memory besides the experts: dense weights, output head, q8_0 sliding-window caches (~106 MiB), prefill buffers,
+# CUDA context (measured 17,438 MiB in use at 8K positions with 15,068 MiB of experts on an RTX 3090, with the host-RAM
+# checkpoint pool active), the q8_0 KV cache of the 8 full-attention passes (17 KiB per position), and room for the desktop
+_INKLING_BASE_MIB = 2300
+_INKLING_KV_MIB_PER_TOKEN = 8 * 2 * (1024 + 32 * 2) / 2**20
+_INKLING_DESKTOP_MIB = 512
+# the smallest expert cache worth running: below it decode is dominated by the CPU
+_INKLING_MIN_CACHE_MIB = 2048
+# bytes per block and values per block of the ggml types Inkling GGUFs use for experts
+_GGML_BLOCKS = {0: (4, 1), 1: (2, 1), 6: (22, 32), 8: (34, 32), 12: (144, 256), 13: (176, 256), 14: (210, 256),
+                16: (66, 256), 17: (74, 256), 18: (98, 256), 20: (18, 32), 22: (82, 256), 23: (136, 256),
+                30: (2, 1), 40: (36, 64)}
+
+
+def gguf_architecture(path: Path) -> str | None:
+    """general.architecture of a GGUF (read from the header up to that key; GGUF writers put it first)."""
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != b"GGUF":
+                return None
+            _version, _n_tensors, n_kv = struct.unpack("<IQQ", f.read(20))
+            for _ in range(min(n_kv, 8)):
+                klen = struct.unpack("<Q", f.read(8))[0]
+                key = f.read(klen).decode("utf-8", "replace")
+                vtype = struct.unpack("<I", f.read(4))[0]
+                if vtype != 8:  # only string values come before it in practice
+                    return None
+                vlen = struct.unpack("<Q", f.read(8))[0]
+                value = f.read(vlen).decode("utf-8", "replace")
+                if key == "general.architecture":
+                    return value
+    except (OSError, struct.error):
+        return None
+    return None
+
+
+def inkling_model(model: str) -> bool:
+    """A mainline-layout Inkling 2 Mini GGUF (unsloth's Mainline_Support files, ggml-org's)."""
+    path = Path(model).expanduser() if model else None
+    return bool(path and path.suffix.lower() == ".gguf" and path.is_file() and gguf_architecture(path) == _INKLING_ARCH)
+
+
+def _inkling_root() -> Path:
+    override = os.environ.get("OPENJET_INKLING_DIR", "").strip()
+    return Path(override).expanduser() if override else openjet_install_root() / "inkling"
+
+
+def _inkling_dir() -> Path | None:
+    root = _inkling_root()
+    return root if _inkling_lib_path(root).is_file() and (root / _INKLING_SERVER).is_file() else None
+
+
+def inkling_expert_mib(model: str) -> float:
+    """Bytes of the routed experts (every *_exps tensor), in MiB, from the GGUF header."""
+    total = 0
+    for name, (ttype, n) in _gguf_tensors(Path(model)).items():
+        if "_exps." in name and ttype in _GGML_BLOCKS:
+            block_bytes, block_values = _GGML_BLOCKS[ttype]
+            total += n // block_values * block_bytes
+    return total / 2**20
+
+
+def inkling_expert_budget_mib(model: str, ctx: int, free_mib: float) -> int | None:
+    """VRAM for the expert cache with *free_mib* free at *ctx* positions: None when every expert fits (no cache
+    needed), else the cache size in MiB (0 when even the smallest useful cache does not fit)."""
+    need = _INKLING_BASE_MIB + ctx * _INKLING_KV_MIB_PER_TOKEN + _INKLING_DESKTOP_MIB
+    room = free_mib - need
+    if room >= inkling_expert_mib(model):
+        return None
+    return int(room) if room >= _INKLING_MIN_CACHE_MIB else 0
+
+
+# the SSD tier: when the experts left out of VRAM don't fit in the available RAM with this much to spare, the engine
+# reads them from the GGUF into a RAM cache of its own (IK_RAM_MIB) instead of page-faulting through the mmap
+# (measured 6.3 against 5.4 tok/s at an 8 GB card budget with RAM capped at 6 GB, inkling/engine/README.md)
+_INKLING_RAM_SPARE_MIB = 3072
+
+
+def inkling_ram_cache_mib(model: str, expert_cache_mib: int, available_mib: float) -> int | None:
+    """RAM for the SSD tier's expert cache, or None when the CPU-side experts fit in RAM (the page cache serves them)."""
+    cpu_side = inkling_expert_mib(model) - expert_cache_mib
+    room = available_mib - _INKLING_RAM_SPARE_MIB
+    if room >= cpu_side:
+        return None
+    return max(1024, int(room))
+
+
+def _inkling_gpu_info() -> tuple[str, str, float] | None:
+    """(index, compute_cap, free MiB) of the first sm_86 / sm_89 GPU (CUDA_VISIBLE_DEVICES' first entry when set), or None."""
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid,compute_cap,memory.free", "--format=csv,noheader,nounits"],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    pinned = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+    for line in result.stdout.strip().splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 4:
+            continue
+        index, uuid, cap, free = fields
+        if pinned and pinned not in (index, uuid):
+            continue
+        if cap in _INKLING_COMPUTE_CAPS:
+            try:
+                return index, cap, float(free)
+            except ValueError:
+                continue
+    return None
+
+
+def _inkling_gpu() -> tuple[str, float] | None:
+    """(index, free MiB) of the first sm_86 / sm_89 GPU, or None."""
+    info = _inkling_gpu_info()
+    return (info[0], info[2]) if info is not None else None
+
+
+def inkling_unavailable_reason(model: str) -> str | None:
+    """None when OpenJet's Inkling engine can serve *model* here, else why not."""
+    if not inkling_model(model):
+        return "the Inkling engine only serves mainline-layout Inkling 2 Mini GGUFs"
+    if _inkling_dir() is None:
+        return f"the Inkling engine is not built ({_inkling_lib_path(_inkling_root())} missing: rerun `openjet setup` or make -C inkling/engine)"
+    if _inkling_gpu() is None:
+        return "the Inkling engine needs an RTX 30, 40 or 50-series GPU (sm_86, sm_89 or sm_120)"
     return None
 
 
@@ -769,7 +916,27 @@ class LlamaServerClient:
                     alloc_cap = _vulkan_max_alloc_ctx(kv_bpt) if kv_bpt else None
                     if alloc_cap is not None:
                         requested_ctx = min(requested_ctx, alloc_cap)
-            if self.backend != "llama":
+            inkling = self.backend != "llama" and inkling_model(self.model)
+            if inkling:
+                if resolved_device != "cuda" or is_jetson:
+                    reason = "OpenJet's Inkling engine needs a desktop CUDA GPU"
+                else:
+                    reason = inkling_unavailable_reason(self.model)
+                if reason is None:
+                    try:
+                        await self._start_inkling(env=env, ctx=requested_ctx)
+                        self.context_window_tokens = requested_ctx
+                        self.active_backend = "inkling"
+                        return
+                    except (RuntimeError, TimeoutError, OSError) as exc:
+                        self._emit_diagnostic("runtime_inkling_start_failed", error=str(exc)[-4000:])
+                        if self.backend == "megakernel":
+                            raise
+                elif self.backend == "megakernel":
+                    raise RuntimeError(f"llama_backend is megakernel, but {reason}")
+                else:
+                    self._emit_diagnostic("runtime_inkling_skipped", reason=reason)
+            if self.backend != "llama" and not inkling:
                 if resolved_device != "cuda" or is_jetson:
                     device_name = "jetson" if is_jetson else resolved_device
                     reason = f"OpenJet's engine needs a desktop CUDA GPU (resolved device: {device_name})"
@@ -940,6 +1107,41 @@ class LlamaServerClient:
             **self._memory_snapshot(),
         )
         raise TimeoutError("llama-server did not become ready")
+
+    async def _start_inkling(self, *, env: dict[str, str], ctx: int) -> None:
+        root = _inkling_dir()
+        assert root is not None
+        cmd = [sys.executable, str(root / _INKLING_SERVER), "-m", self.model, "--host", self.host, "--port", str(self.port),
+               "-c", str(ctx)]
+        env = dict(env)
+        gpu = _inkling_gpu()
+        if gpu is not None and not env.get("CUDA_VISIBLE_DEVICES", "").strip():
+            env.update({"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": gpu[0]})
+        if gpu is not None and not env.get("IK_VRAM_MIB", "").strip():
+            budget = inkling_expert_budget_mib(self.model, ctx, gpu[1])
+            if budget == 0:
+                raise RuntimeError(f"{gpu[1]:.0f} MiB of free VRAM leaves no room for an expert cache at {ctx} positions")
+            if budget is not None:
+                env["IK_VRAM_MIB"] = str(budget)  # offload: the rest of the experts run on the CPU
+                memory = read_memory_snapshot()
+                if memory is not None and not env.get("IK_RAM_MIB", "").strip():
+                    ram = inkling_ram_cache_mib(self.model, budget, memory.available_mb)
+                    if ram is not None:
+                        env["IK_RAM_MIB"] = str(ram)  # RAM can't hold them: read them from the SSD into a cache
+        self._emit_diagnostic("runtime_inkling_launch_command", command=" ".join(cmd), ctx=ctx,
+                              expert_cache_mib=env.get("IK_VRAM_MIB") or "all", ram_cache_mib=env.get("IK_RAM_MIB") or "page cache")
+        stderr_lines: deque[str] = deque(maxlen=120)
+        # loading repacks every expert (and faults in the CPU's in offload mode): minutes on a cold page cache
+        outcome = await self._spawn_until_healthy(cmd, env=env, timeout=900.0, stderr_lines=stderr_lines, keep_reading_stderr=True)
+        if outcome == "exited":
+            detail = _stderr_detail(stderr_lines)
+            self._proc = None
+            raise RuntimeError(f"OpenJet Inkling engine server exited: {detail}")
+        if outcome == "ready":
+            self._emit_diagnostic("runtime_inkling_start_ready", pid=self._proc.pid, ctx=ctx)
+            return
+        await self._stop_server()
+        raise TimeoutError("OpenJet Inkling engine server did not become ready")
 
     async def _start_megakernel(self, *, env: dict[str, str], ctx: int) -> None:
         root = _megakernel_dir(self.model)

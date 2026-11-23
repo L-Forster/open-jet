@@ -192,6 +192,4 @@ without a proxy.
 **Can it use a cloud model?** Only if you choose one. In OpenJet's agent, `/mode` switches between
 Local, Codex, OpenRouter and Slipstream; local is the default.
 
-**Does the engine work on other GPUs or models?** It serves Qwen3.8-27B Q4_K_M and UD-Q4_K_XL on
-RTX 30, 40 and 50-series GPUs with 24 GB or more (sm_86, sm_89, sm_120). It's tuned on an RTX 3090.
-Everything else runs on llama.cpp.
+**Does the engine work on other GPUs or models?** OpenJet's engine serves Qwen3.8-27B (`Q4_K_M` and `UD-Q4_K_XL`) on 24 GB+ RTX 30, 40 and 50-series GPUs, and Inkling 2 Mini (`UD-IQ4_XS`, `UD-IQ3_XXS`, `UD-Q4_K_XL`) on 6-24 GB RTX 30, 40 and 50-series GPUs (`sm_86`, `sm_89`, `sm_120`). Everything else runs on `llama.cpp`.

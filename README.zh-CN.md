@@ -1,15 +1,14 @@
 <h1 align="center"><img src="docs/assets/logo.png" width="498" alt="OpenJet"></h1>
 
-<p align="center"><b>在你自己的 GPU 上运行 Qwen3.8-27B，速度是 llama.cpp 的 2 倍。</b></p>
+<p align="center"><b>在你自己的 GPU 上本地运行 Qwen3.8-27B 和 Inkling 2 Mini，速度是 llama.cpp 的 2–3 倍。</b></p>
 
-<p align="center">适用于 24 GB 显存的 NVIDIA RTX 30、40 和 50 系列显卡。可配合 Claude Code、Codex、OpenCode、OpenClaw
-或 OpenJet 自带的智能体使用。可离线运行。</p>
+<p align="center">适用于 6–24 GB 显存的 NVIDIA RTX 30、40、50 系列显卡，以及 AMD 和 Intel Vulkan 笔记本。可配合 Claude Code、Codex、OpenCode、OpenClaw 或 OpenJet 自带的智能体使用。可离线运行。</p>
 
-<p align="center">没有 24 GB 显卡？<a href="https://www.openjet.dev/pricing#deploy">部署一台云端 RTX 3090</a>，OpenJet 和 Qwen3.8-27B
-已装好即可使用，在 Vast.ai 上约 $0.25/小时。</p>
+<p align="center"><b>云端编程智能体：</b><a href="https://www.openjet.dev/cloud">部署一台租用的 RTX 3090</a>，OpenJet 和 Qwen3.8-27B
+已装好即可使用：最多 4 个智能体一起解码，总速度 424 tok/s，在 Vast.ai 上约 $0.20/小时，不按 token 计费，也没有用量上限。</p>
 
 <p align="center">
-  <a href="#速度">速度</a> · <a href="#安装">安装</a> · <a href="#硬件要求">硬件</a> ·
+  <a href="#支持的模型">模型</a> · <a href="#速度">速度</a> · <a href="#安装">安装</a> · <a href="#硬件要求">硬件</a> ·
   <a href="#配合你的编程工具使用">编程工具</a> · <a href="#一块-gpu-上跑-4-个编程智能体">4 个智能体</a> ·
   <a href="#文档">文档</a>
 </p>
@@ -25,7 +24,23 @@
 
 https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
+## 支持的模型
+
+`openjet setup` 会检测显存和内存并自动选择最合适的模型：
+
+| 你的硬件 | 默认模型 | 运行时 |
+|---|---|---|
+| 24 GB+ NVIDIA RTX 30/40/50（Linux） | **Qwen3.8-27B**（`Q4_K_M`） | OpenJet 引擎 |
+| 8 GB NVIDIA（32 GB 内存）或 10–12 GB NVIDIA | **Inkling 2 Mini**（`UD-IQ4_XS`，14.7 GiB） | OpenJet Inkling 引擎 |
+| 6 GB NVIDIA 或 8 GB NVIDIA（16 GB 内存） | **Inkling 2 Mini**（`UD-IQ3_XXS`，10.9 GiB） | OpenJet Inkling 引擎 |
+| 16 GB AMD / Intel Vulkan 笔记本（6–10 GB 堆） | **Inkling 2 Mini**（`UD-IQ3_XXS`，10.9 GiB） | `llama.cpp` Vulkan（`--cpu-moe`） |
+| 12 GB 独立 Vulkan / Apple 芯片 / 纯 CPU | 内存装得下的最强编程模型 | `llama.cpp` |
+
+完整列表与手动下载链接：[选择模型](docs/models.md) · [Inkling 2 Mini 说明](docs/inkling.md)。
+
 ## 速度
+
+### Qwen3.8-27B（24 GB 显卡）
 
 | RTX 3090，Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
 |---|---|---|
@@ -33,15 +48,21 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 | 开启思考，上下文中有 98K token | 37 tok/s | **96 tok/s**（2.6 倍） |
 | 读取 98K token 的提示词 | 112 秒 | **76 秒**（1.5 倍） |
 
-- 一块 RTX 3090 上的单个对话，不是批处理。106K token 上下文，q8_0 KV 缓存，开启思考，温度 1.0，top_p 0.95，top_k 20，
-  每次回复 1,024 个 token；5 个提示词和一个 98K token 的提示词（[`engine_compare.py`](megakernel/bench/engine_compare.py)）。
-- llama.cpp b11982 使用 MTP 投机解码（2 个草稿）和 flash attention，2026-10-29 测得；OpenJet 引擎使用 7 个草稿，
-  2026-11-17 测得。测试工具和设置相同；两次运行中 5 个短提示词里有一个、以及 98K 提示词的文本不同。
-- 在相同权重下与 llama.cpp 输出一致：首选 token 一致率 98.74%，KL 散度 0.0016；llama.cpp 自身的批处理模式为 98.25% 和
-  0.0023（[结果](megakernel/README.md#results)）。
+- 一块 RTX 3090 上的单个对话，106K token 上下文，`q8_0` KV 缓存，开启思考，温度 1.0，`top_p` 0.95，`top_k` 20，每次回复 1,024 token；5 个短提示词和一个 98K 提示词（[`engine_compare.py`](megakernel/bench/engine_compare.py)）。
+- llama.cpp `b11982`（2 个草稿、flash attention，2026-10-29 测得）对比 OpenJet 引擎（7 个草稿，2026-11-17 测得）。测试工具与设置相同；两次运行中 1 个短提示词及 98K 提示词文本不同。
+- 同权重下输出与 llama.cpp 一致：首选 token 一致率 98.74%，KL 散度 0.0016；llama.cpp 批处理模式为 98.25% 和 0.0023（[结果](megakernel/README.md#results)）。
+- 24 GB 显卡上的上下文：约 **120K token**，使用 `openjet setup --long-context` 时约 **234K**（[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。
 
-24 GB 显卡上的上下文：约 **120K token**，使用 `openjet setup --long-context` 时约 **234K**
-（[KV 缓存预设](megakernel/README.md#kv-cache-presets-mk_kv)）。
+### Inkling 2 Mini（8–24 GB 显卡）
+
+| RTX 3090 + Ryzen 7 5800X，`UD-IQ4_XS`（256 贪心 token） | llama.cpp（`UD-Q4_K_XL`） | OpenJet |
+|---|---:|---:|
+| 8 GB 显卡预算（`6000 MiB` 专家缓存） | 17.7–19.6 tok/s | **47.8–51.1 tok/s**（2.6 倍） |
+| 12 GB 显卡预算（`9000 MiB` 专家缓存） | 23.0–24.7 tok/s | **65.0–67.1 tok/s**（2.7 倍） |
+| 全显存（无 MTP） | 41.6–48.9 tok/s | **82.0 tok/s**（1.8 倍） |
+| 全显存 + DSpark MTP（`mtp.safetensors`） | - | **75–140 tok/s**（代码 95.8–139.7，文本 75.0） |
+
+- 在 RTX 3090 + Ryzen 7 5800X（DDR4，15 GB 内存，页缓存预热后）测得。较小显存显卡通过限制 `IK_VRAM_MIB` 模拟；预填充速度为 **157 tok/s**（8 GB）、**225 tok/s**（12 GB）和 **566 tok/s**（全显存）。详见 [docs/inkling.md](docs/inkling.md#measured-speed)。
 
 ## 安装
 
@@ -56,10 +77,11 @@ openjet serve      # 或者把模型提供给 Claude Code、Codex、OpenCode 或
 
 ## 硬件要求
 
-Linux，以及 24 GB 显存的 NVIDIA RTX 30、40 或 50 系列 GPU（sm_86、sm_89、sm_120），驱动 580 或更新版本。
-`openjet setup` 会下载为你的 GPU 预编译好的 OpenJet 引擎（[具体是哪一个](docs/zh/installation.md#预编译引擎)）。
+- **24 GB NVIDIA RTX 30、40 或 50 系列（Linux）：**用 OpenJet 引擎运行 Qwen3.8-27B（`sm_86`、`sm_89`、`sm_120`，驱动 580+）。
+- **6–12 GB NVIDIA RTX 30、40 或 50 系列（Linux，16 GB+ 内存）：**用 OpenJet Inkling 引擎运行 Inkling 2 Mini（显存专家缓存 + CPU 卸载）。
+- **16 GB AMD/Intel Vulkan 笔记本、Apple 芯片、Windows 或纯 CPU：**`openjet setup` 会自动安装 `llama.cpp` 并选择最适合你内存的模型。
 
-没有 24 GB 显卡？[部署一台云端 RTX 3090](https://www.openjet.dev/pricing#deploy)，OpenJet 和 Qwen3.8-27B 已装好即可使用，在 Vast.ai 上约 $0.25/小时。
+`openjet setup` 会下载为你的 GPU 预编译好的 OpenJet 引擎（[具体是哪一个](docs/zh/installation.md#预编译引擎)）。没有本地显卡？[部署一台租用的 RTX 3090](https://www.openjet.dev/cloud)，OpenJet 和 Qwen3.8-27B 开箱即用（最多 4 个智能体一起解码，总速度 424 tok/s，在 Vast.ai 上约 $0.20/小时）。
 
 更多：[docs/zh/installation.md](docs/zh/installation.md#硬件要求)
 

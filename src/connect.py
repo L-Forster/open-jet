@@ -99,7 +99,7 @@ async def serve(*, host: str, port: int) -> None:
     client = create_runtime_client(cfg, host=host, port=port)
     print(f"Loading {_model_id(cfg)}...", flush=True)
     await client.start()
-    engine = "OpenJet engine" if client.active_backend == "megakernel" else "llama.cpp"
+    engine = {"megakernel": "OpenJet engine", "inkling": "OpenJet Inkling engine"}.get(client.active_backend, "llama.cpp")
     root = f"http://{host}:{port}"
     print(
         f"Serving {_model_id(cfg)} with {engine} at {root}\n"

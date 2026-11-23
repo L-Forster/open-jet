@@ -6,12 +6,13 @@
 
 | 电脑 | 能运行什么 |
 |---|---|
-| Linux，NVIDIA RTX 30、40 或 50 系列，24 GB 或以上显存（sm_86、sm_89、sm_120，以及对应的 RTX 工作站显卡） | [OpenJet 引擎](../../megakernel/README.md)上的 Qwen3.8-27B |
-| 没有 24 GB 的 NVIDIA 显卡 | 在租用的云端 RTX 3090 上运行 OpenJet 引擎和 Qwen3.8-27B，在 Vast.ai 上约 $0.25/小时（[部署](https://www.openjet.dev/pricing#deploy)） |
-| Windows | llama.cpp。OpenJet 引擎在 Windows 上只提供预编译版本，目前仍在构建中 |
-| NVIDIA Turing，24 GB 或以上显存（sm_75，例如 48 GB 的 Quadro RTX 8000） | OpenJet 旧版引擎，实验性支持（[Turing](../../megakernel/legacy/README.md#turing-rtx-8000)） |
-| 其他 GPU、Apple 芯片，或只有 CPU | llama.cpp 上能装下的最好的模型（[按内存选择](../models.md#pick-by-memory)、[纯 CPU](../deployment/cpu-only.md)） |
-| Jetson | llama.cpp（[Jetson 设置](../deployment/jetson.md)） |
+| Linux，NVIDIA RTX 30、40 或 50 系列，24 GB+ 显存（`sm_86`、`sm_89`、`sm_120`） | [OpenJet 引擎](../../megakernel/README.md)上的 Qwen3.8-27B |
+| Linux，NVIDIA RTX 30、40 或 50 系列，6–12 GB 显存且 16 GB+ 内存 | [OpenJet Inkling 引擎](../inkling.md)上的 Inkling 2 Mini（`UD-IQ4_XS` 或 `UD-IQ3_XXS`） |
+| 16 GB AMD / Intel Vulkan 笔记本（Windows 或 Linux，6–10 GB Vulkan 堆） | `llama.cpp`（`b12651`）Vulkan + `--cpu-moe` 运行 Inkling 2 Mini `UD-IQ3_XXS` |
+| 没有 24 GB NVIDIA 显卡（云端方案） | 在租用的 RTX 3090 上运行 OpenJet 引擎和 Qwen3.8-27B，Vast.ai 约 $0.20/小时（[部署](https://www.openjet.dev/pricing#deploy)） |
+| Windows | `llama.cpp` 预编译包（`openjet setup` 自动下载 Vulkan/CUDA 版本）；OpenJet 引擎 Windows 预编译包正在构建中 |
+| NVIDIA Turing，24 GB+ 显存（`sm_75`，例如 Quadro RTX 8000） | OpenJet 旧版引擎，实验性支持（[Turing](../../megakernel/legacy/README.md#turing-rtx-8000)） |
+| 其他 GPU、Apple 芯片、Jetson 或纯 CPU | `llama.cpp` 上能装下的最强模型（[按内存选择](../models.md#pick-by-memory)、[Jetson](../deployment/jetson.md)、[纯 CPU](../deployment/cpu-only.md)） |
 
 使用 OpenJet 引擎还需要支持 CUDA 13.2 的 NVIDIA 驱动（580 或更新版本）；服务 Turing 的旧版引擎需要 CUDA 12.8（570 或更新版本）。
 `openjet setup` 会下载为你的 GPU 预编译好的引擎（[具体是哪一个](#预编译引擎)），所以不需要安装 CUDA 工具包。如果没有匹配的预编译引擎，
@@ -31,23 +32,12 @@ setup 会说明原因，并改用 llama.cpp 运行模型。
 
 ## 预编译引擎
 
-每个 [GitHub release](https://github.com/L-Forster/open-jet/releases) 都附带为各个 GPU 架构编译好的 OpenJet
-引擎。`openjet setup` 读取你 GPU 的计算能力，并从与你的 `open-jet` 包版本相同的 release 中下载对应的压缩包，所以你不需要自己选择。下面的链接指向最新的
-release。
+每个 [GitHub release](https://github.com/L-Forster/open-jet/releases) 为每个操作系统附带一个预编译引擎包，内含所有支持的 GPU 架构（`sm_75`、`sm_86`、`sm_89`、`sm_120`）：
 
-| GPU（24 GB 或以上） | 架构 | Linux |
-|---|---|---|
-| RTX 5090、RTX PRO Blackwell | sm_120 | [openjet-engine-linux-x64-sm120.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm120.tar.gz) |
-| RTX 4090、RTX 6000 Ada、L40、L4 | sm_89 | [openjet-engine-linux-x64-sm89.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm89.tar.gz) |
-| RTX 3090、3090 Ti、RTX A5000、A6000 | sm_86 | [openjet-engine-linux-x64-sm86.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64-sm86.tar.gz) |
-| Titan RTX、Quadro RTX 6000 和 8000（实验性，旧版引擎） | sm_75 | [openjet-engine-legacy-linux-x64-sm75.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-legacy-linux-x64-sm75.tar.gz) |
+- **Linux：**[openjet-engine-linux-x64.tar.gz](https://github.com/L-Forster/open-jet/releases/latest/download/openjet-engine-linux-x64.tar.gz) — 包含 Qwen3.8-27B（当前版和旧版/混合量化版）、Inkling 2 Mini（`sm_86`、`sm_89`、`sm_120`，附带 `profiles/default.f32`）以及用于分词器的 CPU 版 `libllama`。
+- **Windows：**`openjet-engine-windows-x64.zip` — Qwen3.8-27B（仍在构建中；发布前 Windows 上的 OpenJet 使用预编译 `llama.cpp` 运行模型）。
 
-每个 `openjet-engine` 压缩包包含引擎（`libqwen38mk.so`，用于 Q4_K_M 和 UD-Q4_K_XL）以及一个只用于分词器的 CPU 版
-`libllama`。`openjet-engine-legacy` 压缩包包含旧版引擎，setup 只在当前引擎不支持时安装它：Turing（仅 Q4_K_M）和
-UD-Q3_K_XL（`libqwen38mk_mixed.so`，sm_75 中没有）。CUDA 已静态链接，所以只需要 NVIDIA 驱动。用 `nvidia-smi --query-gpu=name,compute_cap --format=csv` 查看 GPU 的架构（8.6 即 sm_86）。
-
-Windows 压缩包（`openjet-engine-windows-x64-sm*.zip`）还没有发布；在那之前，Windows 上的 OpenJet 使用 llama.cpp
-运行模型。
+`openjet setup` 会读取你 GPU 的计算能力（可用 `nvidia-smi --query-gpu=name,compute_cap --format=csv` 查看，8.6 即 `sm_86`），从与你的 `open-jet` 版本匹配的 release 中下载对应操作系统的引擎包，并自动只解压适配你显卡的部分。CUDA 已静态链接，因此只需要 NVIDIA 驱动。
 
 ## 一行命令安装
 

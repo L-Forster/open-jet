@@ -1,15 +1,14 @@
 <h1 align="center"><img src="docs/assets/logo.png" width="498" alt="OpenJet"></h1>
 
-<p align="center"><b>Run Qwen3.8-27B on your own GPU, 2x faster than llama.cpp.</b></p>
+<p align="center"><b>Run Qwen3.8-27B and Inkling 2 Mini locally, 2-3x faster than llama.cpp.</b></p>
 
-<p align="center">For NVIDIA RTX 30, 40 and 50-series cards with 24 GB. Use it with Claude Code, Codex, OpenCode,
-OpenClaw or OpenJet's own agent. Runs offline.</p>
+<p align="center">NVIDIA RTX 30, 40 and 50-series GPUs (6-24 GB VRAM), plus AMD and Intel Vulkan laptops. Works with Claude Code, Codex, OpenCode, OpenClaw or OpenJet's own agent. Runs offline.</p>
 
-<p align="center">No 24 GB card? <a href="https://www.openjet.dev/pricing#deploy">Deploy a cloud RTX 3090</a> with OpenJet and Qwen3.8-27B
-ready to use, about $0.25/hour on Vast.ai.</p>
+<p align="center"><b>Coding agents in the cloud:</b> <a href="https://www.openjet.dev/cloud">deploy a rented RTX 3090</a> with OpenJet and
+Qwen3.8-27B ready: up to 4 agents decoding together, 424 tok/s in total, about $0.20/hour on Vast.ai, with no per-token billing or usage caps.</p>
 
 <p align="center">
-  <a href="#speed">Speed</a> · <a href="#install">Install</a> · <a href="#what-you-need">Hardware</a> ·
+  <a href="#models">Models</a> · <a href="#speed">Speed</a> · <a href="#install">Install</a> · <a href="#what-you-need">Hardware</a> ·
   <a href="#use-it-with-your-coding-tools">Coding tools</a> · <a href="#4-coding-agents-on-one-gpu">4 agents</a> ·
   <a href="#docs">Docs</a>
 </p>
@@ -25,7 +24,23 @@ ready to use, about $0.25/hour on Vast.ai.</p>
 
 https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
+## Models
+
+`openjet setup` checks your VRAM and RAM and picks the best fit automatically:
+
+| Your hardware | Default model | Runtime |
+|---|---|---|
+| 24 GB+ NVIDIA RTX 30/40/50 (Linux) | **Qwen3.8-27B** (`Q4_K_M`) | OpenJet's engine |
+| 8 GB NVIDIA (32 GB RAM) or 10-12 GB NVIDIA | **Inkling 2 Mini** (`UD-IQ4_XS`, 14.7 GiB) | OpenJet's Inkling engine |
+| 6 GB NVIDIA or 8 GB NVIDIA (16 GB RAM) | **Inkling 2 Mini** (`UD-IQ3_XXS`, 10.9 GiB) | OpenJet's Inkling engine |
+| 16 GB AMD / Intel Vulkan laptop (6-10 GB heap) | **Inkling 2 Mini** (`UD-IQ3_XXS`, 10.9 GiB) | `llama.cpp` Vulkan (`--cpu-moe`) |
+| 12 GB discrete Vulkan / Apple silicon / CPU | Best coding model that fits | `llama.cpp` |
+
+Full table and manual download links: [Choosing a model](docs/models.md) · [Inkling 2 Mini guide](docs/inkling.md).
+
 ## Speed
+
+### Qwen3.8-27B (24 GB GPU)
 
 | RTX 3090, Qwen3.8-27B Q4_K_M | llama.cpp | OpenJet |
 |---|---|---|
@@ -33,17 +48,21 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 | Thinking on, 98K tokens in context | 37 tok/s | **96 tok/s** (2.6x) |
 | Reading a 98K-token prompt | 112 s | **76 s** (1.5x) |
 
-- One conversation on one RTX 3090, not a batch. 106K-token context, q8_0 KV cache, thinking on, temperature 1.0,
-  top_p 0.95, top_k 20, 1,024 tokens per reply; 5 prompts and one 98K-token prompt
-  ([`engine_compare.py`](megakernel/bench/engine_compare.py)).
-- llama.cpp b11982 with MTP speculative decoding (2 drafts) and flash attention, measured 2026-10-29; OpenJet's
-  engine at 7 drafts, measured 2026-11-17. Same harness and settings; one of the 5 short prompts and the text of the
-  98K prompt differ between the two runs.
-- Same output as llama.cpp on the same weights: top-token agreement 98.74%, KL divergence 0.0016, against 98.25% and
-  0.0023 for llama.cpp's own batched mode ([results](megakernel/README.md#results)).
+- Single conversation on an RTX 3090, 106K context, `q8_0` KV cache, thinking on, temperature 1.0, `top_p` 0.95, `top_k` 20, 1,024 tokens per reply; 5 short prompts and one 98K prompt ([`engine_compare.py`](megakernel/bench/engine_compare.py)).
+- llama.cpp `b11982` (2 drafts, flash attention, measured 2026-10-29) vs OpenJet's engine (7 drafts, measured 2026-11-17). Same harness and settings; one short prompt and the 98K prompt text differ between runs.
+- Output matches llama.cpp on the same weights: 98.74% top-token agreement, 0.0016 KL divergence, vs 98.25% and 0.0023 for llama.cpp's own batched mode ([results](megakernel/README.md#results)).
+- Context on 24 GB: about **120K tokens**, or about **234K** with `openjet setup --long-context` ([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv)).
 
-Context on a 24 GB card: about **120K tokens**, or about **234K** with `openjet setup --long-context`
-([KV cache presets](megakernel/README.md#kv-cache-presets-mk_kv)).
+### Inkling 2 Mini (8-24 GB GPU)
+
+| RTX 3090 + Ryzen 7 5800X, `UD-IQ4_XS` (256 greedy tok) | llama.cpp (`UD-Q4_K_XL`) | OpenJet |
+|---|---:|---:|
+| 8 GB card budget (`6000 MiB` expert cache) | 17.7-19.6 tok/s | **47.8-51.1 tok/s** (2.6x) |
+| 12 GB card budget (`9000 MiB` expert cache) | 23.0-24.7 tok/s | **65.0-67.1 tok/s** (2.7x) |
+| Full VRAM (no MTP) | 41.6-48.9 tok/s | **82.0 tok/s** (1.8x) |
+| Full VRAM + DSpark MTP (`mtp.safetensors`) | - | **75-140 tok/s** (95.8-139.7 code, 75.0 prose) |
+
+- Measured on RTX 3090 + Ryzen 7 5800X (DDR4, 15 GB RAM, warm page cache). Smaller cards simulated by capping `IK_VRAM_MIB`; prefill runs at **157 tok/s** (8 GB), **225 tok/s** (12 GB), and **566 tok/s** (full VRAM). Full breakdown: [docs/inkling.md](docs/inkling.md#measured-speed).
 
 ## Install
 
@@ -58,11 +77,11 @@ More: [docs/installation.md](docs/installation.md)
 
 ## What you need
 
-Linux and an NVIDIA RTX 30, 40 or 50-series GPU with 24 GB (sm_86, sm_89, sm_120), driver 580 or newer.
-`openjet setup` downloads OpenJet's engine prebuilt for your GPU ([which one](docs/installation.md#prebuilt-engines)).
+- **24 GB NVIDIA RTX 30, 40 or 50-series (Linux):** runs Qwen3.8-27B on OpenJet's engine (`sm_86`, `sm_89`, `sm_120`, driver 580+).
+- **6-12 GB NVIDIA RTX 30, 40 or 50-series (Linux, 16 GB+ RAM):** runs Inkling 2 Mini on OpenJet's Inkling engine with VRAM expert caching + CPU offload.
+- **16 GB AMD/Intel Vulkan laptops, Apple silicon, Windows, or CPU-only:** `openjet setup` installs `llama.cpp` and picks the strongest model that fits your memory.
 
-No 24 GB card? [Deploy a cloud RTX 3090](https://www.openjet.dev/pricing#deploy) with OpenJet and Qwen3.8-27B ready to use, about
-$0.25/hour on Vast.ai.
+`openjet setup` downloads the prebuilt engine for your GPU ([details](docs/installation.md#prebuilt-engines)). No local GPU? [Deploy a rented RTX 3090](https://www.openjet.dev/cloud) with OpenJet and Qwen3.8-27B ready (up to 4 agents decoding together, 424 tok/s total, about $0.20/hour on Vast.ai).
 
 More: [docs/installation.md](docs/installation.md#what-you-need)
 
