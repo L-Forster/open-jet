@@ -41,7 +41,7 @@ inline float ue4m3(uint8_t x) { return k_ue4m3.v[x & 0x7F]; }
 
 inline float fp16(uint16_t h) {
 #if defined(IK_AVX2)
-    return _cvtsh_ss(h);
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h)));
 #else
     const uint32_t s = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF;
     uint32_t b;

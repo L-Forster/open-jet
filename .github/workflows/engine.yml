@@ -27,13 +27,19 @@ jobs:
       - name: Add swap for ptxas
         run: |
           df -h /mnt /
+          if sudo modprobe zram 2>/dev/null && [ -b /dev/zram0 ]; then
+            echo zstd | sudo tee /sys/block/zram0/comp_algorithm > /dev/null 2>&1 || true
+            echo 16G | sudo tee /sys/block/zram0/disksize > /dev/null
+            sudo mkswap /dev/zram0
+            sudo swapon -p 100 /dev/zram0
+          fi
           avail_g=$(df -BG --output=avail /mnt | tail -n 1 | tr -dc '0-9')
           swap_g=$(( avail_g >= 30 ? 28 : 24 ))
           sudo fallocate -l "${swap_g}G" /mnt/engine-swap
           sudo chmod 600 /mnt/engine-swap
           sudo mkswap /mnt/engine-swap
-          sudo swapon /mnt/engine-swap
-          sudo sysctl -w vm.swappiness=100
+          sudo swapon -p 10 /mnt/engine-swap
+          swapon --show
           free -g
       - name: Build llama.cpp's tokenizer libraries (CPU only)
         run: |
@@ -48,7 +54,7 @@ jobs:
       - name: Build the engine for sm_${{ matrix.arch }}
         run: |
           sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
-          make -C megakernel -j1 NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
+          make -C megakernel -j1 GLIBC_TUNABLES="" NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
       - name: Verify and stage sm_${{ matrix.arch }} slice
         run: |
           mkdir -p check stage/sm${{ matrix.arch }} stage/llama parts

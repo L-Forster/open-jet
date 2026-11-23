@@ -4,6 +4,7 @@
 // (ggml-quants.c) and multiplies them with the fp32 input; accumulation is fp32.
 
 #include <cstdint>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include "iq_tables.h"

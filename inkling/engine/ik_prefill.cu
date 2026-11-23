@@ -5,6 +5,7 @@
 
 #include "ik_prefill.cuh"
 
+#include <cmath>
 #include <cuda_fp16.h>
 
 namespace ik {

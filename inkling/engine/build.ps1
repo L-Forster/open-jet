@@ -34,7 +34,14 @@ $cl = @("/nologo", "/O2", "/EHsc", "/MD", "/std:c++17", "/D_CRT_SECURE_NO_WARNIN
 
 function Run([string] $exe, [string[]] $a) {
     Write-Host "> $exe $($a -join ' ')" -ForegroundColor DarkGray
-    & $exe @a
+    # under Stop, any warning on stderr becomes a terminating error when output is redirected
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $exe @a
+    } finally {
+        $ErrorActionPreference = $eap
+    }
     if ($LASTEXITCODE -ne 0) { throw "$exe failed ($LASTEXITCODE)" }
 }
 
