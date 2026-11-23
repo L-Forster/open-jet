@@ -2022,7 +2022,7 @@ private:
             n_cpu_ += nc;
             if (nc) {
                 const auto t0 = std::chrono::steady_clock::now();
-                constexpr int GU_ROWS = 64, DN_ROWS = 128;
+                static constexpr int GU_ROWS = 64, DN_ROWS = 128;
                 const int gu_chunks = (n_ff_ + GU_ROWS - 1) / GU_ROWS, dn_chunks = (E_ + DN_ROWS - 1) / DN_ROWS;
                 // Stage x out of mapped host memory into L1-resident RAM once; accumulate down in stack y_loc before one writeback.
                 memcpy(x_loc.data(), hs.h_x, sizeof(float) * E_);
@@ -2527,7 +2527,7 @@ private:
             std::vector<float> h_buf(size_t(total_miss) * n_ff_);
             memset(vf_h_y_, 0, sizeof(float) * T * E_);
             const auto t0 = std::chrono::steady_clock::now();
-            constexpr int GU_ROWS = 64, DN_ROWS = 128;
+            static constexpr int GU_ROWS = 64, DN_ROWS = 128;
             const int gu_chunks = (n_ff_ + GU_ROWS - 1) / GU_ROWS, dn_chunks = (E_ + DN_ROWS - 1) / DN_ROWS;
             const int max_b = ram_ ? std::max(1, (int) ram_owner_.size()) : n_grps;
             for (int g0 = 0; g0 < n_grps; g0 += max_b) {

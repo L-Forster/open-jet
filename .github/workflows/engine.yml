@@ -27,18 +27,31 @@ jobs:
       - name: Add swap for ptxas
         run: |
           df -h /mnt /
-          if sudo modprobe zram 2>/dev/null && [ -b /dev/zram0 ]; then
+          (
+            set -e
+            sudo modprobe zram 2>/dev/null
+            [ -b /dev/zram0 ]
+            [ "$(cat /sys/block/zram0/disksize 2>/dev/null)" = "0" ]
             echo zstd | sudo tee /sys/block/zram0/comp_algorithm > /dev/null 2>&1 || true
             echo 16G | sudo tee /sys/block/zram0/disksize > /dev/null
             sudo mkswap /dev/zram0
             sudo swapon -p 100 /dev/zram0
+          ) || echo "zram unavailable or already active; continuing with disk swap"
+          avail_mnt=$(df -BG --output=avail /mnt | tail -n 1 | tr -dc '0-9')
+          avail_root=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          if [ "$avail_mnt" -ge "$avail_root" ]; then
+            swap_path=/mnt/engine-swap
+            avail_g=$avail_mnt
+          else
+            swap_path=/engine-swap
+            avail_g=$avail_root
           fi
-          avail_g=$(df -BG --output=avail /mnt | tail -n 1 | tr -dc '0-9')
-          swap_g=$(( avail_g >= 30 ? 28 : 24 ))
-          sudo fallocate -l "${swap_g}G" /mnt/engine-swap
-          sudo chmod 600 /mnt/engine-swap
-          sudo mkswap /mnt/engine-swap
-          sudo swapon -p 10 /mnt/engine-swap
+          swap_g=$(( avail_g >= 30 ? 28 : avail_g - 2 ))
+          [ "$swap_g" -gt 28 ] && swap_g=28
+          sudo fallocate -l "${swap_g}G" "$swap_path"
+          sudo chmod 600 "$swap_path"
+          sudo mkswap "$swap_path"
+          sudo swapon -p 10 "$swap_path"
           swapon --show
           free -g
       - name: Build llama.cpp's tokenizer libraries (CPU only)
