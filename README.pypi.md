@@ -26,17 +26,34 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 ## Models
 
-`openjet setup` checks your VRAM and RAM and picks the best fit automatically:
+<details>
+<summary><b>Qwen3.8-27B</b> (24 GB+ NVIDIA RTX 30, 40 and 50-series)</summary>
 
-| Your hardware | Default model | Runtime |
+| Quant | Your VRAM | Runtime |
 |---|---|---|
-| 24 GB+ NVIDIA RTX 30/40/50 (Linux) | **Qwen3.8-27B** (`Q4_K_M`) | OpenJet's engine |
-| 8 GB NVIDIA (32 GB RAM) or 10-12 GB NVIDIA | **Inkling 2 Mini** (`UD-IQ4_XS`, 14.7 GiB) | OpenJet's Inkling engine |
-| 6 GB NVIDIA or 8 GB NVIDIA (16 GB RAM) | **Inkling 2 Mini** (`UD-IQ3_XXS`, 10.9 GiB) | OpenJet's Inkling engine |
-| 16 GB AMD / Intel Vulkan laptop (6-10 GB heap) | **Inkling 2 Mini** (`UD-IQ3_XXS`, 10.9 GiB) | `llama.cpp` Vulkan (`--cpu-moe`) |
-| 12 GB discrete Vulkan / Apple silicon / CPU | Best coding model that fits | `llama.cpp` |
+| `Q4_K_M` (default) | 24 GB+ | OpenJet's engine |
+| `UD-Q4_K_XL` | 24 GB+ | OpenJet's engine |
+| `UD-Q3_K_XL` | 16 GB+ | OpenJet's engine (mixed) or `llama.cpp` |
 
-Full table and manual download links: [Choosing a model](https://github.com/l-forster/open-jet/blob/master/docs/models.md) · [Inkling 2 Mini guide](https://github.com/l-forster/open-jet/blob/master/docs/inkling.md).
+[Qwen3.8-27B GGUFs on Hugging Face](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)
+
+</details>
+
+<details>
+<summary><b>Inkling 2 Mini</b> (6–24 GB NVIDIA RTX 30/40/50 & 16 GB AMD/Intel Vulkan laptops)</summary>
+
+| Quant | Your RAM | Graphics card | Runtime |
+|---|---|---|---|
+| `UD-IQ3_XXS` (10.9 GiB) | 16 GB+ | 6 GB NVIDIA, or 8 GB NVIDIA (16 GB RAM) | OpenJet's Inkling engine |
+| `UD-IQ3_XXS` (10.9 GiB) | 16 GB+ | AMD / Intel Vulkan laptop (6–10 GB heap) | `llama.cpp` Vulkan (`--cpu-moe`) |
+| `UD-IQ4_XS` (14.7 GiB) | 16–32 GB+ | 8 GB NVIDIA (32 GB RAM), 10–12 GB or 24 GB NVIDIA | OpenJet's Inkling engine |
+| `UD-Q4_K_XL` (16.4 GiB) | 16 GB+ | 24 GB NVIDIA | OpenJet's Inkling engine |
+
+[Inkling 2 Mini Mainline GGUFs on Hugging Face](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/tree/main/Mainline_Support) · [Inkling guide](https://github.com/l-forster/open-jet/blob/master/docs/inkling.md)
+
+</details>
+
+Not sure what fits? [Choose a model for your computer](https://github.com/l-forster/open-jet/blob/master/docs/models.md).
 
 ## Speed
 

@@ -26,17 +26,34 @@ https://github.com/user-attachments/assets/e91b1cd1-d8fe-4657-b2b1-5e44a71592bf
 
 ## 支持的模型
 
-`openjet setup` 会检测显存和内存并自动选择最合适的模型：
+<details>
+<summary><b>Qwen3.8-27B</b>（24 GB+ NVIDIA RTX 30、40、50 系列显卡）</summary>
 
-| 你的硬件 | 默认模型 | 运行时 |
+| 量化版本 | 显存要求 | 运行时 |
 |---|---|---|
-| 24 GB+ NVIDIA RTX 30/40/50（Linux） | **Qwen3.8-27B**（`Q4_K_M`） | OpenJet 引擎 |
-| 8 GB NVIDIA（32 GB 内存）或 10–12 GB NVIDIA | **Inkling 2 Mini**（`UD-IQ4_XS`，14.7 GiB） | OpenJet Inkling 引擎 |
-| 6 GB NVIDIA 或 8 GB NVIDIA（16 GB 内存） | **Inkling 2 Mini**（`UD-IQ3_XXS`，10.9 GiB） | OpenJet Inkling 引擎 |
-| 16 GB AMD / Intel Vulkan 笔记本（6–10 GB 堆） | **Inkling 2 Mini**（`UD-IQ3_XXS`，10.9 GiB） | `llama.cpp` Vulkan（`--cpu-moe`） |
-| 12 GB 独立 Vulkan / Apple 芯片 / 纯 CPU | 内存装得下的最强编程模型 | `llama.cpp` |
+| `Q4_K_M`（默认） | 24 GB+ | OpenJet 引擎 |
+| `UD-Q4_K_XL` | 24 GB+ | OpenJet 引擎 |
+| `UD-Q3_K_XL` | 16 GB+ | OpenJet 引擎（混合量化）或 `llama.cpp` |
 
-完整列表与手动下载链接：[选择模型](docs/models.md) · [Inkling 2 Mini 说明](docs/inkling.md)。
+[Hugging Face 上的 Qwen3.8-27B GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF)
+
+</details>
+
+<details>
+<summary><b>Inkling 2 Mini</b>（6–24 GB NVIDIA RTX 30/40/50 显卡与 16 GB AMD/Intel Vulkan 笔记本）</summary>
+
+| 量化版本 | 内存要求 | 显卡 | 运行时 |
+|---|---|---|---|
+| `UD-IQ3_XXS`（10.9 GiB） | 16 GB+ | 6 GB NVIDIA，或 8 GB NVIDIA（16 GB 内存） | OpenJet Inkling 引擎 |
+| `UD-IQ3_XXS`（10.9 GiB） | 16 GB+ | AMD / Intel Vulkan 笔记本（6–10 GB 堆） | `llama.cpp` Vulkan（`--cpu-moe`） |
+| `UD-IQ4_XS`（14.7 GiB） | 16–32 GB+ | 8 GB NVIDIA（32 GB 内存）、10–12 GB 或 24 GB NVIDIA | OpenJet Inkling 引擎 |
+| `UD-Q4_K_XL`（16.4 GiB） | 16 GB+ | 24 GB NVIDIA | OpenJet Inkling 引擎 |
+
+[Hugging Face 上的 Inkling 2 Mini Mainline GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/tree/main/Mainline_Support) · [Inkling 指南](docs/inkling.md)
+
+</details>
+
+不确定哪款适合？[为你的电脑选择模型](docs/models.md)。
 
 ## 速度
 
