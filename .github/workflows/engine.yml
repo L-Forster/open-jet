@@ -27,16 +27,38 @@ jobs:
       - name: Add swap for ptxas
         run: |
           df -h /mnt /
-          (
-            set -e
-            sudo modprobe zram 2>/dev/null
-            [ -b /dev/zram0 ]
-            [ "$(cat /sys/block/zram0/disksize 2>/dev/null)" = "0" ]
-            echo zstd | sudo tee /sys/block/zram0/comp_algorithm > /dev/null 2>&1 || true
-            echo 16G | sudo tee /sys/block/zram0/disksize > /dev/null
-            sudo mkswap /dev/zram0
-            sudo swapon -p 100 /dev/zram0
-          ) || echo "zram unavailable or already active; continuing with disk swap"
+          # Enable in-RAM compressed swap (zswap) so ptxas's ~21 GiB heap compresses in RAM instead of thrashing Azure disk I/O
+          zswap_ok=0
+          if [ -e /sys/module/zswap/parameters/enabled ]; then
+            for zp in zsmalloc z3fold zbud; do
+              if echo "$zp" | sudo tee /sys/module/zswap/parameters/zpool > /dev/null 2>&1; then
+                break
+              fi
+            done
+            for alg in zstd lz4 lzo; do
+              if echo "$alg" | sudo tee /sys/module/zswap/parameters/compressor > /dev/null 2>&1; then
+                break
+              fi
+            done
+            echo 50 | sudo tee /sys/module/zswap/parameters/max_pool_percent > /dev/null 2>&1 || true
+            echo 1 | sudo tee /sys/module/zswap/parameters/enabled > /dev/null 2>&1 || true
+            if [ "$(cat /sys/module/zswap/parameters/enabled 2>/dev/null)" = "Y" ]; then
+              zswap_ok=1
+              grep -H . /sys/module/zswap/parameters/enabled /sys/module/zswap/parameters/zpool /sys/module/zswap/parameters/compressor /sys/module/zswap/parameters/max_pool_percent || true
+            fi
+          fi
+          if [ "$zswap_ok" = "0" ]; then
+            (
+              set -e
+              sudo modprobe zram 2>/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" && sudo modprobe zram; }
+              [ -b /dev/zram0 ]
+              [ "$(cat /sys/block/zram0/disksize 2>/dev/null)" = "0" ]
+              echo zstd | sudo tee /sys/block/zram0/comp_algorithm > /dev/null 2>&1 || true
+              echo 16G | sudo tee /sys/block/zram0/disksize > /dev/null
+              sudo mkswap /dev/zram0
+              sudo swapon -p 100 /dev/zram0
+            ) || echo "zram unavailable; continuing with disk swap"
+          fi
           avail_mnt=$(df -BG --output=avail /mnt | tail -n 1 | tr -dc '0-9')
           avail_root=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
           if [ "$avail_mnt" -ge "$avail_root" ]; then
@@ -52,6 +74,7 @@ jobs:
           sudo chmod 600 "$swap_path"
           sudo mkswap "$swap_path"
           sudo swapon -p 10 "$swap_path"
+          sudo sysctl -w vm.page-cluster=0 || true
           swapon --show
           free -g
       - name: Build llama.cpp's tokenizer libraries (CPU only)
@@ -67,7 +90,10 @@ jobs:
       - name: Build the engine for sm_${{ matrix.arch }}
         run: |
           sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
-          make -C megakernel -j1 GLIBC_TUNABLES="" NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
+          (while sleep 60; do free -h | awk 'NR==2||NR==3{printf "%s %s/%s  ", $1, $3, $2} END{print ""}'; done) &
+          mon_pid=$!
+          trap "kill $mon_pid 2>/dev/null || true" EXIT
+          nice -n 10 ionice -c 3 make -C megakernel -j1 GLIBC_TUNABLES="" NVCC="$CUDA_PATH/bin/nvcc" ARCH=sm_${{ matrix.arch }} LLAMA=/opt/llama.cpp RPATH='$$ORIGIN' libqwen38mk.so
       - name: Verify and stage sm_${{ matrix.arch }} slice
         run: |
           mkdir -p check stage/sm${{ matrix.arch }} stage/llama parts
