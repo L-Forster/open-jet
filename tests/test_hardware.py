@@ -125,3 +125,47 @@ class HardwareDetectionTests(unittest.TestCase):
         self.assertEqual(rec_3060["label"], "Inkling 2 Mini UD-IQ4_XS")
         with patch("src.llama_server._inkling_gpu", return_value=("0", 6000.0)):
             self.assertEqual(llama_server.model_runtime_label(rec_4050["filename"]), llama_server.INKLING_RUNTIME_LABEL)
+
+    def test_16gb_laptop_with_uma_carveout_13_3gb_ram_picks_inkling_iq3(self) -> None:
+        from src import provisioning
+
+        # Real 16 GB AMD/Intel laptop with ~2.7 GB BIOS UMA carve-out (13.3 GB OS RAM):
+        # works both when VRAM reports the 2.7 GB UMA carve-out and when WDDM/GTT reports ~6.65 GB.
+        for vram_mb in (2700.0, 6810.0):
+            hw = hardware.HardwareInfo(
+                label="Vulkan-capable device",
+                total_ram_gb=13.3,
+                has_cuda=False,
+                has_vulkan=True,
+                vram_mb=vram_mb,
+            )
+            rec = provisioning.recommend_direct_model(hw)
+            self.assertEqual(rec["label"], "Inkling 2 Mini UD-IQ3_XXS")
+            self.assertTrue(rec["llama_cpu_moe"])
+
+        # 8 GB laptop must NOT pick Inkling (10.9 GiB won't fit)
+        hw_8gb = hardware.HardwareInfo(
+            label="Vulkan-capable device",
+            total_ram_gb=7.5,
+            has_cuda=False,
+            has_vulkan=True,
+            vram_mb=3840.0,
+        )
+        self.assertEqual(provisioning.recommend_direct_model(hw_8gb)["label"], "Qwen3.5 4B")
+
+    def test_windows_vulkan_vram_boosts_small_vulkaninfo_uma_heap_and_reg_binary(self) -> None:
+        from types import SimpleNamespace
+
+        # 2 GB little-endian REG_BINARY (0x80000000) on an Arc 140V / Radeon iGPU with 13.3 GB OS RAM
+        fake_mem = SimpleNamespace(total_mb=13619.0, available_mb=10900.0)
+        fake_vk = SimpleNamespace(returncode=0, stdout="memoryHeaps[0]:\n  size = 2147483648\n  flags = MEMORY_HEAP_DEVICE_LOCAL_BIT\n", stderr="")
+        fake_ps = SimpleNamespace(
+            returncode=0,
+            stdout='{"DriverDesc":"Intel(R) Arc(TM) 140V GPU","Mem":[0,0,0,128,0,0,0,0]}',
+        )
+        with patch("src.hardware.sys.platform", "win32"), patch(
+            "src.hardware.shutil.which", return_value="vulkaninfo"
+        ), patch("src.hardware.read_memory_snapshot", return_value=fake_mem), patch(
+            "src.hardware.subprocess.run", side_effect=[fake_vk, fake_ps]
+        ):
+            self.assertAlmostEqual(hardware._read_vulkan_vram_mb(), 13619.0 * 0.5, places=1)

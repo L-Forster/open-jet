@@ -163,7 +163,7 @@ async def run_setup(*, model: str | None = None, context: int | None = None, dry
         payload["llama_cpp_ref"] = str(direct.get("llama_cpp_ref") or "")
     gpu = device in {"cuda", "rocm", "vulkan"} and hardware.vram_mb > 0
     budget_mb = hardware.vram_mb if gpu else hardware.total_ram_gb * 1024
-    size_mb = float(payload.get("active_model_size_mb") or payload.get("model_size_mb") or 0)
+    size_mb = float(payload.get("resident_model_size_mb") or payload.get("active_model_size_mb") or payload.get("model_size_mb") or 0)
     if budget_mb <= 0 or size_mb > budget_mb * 0.9:
         raise SetupError("model", "No selected model fits available memory with runtime headroom. Free memory or select a smaller catalog model with --model.")
     recommended_context = _recommended_context_for_payload(

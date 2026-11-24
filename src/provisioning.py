@@ -308,15 +308,19 @@ def _select_direct_model(
             return inkling_rows[0]
         return inkling_vk_rows[0]
 
-    # 16 GB+ AMD/Intel Vulkan laptops & 6-10 GB non-CUDA Vulkan GPUs: Inkling 2 Mini UD-IQ3_XXS (11.66 GB, 94.7%
-    # top-1, ~2.8 GB active/tok) with --cpu-moe keeps dense layers + KV inside the 8 GB Vulkan heap (~2x faster than 9B)
+    # 16 GB+ AMD/Intel Vulkan laptops (including 12-15 GB usable OS RAM after a 1-4 GB BIOS UMA carve-out) and
+    # 4-10 GB non-CUDA Vulkan GPUs: Inkling 2 Mini UD-IQ3_XXS (10.9 GiB, 94.7% top-1, ~2.3 GiB dense + KV on GPU)
+    # with --cpu-moe keeps dense layers + KV inside the Vulkan heap (~2x faster than 9B) and experts in RAM.
     if (
         inkling_vk_rows
         and (hardware_info.has_vulkan or hardware_info.has_rocm)
         and not hardware_info.has_cuda
         and not unified_memory
-        and 5500.0 <= vram_mb < 10500.0
-        and hardware_info.total_ram_gb >= 15.0
+        and hardware_info.total_ram_gb >= 11.5
+        and (
+            (2000.0 <= vram_mb < 10500.0 and (hardware_info.total_ram_gb + vram_mb / 1024.0) >= 14.5)
+            or (vram_mb == 0.0 and hardware_info.total_ram_gb >= 14.5)
+        )
     ):
         return inkling_vk_rows[0]
 

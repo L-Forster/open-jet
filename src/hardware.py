@@ -104,6 +104,25 @@ def _read_nvidia_vram_mb() -> float:
     return total
 
 
+def _read_linux_igpu_shared_vram_mb() -> float:
+    """Return AMD iGPU GTT shared memory (MiB) on Linux when dedicated UMA VRAM is a small carve-out."""
+    drm = Path("/sys/class/drm")
+    if not drm.is_dir():
+        return 0.0
+    best = 0.0
+    for card in drm.glob("card[0-9]*/device"):
+        vram_path = card / "mem_info_vram_total"
+        gtt_path = card / "mem_info_gtt_total"
+        try:
+            vram_mb = float(vram_path.read_text().strip()) / (1024.0 * 1024.0)
+            gtt_mb = float(gtt_path.read_text().strip()) / (1024.0 * 1024.0)
+        except (OSError, ValueError):
+            continue
+        if 0 < vram_mb <= 4096.0 and gtt_mb > vram_mb:
+            best = max(best, gtt_mb)
+    return best
+
+
 def _read_rocm_vram_mb() -> float:
     """Total VRAM across all AMD GPUs via sysfs or rocm-smi."""
     total = 0.0
@@ -115,6 +134,10 @@ def _read_rocm_vram_mb() -> float:
                 total += float(card.read_text().strip()) / (1024.0 * 1024.0)
             except (OSError, ValueError):
                 pass
+    if 0 < total <= 4096.0:
+        shared = _read_linux_igpu_shared_vram_mb()
+        if shared > total:
+            return shared
     if total > 0:
         return total
     # Fall back to rocm-smi
@@ -227,6 +250,7 @@ def _parse_vulkaninfo_text_total_vram_mb(text: str) -> float:
 _WIN_IGPU_PATTERNS = (
     "radeon(tm) graphics",
     "radeon graphics",
+    "radeon 610m",
     "radeon 660m",
     "radeon 680m",
     "radeon 740m",
@@ -235,24 +259,46 @@ _WIN_IGPU_PATTERNS = (
     "radeon 860m",
     "radeon 880m",
     "radeon 890m",
+    "radeon 8050s",
+    "radeon 8060s",
+    "radeon(tm) 610m",
+    "radeon(tm) 660m",
+    "radeon(tm) 680m",
     "radeon(tm) 740m",
     "radeon(tm) 760m",
     "radeon(tm) 780m",
     "radeon(tm) 860m",
     "radeon(tm) 880m",
     "radeon(tm) 890m",
+    "radeon(tm) 8050s",
+    "radeon(tm) 8060s",
     "vega",
     "iris",
     "uhd graphics",
     "hd graphics",
     "intel(r) graphics",
+    "intel(r) xe",
+    "xe graphics",
     "arc(tm) graphics",
+    "arc(tm) 130v",
+    "arc(tm) 140v",
+    "arc(tm) 130t",
+    "arc(tm) 140t",
+    "adreno",
 )
 
 
 def _is_windows_igpu_name(name: str) -> bool:
     lowered = name.strip().lower()
     return any(pat in lowered for pat in _WIN_IGPU_PATTERNS)
+
+
+def _parse_windows_reg_mem_bytes(raw_mem: object) -> float:
+    if isinstance(raw_mem, (int, float)) and raw_mem > 0:
+        return float(raw_mem)
+    if isinstance(raw_mem, list) and raw_mem and all(isinstance(b, int) and 0 <= b <= 255 for b in raw_mem):
+        return float(int.from_bytes(bytes(raw_mem), "little"))
+    return 0.0
 
 
 def _read_windows_vulkan_vram_mb() -> float:
@@ -285,10 +331,8 @@ def _read_windows_vulkan_vram_mb() -> float:
                 name = str(row.get("DriverDesc") or "").strip()
                 if not name or "microsoft basic" in name.lower():
                     continue
-                raw_mem = row.get("Mem")
-                mem_mb = 0.0
-                if isinstance(raw_mem, (int, float)) and raw_mem > 0:
-                    mem_mb = float(raw_mem) / (1024.0 * 1024.0)
+                raw_bytes = _parse_windows_reg_mem_bytes(row.get("Mem"))
+                mem_mb = raw_bytes / (1024.0 * 1024.0) if raw_bytes > 0 else 0.0
                 if _is_windows_igpu_name(name) or (0 < mem_mb <= 2048.0 and total_ram_mb >= 8192.0):
                     saw_igpu = True
                 if mem_mb > best_mb:
@@ -307,7 +351,8 @@ def _read_windows_vulkan_vram_mb() -> float:
 
 
 def _read_vulkan_vram_mb() -> float:
-    """Total device-local VRAM via vulkaninfo JSON or text output (or Windows WDDM registry)."""
+    """Total device-local VRAM via vulkaninfo JSON or text output (or Windows WDDM / Linux GTT shared heap)."""
+    found_mb = 0.0
     tool = shutil.which("vulkaninfo")
     if tool:
         shell = os.environ.get("SHELL") or "/bin/bash"
@@ -332,13 +377,19 @@ def _read_vulkan_vram_mb() -> float:
                 if payload is not None:
                     total = _collect_vulkan_device_local_heap_mb(payload)
                     if total > 0:
-                        return total
+                        found_mb = total
+                        break
             total = _parse_vulkaninfo_text_total_vram_mb(output)
             if total > 0:
-                return total
-    if sys.platform == "win32":
-        return _read_windows_vulkan_vram_mb()
-    return 0.0
+                found_mb = total
+                break
+    # On AMD/Intel iGPUs, vulkaninfo often reports only the small BIOS UMA carve-out (512 MB - 4 GB)
+    # rather than the WDDM / GTT shared Vulkan heap.
+    if sys.platform == "win32" and found_mb <= 4096.0:
+        return max(found_mb, _read_windows_vulkan_vram_mb())
+    if sys.platform == "linux" and found_mb <= 4096.0:
+        return max(found_mb, _read_linux_igpu_shared_vram_mb())
+    return found_mb
 
 
 def _read_metal_vram_mb() -> float:
