@@ -2984,10 +2984,11 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("Active model preset: base", printer.call_args.args[0])
 
     def test_main_setup_command_launches_app_in_setup_mode(self) -> None:
-        with patch("src.cli.launch_tui") as launch_tui:
+        with patch("src.cli._run_interactive_setup") as run_setup, patch("src.cli.launch_tui") as launch_tui:
             main(["setup"])
 
-        launch_tui.assert_called_once_with(force_setup=True)
+        run_setup.assert_called_once_with()
+        launch_tui.assert_not_called()
 
     def test_main_version_option_prints_version(self) -> None:
         with patch("src.cli._open_jet_version", return_value="0.3.8"), patch("builtins.print") as printer:

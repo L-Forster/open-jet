@@ -543,6 +543,80 @@ def _start_project(args: argparse.Namespace) -> None:
         raise SystemExit(str(exc))
 
 
+async def _run_interactive_setup_async() -> None:
+    from rich.console import Console
+
+    from .hardware import detect_hardware_info, recommended_context_window_tokens
+    from .provisioning import provision_setup_artifacts
+    from .setup import run_setup_wizard
+
+    console = Console()
+    session = None
+    if sys.stdin.isatty():
+        try:
+            from prompt_toolkit import PromptSession
+
+            session = PromptSession()
+        except Exception:
+            session = None
+
+    cfg = load_config()
+    hardware_info = detect_hardware_info()
+    try:
+        setup_result = await run_setup_wizard(
+            session=session,
+            console=console,
+            hardware_info=hardware_info,
+            recommended_ctx=recommended_context_window_tokens(),
+            current_cfg=cfg,
+        )
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[yellow]Setup cancelled.[/]")
+        return
+    if not isinstance(setup_result, dict):
+        return
+
+    class _TerminalSetupLog:
+        def write(self, text: str) -> None:
+            console.print(text)
+
+    last_status = ""
+
+    def _set_status(text: str) -> None:
+        nonlocal last_status
+        clean = str(text or "").strip()
+        if clean and clean != last_status:
+            last_status = clean
+            console.print(f"[dim]{clean}[/]")
+
+    resolved = await provision_setup_artifacts(
+        dict(setup_result),
+        hardware_info=hardware_info,
+        log=_TerminalSetupLog(),
+        set_status=_set_status,
+        clear_status=lambda: None,
+    )
+    profile_name = str(resolved.pop("model_profile_name", "")).strip() or None
+    resolved.pop("system_prompt", None)
+    cfg.pop("system_prompt", None)
+    cfg.update(resolved)
+    sync_active_model_profile(cfg, preferred_name=profile_name)
+    save_config(cfg)
+    model_ref = active_model_ref(cfg) or str(cfg.get("llama_model") or "")
+    console.print(
+        f"\n[bold green]Setup complete:[/] {model_ref} "
+        f"({cfg.get('device', 'auto')}, {cfg.get('context_window_tokens', '?')} tokens)"
+    )
+    console.print("Run [bold]openjet[/] to start, or [bold]openjet serve[/] to expose the API.")
+
+
+def _run_interactive_setup() -> None:
+    try:
+        asyncio.run(_run_interactive_setup_async())
+    except (RuntimeError, ValueError, OSError) as exc:
+        raise SystemExit(f"Setup failed: {exc}")
+
+
 def main(argv: list[str] | None = None) -> None:
     normalized_argv = list(argv) if argv is not None else sys.argv[1:]
     if normalized_argv:
@@ -782,5 +856,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "setup" and (args.model or args.context_tokens is not None or args.json_output or args.long_context):
         raise SystemExit("Use --non-interactive, --yes, or --dry-run with setup options.")
-    force_setup = bool(args.command == "setup")
-    launch_tui(force_setup=force_setup)
+    if args.command == "setup":
+        _run_interactive_setup()
+        return
+    launch_tui(force_setup=False)

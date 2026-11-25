@@ -374,9 +374,14 @@ class OpenJetServiceController:
             )
             for key in (
                 "device",
+                "llama_model",
+                "model_download_path",
+                "setup_missing_model",
                 "llama_server_path",
                 "llama_cpp_ref",
                 "llama_mtp",
+                "llama_cpu_moe",
+                "llama_n_cpu_moe",
                 "setup_missing_runtime",
                 "context_window_tokens",
             ):
@@ -699,11 +704,18 @@ class OpenJetServiceController:
             current_cfg=self.cfg,
         )
         log = _SetupLog()
+        loop = asyncio.get_running_loop()
+
+        def _emit_status(text: str) -> None:
+            clean = str(text or "").strip()
+            if clean:
+                loop.create_task(self.emit("status_update", {"text": clean}))
+
         setup_result = await provision_setup_artifacts(
             dict(setup_result),
             hardware_info=hardware_info,
             log=log,
-            set_status=lambda text: None,
+            set_status=_emit_status,
             clear_status=lambda: None,
         )
         profile_name = str(setup_result.pop("model_profile_name", "")).strip() or None

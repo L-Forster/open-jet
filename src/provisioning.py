@@ -592,12 +592,28 @@ def _parse_huggingface_resolve_url(url: str) -> tuple[str, str, str] | None:
 
 
 def _hf_cli_command() -> list[str]:
+    names = ("hf.exe", "hf", "huggingface-cli.exe", "huggingface-cli") if sys.platform == "win32" else ("hf", "huggingface-cli")
+    seen_dirs: list[Path] = []
+    for exe_path in (Path(sys.executable), Path(sys.executable).resolve()):
+        parent = exe_path.parent
+        if parent not in seen_dirs:
+            seen_dirs.append(parent)
+            for name in names:
+                candidate = parent / name
+                if candidate.is_file():
+                    return [str(candidate), "download"]
     hf = _native_tool_path("hf")
     if hf:
         return [hf, "download"]
     huggingface_cli = _native_tool_path("huggingface-cli")
     if huggingface_cli:
         return [huggingface_cli, "download"]
+    try:
+        import huggingface_hub.cli.hf  # noqa: F401
+    except Exception:
+        pass
+    else:
+        return [sys.executable, "-c", "from huggingface_hub.cli.hf import main; main()", "download"]
     raise RuntimeError(
         "Hugging Face CLI is required for model downloads. Install OpenJet dependencies "
         "or run `pip install 'huggingface_hub[hf_transfer]' hf_transfer`."

@@ -253,9 +253,65 @@ class AgentSetupCliTests(unittest.TestCase):
         tui.assert_not_called()
 
     def test_bare_setup_preserves_guided_flow(self):
-        with patch("src.cli.launch_tui") as tui:
+        with patch("src.cli._run_interactive_setup") as interactive, patch("src.cli.launch_tui") as tui:
             main(["setup"])
-        tui.assert_called_once_with(force_setup=True)
+        interactive.assert_called_once_with()
+        tui.assert_not_called()
+
+    def test_hf_cli_command_finds_hf_next_to_sys_executable(self):
+        from src import provisioning
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = Path(tmp) / "bin"
+            fake_bin.mkdir()
+            fake_py = fake_bin / "python"
+            fake_py.write_text("")
+            fake_hf = fake_bin / ("hf.exe" if provisioning.sys.platform == "win32" else "hf")
+            fake_hf.write_text("")
+            with patch.object(provisioning.sys, "executable", str(fake_py)), patch.object(
+                provisioning, "_native_tool_path", return_value=None
+            ):
+                self.assertEqual(provisioning._hf_cli_command(), [str(fake_hf), "download"])
+
+    def test_interactive_setup_provisions_and_saves_without_launching_tui(self):
+        import asyncio
+        from src import cli
+
+        hardware = HardwareInfo("Vulkan-capable device", total_ram_gb=13.3, has_cuda=False, has_vulkan=True, vram_mb=6800.0)
+        wizard_payload = {
+            "model_source": "direct",
+            "model_download_url": "https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main/Mainline_Support/Inkling-2-Mini-UD-IQ3_XXS.gguf_file?download=true",
+            "model_download_path": "/tmp/Inkling-2-Mini-UD-IQ3_XXS-mainline.gguf",
+            "device": "vulkan",
+            "context_window_tokens": 32768,
+            "gpu_layers": 99,
+            "llama_cpu_moe": True,
+            "llama_cpp_ref": "b12651",
+            "setup_complete": True,
+            "model_profile_name": "Inkling 2 Mini UD-IQ3_XXS",
+        }
+        provisioned = {
+            **wizard_payload,
+            "llama_model": "/tmp/Inkling-2-Mini-UD-IQ3_XXS-mainline.gguf",
+            "llama_server_path": "/tmp/llama-server",
+            "setup_missing_model": False,
+            "setup_missing_runtime": False,
+        }
+        saved: list[dict] = []
+        with patch("src.cli.load_config", return_value={}), patch(
+            "src.cli.save_config", side_effect=lambda cfg: saved.append(dict(cfg))
+        ), patch("src.hardware.detect_hardware_info", return_value=hardware), patch(
+            "src.hardware.recommended_context_window_tokens", return_value=8192
+        ), patch("src.setup.run_setup_wizard", AsyncMock(return_value=wizard_payload)), patch(
+            "src.provisioning.provision_setup_artifacts", AsyncMock(return_value=provisioned)
+        ) as provision, patch("src.cli.launch_tui") as tui:
+            asyncio.run(cli._run_interactive_setup_async())
+
+        provision.assert_awaited_once()
+        tui.assert_not_called()
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0]["llama_model"], "/tmp/Inkling-2-Mini-UD-IQ3_XXS-mainline.gguf")
+        self.assertTrue(saved[0]["llama_cpu_moe"])
 
     def test_status_json_works_through_status_alias(self):
         stdout = io.StringIO()
